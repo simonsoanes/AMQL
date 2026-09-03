@@ -12,6 +12,8 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <AssemblyName>amql-cli</AssemblyName>
+    <RootNamespace>Amql.Cli</RootNamespace>
   </PropertyGroup>
 
 </Project>
