@@ -1,0 +1,30 @@
+## .NET build results
+bin/
+obj/
+*.user
+*.suo
+
+## NuGet
+*.nupkg
+*.snupkg
+packages/
+
+## Test results
+TestResults/
+*.trx
+*.coverage
+*.coveragexml
+
+## Visual Studio / Rider
+.vs/
+.idea/
+*.userosscache
+*.sln.docstates
+
+## OS files
+.DS_Store
+Thumbs.db
+
+## User-specific / generated
+*.tmp
+*.log
