@@ -1,0 +1,11 @@
+D:\Dev\AMQL\src\Amql.Safetensors\bin\Debug\net10.0\Amql.Safetensors.deps.json
+D:\Dev\AMQL\src\Amql.Safetensors\bin\Debug\net10.0\Amql.Safetensors.dll
+D:\Dev\AMQL\src\Amql.Safetensors\bin\Debug\net10.0\Amql.Safetensors.pdb
+D:\Dev\AMQL\src\Amql.Safetensors\obj\Debug\net10.0\Amql.Safetensors.GeneratedMSBuildEditorConfig.editorconfig
+D:\Dev\AMQL\src\Amql.Safetensors\obj\Debug\net10.0\Amql.Safetensors.AssemblyInfoInputs.cache
+D:\Dev\AMQL\src\Amql.Safetensors\obj\Debug\net10.0\Amql.Safetensors.AssemblyInfo.cs
+D:\Dev\AMQL\src\Amql.Safetensors\obj\Debug\net10.0\Amql.Safetensors.csproj.CoreCompileInputs.cache
+D:\Dev\AMQL\src\Amql.Safetensors\obj\Debug\net10.0\Amql.Safetensors.dll
+D:\Dev\AMQL\src\Amql.Safetensors\obj\Debug\net10.0\refint\Amql.Safetensors.dll
+D:\Dev\AMQL\src\Amql.Safetensors\obj\Debug\net10.0\Amql.Safetensors.pdb
+D:\Dev\AMQL\src\Amql.Safetensors\obj\Debug\net10.0\ref\Amql.Safetensors.dll

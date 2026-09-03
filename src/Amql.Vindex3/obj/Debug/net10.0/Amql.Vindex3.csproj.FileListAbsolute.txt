@@ -1,0 +1,15 @@
+D:\Dev\AMQL\src\Amql.Vindex3\obj\Debug\net10.0\Amql.Vindex3.csproj.AssemblyReference.cache
+D:\Dev\AMQL\src\Amql.Vindex3\obj\Debug\net10.0\Amql.Vindex3.GeneratedMSBuildEditorConfig.editorconfig
+D:\Dev\AMQL\src\Amql.Vindex3\obj\Debug\net10.0\Amql.Vindex3.AssemblyInfoInputs.cache
+D:\Dev\AMQL\src\Amql.Vindex3\obj\Debug\net10.0\Amql.Vindex3.AssemblyInfo.cs
+D:\Dev\AMQL\src\Amql.Vindex3\obj\Debug\net10.0\Amql.Vindex3.csproj.CoreCompileInputs.cache
+D:\Dev\AMQL\src\Amql.Vindex3\bin\Debug\net10.0\Amql.Vindex3.deps.json
+D:\Dev\AMQL\src\Amql.Vindex3\bin\Debug\net10.0\Amql.Vindex3.dll
+D:\Dev\AMQL\src\Amql.Vindex3\bin\Debug\net10.0\Amql.Vindex3.pdb
+D:\Dev\AMQL\src\Amql.Vindex3\bin\Debug\net10.0\Amql.Safetensors.dll
+D:\Dev\AMQL\src\Amql.Vindex3\bin\Debug\net10.0\Amql.Safetensors.pdb
+D:\Dev\AMQL\src\Amql.Vindex3\obj\Debug\net10.0\Amql.Vin.D9802526.Up2Date
+D:\Dev\AMQL\src\Amql.Vindex3\obj\Debug\net10.0\Amql.Vindex3.dll
+D:\Dev\AMQL\src\Amql.Vindex3\obj\Debug\net10.0\refint\Amql.Vindex3.dll
+D:\Dev\AMQL\src\Amql.Vindex3\obj\Debug\net10.0\Amql.Vindex3.pdb
+D:\Dev\AMQL\src\Amql.Vindex3\obj\Debug\net10.0\ref\Amql.Vindex3.dll

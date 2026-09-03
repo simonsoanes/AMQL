@@ -1,0 +1,17 @@
+D:\Dev\AMQL\src\Amql.Inference\bin\Debug\net10.0\Amql.Inference.deps.json
+D:\Dev\AMQL\src\Amql.Inference\bin\Debug\net10.0\Amql.Inference.dll
+D:\Dev\AMQL\src\Amql.Inference\bin\Debug\net10.0\Amql.Inference.pdb
+D:\Dev\AMQL\src\Amql.Inference\bin\Debug\net10.0\Amql.Safetensors.dll
+D:\Dev\AMQL\src\Amql.Inference\bin\Debug\net10.0\Amql.Vindex3.dll
+D:\Dev\AMQL\src\Amql.Inference\bin\Debug\net10.0\Amql.Vindex3.pdb
+D:\Dev\AMQL\src\Amql.Inference\bin\Debug\net10.0\Amql.Safetensors.pdb
+D:\Dev\AMQL\src\Amql.Inference\obj\Debug\net10.0\Amql.Inference.csproj.AssemblyReference.cache
+D:\Dev\AMQL\src\Amql.Inference\obj\Debug\net10.0\Amql.Inference.GeneratedMSBuildEditorConfig.editorconfig
+D:\Dev\AMQL\src\Amql.Inference\obj\Debug\net10.0\Amql.Inference.AssemblyInfoInputs.cache
+D:\Dev\AMQL\src\Amql.Inference\obj\Debug\net10.0\Amql.Inference.AssemblyInfo.cs
+D:\Dev\AMQL\src\Amql.Inference\obj\Debug\net10.0\Amql.Inference.csproj.CoreCompileInputs.cache
+D:\Dev\AMQL\src\Amql.Inference\obj\Debug\net10.0\Amql.Inf.410731D0.Up2Date
+D:\Dev\AMQL\src\Amql.Inference\obj\Debug\net10.0\Amql.Inference.dll
+D:\Dev\AMQL\src\Amql.Inference\obj\Debug\net10.0\refint\Amql.Inference.dll
+D:\Dev\AMQL\src\Amql.Inference\obj\Debug\net10.0\Amql.Inference.pdb
+D:\Dev\AMQL\src\Amql.Inference\obj\Debug\net10.0\ref\Amql.Inference.dll
