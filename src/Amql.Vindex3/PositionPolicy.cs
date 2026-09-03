@@ -36,6 +36,21 @@ public sealed class PositionRope : PositionPolicy
     public double Theta { get; init; } = 10_000.0;
 }
 
+/// <summary>
+/// Partial rotary position embedding: rotation spans the first
+/// <c>head_dim × RotaryFactor</c> dims of each head (text-only MRoPE
+/// collapses to exactly this — identical positions across the MRoPE
+/// streams). Serialised as <c>{"kind":"partial_rope","theta":…,
+/// "rotary_factor":0.25}</c>.
+/// </summary>
+public sealed class PositionPartialRope : PositionPolicy
+{
+    public double Theta { get; init; } = 10_000.0;
+    public double RotaryFactor { get; init; } = 1.0;
+
+    public int RotaryWidth(int headDim) => Math.Max(2, (int)(headDim * RotaryFactor));
+}
+
 /// <summary>A position policy this build has not judged. The payload is
 /// kept verbatim so the fact is never silently lost; planning refuses it.</summary>
 public sealed class PositionUnresolved : PositionPolicy
@@ -63,6 +78,12 @@ public sealed class PositionPolicyConverter : JsonConverter<PositionPolicy>
             case "rope":
                 double theta = root.GetProperty("theta").GetDouble();
                 return new PositionRope { Theta = theta };
+            case "partial_rope":
+                double partialTheta = root.GetProperty("theta").GetDouble();
+                double factor = root.TryGetProperty("rotary_factor", out var rf)
+                    ? rf.GetDouble()
+                    : throw new JsonException("partial_rope requires 'rotary_factor'");
+                return new PositionPartialRope { Theta = partialTheta, RotaryFactor = factor };
             default:
                 // Unknown/pending variant — carry verbatim, refuse at plan time.
                 return new PositionUnresolved { Kind = kind, Payload = root.Clone() };
@@ -82,6 +103,13 @@ public sealed class PositionPolicyConverter : JsonConverter<PositionPolicy>
                 writer.WriteStartObject();
                 writer.WriteString("kind", "rope");
                 writer.WriteNumber("theta", rope.Theta);
+                writer.WriteEndObject();
+                break;
+            case PositionPartialRope partial:
+                writer.WriteStartObject();
+                writer.WriteString("kind", "partial_rope");
+                writer.WriteNumber("theta", partial.Theta);
+                writer.WriteNumber("rotary_factor", partial.RotaryFactor);
                 writer.WriteEndObject();
                 break;
             case PositionUnresolved unresolved:

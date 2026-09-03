@@ -83,8 +83,10 @@ public class HfTests
         Assert.Equal(LayerOperators.LinearAttention, target.Attention[0].Operator);
         Assert.Equal(LayerOperators.Softmax, target.Attention[1].Operator);
         Assert.Equal(LayerOperators.Softmax, target.Attention[2].Operator);
-        Assert.IsType<PositionUnresolved>(target.Attention[0].Position);
-        Assert.Equal("partial_mrope", ((PositionUnresolved)target.Attention[0].Position).Kind);
+        // Text-only default rope with a partial factor is now SERVED as
+        // partial rotary (MRoPE collapses for text).
+        Assert.IsType<PositionPartialRope>(target.Attention[0].Position);
+        Assert.Equal(0.25, ((PositionPartialRope)target.Attention[0].Position).RotaryFactor, 6);
         Assert.NotNull(graph.Component("vision"));
         Assert.NotNull(graph.Component("mtp"));
 
@@ -99,9 +101,12 @@ public class HfTests
         Assert.Equal(Dtype.F16, q.Dtype);
         Assert.Equal(2, q.Shape.Length);
 
-        // The hybrid operator boundary fails closed, by name.
-        var ex = Assert.Throws<UnsupportedOperatorException>(() => Planner.Plan(container, "target", store));
-        Assert.Contains("linear_attention", ex.Message);
+        // The hybrid operator now plans: layer 0 is a served linear
+        // (GatedDeltaNet) layer, layers 1-2 are softmax.
+        var plan = Planner.Plan(container, "target", store);
+        Assert.NotNull(plan.Layers[0].LinearAttention);
+        Assert.NotNull(plan.Layers[1].Attention);
+        Assert.Null(plan.Layers[1].LinearAttention);
     }
 
     [Fact]

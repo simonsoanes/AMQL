@@ -261,14 +261,34 @@ lives with the checkpoint, not the container, so text commands take
 <code>decode</code> (ids → text), <code>generate --prompt</code>, and
 <code>inspect-token --model-dir</code> (the token's text representation).
 
-**Executable boundary for Qwen3.5-0.8B:** the loaded container is fully
-faithful (24 layers, 320 tensors, ~1.4 GiB), but this build's executor
-serves none of its layers yet — 18 are `linear_attention` (conv +
-recurrent-key hybrid) and even the 6 `softmax` layers carry a hard output
-gate (second half of `q_proj`) plus partial-MRoPE (rotary factor 0.25).
-Each of those is refused by name at plan time rather than approximated.
-Weighted QK norm is likewise refused (a stack with `q_norm`/`k_norm`
-tensors would otherwise silently skip normalising Q/K).
+**Qwen3.5-0.8B executes end-to-end:** the loaded container (24 layers,
+320 tensors, ~1.4 GiB) runs the full hybrid text decoder in managed .NET
+on CPU. The 18 `linear_attention` layers are a served GatedDeltaNet
+(depthwise causal conv over the qkv stream, the gated delta-rule
+recurrence with per-key-head state, a z-gated RMSNorm, output projection),
+and the 6 `softmax` layers carry the hard output gate (second half of each
+interleaved `q_proj` head block), the weighted per-head QK norm
+(`q_norm`/`k_norm`, Qwen3.5's 1+w affine convention), and text-MRoPE
+(partial rotary over the first quarter of each head, theta 1e7, which
+collapses to standard partial rope for text). Parity is verified against
+the reference implementation (transformers 5.16.1, CPU fp32) on the real
+checkpoint: single-token forward matches to 1e-5 at every layer with exact
+logits and top-8; a 4-token forward stays within fp drift on logits and
+≥6/8 top-8 overlap (deep-recurrence fp amplification outliers documented at
+L20/L23). The key layering facts were taken from the reference source, not
+guessed — including three subtle conventions a naive port gets wrong:
+projection tensors are stored `[out, in]`, the gate interleaves per head
+(`[q_h | gate_h]` blocks, not contiguous halves), and rotary pairs the two
+halves of the rotation window.
+
+**Extensibility** (architecture / runtime plug-in): the interpreter
+dispatches per-layer on the plan's operator — `AttentionOp` (softmax) vs
+`LinearAttentionOp` (GatedDeltaNet) — both produced by the same planner,
+driven by the same position-major/batched executor. A future architecture
+adds its operator op + kernel and a mapper judgment; prefill
+automatically serialises when any layer is stateful. Weight sources stay
+plug-and-play because every tensor is reached only through
+`OperandStore` → `WeightLoader` (the container is the deletion boundary).
 
 ## 6. Explicit non-goals (this slice)
 
@@ -276,9 +296,11 @@ tensors would otherwise silently skip normalising Q/K).
   the Qwen3.5 text family's judged surface, carried verbatim rather than
   approximated. Generalised `inspect-hf` heuristics, representability
   arithmetic (choosing encodings), and quantisation policy remain absent.
-- **Linear-attention / partial-MRoPE / output-gate / weighted-QK-norm
-  kernels**: declared in the graph, refused at plan time by name. Porting
-  them is future work, not approximation.
+- **Non-text MRoPE / non-default rope scaling** (`llama3`, `yarn`), MoE
+  routers with exotic gate policies, further layer operators
+  (`gated_delta`, `mamba2`, `kda`, `mla`, `conv_qkv`…): declared in the
+  graph, refused at plan time by name. Porting them is future work, not
+  approximation.
 - **Quantization** (k-quants, MXFP4, FP8 serving), GGUF loading, remote
   expert serving, Metal/GPU backends.
 - **LQL**, the router/server surface, KV dispatch tiers, drafter/inference
@@ -288,8 +310,9 @@ tensors would otherwise silently skip normalising Q/K).
   against the reference; older `vocab.json`/`merges.txt`-only checkpoints
   (SentencePiece-tier piping) refuse with a clear message.
 - **Byte-parity with Rust for every kernel**: numerics follow the same
-  formulas; tests validate against independent hand-computed references,
-  not against Rust goldens (no cross-compiler A/B harness in this slice).
+  formulas; tests validate against independent hand-computed references
+  and the reference Python implementation, not against Rust goldens (no
+  cross-compiler A/B harness in this slice).
 
 ## 7. Verification story
 
@@ -317,3 +340,13 @@ tensors would otherwise silently skip normalising Q/K).
   sampled replay for a fixed seed + different seed divergence, embedding
   profile / neighbour ranking vs a brute-force oracle, logits top-1 ==
   library argmax, and the named `linear_attention` refusal.
+- **Hybrid operators**: the weighted QK norm, the hard output gate, and
+  the linear-attention (GatedDeltaNet) layer each verify against
+  independent naive implementations; the linear and mixed pipelines are
+  pinned to a reference oracle (`synth_oracle.json`, a python port of the
+  Qwen3.5 math over the same synthetic weights).
+- **Real-model parity** (`golden_qwen35_forward.json`,
+  `golden_qwen35_1tok.json`): the .NET runtime's forward pass against the
+  HF reference on the actual Qwen3.5-0.8B checkpoint — single token at
+  1e-5 per layer with exact logits/top-8; 4 tokens within fp drift on
+  logits and ≥6/8 top-8 (documented deep-recurrence outliers).

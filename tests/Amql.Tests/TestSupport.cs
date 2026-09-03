@@ -36,10 +36,21 @@ public sealed record Dims(
     int Experts = 2,
     int TopK = 1,
     bool WeightedQkNorm = false,
-    bool OutputGate = false)
+    bool OutputGate = false,
+    bool LinearLayer0 = false)
 {
     public int QDim => NumQHeads * HeadDim;
     public int KvDim => NumKvHeads * HeadDim;
+
+    // Linear-attention geometry for the synthetic LinearLayer0 case.
+    public const int LinKHeads = 2;
+    public const int LinKHeadDim = 2;
+    public const int LinVHeads = 2;
+    public const int LinVHeadDim = 2;
+    public const int LinConvKernel = 2;
+    public int LinKeyDim => LinKHeads * LinKHeadDim;
+    public int LinValueDim => LinVHeads * LinVHeadDim;
+    public int LinConvDim => 2 * LinKeyDim + LinValueDim;
 }
 
 /// <summary>
@@ -90,14 +101,45 @@ public static class SyntheticModel
 
         for (int l = 0; l < d.Layers; l++)
         {
-            Matrix($"{l}.self_attn.q_proj.weight", d.Hidden, d.QDim, 2, l);
-            Matrix($"{l}.self_attn.k_proj.weight", d.Hidden, d.KvDim, 3, l);
-            Matrix($"{l}.self_attn.v_proj.weight", d.Hidden, d.KvDim, 4, l);
-            Matrix($"{l}.self_attn.o_proj.weight", d.Hidden, d.QDim, 5, l);
+            bool linearLayer = d.LinearLayer0 && l == 0;
+            if (linearLayer)
+            {
+                int qkvRows = d.LinConvDim;
+                Matrix($"{l}.linear_attn.in_proj_qkv.weight", qkvRows, d.Hidden, 50, l);
+                Matrix($"{l}.linear_attn.in_proj_z.weight", d.LinValueDim, d.Hidden, 51, l);
+                Matrix($"{l}.linear_attn.in_proj_a.weight", Dims.LinVHeads, d.Hidden, 52, l);
+                Matrix($"{l}.linear_attn.in_proj_b.weight", Dims.LinVHeads, d.Hidden, 53, l);
+                Matrix($"{l}.linear_attn.out_proj.weight", d.Hidden, d.LinValueDim, 54, l);
+                // conv1d weight [LinConvDim, 1, LinConvKernel] flattened.
+                tensors[$"{l}.linear_attn.conv1d.weight"] = (
+                    Dtype.F32,
+                    new long[] { d.LinConvDim, 1, Dims.LinConvKernel },
+                    ToBytes(Enumerable.Range(0, d.LinConvDim * Dims.LinConvKernel)
+                        .Select(i => W(l, i, 0, 55)).ToArray()));
+                // A_log and dt_bias are per-value-head vectors; A_log is a
+                // deliberate F32 inside an otherwise F16 family in the real
+                // model — here both are stored F32 for simplicity.
+                tensors[$"{l}.linear_attn.A_log"] = (
+                    Dtype.F32, new long[] { Dims.LinVHeads },
+                    ToBytes(Enumerable.Range(0, Dims.LinVHeads).Select(i => W(l, i, 0, 56)).ToArray()));
+                tensors[$"{l}.linear_attn.dt_bias"] = (
+                    Dtype.F32, new long[] { Dims.LinVHeads },
+                    ToBytes(Enumerable.Range(0, Dims.LinVHeads).Select(i => W(l, i, 0, 57)).ToArray()));
+                tensors[$"{l}.linear_attn.norm.weight"] = (
+                    Dtype.F32, new long[] { Dims.LinVHeadDim },
+                    ToBytes(Enumerable.Range(0, Dims.LinVHeadDim).Select(i => W(l, i, 0, 58)).ToArray()));
+            }
+            else
+            {
+                Matrix($"{l}.self_attn.q_proj.weight", d.OutputGate ? 2 * d.QDim : d.QDim, d.Hidden, 2, l);
+                Matrix($"{l}.self_attn.k_proj.weight", d.KvDim, d.Hidden, 3, l);
+                Matrix($"{l}.self_attn.v_proj.weight", d.KvDim, d.Hidden, 4, l);
+                Matrix($"{l}.self_attn.o_proj.weight", d.Hidden, d.QDim, 5, l);
+            }
             Vector($"{l}.input_layernorm.weight", d.Hidden, 11);
             Vector($"{l}.post_attention_layernorm.weight", d.Hidden, 12);
 
-            if (d.WeightedQkNorm)
+            if (d.WeightedQkNorm && !linearLayer)
             {
                 Vector($"{l}.self_attn.q_norm.weight", d.HeadDim, 40);
                 Vector($"{l}.self_attn.k_norm.weight", d.HeadDim, 41);
@@ -121,10 +163,24 @@ public static class SyntheticModel
             }
         }
 
+        // Linear-attention surface facts (used when a linear layer exists).
+        System.Text.Json.JsonElement? linearSurface = d.LinearLayer0
+            ? System.Text.Json.JsonSerializer.SerializeToElement(new
+            {
+                key_heads = Dims.LinKHeads,
+                key_head_dim = Dims.LinKHeadDim,
+                value_heads = Dims.LinVHeads,
+                value_head_dim = Dims.LinVHeadDim,
+                conv_kernel = Dims.LinConvKernel,
+                state_dtype = "float32",
+            }, ViJson.Options)
+            : null;
+
         var normSpec = new NormSpec { Kind = NormType.RmsNorm, Eps = d.NormEps, WeightOffset = 0 };
         var surface = new ExecutionSurface
         {
             ContextLength = 2048,
+            LinearAttention = linearSurface,
             Attention = new AttentionSurface
             {
                 NumQHeads = d.NumQHeads,
@@ -163,12 +219,14 @@ public static class SyntheticModel
         var policies = new List<AttentionLayerPolicy>();
         for (int l = 0; l < d.Layers; l++)
         {
+            bool linearLayer = d.LinearLayer0 && l == 0;
             policies.Add(new AttentionLayerPolicy
             {
-                Operator = LayerOperators.Softmax,
+                Operator = linearLayer ? LayerOperators.LinearAttention : LayerOperators.Softmax,
                 Span = d.Window is null ? AttentionSpan.Full : AttentionSpan.Sliding,
-                Window = d.Window,
-                Position = d.Rope ? PositionPolicy.CreateRope(d.RopeTheta) : PositionPolicy.None,
+                Window = linearLayer ? null : d.Window,
+                // Linear layers are position-free; softmax layers use rope.
+                Position = linearLayer ? PositionPolicy.None : (d.Rope ? PositionPolicy.CreateRope(d.RopeTheta) : PositionPolicy.None),
                 Geometry = new HeadGeometry { HeadDim = d.HeadDim, NumKvHeads = d.NumKvHeads },
             });
         }

@@ -6,10 +6,11 @@ namespace Amql.Inference;
 /// Rotary position embedding. The general entry computes
 /// <c>inv_freq[i] = 1 / theta^(2i/rotary_dim)</c> and rotates the two
 /// halves of each rotary pair by <c>angle = position · inv_freq[i]</c>.
-/// Only the identity rotary (fraction 1.0, no frequency scaling, no
-/// divisor) is implemented here; every scaled variant is refused — the
-/// reference refuses to serve an unknown position policy rather than
-/// approximate one.
+/// The rotation covers the first <c>rotaryWidth</c> dims of each head:
+/// full-width for <see cref="PositionRope"/>, the partial fraction for
+/// <see cref="PositionPartialRope"/> (text-only MRoPE collapses to this).
+/// Scaled variants are refused — the reference refuses to serve an
+/// unknown position policy rather than approximate one.
 /// </summary>
 public static class Rope
 {
@@ -22,22 +23,35 @@ public static class Rope
     public static void Apply(Tensor2D x, int numHeads, int headDim,
         PositionPolicy positionPolicy, ReadOnlySpan<int> positions)
     {
-        if (positionPolicy is PositionNone)
+        int rotaryWidth;
+        double theta;
+        switch (positionPolicy)
         {
-            return;
-        }
-        if (positionPolicy is not PositionRope rope)
-        {
-            throw new UnsupportedOperatorException(
-                $"position policy '{((PositionUnresolved)positionPolicy).Kind}' has no managed rotary implementation");
+            case PositionNone:
+                return;
+            case PositionRope rope:
+                rotaryWidth = headDim;
+                theta = rope.Theta;
+                break;
+            case PositionPartialRope partial:
+                rotaryWidth = partial.RotaryWidth(headDim);
+                theta = partial.Theta;
+                break;
+            default:
+                throw new UnsupportedOperatorException(
+                    $"position policy '{((PositionUnresolved)positionPolicy).Kind}' has no managed rotary implementation");
         }
 
-        int rotaryDim = headDim;
-        int pairCount = rotaryDim / 2;
+        if (rotaryWidth > headDim)
+        {
+            throw new ArgumentException($"rotary width {rotaryWidth} exceeds head dim {headDim}");
+        }
+
+        int pairCount = rotaryWidth / 2;
         var invFreq = new double[pairCount];
         for (int i = 0; i < pairCount; i++)
         {
-            invFreq[i] = 1.0 / Math.Pow(rope.Theta, 2.0 * i / rotaryDim);
+            invFreq[i] = 1.0 / Math.Pow(theta, 2.0 * i / rotaryWidth);
         }
 
         for (int r = 0; r < x.Rows; r++)
@@ -47,10 +61,12 @@ public static class Rope
             for (int h = 0; h < numHeads; h++)
             {
                 int head = h * headDim;
+                // The reference pairs the two halves of the rotary window:
+                // dims i and i + rotaryWidth/2 rotate together.
                 for (int i = 0; i < pairCount; i++)
                 {
-                    int a = rowStart + head + 2 * i;
-                    int b = a + 1;
+                    int a = rowStart + head + i;
+                    int b = a + pairCount;
                     double angle = position * invFreq[i];
                     double cos = Math.Cos(angle);
                     double sin = Math.Sin(angle);

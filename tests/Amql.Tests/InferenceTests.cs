@@ -98,14 +98,17 @@ public class InferenceTests
                 {
                     for (int i = 0; i < pairs; i++)
                     {
+                        // Reference pairing: the two halves of the rotary
+                        // window rotate together (i with i + pairs).
                         double angle = p * inv[i];
                         double cos = Math.Cos(angle);
                         double sin = Math.Sin(angle);
-                        int a = p * heads * headDim + h * headDim + 2 * i;
+                        int a = p * heads * headDim + h * headDim + i;
+                        int bb = a + pairs;
                         double x1 = m[a];
-                        double x2 = m[a + 1];
+                        double x2 = m[bb];
                         m[a] = (float)(x1 * cos - x2 * sin);
-                        m[a + 1] = (float)(x1 * sin + x2 * cos);
+                        m[bb] = (float)(x1 * sin + x2 * cos);
                     }
                 }
             }
@@ -127,9 +130,9 @@ public class InferenceTests
             var h = (float[])x.Clone();
             NormRows(h, T, hidden, preW, 0);
 
-            var q = MatMulTransposedB(h, T, hidden, Wm(hidden, qDim, 2, l), qDim);
-            var k = MatMulTransposedB(h, T, hidden, Wm(hidden, kvDim, 3, l), kvDim);
-            var v = MatMulTransposedB(h, T, hidden, Wm(hidden, kvDim, 4, l), kvDim);
+            var q = MatMulTransposedB(h, T, hidden, Wm(qDim, hidden, 2, l), qDim);
+            var k = MatMulTransposedB(h, T, hidden, Wm(kvDim, hidden, 3, l), kvDim);
+            var v = MatMulTransposedB(h, T, hidden, Wm(kvDim, hidden, 4, l), kvDim);
 
             if (applyRope)
             {
@@ -432,9 +435,9 @@ public class InferenceTests
         }
 
         // Attention (causal, no rope).
-        var q = M2(h, 2, hidden, Wm(hidden, qDim, 2, 0), qDim);
-        var k = M2(h, 2, hidden, Wm(hidden, kvDim, 3, 0), kvDim);
-        var v = M2(h, 2, hidden, Wm(hidden, kvDim, 4, 0), kvDim);
+        var q = M2(h, 2, hidden, Wm(qDim, hidden, 2, 0), qDim);
+        var k = M2(h, 2, hidden, Wm(kvDim, hidden, 3, 0), kvDim);
+        var v = M2(h, 2, hidden, Wm(kvDim, hidden, 4, 0), kvDim);
         var ao = new float[2 * qDim];
         for (int qi = 0; qi < 2; qi++)
         {
@@ -562,29 +565,30 @@ public class InferenceTests
     }
 
     [Fact]
-    public void Gated_Attention_Refuses_At_Plan()
+    public void Gated_Attention_Serves_At_Plan()
     {
-        // A persisted output gate must refuse, never be silently skipped.
+        // A persisted output gate is now executed (sigmoid gate from the
+        // second half of q_proj), not refused.
         using var dir = new TempDir();
         var containerPath = EncodeTo(SyntheticModel.BuildSpec(new Dims(OutputGate: true)), dir);
         using var container = Vindex3Container.Open(containerPath);
         using var store = container.CreateOperandStore();
-        var ex = Assert.Throws<UnsupportedOperatorException>(() => Planner.Plan(container, "target", store));
-        Assert.Contains("output gate", ex.Message);
+        var plan = Planner.Plan(container, "target", store);
+        Assert.True(plan.Layers[0].Attention!.OutputGate);
     }
 
     [Fact]
-    public void Weighted_QkNorm_Refuses_At_Plan()
+    public void Weighted_QkNorm_Serves_At_Plan()
     {
-        // q_norm/k_norm weight tensors present ⇒ weighted QK norm is part
-        // of the program; the managed executor serves only the
-        // parameter-free variant and must refuse instead of skipping it.
+        // q_norm/k_norm tensors are now executed as weighted per-head QK
+        // norm; the plan binds both operands.
         using var dir = new TempDir();
         var containerPath = EncodeTo(SyntheticModel.BuildSpec(new Dims(WeightedQkNorm: true)), dir);
         using var container = Vindex3Container.Open(containerPath);
         using var store = container.CreateOperandStore();
-        var ex = Assert.Throws<UnsupportedOperatorException>(() => Planner.Plan(container, "target", store));
-        Assert.Contains("weighted QK norm", ex.Message);
+        var plan = Planner.Plan(container, "target", store);
+        Assert.NotNull(plan.Layers[0].Attention!.QNorm);
+        Assert.NotNull(plan.Layers[0].Attention!.KNorm);
     }
 
     [Fact]

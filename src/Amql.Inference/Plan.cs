@@ -56,9 +56,20 @@ public sealed class AttentionOp
 
     public bool VFromK { get; init; }
 
+    /// <summary>Hard attention output gate (Qwen3.5): <c>q_proj</c> is
+    /// [hidden, 2×QDim], the second half gates the attention output
+    /// elementwise — <c>o_proj(attn_out ⊙ sigmoid(gate))</c>.</summary>
+    public bool OutputGate { get; init; }
+
     public QkNormScope QkNormScope { get; init; } = QkNormScope.PerHead;
     public float QkNormWeightOffset { get; init; }
     public ParameterFreeQkNorm ParameterFreeQkNorm { get; init; } = new();
+
+    /// <summary>Weighted QK norm operands (learned q_norm/k_norm per
+    /// head) — distinct from the parameter-free variant. The eps and the
+    /// 1+w affine convention come from the declared norm surface.</summary>
+    public NormOp? QNorm { get; init; }
+    public NormOp? KNorm { get; init; }
 
     /// <summary>Epsilon for the parameter-free QK norm (weightless; the
     /// planner takes it from the declared norm surface — an executor never
@@ -69,6 +80,10 @@ public sealed class AttentionOp
     public required OperandRef KProj { get; init; }
     public required OperandRef VProj { get; init; }
     public required OperandRef OProj { get; init; }
+
+    /// <summary>Width of the q_proj operand: QDim when ungated, 2×QDim
+    /// when the output gate is declared.</summary>
+    public int QProjWidth => OutputGate ? 2 * QDim : QDim;
 
     public int KvDim => NumKvHeads * HeadDim;
     public int QDim => NumQHeads * HeadDim;
@@ -110,9 +125,48 @@ public sealed class LayerFfn
     public bool IsPresent => Dense is not null || Routed is not null;
 }
 
+/// <summary>
+/// The Qwen3.5-style linear-attention operator (GatedDeltaNet): a
+/// depthwise causal conv over the qkv stream, then a gated delta-rule
+/// recurrence with per-(key)-head state, a z-gated RMSNorm on the value
+/// head dim, and the output projection. Position-free (NoPE). The state
+/// the recurrence carries is caller-owned per layer.
+/// </summary>
+public sealed class LinearAttentionOp
+{
+    public required OperandRef InProjQkv { get; init; }
+    public required OperandRef InProjZ { get; init; }
+    public required OperandRef InProjA { get; init; }
+    public required OperandRef InProjB { get; init; }
+    public required OperandRef Conv1d { get; init; }
+    public required OperandRef ALog { get; init; }
+    public required OperandRef DtBias { get; init; }
+    public required OperandRef NormWeight { get; init; }
+    public required OperandRef OutProj { get; init; }
+
+    public required int NumKHeads { get; init; }
+    public required int HeadKDim { get; init; }
+    public required int NumVHeads { get; init; }
+    public required int HeadVDim { get; init; }
+    public required int ConvKernel { get; init; }
+    public required int HiddenSize { get; init; }
+    public required double NormEps { get; init; }
+
+    public int KeyDim => NumKHeads * HeadKDim;
+    public int ValueDim => NumVHeads * HeadVDim;
+
+    /// <summary>The conv stream width — qkv concatenated.</summary>
+    public int ConvDim => 2 * KeyDim + ValueDim;
+}
+
 public sealed class LayerPlan
 {
-    public required AttentionOp Attention { get; init; }
+    /// <summary>The softmax attention op (present on full-attention
+    /// layers).</summary>
+    public AttentionOp? Attention { get; init; }
+
+    /// <summary>The linear-attention op (present on linear layers).</summary>
+    public LinearAttentionOp? LinearAttention { get; init; }
 
     /// <summary>Norm sites; which of these are bound follows the
     /// placement evidence: PreOnly = pre-attn + pre-ffn (the reference's
@@ -124,6 +178,10 @@ public sealed class LayerPlan
     public NormOp? PostFfnNorm { get; init; }
 
     public LayerFfn? Ffn { get; init; }
+
+    /// <summary>Whether this layer carries a stateful operator (its states
+    /// must advance position by position — prefill cannot batch rows).</summary>
+    public bool IsStateful => LinearAttention is not null;
 }
 
 public sealed class OutputOp

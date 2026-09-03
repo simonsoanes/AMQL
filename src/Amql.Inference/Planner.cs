@@ -83,13 +83,18 @@ public static class Planner
         bool prePost,
         int hiddenSize)
     {
-        if (policy.Operator != LayerOperators.Softmax)
+        bool linear = policy.Operator == LayerOperators.LinearAttention;
+        bool softmax = policy.Operator == LayerOperators.Softmax;
+        if (!linear && !softmax)
         {
             throw new UnsupportedOperatorException(
                 $"layer {layer}: operator '{policy.Operator}' has no managed implementation (required primitive: {policy.Operator})");
         }
-        if (policy.Position is PositionUnresolved unresolved)
+        if (softmax && policy.Position is PositionUnresolved unresolved)
         {
+            // Softmax layers embed position; an unresolved policy cannot be
+            // executed. Linear layers are position-free — their policy row
+            // is carried and ignored.
             throw new UnsupportedOperatorException(
                 $"layer {layer}: position policy '{unresolved.Kind}' has no managed implementation");
         }
@@ -99,30 +104,60 @@ public static class Planner
                 $"layer {layer}: expert gate policy '{ffnSurface.GatePolicy.GetType().Name}' has no managed implementation");
         }
 
-        var attnSurface = surface.Attention!;
-        if (attnSurface.OutputGate is not null)
+        // ── norm sites + FFN (shared by both operator families) ──────────
+        string preAttnName = $"{layer}.input_layernorm.weight";
+        string postAttnName = $"{layer}.post_attention_layernorm.weight";
+        Require(store, stackId, preAttnName, layer, "pre-attention norm");
+
+        NormOp? preAttention = BindNorm(store, stackId, preAttnName, normSurface.Pre, hiddenSize);
+        NormOp? postAttention = null;
+        NormOp? preFfn;
+        NormOp? postFfn = null;
+        if (prePost)
         {
-            throw new UnsupportedOperatorException(
-                $"layer {layer}: the persisted attention surface declares an output gate (hard attention gate) " +
-                "with no managed implementation");
+            Require(store, stackId, postAttnName, layer, "post-attention norm");
+            postAttention = BindNorm(store, stackId, postAttnName, normSurface.Post!, hiddenSize);
+            string preFfnName = $"{layer}.mlp.pre_layernorm.weight";
+            string postFfnName = $"{layer}.mlp.post_layernorm.weight";
+            Require(store, stackId, preFfnName, layer, "pre-ffn norm");
+            Require(store, stackId, postFfnName, layer, "post-ffn norm");
+            preFfn = BindNorm(store, stackId, preFfnName, normSurface.Post!, hiddenSize);
+            postFfn = BindNorm(store, stackId, postFfnName, normSurface.Post!, hiddenSize);
         }
+        else
+        {
+            preFfn = BindNorm(store, stackId, postAttnName, normSurface.Post!, hiddenSize);
+        }
+
+        // ── the token mixer ─────────────────────────────────────────────
+        return new LayerPlan
+        {
+            Attention = softmax ? BuildSoftmaxAttention(store, stackId, layer, policy, surface, normSurface) : null,
+            LinearAttention = linear ? BuildLinearAttention(store, stackId, layer, surface, normSurface, hiddenSize) : null,
+            PreAttentionNorm = preAttention,
+            PostAttentionNorm = postAttention,
+            PreFfnNorm = preFfn,
+            PostFfnNorm = postFfn,
+            Ffn = BuildFfn(store, stackId, layer, ffnSurface, hiddenSize),
+        };
+    }
+
+    private static AttentionOp BuildSoftmaxAttention(
+        OperandStore store,
+        string stackId,
+        int layer,
+        AttentionLayerPolicy policy,
+        ExecutionSurface surface,
+        NormSurface normSurface)
+    {
+        var attnSurface = surface.Attention!;
         if (attnSurface.Sinks is not null)
         {
             throw new UnsupportedOperatorException(
                 $"layer {layer}: the persisted attention surface declares learned sinks with no managed implementation");
         }
-        // Weighted QK norm (a learned q_norm/k_norm per head) is a distinct
-        // operation from the parameter-free variant the executor serves.
-        // A stack carrying the weight tensors must refuse until a weighted
-        // kernel exists — never silently skip normalising Q/K.
-        if (store.ContainsTensor(stackId, $"{layer}.self_attn.q_norm.weight") ||
-            store.ContainsTensor(stackId, $"{layer}.self_attn.k_norm.weight"))
-        {
-            throw new UnsupportedOperatorException(
-                $"layer {layer}: weighted QK norm tensors (q_norm/k_norm) are present but the managed " +
-                "executor serves only the parameter-free QK norm");
-        }
-        var attn = new AttentionOp
+
+        var op = new AttentionOp
         {
             NumQHeads = attnSurface.NumQHeads,
             NumKvHeads = attnSurface.NumKvHeads,
@@ -132,10 +167,13 @@ public static class Planner
             Window = policy.Window,
             Position = policy.Position,
             VFromK = policy.VFromK,
+            OutputGate = attnSurface.OutputGate is not null,
             QkNormScope = attnSurface.QkNormScope,
             QkNormWeightOffset = attnSurface.QkNormWeightOffset,
             ParameterFreeQkNorm = attnSurface.ParameterFreeQkNorm,
             ParameterFreeQkNormEps = normSurface.Pre.Eps,
+            QNorm = BindOptionalQkNorm(store, stackId, layer, "q_norm", attnSurface, normSurface),
+            KNorm = BindOptionalQkNorm(store, stackId, layer, "k_norm", attnSurface, normSurface),
             QProj = new OperandRef(stackId, $"{layer}.self_attn.q_proj.weight"),
             KProj = new OperandRef(stackId, $"{layer}.self_attn.k_proj.weight"),
             VProj = new OperandRef(stackId, $"{layer}.self_attn.v_proj.weight"),
@@ -145,42 +183,101 @@ public static class Planner
         Require(store, stackId, $"{layer}.self_attn.k_proj.weight", layer, "attention (k_proj)");
         Require(store, stackId, $"{layer}.self_attn.v_proj.weight", layer, "attention (v_proj)");
         Require(store, stackId, $"{layer}.self_attn.o_proj.weight", layer, "attention (o_proj)");
+        return op;
+    }
 
-        // Norm sites — bound from the placement estate, refused when the
-        // operand is missing (closure).
-        string preAttnName = $"{layer}.input_layernorm.weight";
-        string postAttnName = $"{layer}.post_attention_layernorm.weight";
-        Require(store, stackId, preAttnName, layer, "pre-attention norm");
-
-        NormOp? preAttention = BindNorm(store, stackId, preAttnName, normSurface.Pre, 0);
-        NormOp? postAttention = null;
-        NormOp? preFfn;
-        NormOp? postFfn = null;
-        if (prePost)
+    /// <summary>Binds a weighted QK norm operand when the learned tensor
+    /// exists. The pair is symmetric in the reference — one without the
+    /// other is a defect this build refuses.</summary>
+    private static NormOp? BindOptionalQkNorm(
+        OperandStore store, string stackId, int layer, string kind,
+        AttentionSurface attnSurface, NormSurface normSurface)
+    {
+        string name = $"{layer}.self_attn.{kind}.weight";
+        string other = $"{layer}.self_attn.{(kind == "q_norm" ? "k_norm" : "q_norm")}.weight";
+        bool present = store.ContainsTensor(stackId, name);
+        bool otherPresent = store.ContainsTensor(stackId, other);
+        if (present != otherPresent)
         {
-            Require(store, stackId, postAttnName, layer, "post-attention norm");
-            postAttention = BindNorm(store, stackId, postAttnName, normSurface.Post!, 0);
-            string preFfnName = $"{layer}.mlp.pre_layernorm.weight";
-            string postFfnName = $"{layer}.mlp.post_layernorm.weight";
-            Require(store, stackId, preFfnName, layer, "pre-ffn norm");
-            Require(store, stackId, postFfnName, layer, "post-ffn norm");
-            preFfn = BindNorm(store, stackId, preFfnName, normSurface.Post!, 0);
-            postFfn = BindNorm(store, stackId, postFfnName, normSurface.Post!, 0);
+            throw new ContainerException(
+                $"operand closure: layer {layer}: weighted QK norm pair is asymmetric " +
+                $"('{name}' present: {present}, '{other}' present: {otherPresent})");
         }
-        else
+        if (!present)
         {
-            preFfn = BindNorm(store, stackId, postAttnName, normSurface.Post!, 0);
+            return null;
         }
-
-        return new LayerPlan
+        Require(store, stackId, name, layer, $"weighted QK norm ({kind})");
+        var spec = new NormSpec
         {
-            Attention = attn,
-            PreAttentionNorm = preAttention,
-            PostAttentionNorm = postAttention,
-            PreFfnNorm = preFfn,
-            PostFfnNorm = postFfn,
-            Ffn = BuildFfn(store, stackId, layer, ffnSurface, hiddenSize),
+            Kind = NormType.RmsNorm,
+            Eps = normSurface.Pre.Eps,
+            WeightOffset = attnSurface.QkNormWeightOffset,
         };
+        return new NormOp
+        {
+            Weight = new OperandRef(stackId, name),
+            Kind = spec.Kind,
+            Eps = spec.Eps,
+            WeightOffset = spec.WeightOffset,
+            Width = attnSurface.HeadDim, // per-head, one weight set shared by all heads
+        };
+    }
+
+    /// <summary>Builds the linear-attention operator (GatedDeltaNet) for a
+    /// linear layer. Geometry comes from the persisted linear surface; the
+    /// tensor names are those of the Qwen3.5 GatedDeltaNet.</summary>
+    private static LinearAttentionOp BuildLinearAttention(
+        OperandStore store, string stackId, int layer,
+        ExecutionSurface surface, NormSurface normSurface, int hiddenSize)
+    {
+        if (surface.LinearAttention is not { } json)
+        {
+            throw new UnsupportedOperatorException(
+                $"layer {layer}: operator 'linear_attention' declared but no linear attention surface was persisted");
+        }
+
+        int KeyHeads = Int(json, "key_heads") ?? throw new UnsupportedOperatorException($"layer {layer}: linear surface missing 'key_heads'");
+        int KeyHeadDim = Int(json, "key_head_dim") ?? throw new UnsupportedOperatorException($"layer {layer}: linear surface missing 'key_head_dim'");
+        int ValueHeads = Int(json, "value_heads") ?? throw new UnsupportedOperatorException($"layer {layer}: linear surface missing 'value_heads'");
+        int ValueHeadDim = Int(json, "value_head_dim") ?? throw new UnsupportedOperatorException($"layer {layer}: linear surface missing 'value_head_dim'");
+        int ConvKernel = Int(json, "conv_kernel") ?? throw new UnsupportedOperatorException($"layer {layer}: linear surface missing 'conv_kernel'");
+
+        string[] operands =
+        {
+            "in_proj_qkv.weight", "in_proj_z.weight", "in_proj_a.weight", "in_proj_b.weight",
+            "conv1d.weight", "A_log", "dt_bias", "norm.weight", "out_proj.weight",
+        };
+        foreach (var name in operands)
+        {
+            Require(store, stackId, $"{layer}.linear_attn.{name}", layer, $"linear attention ({name})");
+        }
+
+        return new LinearAttentionOp
+        {
+            InProjQkv = new OperandRef(stackId, $"{layer}.linear_attn.in_proj_qkv.weight"),
+            InProjZ = new OperandRef(stackId, $"{layer}.linear_attn.in_proj_z.weight"),
+            InProjA = new OperandRef(stackId, $"{layer}.linear_attn.in_proj_a.weight"),
+            InProjB = new OperandRef(stackId, $"{layer}.linear_attn.in_proj_b.weight"),
+            Conv1d = new OperandRef(stackId, $"{layer}.linear_attn.conv1d.weight"),
+            ALog = new OperandRef(stackId, $"{layer}.linear_attn.A_log"),
+            DtBias = new OperandRef(stackId, $"{layer}.linear_attn.dt_bias"),
+            NormWeight = new OperandRef(stackId, $"{layer}.linear_attn.norm.weight"),
+            OutProj = new OperandRef(stackId, $"{layer}.linear_attn.out_proj.weight"),
+            NumKHeads = KeyHeads,
+            HeadKDim = KeyHeadDim,
+            NumVHeads = ValueHeads,
+            HeadVDim = ValueHeadDim,
+            ConvKernel = ConvKernel,
+            HiddenSize = hiddenSize,
+            NormEps = normSurface.Pre.Eps,
+        };
+
+        static int? Int(System.Text.Json.JsonElement json, string name) =>
+            json.ValueKind == System.Text.Json.JsonValueKind.Object &&
+            json.TryGetProperty(name, out var v) && v.ValueKind == System.Text.Json.JsonValueKind.Number
+                ? v.GetInt32()
+                : null;
     }
 
     private static LayerFfn? BuildFfn(OperandStore store, string stackId, int layer, FfnSurface ffnSurface, int hiddenSize)

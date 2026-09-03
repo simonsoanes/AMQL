@@ -28,6 +28,9 @@
 
   <ItemGroup>
     <None Update="golden_tokenizer.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="synth_oracle.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="golden_qwen35_forward.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="golden_qwen35_1tok.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

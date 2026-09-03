@@ -65,7 +65,17 @@ public static class ArchMapper
         }
 
         // ── execution surface ────────────────────────────────────────────
-        var normSpec = new NormSpec { Kind = NormType.RmsNorm, Eps = facts.RmsNormEps, WeightOffset = 0 };
+        // The 1+w affine convention is an architecture fact: Qwen3.5's
+        // RMSNorm (layer norms AND the per-head QK norms) applies
+        // RMS(x)·(1+w), i.e. weightOffset 1.0. The linear layers' internal
+        // z-gated norm multiplies the weight directly (offset 0) — that is
+        // an operator fact, not a surface fact.
+        var normSpec = new NormSpec
+        {
+            Kind = NormType.RmsNorm,
+            Eps = facts.RmsNormEps,
+            WeightOffset = NormWeightOffsetFor(facts.ModelType),
+        };
         var surface = new ExecutionSurface
         {
             ContextLength = facts.MaxPositionEmbeddings,
@@ -76,6 +86,7 @@ public static class ArchMapper
                 HeadDim = facts.HeadDim,
                 ScoreScale = 1.0 / Math.Sqrt(facts.HeadDim),
                 QkNormScope = QkNormScope.PerHead,
+                QkNormWeightOffset = NormWeightOffsetFor(facts.ModelType),
                 AttentionBias = facts.AttentionBias,
                 OutputGate = facts.AttentionOutputGate
                     ? JsonSerializer.SerializeToElement(new { attn_output_gate = true }, ViJson.Options)
@@ -265,6 +276,12 @@ public static class ArchMapper
         };
     }
 
+    /// <summary>The RMSNorm affine convention of a text family: Qwen3.5
+    /// applies RMS(x)·(1+w) to its layer norms and per-head QK norms;
+    /// other families this build maps default to plain RMS(x)·w.</summary>
+    private static float NormWeightOffsetFor(string modelType) =>
+        modelType is "qwen3_5_text" or "qwen3_5" ? 1.0f : 0f;
+
     /// <summary>Judges whether the persisted rope facts are the served plain
     /// default rotary (PositionRope) or must be carried unresolved. The
     /// reference's rule is mirrored: a fact this build cannot serve is
@@ -272,29 +289,34 @@ public static class ArchMapper
     private static PositionPolicy JudgePosition(TextArchitectureFacts facts)
     {
         var rope = facts.RopeParameters;
-        bool hasMropeSections = rope.ValueKind == JsonValueKind.Object &&
-                                rope.TryGetProperty("mrope_section", out var section) &&
-                                section.ValueKind == JsonValueKind.Array;
         string? scaledType = rope.ValueKind == JsonValueKind.Object &&
                              rope.TryGetProperty("rope_type", out var rtype)
             ? rtype.GetString()
             : "default";
 
-        if (!hasMropeSections && facts.PartialRotaryFactor >= 1.0 && scaledType == "default")
+        if (scaledType == "default")
         {
             double theta = rope.ValueKind == JsonValueKind.Object &&
                            rope.TryGetProperty("rope_theta", out var t)
                 ? t.GetDouble()
                 : 10_000.0;
+
+            // Text-only MRoPE carries identical positions across the
+            // streams, which collapses to standard rotary over the partial
+            // width — served as PositionPartialRope. A partial factor is
+            // exactly that; full factor is plain PositionRope.
+            if (facts.PartialRotaryFactor < 1.0)
+            {
+                return new PositionPartialRope { Theta = theta, RotaryFactor = facts.PartialRotaryFactor };
+            }
             return PositionPolicy.CreateRope(theta);
         }
 
-        string kind = facts.PartialRotaryFactor < 1.0
-            ? "partial_mrope"
-            : hasMropeSections
-                ? "mrope"
-                : $"rope_scaling({scaledType})";
-        return new PositionUnresolved { Kind = kind, Payload = facts.RopeParameters.Clone() };
+        return new PositionUnresolved
+        {
+            Kind = $"rope_scaling({scaledType})",
+            Payload = facts.RopeParameters.Clone(),
+        };
     }
 
     /// <summary>Finds the tensor prefix the text decoder actually lives
