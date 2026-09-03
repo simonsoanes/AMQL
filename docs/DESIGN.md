@@ -35,12 +35,15 @@ embedded inference).
 D:\Dev\AMQL\
 ├── AMQL.slnx                      # .NET 10 solution (slnx format)
 ├── docs/DESIGN.md                 # this document
+├── containers/                    # encoder output (e.g. Qwen3.5-0.8B/)
 ├── src/
 │   ├── Amql.Safetensors/          # ↦ larql-models::loading::safetensors
 │   ├── Amql.Vindex3/              # ↦ larql-vindex::format::vindex3 (+ graph)
-│   └── Amql.Inference/            # ↦ larql-inference::vindex3 (generic runtime)
+│   ├── Amql.Inference/            # ↦ larql-inference::vindex3 (generic runtime)
+│   ├── Amql.Hf/                   # ↦ larql-models detection: G0 inventory, G1 facts, G2 graph
+│   └── Amql.Cli/                  # the loader front-end: encode + verify
 └── tests/
-    └── Amql.Tests/                # xunit: format round-trips + end-to-end forward
+    └── Amql.Tests/                # xunit: format, runtime, and loader pipeline tests
 ```
 
 Dependency spine mirrors the Rust crate graph:
@@ -51,6 +54,10 @@ Amql.Safetensors   (no deps — only System.Text.Json / System.IO.MemoryMappedFi
 Amql.Vindex3       (↦ larql-vindex)
    ▲
 Amql.Inference     (↦ larql-inference)
+   ▲
+Amql.Hf            (↦ larql-models detection: G0/G1/G2)
+   ▲
+Amql.Cli           (shell: encode <model-dir> --out <container-dir> | verify <container-dir>)
 ```
 
 ## 3. Building-block map (Rust → C#)
@@ -63,7 +70,7 @@ Amql.Inference     (↦ larql-inference)
 | `larql-inference/src/vindex3/runtime.rs` (GenericRuntime) | `Amql.Inference` | op plan, generic layer loop, KV cache, decode session |
 | `opplan/*` (ComponentOpPlan, LayerPlan, ops) | `Amql.Inference.Plan` | same op vocabulary: embedding, norms, attention, ffn, head |
 | `larql-compute` attention/ffn/rope kernels | `Amql.Inference.Ops` | plain managed implementations, `Vector<float>`-accelerated dot products |
-| `g0/g1/g2` inventory + representability plan | — | **out of scope** (see §6): encoder takes an explicit graph |
+| `inspect-hf` → invent → represent → encode | `Amql.Hf` + `Amql.Cli` | **shipped in the loader**: G0 inventory, G1 config facts, G2 graph/surface, G3 canonical encode; the reference's auto-detection depth is explicitly bounded (see §6) |
 | quantisation / `represent`/k-quants / MXFP4 | — | **out of scope**: canonical raw encodings only |
 | remote MoE / Metal / GPU backends, LQL, router, server | — | **out of scope** |
 
@@ -197,15 +204,59 @@ container ──open──▶ SystemInspection ──plan──▶ ComponentOpPl
 The deletion invariant holds by construction: the runtime reads only the
 container; no original HF tensor name appears on the execution path.
 
+## 5.5 The loader pipeline (Amql.Hf + Amql.Cli)
+
+`amql-cli encode <model-dir> --out <container-dir>` runs the reference's
+G0→G3 chain, .NET-shaped:
+
+1. **G0 inventory** (`HfInventory`): discovers `*.safetensors` shards
+   (root or MLX `weights/`), exposes tensor names/facts/payloads.
+2. **G1 facts** (`ModelConfig`): `config.json` → `TextArchitectureFacts`.
+   The multimodal wrapper (`Qwen3_5ForConditionalGeneration`) is unwrapped
+   to its `text_config`; `layer_types` (a judged per-layer operator table)
+   is mandatory — an absent table refuses the checkpoint.
+3. **G2 graph** (`ArchMapper`): facts → `SystemGraph` + `ExecutionSurface`.
+   The text prefix is detected from the inventory (`model.language_model`,
+   `model`, …), never assumed. Vision and MTP side-components are recorded
+   as carried objects (source bindings only, no segments).
+4. **G3 encode** (`ContainerEncoder`): object-relative segment names
+   (`layers.3.self_attn.q_proj.weight → 3.self_attn.q_proj.weight`,
+   `embed_tokens.weight → weight`), payload bytes copied verbatim, the
+   canonical encoding judged from the stored dtype. Tensors deliberately
+   kept in another dtype (Qwen3.5 keeps `A_log` and the recurrent norm in
+   F32 inside the BF16 stack) are recorded in `index.precision_map` as
+   exceptions — never promoted, never refused.
+
+`amql-cli verify <container-dir>` re-derives byte equivalence from disk
+alone (integrity hashes), resolves + widens real payloads through the
+operand store, prints the operator census, and reports the runtime
+boundary by attempting to plan the component (fail-closed refusal names
+the primitives this build does not serve).
+
+**Executable boundary for Qwen3.5-0.8B:** the loaded container is fully
+faithful (24 layers, 320 tensors, ~1.4 GiB), but this build's executor
+serves none of its layers yet — 18 are `linear_attention` (conv +
+recurrent-key hybrid) and even the 6 `softmax` layers carry a hard output
+gate (second half of `q_proj`) plus partial-MRoPE (rotary factor 0.25).
+Each of those is refused by name at plan time rather than approximated.
+Weighted QK norm is likewise refused (a stack with `q_norm`/`k_norm`
+tensors would otherwise silently skip normalising Q/K).
+
 ## 6. Explicit non-goals (this slice)
 
-- **G0–G2 detection pipeline** (`inspect-hf`, representability planning,
-  `config.json` semantics). The .NET encoder takes an explicit `SystemGraph`
-  + tensor bindings instead of inferring them.
+- **Reference-depth auto-detection** (G0–G2): the loader ships G0/G1/G2 for
+  the Qwen3.5 text family's judged surface, carried verbatim rather than
+  approximated. Generalised `inspect-hf` heuristics, representability
+  arithmetic (choosing encodings), and quantisation policy remain absent.
+- **Linear-attention / partial-MRoPE / output-gate / weighted-QK-norm
+  kernels**: declared in the graph, refused at plan time by name. Porting
+  them is future work, not approximation.
 - **Quantization** (k-quants, MXFP4, FP8 serving), GGUF loading, remote
   expert serving, Metal/GPU backends.
 - **LQL**, the router/server surface, KV dispatch tiers, drafter/inference
   pipelines on top of the runtime.
+- **Tokenizer support**: the loader and runtime operate on token ids;
+  `tokenizer.json`/`vocab.json` are not parsed in this slice.
 - **Byte-parity with Rust for every kernel**: numerics follow the same
   formulas; tests validate against independent hand-computed references,
   not against Rust goldens (no cross-compiler A/B harness in this slice).
@@ -224,4 +275,11 @@ container; no original HF tensor name appears on the execution path.
   checkpoint in safetensors (deterministic weights), encode to a container,
   open it, run prefill + decode, and check hidden states / logits against
   hand-computed references (embedding lookup, RMSNorm, RoPE at position,
-  causal sliding attention, FFN, head).
+  causal sliding attention, FFN, head, routed MoE). Fail-closed guards:
+  gated attention, sinks, weighted QK norm, linear-attention and unknown
+  position/operator rows all refuse by name.
+- **Loader pipeline**: a synthetic multimodal checkpoint (text_config
+  wrapper, mixed linear/softmax `layer_types`, F32 precision exceptions,
+  vision + MTP side-components) encodes → opens → verifies → resolves
+  payloads end-to-end; the real Qwen3.5-0.8B config facts are asserted
+  when the checkpoint is present on the machine.

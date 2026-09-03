@@ -28,6 +28,10 @@ public sealed class ContainerSpec
     public required int NumLayers { get; init; }
     public required SystemGraph SystemGraph { get; init; }
     public required List<RepresentationSpec> Representations { get; init; }
+
+    /// <summary>Stored-precision policy documenting per-tensor dtype
+    /// deviations from the canonical encoding.</summary>
+    public PrecisionMap? PrecisionMap { get; init; }
 }
 
 public sealed record EncodeResult(
@@ -100,6 +104,7 @@ public static class ContainerEncoder
             Profiles = new List<Profile> { Profile.Exact() },
             Segments = segments,
             Authority = ContainerAuthority.Canonical,
+            PrecisionMap = spec.PrecisionMap,
         };
 
         // Write the container: sole root authority, then the graph, then

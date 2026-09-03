@@ -548,6 +548,46 @@ public class InferenceTests
     }
 
     [Fact]
+    public void Linear_Attention_Operator_Refuses_At_Plan()
+    {
+        var spec = SyntheticModel.BuildSpec(new Dims());
+        spec.SystemGraph.Components[0].Attention![0].SetOperator(LayerOperators.LinearAttention);
+
+        using var dir = new TempDir();
+        var containerPath = EncodeTo(spec, dir);
+        using var container = Vindex3Container.Open(containerPath);
+        using var store = container.CreateOperandStore();
+        var ex = Assert.Throws<UnsupportedOperatorException>(() => Planner.Plan(container, "target", store));
+        Assert.Contains("linear_attention", ex.Message);
+    }
+
+    [Fact]
+    public void Gated_Attention_Refuses_At_Plan()
+    {
+        // A persisted output gate must refuse, never be silently skipped.
+        using var dir = new TempDir();
+        var containerPath = EncodeTo(SyntheticModel.BuildSpec(new Dims(OutputGate: true)), dir);
+        using var container = Vindex3Container.Open(containerPath);
+        using var store = container.CreateOperandStore();
+        var ex = Assert.Throws<UnsupportedOperatorException>(() => Planner.Plan(container, "target", store));
+        Assert.Contains("output gate", ex.Message);
+    }
+
+    [Fact]
+    public void Weighted_QkNorm_Refuses_At_Plan()
+    {
+        // q_norm/k_norm weight tensors present ⇒ weighted QK norm is part
+        // of the program; the managed executor serves only the
+        // parameter-free variant and must refuse instead of skipping it.
+        using var dir = new TempDir();
+        var containerPath = EncodeTo(SyntheticModel.BuildSpec(new Dims(WeightedQkNorm: true)), dir);
+        using var container = Vindex3Container.Open(containerPath);
+        using var store = container.CreateOperandStore();
+        var ex = Assert.Throws<UnsupportedOperatorException>(() => Planner.Plan(container, "target", store));
+        Assert.Contains("weighted QK norm", ex.Message);
+    }
+
+    [Fact]
     public void Unresolved_Position_Refuses_At_Plan()
     {
         var spec = SyntheticModel.BuildSpec(new Dims());

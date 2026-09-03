@@ -34,7 +34,9 @@ public sealed record Dims(
     long? Window = null,
     bool MoE = false,
     int Experts = 2,
-    int TopK = 1)
+    int TopK = 1,
+    bool WeightedQkNorm = false,
+    bool OutputGate = false)
 {
     public int QDim => NumQHeads * HeadDim;
     public int KvDim => NumKvHeads * HeadDim;
@@ -95,6 +97,12 @@ public static class SyntheticModel
             Vector($"{l}.input_layernorm.weight", d.Hidden, 11);
             Vector($"{l}.post_attention_layernorm.weight", d.Hidden, 12);
 
+            if (d.WeightedQkNorm)
+            {
+                Vector($"{l}.self_attn.q_norm.weight", d.HeadDim, 40);
+                Vector($"{l}.self_attn.k_norm.weight", d.HeadDim, 41);
+            }
+
             if (d.MoE)
             {
                 Matrix($"{l}.mlp.router.weight", d.Experts, d.Hidden, 13, l);
@@ -123,6 +131,9 @@ public static class SyntheticModel
                 NumKvHeads = d.NumKvHeads,
                 HeadDim = d.HeadDim,
                 ScoreScale = 1.0 / Math.Sqrt(d.HeadDim),
+                OutputGate = d.OutputGate
+                    ? System.Text.Json.JsonSerializer.SerializeToElement(new { attn_output_gate = true }, ViJson.Options)
+                    : null,
             },
             Ffn = new FfnSurface
             {

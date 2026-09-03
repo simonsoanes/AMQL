@@ -85,11 +85,17 @@ public sealed class PositionPolicyConverter : JsonConverter<PositionPolicy>
                 writer.WriteEndObject();
                 break;
             case PositionUnresolved unresolved:
-                // Re-emit the original object exactly, kind included.
+                // Re-emit the original object with the kind discriminator
+                // stamped in (payloads like raw rope_parameters carry the
+                // facts but not the discriminator).
                 writer.WriteStartObject();
+                writer.WriteString("kind", unresolved.Kind);
                 foreach (var property in unresolved.Payload.EnumerateObject())
                 {
-                    property.WriteTo(writer);
+                    if (property.Name != "kind")
+                    {
+                        property.WriteTo(writer);
+                    }
                 }
                 writer.WriteEndObject();
                 break;

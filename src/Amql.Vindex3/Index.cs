@@ -44,6 +44,14 @@ public sealed class Vindex3Index
 
     public ContainerAuthority Authority { get; init; } = ContainerAuthority.Canonical;
 
+    /// <summary>Stored-precision documentation: the canonical stack encoding
+    /// plus the per-tensor exceptions that legitimately deviate (Qwen3.5
+    /// keeps e.g. A_log and the recurrent norm in F32 inside a BF16 stack).
+    /// Segment headers still carry each tensor's own dtype verbatim; this
+    /// map is the human/authority-level record of the policy.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public PrecisionMap? PrecisionMap { get; init; }
+
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? DerivedFromModel { get; init; }
 
@@ -57,6 +65,26 @@ public enum ContainerAuthority
 {
     Canonical,
     Derived,
+}
+
+/// <summary>
+/// The stored-precision policy of a container's representations: which
+/// encoding is canonical and which segment-relative tensor names deviate
+/// (kept in a different storage dtype). Mirrors the reference's
+/// precision map at the level of its declared shape.
+/// </summary>
+public sealed class PrecisionMap
+{
+    public string Name { get; init; } = string.Empty;
+    public string Encoding { get; init; } = string.Empty;
+
+    /// <summary>Roles the canonical encoding covers ("all" when the whole
+    /// stack follows it).</summary>
+    public List<string> Roles { get; init; } = new();
+
+    /// <summary>Segment-relative tensor names that deviate from the
+    /// canonical encoding.</summary>
+    public List<string> Exceptions { get; init; } = new();
 }
 
 /// <summary>One directory entry of <c>index.representations</c>: which

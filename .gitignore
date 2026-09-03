@@ -28,3 +28,6 @@ Thumbs.db
 ## User-specific / generated
 *.tmp
 *.log
+
+## Containers
+containers/

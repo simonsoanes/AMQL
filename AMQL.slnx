@@ -1,5 +1,7 @@
 <Solution>
   <Folder Name="/src/">
+    <Project Path="src/Amql.Cli/Amql.Cli.csproj" />
+    <Project Path="src/Amql.Hf/Amql.Hf.csproj" />
     <Project Path="src/Amql.Inference/Amql.Inference.csproj" />
     <Project Path="src/Amql.Safetensors/Amql.Safetensors.csproj" />
     <Project Path="src/Amql.Vindex3/Amql.Vindex3.csproj" />

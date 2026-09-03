@@ -100,6 +100,28 @@ public static class Planner
         }
 
         var attnSurface = surface.Attention!;
+        if (attnSurface.OutputGate is not null)
+        {
+            throw new UnsupportedOperatorException(
+                $"layer {layer}: the persisted attention surface declares an output gate (hard attention gate) " +
+                "with no managed implementation");
+        }
+        if (attnSurface.Sinks is not null)
+        {
+            throw new UnsupportedOperatorException(
+                $"layer {layer}: the persisted attention surface declares learned sinks with no managed implementation");
+        }
+        // Weighted QK norm (a learned q_norm/k_norm per head) is a distinct
+        // operation from the parameter-free variant the executor serves.
+        // A stack carrying the weight tensors must refuse until a weighted
+        // kernel exists — never silently skip normalising Q/K.
+        if (store.ContainsTensor(stackId, $"{layer}.self_attn.q_norm.weight") ||
+            store.ContainsTensor(stackId, $"{layer}.self_attn.k_norm.weight"))
+        {
+            throw new UnsupportedOperatorException(
+                $"layer {layer}: weighted QK norm tensors (q_norm/k_norm) are present but the managed " +
+                "executor serves only the parameter-free QK norm");
+        }
         var attn = new AttentionOp
         {
             NumQHeads = attnSurface.NumQHeads,
