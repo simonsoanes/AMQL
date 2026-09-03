@@ -132,10 +132,13 @@ public sealed class GenericRuntime
             AddInPlace(x, ffnOut);
         }
 
+        ApplyPatches(x, layer, queryPositions);
         return x;
     }
 
     // ── softmax attention mixer ─────────────────────────────────────────────
+
+    private List<(int Head, float[] Weights)>? _lastCapture;
 
     private Tensor2D RunSoftmaxAttention(Tensor2D h, int layer, LayerPlan layerPlan, int[] queryPositions, int[] kvPositions, bool appendKv)
     {
@@ -192,12 +195,25 @@ public sealed class GenericRuntime
         var vMat = new Tensor2D(vRows.SelectMany(r => r).ToArray(),
             kvSeq, kvSeq == 0 ? attn.KvDim : vRows[0].Length);
 
+        _lastCapture = AttentionTrace is not null
+            ? new List<(int Head, float[] Weights)>(attn.NumQHeads)
+            : null;
         var output = AttentionKernel.Execute(
             q, kMat, vMat,
             attn.NumQHeads, attn.NumKvHeads, attn.HeadDim,
             attn.ScoreScale, attn.LogitSoftcapping, null,
             attn.Window is { } windowValue ? checked((int)windowValue) : null,
-            queryPositions, kvPositions);
+            queryPositions, kvPositions,
+            _lastCapture);
+
+        if (AttentionTrace is { } trace && _lastCapture is { Count: > 0 })
+        {
+            foreach (var (head, weights) in _lastCapture)
+            {
+                trace.Add(new LayerHeadAttention(layer, head, weights));
+            }
+        }
+        _lastCapture = null;
 
         // Hard output gate: attention output × sigmoid(gate).
         if (gate is not null && output.Rows == gate.Rows)
@@ -347,6 +363,10 @@ public sealed class GenericRuntime
     {
         _linearStates.Clear();
         SessionPosition = 0;
+        if (_patches.Count > 0)
+        {
+            _patches.Clear();
+        }
     }
 
     private LinearAttentionState StateFor(int layer, LinearAttentionOp op)
@@ -527,6 +547,63 @@ public sealed class GenericRuntime
     /// consumed token, independent of the KV cache shape (mixed plans may
     /// have no key/value rows at layer 0).</summary>
     public int SessionPosition { get; internal set; }
+
+    /// <summary>One attention-weights row: a softmax layer's final query
+    /// row, one head's post-softmax attention over its causal key span.</summary>
+    public sealed record LayerHeadAttention(int Layer, int Head, float[] Weights);
+
+    /// <summary>When set, softmax layers append their final-row attention
+    /// weights here. The relationship router consumes this to name which
+    /// (layer, head) tensors carry a token link.</summary>
+    public List<LayerHeadAttention>? AttentionTrace { get; set; }
+
+    /// <summary>
+    /// A residual-stream override: after <c>Layer</c> completes (mixer +
+    /// FFN + residual), the computed row at absolute position <c>Row</c> is
+    /// overwritten with <c>Values</c> (residual-stream width). This is the
+    /// activation patch seam — future patch applications and LoRA adapter
+    /// injection build on it; the causal tracer uses it today.
+    /// </summary>
+    public sealed record ResidualPatch(int Layer, int Row, float[] Values);
+
+    private List<ResidualPatch> _patches = new();
+
+    /// <summary>Schedules a residual-stream patch (applied after the layer
+    /// completes). Cleared per session reset.</summary>
+    public void SetPatch(int layer, int row, float[] values) => _patches.Add(new ResidualPatch(layer, row, values));
+
+    public void ClearPatches() => _patches.Clear();
+
+    /// <summary>Applies any patches scheduled for this layer. The patch row
+    /// is an absolute position, resolved against <c>queryPositions</c>
+    /// (each x row's absolute position).</summary>
+    private void ApplyPatches(Tensor2D x, int layer, int[] queryPositions)
+    {
+        if (_patches.Count == 0)
+        {
+            return;
+        }
+        foreach (var patch in _patches)
+        {
+            if (patch.Layer != layer)
+            {
+                continue;
+            }
+            for (int r = 0; r < x.Rows; r++)
+            {
+                if (queryPositions[r] == patch.Row)
+                {
+                    if (patch.Values.Length != x.Cols)
+                    {
+                        throw new ArgumentException(
+                            $"patch at layer {layer} row {patch.Row}: {patch.Values.Length} values vs residual width {x.Cols}");
+                    }
+                    patch.Values.CopyTo(x.Data, r * x.Cols);
+                    break;
+                }
+            }
+        }
+    }
 
     public static void AddInPlace(Tensor2D target, Tensor2D addend)
     {

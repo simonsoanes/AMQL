@@ -32,6 +32,7 @@ internal static class Program
                 "synth-model" => SynthModel(args[1..]),
                 "tokens" => Tokens(args[1..]),
                 "decode" => Decode(args[1..]),
+                "route" => Route(args[1..]),
                 "generate" => Generate(args[1..]),
                 "inspect-token" => InspectToken(args[1..]),
                 _ => throw new CliException($"unknown command '{args[0]}'"),
@@ -239,6 +240,72 @@ internal static class Program
 
     private static HfTokenizer Tokenizer(string modelDir) => HfTokenizer.FromModelDir(modelDir);
 
+    // ── route: relationship probing between two tokens ─────────────────────
+
+    private static int Route(string[] args)
+    {
+        var containerDir = Arg(args, 0) ?? throw new CliException("route requires a container directory");
+        // A and B are positionals 2 and 3 — the container already consumed.
+        var rest = args.Skip(1).ToArray();
+        string a = FirstPositional(rest, "--tokenizer", "--model-dir", "--top", "--templates",
+            "--trace-layer-start", "--trace-layer-end", "--corrupt", "--component") ??
+            throw new CliException("route requires two tokens, e.g. 'amql-cli route <container> France Paris --tokenizer <checkpoint-dir>'");
+        string b = SecondPositional(rest, "--tokenizer", "--model-dir", "--top", "--templates",
+            "--trace-layer-start", "--trace-layer-end", "--corrupt", "--component") ??
+            throw new CliException("route requires two tokens: 'amql-cli route <container> <A> <B>'");
+        var modelDir = RequiredModelDir(args);
+
+        var options = new RouteOptions(
+            Top: IntOption(args, "--top", 5),
+            MaxTemplates: IntOption(args, "--templates", 8),
+            TraceLayerStart: IntOption(args, "--trace-layer-start", 8),
+            TraceLayerEnd: IntOption(args, "--trace-layer-end", 24),
+            NoTrace: args.Contains("--no-trace"),
+            CorruptToken: OptionValue(args, "--corrupt") ?? "the");
+        string component = OptionValue(args, "--component") ?? "target";
+
+        using var container = Vindex3Container.Open(containerDir);
+        Console.WriteLine($"container: {containerDir} (weights)   tokenizer: {modelDir} (checkpoint)");
+        var tokenizer = Tokenizer(modelDir);
+
+        var (links, notes) = RelationRouter.Route(container, component, tokenizer, a, b, options, Console.Write);
+        foreach (var note in notes)
+        {
+            Console.WriteLine($"note: {note}");
+        }
+        Console.WriteLine();
+        foreach (var link in links.Take(options.Top))
+        {
+            var topCoord = link.Coordinates.FirstOrDefault();
+            string coordTag = topCoord is null
+                ? string.Empty
+                : $" @ {topCoord.Layer},{topCoord.Head},{topCoord.QueryPos},{topCoord.KeyPos}";
+            Console.WriteLine($"{a} -> {link.Relation} ({link.Score:0.00}{coordTag}) -> {b}");
+            foreach (var c in link.Coordinates.Skip(1).Take(3))
+            {
+                Console.WriteLine($"     @ L{c.Layer} H{c.Head} ({c.QueryPos}->{c.KeyPos}) {c.Weight:0.00}");
+            }
+            if (!options.NoTrace && link.Attribution is { } attr)
+            {
+                Console.WriteLine($"     causal weights (patch targets), P({b}) clean={attr.CleanProbability:0.###} corrupt={attr.CorruptProbability:0.###}:");
+                var strong = Enumerable.Range(0, attr.LayerDelta.Length)
+                    .Select((l, i) => (Layer: i, Delta: attr.LayerDelta[i]))
+                    .Where(x => x.Delta > 0f)
+                    .OrderByDescending(x => x.Delta)
+                    .Take(8);
+                foreach (var (layer, delta) in strong)
+                {
+                    Console.WriteLine($"       L{layer,2}: Δ {delta:0.0000} ({attr.LayerShare[layer] * 100,4:0.0}% of effect)");
+                }
+            }
+        }
+        Console.WriteLine();
+        Console.WriteLine("scores = P(B) after template(A); coords = (layer, head, queryPos, keyPos) of the final-row attention onto A;");
+        Console.WriteLine("causal Δ = P(B) restored by reinstating that layer's clean residual (corrupt → clean) — the tensors to patch/LoRA.");
+        Console.WriteLine($"progress: {links.Count} templates probed{(options.NoTrace ? " (no attribution)" : $", attribution on top link over layers {options.TraceLayerStart}..{options.TraceLayerEnd}")}.");
+        return 0;
+    }
+
     // ── generate ───────────────────────────────────────────────────────────
 
     private static int Generate(string[] args)
@@ -389,6 +456,9 @@ internal static class Program
               amql-cli synth-model <dir>                          write an executable demo checkpoint
               amql-cli tokens --tokenizer <checkpoint-dir> "text"
               amql-cli decode --tokenizer <checkpoint-dir> <id,id,…>
+              amql-cli route <container-dir> <A> <B> --tokenizer <checkpoint-dir>
+                              [--top 5] [--templates 8] [--trace-layer-start 8]
+                              [--trace-layer-end 24] [--no-trace] [--corrupt the]
               amql-cli generate <container-dir>
                               --prompt "text" --tokenizer <checkpoint-dir>
                               [--steps 8] [--temperature 0] [--top-k 0] [--top-p 0]
@@ -402,6 +472,13 @@ internal static class Program
               amql-cli synth-model demo-model
               amql-cli encode demo-model --out demo-container
               amql-cli generate demo-container --prompt "hi" --tokenizer demo-model
+              amql-cli route demo-container France Paris --tokenizer demo-model --top 5
+
+            route probes relationships between two tokens: template-scored
+            links (capital, language, contains, …) each with (layer, head,
+            position) attention coordinates, and — for the strongest link —
+            causal-tracing layer weights naming exactly which residual
+            tensors to adjust (patch/LoRA) to change the propensity.
 
             Two kinds of directory are involved: the CONTAINER (<container-dir>,
             encode output, holds weights only) and the CHECKPOINT
@@ -429,6 +506,30 @@ internal static class Program
                 {
                     i++; // skip the option's value
                 }
+                continue;
+            }
+            return args[i];
+        }
+        return null;
+    }
+
+    /// <summary>Second non-option argument (route's B token).</summary>
+    private static string? SecondPositional(string[] args, params string[] valueOptions)
+    {
+        bool found = false;
+        for (int i = 0; i < args.Length; i++)
+        {
+            if (args[i].StartsWith("--", StringComparison.Ordinal))
+            {
+                if (valueOptions.Contains(args[i]))
+                {
+                    i++;
+                }
+                continue;
+            }
+            if (!found)
+            {
+                found = true;
                 continue;
             }
             return args[i];

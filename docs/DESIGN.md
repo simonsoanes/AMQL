@@ -2,10 +2,13 @@
 
 Status: **initial scaffold**. This document is the design companion for the
 first .NET slice. Scope is deliberately bounded: the port implements the
-*high-level building blocks* of the [LARQL](https://github.com/HuggingFace/larql)
-stack — a safetensors loader, the VINDEX3 model-system container format, and a
+*high-level building blocks* of the [LARQL](https://github.com/chrishayuk/larql)
+stack by Chris Hay — a safetensors loader, the VINDEX3 model-system container format, and a
 generic (architecture-agnostic) inference runtime. Total parity is not a goal;
 every deliberate divergence is called out below.
+
+It is not intended to be a complete re-implementation, it's just for research 
+and to provide assurance the Vindex3 implementation is complete.
 
 Reference: `D:\Dev\Open Source\larql` (Rust workspace), studied 2026-09-03.
 
@@ -289,6 +292,31 @@ adds its operator op + kernel and a mapper judgment; prefill
 automatically serialises when any layer is stateful. Weight sources stay
 plug-and-play because every tensor is reached only through
 `OperandStore` → `WeightLoader` (the container is the deletion boundary).
+
+**Relationship probing (`route`)** — stage one of the larql-style probe
+machinery: `amql-cli route <container> <A> <B> --tokenizer <checkpoint-dir>`
+names relations between two tokens with template probing (LAMA-style:
+score = max P(B), P(ĠB) after template(A) — the space-merged spelling
+differs from the standalone token id and both are scored), reports the
+(layer, head, queryPos, keyPos) attention tensors carrying A into B's
+prediction, and — via causal attribution — outputs per-layer relationship
+weights: exactly which residual tensors to patch/LoRA to change the
+propensity. The template list is plain data; a future trained-probe
+pipeline slots in by swapping it for probe weights.
+
+**Causal attribution (patch targeting)** — the runtime exposes a residual
+patch seam (`GenericRuntime.SetPatch(layer, row, values)` — the same seam
+future patch applications and LoRA injection build on) and the tracer
+(`Amql.Inference.CausalTracer`) runs ROME-style causal tracing: clean
+context, corrupt the source token's embedding, then restore each traced
+layer's clean residual and re-measure P(B); the per-layer Δ is that
+layer's share of the knowledge. Caveat established by the parity chase:
+residual patches restore the *stream*, while a layer's attention keys for
+the restored row are cached pre-patch — so each single-layer restore
+measures "layers above L see the clean source", the correct ROME
+semantics; a restore-every-layer run does not equal the clean run
+cell-for-cell, and the tests assert the seam's real contract (the patch
+takes effect deterministically).
 
 ## 6. Explicit non-goals (this slice)
 

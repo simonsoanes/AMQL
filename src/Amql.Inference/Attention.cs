@@ -138,7 +138,8 @@ public static class AttentionKernel
         float[]? sinks,
         int? window,
         int[] queryPositions,
-        int[] kvPositions)
+        int[] kvPositions,
+        List<(int Head, float[] Weights)>? lastRowCapture = null)
     {
         int seq = q.Rows;
         int kvSeq = k.Rows;
@@ -195,6 +196,12 @@ public static class AttentionKernel
                 }
 
                 SoftmaxInPlace(weights.AsSpan(0, spanEnd));
+                if (lastRowCapture is not null && qi == seq - 1)
+                {
+                    // Post-softmax attention of the final query row over all
+                    // its causal keys — the observable A→B link tensors.
+                    lastRowCapture.Add((h, weights.AsSpan(0, spanEnd).ToArray()));
+                }
                 for (int d = 0; d < headDim; d++)
                 {
                     float acc = 0f;
