@@ -26,4 +26,8 @@
     <ProjectReference Include="..\..\src\Amql.Cli\Amql.Cli.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <None Update="golden_tokenizer.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>

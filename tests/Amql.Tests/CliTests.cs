@@ -39,7 +39,6 @@ public class CliTests
 
         Assert.Equal(10, first.Length);
         Assert.All(first, id => Assert.InRange(id, 0, SyntheticCheckpoint.Vocab - 1));
-        Assert.All(first, id => Assert.Equal(true, first.Contains(id))); // ids are sane ints
 
         using var container2 = Vindex3Container.Open(containerPath);
         var (_, steps2) = InferenceRunner.Generate(container2, "target", new[] { 2, 3 }, 10, cfg);

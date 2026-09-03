@@ -1,4 +1,5 @@
 using System.Text;
+using System.Text.Json;
 using Amql.Safetensors;
 
 namespace Amql.Hf;
@@ -110,6 +111,60 @@ public static class SyntheticCheckpoint
             }
             """;
         File.WriteAllText(Path.Combine(modelDir, "config.json"), config);
+        WriteTokenizer(modelDir);
+    }
+
+    /// <summary>A matching tokenizer.json for the demo vocabulary: ids
+    /// 0..11 = space, letters a..j, '?'. Plain text only — the demo
+    /// alphabet is deliberately small so the demo model and its vocabulary
+    /// stay in sync (any other letter refuses at encode time with a clear
+    /// message, which is the honest boundary).</summary>
+    private static void WriteTokenizer(string modelDir)
+    {
+        const string tokenizerJson = """
+            {
+              "version": "1.0.0",
+              "truncation": null,
+              "padding": null,
+              "added_tokens": [],
+              "normalizer": { "type": "NFC" },
+              "pre_tokenizer": {
+                "type": "Sequence",
+                "pretokenizers": [
+                  { "type": "Split", "pattern": { "Regex": "(?i:[a-j?])| +|[\\s\\S]" }, "behavior": "Isolated", "invert": false },
+                  { "type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": false }
+                ]
+              },
+              "post_processor": null,
+              "decoder": { "type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": false },
+              "model": {
+                "type": "BPE",
+                "dropout": null,
+                "unk_token": null,
+                "continuing_subword_prefix": null,
+                "end_of_word_suffix": null,
+                "fuse_unk": false,
+                "byte_fallback": false,
+                "ignore_merges": false,
+                "vocab": {
+                  "\u0120": 0,
+                  "a": 1,
+                  "b": 2,
+                  "c": 3,
+                  "d": 4,
+                  "e": 5,
+                  "f": 6,
+                  "g": 7,
+                  "h": 8,
+                  "i": 9,
+                  "j": 10,
+                  "?": 11
+                },
+                "merges": []
+              }
+            }
+            """;
+        File.WriteAllText(Path.Combine(modelDir, "tokenizer.json"), tokenizerJson);
     }
 
     private static byte[] ToBytes(float[] values)

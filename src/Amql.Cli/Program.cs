@@ -30,6 +30,8 @@ internal static class Program
                 "encode" => Encode(args[1..]),
                 "verify" => Verify(args[1..]),
                 "synth-model" => SynthModel(args[1..]),
+                "tokens" => Tokens(args[1..]),
+                "decode" => Decode(args[1..]),
                 "generate" => Generate(args[1..]),
                 "inspect-token" => InspectToken(args[1..]),
                 _ => throw new CliException($"unknown command '{args[0]}'"),
@@ -176,12 +178,80 @@ internal static class Program
         return 0;
     }
 
+    // ── tokens / decode (text ↔ ids via the model's tokenizer) ─────────────
+
+    private static int Tokens(string[] args)
+    {
+        var modelDir = RequiredModelDir(args);
+        string text = FirstPositional(args, "--model-dir") ?? throw new CliException("tokens requires a text argument (quote it)");
+        var tokenizer = Tokenizer(modelDir);
+
+        var result = tokenizer.Encode(text);
+        Console.WriteLine($"text:    {text}");
+        Console.WriteLine($"tokens:  {result.Ids.Count}");
+        foreach (var piece in result.Pieces)
+        {
+            Console.WriteLine($"  {piece.Id,6}  {(piece.IsSpecial ? "special " : "        ")}{(piece.Representation ?? "-")}  →  {piece.DecodedText ?? "-"}");
+        }
+        Console.WriteLine($"decoded: {result.ToDecodedText()}");
+        return 0;
+    }
+
+    private static int Decode(string[] args)
+    {
+        var modelDir = RequiredModelDir(args);
+        var ids = ParseIntList(FirstPositional(args, "--model-dir"), fallback: Array.Empty<int>());
+        if (ids.Length == 0)
+        {
+            throw new CliException("decode requires token ids, e.g. 'amql-cli decode --model-dir <dir> 9419,11'");
+        }
+        var tokenizer = Tokenizer(modelDir);
+        var text = tokenizer.Decode(ids);
+        Console.WriteLine($"ids {string.Join(",", ids)} → \"{text}\"");
+        foreach (var id in ids)
+        {
+            var info = tokenizer.TokenInfo(id);
+            Console.WriteLine($"  {id,6}  {(info.IsSpecial ? "special " : "        ")}{info.Representation ?? "-"}");
+        }
+        return 0;
+    }
+
+    private static string RequiredModelDir(string[] args)
+    {
+        var modelDir = OptionValue(args, "--model-dir");
+        if (modelDir is null)
+        {
+            throw new CliException("this command requires '--model-dir <dir>' (the tokenizer lives with the checkpoint, not in the container)");
+        }
+        return modelDir;
+    }
+
+    private static HfTokenizer Tokenizer(string modelDir) => HfTokenizer.FromModelDir(modelDir);
+
     // ── generate ───────────────────────────────────────────────────────────
 
     private static int Generate(string[] args)
     {
         var containerDir = Arg(args, 0) ?? throw new CliException("generate requires a container directory");
-        var tokens = ParseIntList(OptionValue(args, "--tokens"), fallback: new[] { 0 });
+        string? prompt = OptionValue(args, "--prompt");
+
+        // Prompt mode: the tokenizer lives with the checkpoint.
+        HfTokenizer? tokenizer = null;
+        int[] tokens;
+        if (prompt is not null)
+        {
+            tokenizer = Tokenizer(RequiredModelDir(args));
+            tokens = tokenizer.EncodeToIds(prompt).ToArray();
+            if (tokens.Length == 0)
+            {
+                throw new CliException("the prompt encoded to zero tokens");
+            }
+        }
+        else
+        {
+            tokens = ParseIntList(OptionValue(args, "--tokens"), fallback: new[] { 0 });
+        }
+
         int steps = IntOption(args, "--steps", 8);
         var config = new Amql.Inference.SamplingConfig(
             Seed: IntOption(args, "--seed", 42),
@@ -196,11 +266,18 @@ internal static class Program
         var (prefill, steps2) = InferenceRunner.Generate(
             container, component, tokens, steps, config, showTopK);
 
+        string prefillText = tokenizer is null ? string.Empty : tokenizer.Decode(prefill);
         string mode = sampling ? "sampled" : "greedy";
-        Console.WriteLine($"prefill [{string.Join(",", prefill)}] → position {prefill.Length} during [{mode}]");
+        Console.WriteLine($"prefill [{string.Join(",", prefill)}] → position {prefill.Length} during [{mode}]" +
+                          (prefillText.Length > 0 ? $"  ({prefillText})" : string.Empty));
         foreach (var outcome in steps2)
         {
+            string? text = tokenizer?.TokenInfo(outcome.Token).DecodedText;
             Console.Write($"{outcome.Token}");
+            if (text is { Length: > 0 })
+            {
+                Console.Write($"  ({text})");
+            }
             if (outcome.Candidates is { } candidates)
             {
                 Console.WriteLine("   " + string.Join("  ",
@@ -210,6 +287,12 @@ internal static class Program
             {
                 Console.WriteLine();
             }
+        }
+
+        if (tokenizer is not null)
+        {
+            var generatedIds = prefill.Concat(steps2.Select(s => s.Token)).ToArray();
+            Console.WriteLine($"text:      {tokenizer.Decode(generatedIds)}");
         }
         Console.WriteLine($"position: {prefill.Length + steps}");
         return 0;
@@ -229,11 +312,19 @@ internal static class Program
         int neighbors = IntOption(args, "--neighbors", TokenInspector.DefaultNeighbors);
         int? logitsK = IntOptionOrNull(args, "--logits");
         int[]? context = ParseOptionalIntList(OptionValue(args, "--tokens"));
+        string? modelDir = OptionValue(args, "--model-dir");
 
         using var container = Vindex3Container.Open(containerDir);
         var profile = TokenInspector.InspectEmbedding(container, component, token, neighbors);
 
         Console.WriteLine($"token {profile.Token} — vocab {profile.Vocab}, dim {profile.Dim}, stored {profile.StoredDtype}");
+        if (modelDir is not null)
+        {
+            var tokenizer = Tokenizer(modelDir);
+            var info = tokenizer.TokenInfo(token);
+            Console.WriteLine($"  text:    \"{info.DecodedText ?? "-"}\"{(info.IsSpecial ? " (special)" : string.Empty)}");
+            Console.WriteLine($"  repr:    {info.Representation ?? "-"}");
+        }
         Console.WriteLine($"  row: [{string.Join(", ", profile.Row.Take(Math.Min(8, profile.Dim)).Select(v => $"{v:0.###}"))}{(profile.Dim > 8 ? ", …" : string.Empty)}]");
         Console.WriteLine($"  min {profile.Min:0.###}  max {profile.Max:0.###}  mean {profile.Mean:0.###}  L2 {profile.Norm:0.###}");
         Console.WriteLine("  nearest neighbours (cosine):");
@@ -276,23 +367,47 @@ internal static class Program
               amql-cli encode <model-dir> --out <container-dir>   map + materialise
               amql-cli verify <container-dir>                     integrity + readiness
               amql-cli synth-model <dir>                          write an executable demo checkpoint
+              amql-cli tokens --model-dir <dir> "text"            ids + text pieces for a string
+              amql-cli decode --model-dir <dir> <id,id,…>         text for token ids
               amql-cli generate <container> --tokens 0,1
+                              | --prompt "text" --model-dir <dir>
                               [--steps 8] [--temperature 0] [--top-k 0] [--top-p 0]
                               [--seed 42] [--logits K] [--component target]
               amql-cli inspect-token <container> <token>
                               [--tokens ctx,ids] [--neighbors 5] [--logits K]
-                              [--component target]
+                              [--model-dir <dir>] [--component target]
               amql-cli help
 
             The encoder runs the G0→G3 pipeline: shard inventory, config facts,
             system graph + execution surface, canonical (unquantised) segments.
-            Operators this build has not judged are recorded verbatim and refused
-            at plan time by name — never approximated. Standard rope is served;
-            partial-MRoPE / linear-attention / gated layers are carried-refused.
+            The tokenizer is the HF tokenizers format (byte-level BPE + the
+            configured split); it lives with the checkpoint, so text commands
+            take --model-dir. Operators this build has not judged are recorded
+            verbatim and refused at plan time by name — never approximated.
             """);
     }
 
     private static string? Arg(string[] args, int index) => index < args.Length ? args[index] : null;
+
+    /// <summary>First non-option argument; options that take a value are
+    /// skipped together with their value, so <c>tokens --model-dir d "text"</c>
+    /// and <c>tokens "text" --model-dir d</c> both find "text".</summary>
+    private static string? FirstPositional(string[] args, params string[] valueOptions)
+    {
+        for (int i = 0; i < args.Length; i++)
+        {
+            if (args[i].StartsWith("--", StringComparison.Ordinal))
+            {
+                if (valueOptions.Contains(args[i]))
+                {
+                    i++; // skip the option's value
+                }
+                continue;
+            }
+            return args[i];
+        }
+        return null;
+    }
 
     private static string? OptionValue(string[] args, string name)
     {

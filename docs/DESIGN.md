@@ -250,6 +250,17 @@ Rope judgment in the loader: plain default rotary (no MRoPE sections,
 full factor, no frequency scaling) is served as standard `PositionRope`;
 every other rope fact is carried-unresolved and refused by name.
 
+**Tokenizer** (`Amql.Hf.HfTokenizer`): the HF tokenizers format for the
+byte-level BPE family — NFC normalisation, the configured regex split
+(the GPT-2-style pattern, Isolated behavior), added/special-token carving
+(they live outside the BPE vocab), greedy BPE over the GPT-2 byte-level
+characters, and ByteLevel decoding. Parity is verified against the
+reference implementation (HF `tokenizers`) on a captured golden corpus. It
+lives with the checkpoint, not the container, so text commands take
+<code>--model-dir</code>: <code>tokens</code> (text → ids + pieces),
+<code>decode</code> (ids → text), <code>generate --prompt</code>, and
+<code>inspect-token --model-dir</code> (the token's text representation).
+
 **Executable boundary for Qwen3.5-0.8B:** the loaded container is fully
 faithful (24 layers, 320 tensors, ~1.4 GiB), but this build's executor
 serves none of its layers yet — 18 are `linear_attention` (conv +
@@ -272,8 +283,10 @@ tensors would otherwise silently skip normalising Q/K).
   expert serving, Metal/GPU backends.
 - **LQL**, the router/server surface, KV dispatch tiers, drafter/inference
   pipelines on top of the runtime.
-- **Tokenizer support**: the loader and runtime operate on token ids;
-  `tokenizer.json`/`vocab.json` are not parsed in this slice.
+- **Tokenizer formats beyond HF tokenizers**: `tokenizer.json` (byte-level
+  BPE with NFC + the configured split) is served, with golden-parity tests
+  against the reference; older `vocab.json`/`merges.txt`-only checkpoints
+  (SentencePiece-tier piping) refuse with a clear message.
 - **Byte-parity with Rust for every kernel**: numerics follow the same
   formulas; tests validate against independent hand-computed references,
   not against Rust goldens (no cross-compiler A/B harness in this slice).
