@@ -183,7 +183,7 @@ internal static class Program
     private static int Tokens(string[] args)
     {
         var modelDir = RequiredModelDir(args);
-        string text = FirstPositional(args, "--model-dir") ?? throw new CliException("tokens requires a text argument (quote it)");
+        string text = FirstPositional(args, "--model-dir", "--tokenizer") ?? throw new CliException("tokens requires a text argument (quote it)");
         var tokenizer = Tokenizer(modelDir);
 
         var result = tokenizer.Encode(text);
@@ -200,10 +200,10 @@ internal static class Program
     private static int Decode(string[] args)
     {
         var modelDir = RequiredModelDir(args);
-        var ids = ParseIntList(FirstPositional(args, "--model-dir"), fallback: Array.Empty<int>());
+        var ids = ParseIntList(FirstPositional(args, "--model-dir", "--tokenizer"), fallback: Array.Empty<int>());
         if (ids.Length == 0)
         {
-            throw new CliException("decode requires token ids, e.g. 'amql-cli decode --model-dir <dir> 9419,11'");
+            throw new CliException("decode requires token ids, e.g. 'amql-cli decode --tokenizer <checkpoint-dir> 9419,11'");
         }
         var tokenizer = Tokenizer(modelDir);
         var text = tokenizer.Decode(ids);
@@ -216,12 +216,23 @@ internal static class Program
         return 0;
     }
 
+    /// <summary>The checkpoint directory whose tokenizer.json converts text ↔
+    /// ids. The prime name is <c>--tokenizer</c> (a checkpoint dir, NOT the
+    /// container dir — containers hold weights only); <c>--model-dir</c> is
+    /// kept as an alias.</summary>
+    private static string? TokenizerDir(string[] args) =>
+        OptionValue(args, "--tokenizer") ?? OptionValue(args, "--model-dir");
+
     private static string RequiredModelDir(string[] args)
     {
-        var modelDir = OptionValue(args, "--model-dir");
+        var modelDir = TokenizerDir(args);
         if (modelDir is null)
         {
-            throw new CliException("this command requires '--model-dir <dir>' (the tokenizer lives with the checkpoint, not in the container)");
+            throw new CliException(
+                "this command needs text, which requires the checkpoint directory containing the " +
+                "model's tokenizer.json — pass '--tokenizer <checkpoint-dir>' (alias: --model-dir). " +
+                "The positional argument is the VINDEX3 container directory (encode output); it " +
+                "holds weights only, no tokenizer.");
         }
         return modelDir;
     }
@@ -263,6 +274,11 @@ internal static class Program
         bool sampling = config.Temperature > 0f || config.TopK > 0 || config.TopP > 0;
 
         using var container = Vindex3Container.Open(containerDir);
+        if (tokenizer is not null)
+        {
+            string tokenizerDir = OptionValue(args, "--tokenizer") ?? OptionValue(args, "--model-dir") ?? "?";
+            Console.WriteLine($"container: {containerDir} (weights)   tokenizer: {tokenizerDir} (checkpoint)");
+        }
         var (prefill, steps2) = InferenceRunner.Generate(
             container, component, tokens, steps, config, showTopK);
 
@@ -312,7 +328,11 @@ internal static class Program
         int neighbors = IntOption(args, "--neighbors", TokenInspector.DefaultNeighbors);
         int? logitsK = IntOptionOrNull(args, "--logits");
         int[]? context = ParseOptionalIntList(OptionValue(args, "--tokens"));
-        string? modelDir = OptionValue(args, "--model-dir");
+        string? modelDir = TokenizerDir(args);
+        if (modelDir is not null)
+        {
+            Console.WriteLine($"container: {containerDir} (weights)   tokenizer: {modelDir} (checkpoint)");
+        }
 
         using var container = Vindex3Container.Open(containerDir);
         var profile = TokenInspector.InspectEmbedding(container, component, token, neighbors);
@@ -367,23 +387,30 @@ internal static class Program
               amql-cli encode <model-dir> --out <container-dir>   map + materialise
               amql-cli verify <container-dir>                     integrity + readiness
               amql-cli synth-model <dir>                          write an executable demo checkpoint
-              amql-cli tokens --model-dir <dir> "text"            ids + text pieces for a string
-              amql-cli decode --model-dir <dir> <id,id,…>         text for token ids
-              amql-cli generate <container> --tokens 0,1
-                              | --prompt "text" --model-dir <dir>
+              amql-cli tokens --tokenizer <checkpoint-dir> "text"
+              amql-cli decode --tokenizer <checkpoint-dir> <id,id,…>
+              amql-cli generate <container-dir>
+                              --prompt "text" --tokenizer <checkpoint-dir>
                               [--steps 8] [--temperature 0] [--top-k 0] [--top-p 0]
                               [--seed 42] [--logits K] [--component target]
-              amql-cli inspect-token <container> <token>
+              amql-cli inspect-token <container-dir> <token>
                               [--tokens ctx,ids] [--neighbors 5] [--logits K]
-                              [--model-dir <dir>] [--component target]
+                              [--tokenizer <checkpoint-dir>] [--component target]
               amql-cli help
 
+            Example:
+              amql-cli synth-model demo-model
+              amql-cli encode demo-model --out demo-container
+              amql-cli generate demo-container --prompt "hi" --tokenizer demo-model
+
+            Two kinds of directory are involved: the CONTAINER (<container-dir>,
+            encode output, holds weights only) and the CHECKPOINT
+            (--tokenizer, the original HF model directory whose tokenizer.json
+            converts text to ids; --model-dir is an accepted alias).
             The encoder runs the G0→G3 pipeline: shard inventory, config facts,
             system graph + execution surface, canonical (unquantised) segments.
-            The tokenizer is the HF tokenizers format (byte-level BPE + the
-            configured split); it lives with the checkpoint, so text commands
-            take --model-dir. Operators this build has not judged are recorded
-            verbatim and refused at plan time by name — never approximated.
+            Operators this build has not judged are recorded verbatim and refused
+            at plan time by name — never approximated.
             """);
     }
 

@@ -259,7 +259,7 @@ reference implementation (HF `tokenizers`) on a captured golden corpus. It
 lives with the checkpoint, not the container, so text commands take
 <code>--model-dir</code>: <code>tokens</code> (text → ids + pieces),
 <code>decode</code> (ids → text), <code>generate --prompt</code>, and
-<code>inspect-token --model-dir</code> (the token's text representation).
+<code>inspect-token --tokenizer</code> (the token's text representation).
 
 **Qwen3.5-0.8B executes end-to-end:** the loaded container (24 layers,
 320 tensors, ~1.4 GiB) runs the full hybrid text decoder in managed .NET
