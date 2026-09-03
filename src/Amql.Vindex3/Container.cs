@@ -19,11 +19,13 @@ public sealed record IntegrityReport(bool Ok, List<IntegrityCheck> Checks);
 /// when recorded, <c>system_graph.json</c> (semantic IR). Opening is
 /// schema-gated and fails closed — an unreadable schema, a dangling
 /// reference or a missing file is a typed error, never a guess.
+///
+/// The container is a stateless view (index + graph + root path): payload
+/// segments are owned by <see cref="OperandStore"/> instances, each
+/// mapping its own files so disposal of one store never affects another.
 /// </summary>
 public sealed class Vindex3Container : IDisposable
 {
-    private readonly List<SegmentFile> _segments = new();
-
     public Vindex3Container(string root, Vindex3Index index, SystemGraph? graph)
     {
         Root = root;
@@ -234,27 +236,16 @@ public sealed class Vindex3Container : IDisposable
     /// container and must be disposed by the caller.</summary>
     public OperandStore CreateOperandStore() => new(this);
 
-    /// <summary>Opens a segment file, caching it on the container so
-    /// repeated representation resolution reuses the mapping.</summary>
-    internal SegmentFile OpenSegment(string relativePath)
-    {
-        var full = System.IO.Path.Combine(Root, relativePath);
-        var existing = _segments.Find(s => s.Path == full);
-        if (existing is not null)
-        {
-            return existing;
-        }
-        var opened = SegmentFile.Open(full);
-        _segments.Add(opened);
-        return opened;
-    }
+    /// <summary>Opens a segment file at a container-relative path. Every
+    /// caller receives its own mapping (the store caches per-store);
+    /// disposal is the caller's.
+    /// </summary>
+    internal SegmentFile OpenSegment(string relativePath) =>
+        SegmentFile.Open(System.IO.Path.Combine(Root, relativePath));
 
     public void Dispose()
     {
-        foreach (var segment in _segments)
-        {
-            segment.Dispose();
-        }
-        _segments.Clear();
+        // Stateless view: there is nothing to release. Operand stores own
+        // and dispose their own segment mappings.
     }
 }

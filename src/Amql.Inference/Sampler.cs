@@ -32,13 +32,25 @@ public static class Sampler
     public static int Sample(Tensor2D logits, SamplingConfig config)
     {
         var row = logits.FirstRow();
-        return ApplyTemperatureAndSample(row, config);
+        return ApplyTemperatureAndSample(row, config, new Random(config.Seed));
     }
 
     public static int Sample(ReadOnlySpan<float> logits, SamplingConfig config) =>
-        ApplyTemperatureAndSample(logits, config);
+        ApplyTemperatureAndSample(logits, config, new Random(config.Seed));
 
-    private static int ApplyTemperatureAndSample(ReadOnlySpan<float> logits, SamplingConfig config)
+    /// <summary>
+    /// Sample with an explicit session RNG. Autoregressive loops MUST pass
+    /// one Random created once per session: the convenience overloads above
+    /// reseed from <c>config.Seed</c> on every call, which repeats the same
+    /// draw sequence across steps otherwise.
+    /// </summary>
+    public static int Sample(ReadOnlySpan<float> logits, SamplingConfig config, Random rng) =>
+        ApplyTemperatureAndSample(logits, config, rng);
+
+    public static int Sample(Tensor2D logits, SamplingConfig config, Random rng) =>
+        ApplyTemperatureAndSample(logits.FirstRow(), config, rng);
+
+    private static int ApplyTemperatureAndSample(ReadOnlySpan<float> logits, SamplingConfig config, Random rng)
     {
         // Greedy for temperature ≤ 0.
         if (config.Temperature <= 0f)
@@ -131,7 +143,6 @@ public static class Sampler
             return ArgMaxOf(logits);
         }
 
-        var rng = new Random(config.Seed);
         double draw = rng.NextDouble() * total;
         double acc = 0;
         for (int i = 0; i < probs.Length; i++)

@@ -23,6 +23,7 @@
     <ProjectReference Include="..\..\src\Amql.Vindex3\Amql.Vindex3.csproj" />
     <ProjectReference Include="..\..\src\Amql.Inference\Amql.Inference.csproj" />
     <ProjectReference Include="..\..\src\Amql.Hf\Amql.Hf.csproj" />
+    <ProjectReference Include="..\..\src\Amql.Cli\Amql.Cli.csproj" />
   </ItemGroup>
 
 </Project>

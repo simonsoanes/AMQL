@@ -233,6 +233,23 @@ operand store, prints the operator census, and reports the runtime
 boundary by attempting to plan the component (fail-closed refusal names
 the primitives this build does not serve).
 
+`amql-cli generate <container> --tokens 0,1 [--steps N]` runs
+autoregressive generation against the planned component: greedy by
+default, or temperature/top-k/top-p with a session-stable RNG (one
+`Random` per run — repeated steps are draws, not replays). `--logits K`
+prints each step's top-K window with probabilities. `amql-cli
+inspect-token <container> <id>` inspects a token in vocabulary space from
+the container alone: embedding profile (row, min/max/mean, L2) and
+nearest neighbours by cosine; with `--tokens ctx,...` and an executable
+component it also reports the model's logit/rank for the token at the
+end of that context. `amql-cli synth-model <dir>` writes the executable
+2-layer demo checkpoint so the whole chain (encode → generate →
+inspect-token) is exercisable without a servable HF model.
+
+Rope judgment in the loader: plain default rotary (no MRoPE sections,
+full factor, no frequency scaling) is served as standard `PositionRope`;
+every other rope fact is carried-unresolved and refused by name.
+
 **Executable boundary for Qwen3.5-0.8B:** the loaded container is fully
 faithful (24 layers, 320 tensors, ~1.4 GiB), but this build's executor
 serves none of its layers yet — 18 are `linear_attention` (conv +
@@ -278,8 +295,12 @@ tensors would otherwise silently skip normalising Q/K).
   causal sliding attention, FFN, head, routed MoE). Fail-closed guards:
   gated attention, sinks, weighted QK norm, linear-attention and unknown
   position/operator rows all refuse by name.
-- **Loader pipeline**: a synthetic multimodal checkpoint (text_config
+- **Loader + inference CLI**: a synthetic multimodal checkpoint (text_config
   wrapper, mixed linear/softmax `layer_types`, F32 precision exceptions,
   vision + MTP side-components) encodes → opens → verifies → resolves
   payloads end-to-end; the real Qwen3.5-0.8B config facts are asserted
-  when the checkpoint is present on the machine.
+  when the checkpoint is present on the machine. CLI commands are tested
+  against the encoded demo checkpoint: greedy determinism + vocab bounds,
+  sampled replay for a fixed seed + different seed divergence, embedding
+  profile / neighbour ranking vs a brute-force oracle, logits top-1 ==
+  library argmax, and the named `linear_attention` refusal.

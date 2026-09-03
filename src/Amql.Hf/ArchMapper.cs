@@ -36,8 +36,12 @@ public static class ArchMapper
         }
 
         // ── per-layer policy table ────────────────────────────────────────
-        string ropeKind = facts.PartialRotaryFactor < 1.0 ? "partial_mrope" : "mrope";
-        var position = new PositionUnresolved { Kind = ropeKind, Payload = facts.RopeParameters.Clone() };
+        // Position policy: plain default rope (no MRoPE sections, full
+        // rotary factor, no frequency scaling) is SERVED as a standard
+        // PositionRope; every other rope fact (partial factor, MRoPE
+        // sections, scaled families) is carried verbatim as unresolved and
+        // refused by the planner naming the kind.
+        PositionPolicy position = JudgePosition(facts);
         var policies = new List<AttentionLayerPolicy>(facts.NumLayers);
         for (int l = 0; l < facts.NumLayers; l++)
         {
@@ -259,6 +263,38 @@ public static class ArchMapper
                     Exceptions = exceptions,
                 },
         };
+    }
+
+    /// <summary>Judges whether the persisted rope facts are the served plain
+    /// default rotary (PositionRope) or must be carried unresolved. The
+    /// reference's rule is mirrored: a fact this build cannot serve is
+    /// carried verbatim and refused by name, never approximated.</summary>
+    private static PositionPolicy JudgePosition(TextArchitectureFacts facts)
+    {
+        var rope = facts.RopeParameters;
+        bool hasMropeSections = rope.ValueKind == JsonValueKind.Object &&
+                                rope.TryGetProperty("mrope_section", out var section) &&
+                                section.ValueKind == JsonValueKind.Array;
+        string? scaledType = rope.ValueKind == JsonValueKind.Object &&
+                             rope.TryGetProperty("rope_type", out var rtype)
+            ? rtype.GetString()
+            : "default";
+
+        if (!hasMropeSections && facts.PartialRotaryFactor >= 1.0 && scaledType == "default")
+        {
+            double theta = rope.ValueKind == JsonValueKind.Object &&
+                           rope.TryGetProperty("rope_theta", out var t)
+                ? t.GetDouble()
+                : 10_000.0;
+            return PositionPolicy.CreateRope(theta);
+        }
+
+        string kind = facts.PartialRotaryFactor < 1.0
+            ? "partial_mrope"
+            : hasMropeSections
+                ? "mrope"
+                : $"rope_scaling({scaledType})";
+        return new PositionUnresolved { Kind = kind, Payload = facts.RopeParameters.Clone() };
     }
 
     /// <summary>Finds the tensor prefix the text decoder actually lives
