@@ -43,7 +43,8 @@ public static class PathFinder
         int a,
         int b,
         PathSearchOptions options,
-        Action<string>? progress = null)
+        Action<string>? progress = null,
+        WeightPatch? patch = null)
     {
         if (a == b)
         {
@@ -54,7 +55,7 @@ public static class PathFinder
 
         using var store = container.CreateOperandStore();
         var plan = Planner.Plan(container, component, store);
-        var rt = new GenericRuntime(plan, store);
+        var rt = new GenericRuntime(plan, store, patch);
 
         var fwdQueue = new PriorityQueue<ChainEntry, double>();
         var bwdQueue = new PriorityQueue<ChainEntry, double>();

@@ -36,6 +36,8 @@ internal static class Program
                 "path" => PathCmd(args[1..]),
                 "generate" => Generate(args[1..]),
                 "inspect-token" => InspectToken(args[1..]),
+                "change-tensor" => ChangeTensor(args[1..]),
+                "save-lora" => SaveLora(args[1..]),
                 _ => throw new CliException($"unknown command '{args[0]}'"),
             };
         }
@@ -185,8 +187,9 @@ internal static class Program
     private static int Tokens(string[] args)
     {
         var modelDir = RequiredModelDir(args);
-        string text = FirstPositional(args, "--model-dir", "--tokenizer") ?? throw new CliException("tokens requires a text argument (quote it)");
+        string text = FirstPositional(args, "--model-dir", "--tokenizer", "--patch") ?? throw new CliException("tokens requires a text argument (quote it)");
         var tokenizer = Tokenizer(modelDir);
+        LoadTokenizerPatch(args);
 
         var result = tokenizer.Encode(text);
         Console.WriteLine($"text:    {text}");
@@ -202,12 +205,13 @@ internal static class Program
     private static int Decode(string[] args)
     {
         var modelDir = RequiredModelDir(args);
-        var ids = ParseIntList(FirstPositional(args, "--model-dir", "--tokenizer"), fallback: Array.Empty<int>());
+        var ids = ParseIntList(FirstPositional(args, "--model-dir", "--tokenizer", "--patch"), fallback: Array.Empty<int>());
         if (ids.Length == 0)
         {
             throw new CliException("decode requires token ids, e.g. 'amql-cli decode --tokenizer <checkpoint-dir> 9419,11'");
         }
         var tokenizer = Tokenizer(modelDir);
+        LoadTokenizerPatch(args);
         var text = tokenizer.Decode(ids);
         Console.WriteLine($"ids {string.Join(",", ids)} → \"{text}\"");
         foreach (var id in ids)
@@ -216,6 +220,21 @@ internal static class Program
             Console.WriteLine($"  {id,6}  {(info.IsSpecial ? "special " : "        ")}{info.Representation ?? "-"}");
         }
         return 0;
+    }
+
+    /// <summary>tokens/decode are tokenizer-only — they never load weights,
+    /// so a patch is accepted (and parsed, so typos surface) but cannot
+    /// influence the output.</summary>
+    private static void LoadTokenizerPatch(string[] args)
+    {
+        string? path = OptionValue(args, "--patch");
+        if (path is null)
+        {
+            return;
+        }
+        var patch = WeightPatch.Load(path);
+        Console.WriteLine($"patch: {path} ({patch.Entries.Count} tensor{(patch.Entries.Count == 1 ? string.Empty : "s")}) — " +
+                          "the tokenizer path is unaffected by weight patches");
     }
 
     /// <summary>The checkpoint directory whose tokenizer.json converts text ↔
@@ -284,10 +303,10 @@ internal static class Program
         // A and B are positionals 2 and 3 — the container already consumed.
         var rest = args.Skip(1).ToArray();
         string a = FirstPositional(rest, "--tokenizer", "--model-dir", "--top", "--templates",
-            "--trace-layer-start", "--trace-layer-end", "--corrupt", "--component") ??
+            "--trace-layer-start", "--trace-layer-end", "--corrupt", "--component", "--patch") ??
             throw new CliException("route requires two tokens, e.g. 'amql-cli route <container> France Paris --tokenizer <checkpoint-dir>'");
         string b = SecondPositional(rest, "--tokenizer", "--model-dir", "--top", "--templates",
-            "--trace-layer-start", "--trace-layer-end", "--corrupt", "--component") ??
+            "--trace-layer-start", "--trace-layer-end", "--corrupt", "--component", "--patch") ??
             throw new CliException("route requires two tokens: 'amql-cli route <container> <A> <B>'");
         var modelDir = ResolveTokenizerDir(containerDir, args);
 
@@ -301,10 +320,11 @@ internal static class Program
         string component = OptionValue(args, "--component") ?? "target";
 
         using var container = Vindex3Container.Open(containerDir);
+        var patch = LoadPatch(args, container);
         Console.WriteLine($"container: {containerDir} (weights)   tokenizer: {modelDir} (checkpoint)");
         var tokenizer = Tokenizer(modelDir);
 
-        var (links, notes) = RelationRouter.Route(container, component, tokenizer, a, b, options, Console.Write);
+        var (links, notes) = RelationRouter.Route(container, component, tokenizer, a, b, options, Console.Write, patch);
         foreach (var note in notes)
         {
             Console.WriteLine($"note: {note}");
@@ -348,9 +368,9 @@ internal static class Program
     {
         var containerDir = Arg(args, 0) ?? throw new CliException("path requires a container directory");
         var rest = args.Skip(1).ToArray();
-        string a = FirstPositional(rest, "--tokenizer", "--model-dir", "--topk", "--max-nodes", "--max-depth", "--component") ??
+        string a = FirstPositional(rest, "--tokenizer", "--model-dir", "--topk", "--max-nodes", "--max-depth", "--component", "--patch") ??
             throw new CliException("path requires two tokens, e.g. 'amql-cli path <container> France Paris'");
-        string b = SecondPositional(rest, "--tokenizer", "--model-dir", "--topk", "--max-nodes", "--max-depth", "--component") ??
+        string b = SecondPositional(rest, "--tokenizer", "--model-dir", "--topk", "--max-nodes", "--max-depth", "--component", "--patch") ??
             throw new CliException("path requires two tokens: 'amql-cli path <container> <A> <B>'");
         var modelDir = ResolveTokenizerDir(containerDir, args);
         var tokenizer = Tokenizer(modelDir);
@@ -372,11 +392,12 @@ internal static class Program
         string component = OptionValue(args, "--component") ?? "target";
 
         using var container = Vindex3Container.Open(containerDir);
+        var patch = LoadPatch(args, container);
         bool inContainer = modelDir.Equals(containerDir, StringComparison.OrdinalIgnoreCase);
         Console.WriteLine($"container: {containerDir} (weights)   tokenizer: {modelDir} ({(inContainer ? "in container" : "checkpoint")})");
         Console.WriteLine($"searching from '{a}' (id {aId}) toward '{b}' (id {bId}) — edges = top-{options.TopK} continuations (cost −log P) …");
 
-        var result = PathFinder.Search(container, component, tokenizer, aId, bId, options, Console.Write);
+        var result = PathFinder.Search(container, component, tokenizer, aId, bId, options, Console.Write, patch);
         Console.WriteLine();
 
         if (!result.Found)
@@ -435,13 +456,14 @@ internal static class Program
         bool sampling = config.Temperature > 0f || config.TopK > 0 || config.TopP > 0;
 
         using var container = Vindex3Container.Open(containerDir);
+        var patch = LoadPatch(args, container);
         if (tokenizer is not null)
         {
             bool inContainer = tokenizerSource!.Equals(containerDir, StringComparison.OrdinalIgnoreCase);
             Console.WriteLine($"container: {containerDir} (weights)   tokenizer: {tokenizerSource} ({(inContainer ? "in container" : "checkpoint")})");
         }
         var (prefill, steps2) = InferenceRunner.Generate(
-            container, component, tokens, steps, config, showTopK);
+            container, component, tokens, steps, config, showTopK, patch);
 
         string prefillText = tokenizer is null ? string.Empty : tokenizer.Decode(prefill);
         string mode = sampling ? "sampled" : "greedy";
@@ -501,7 +523,8 @@ internal static class Program
         }
 
         using var container = Vindex3Container.Open(containerDir);
-        var profile = TokenInspector.InspectEmbedding(container, component, token, neighbors);
+        var patch = LoadPatch(args, container);
+        var profile = TokenInspector.InspectEmbedding(container, component, token, neighbors, patch);
 
         Console.WriteLine($"token {profile.Token} — vocab {profile.Vocab}, dim {profile.Dim}, stored {profile.StoredDtype}");
         if (modelDir is not null)
@@ -523,7 +546,7 @@ internal static class Program
         {
             try
             {
-                var report = TokenInspector.InspectLogits(container, component, token, context, logitsK ?? 5);
+                var report = TokenInspector.InspectLogits(container, component, token, context, logitsK ?? 5, patch);
                 if (report is not null)
                 {
                     Console.WriteLine($"logits after prefill [{string.Join(",", context)}]: token {token} rank {report.Rank} logit {report.Logit:0.####} (p {report.Probability * 100:0.###}%)");
@@ -539,6 +562,158 @@ internal static class Program
             }
         }
         return 0;
+    }
+
+    // ── change-tensor: manually edit one weight cell into a patch ──────────
+
+    private static int ChangeTensor(string[] args)
+    {
+        var containerDir = Arg(args, 0) ?? throw new CliException(
+            "change-tensor requires a container directory, e.g. 'amql-cli change-tensor <container> target.embedding weight 3,1 --set 0.5 --out patch.safetensors'");
+        var pos = Positionals(args.Skip(1).ToArray(), "--out", "--set", "--add", "--scale", "--zero", "--patch");
+        string objectId = pos.Length > 0 ? pos[0] : throw new CliException("change-tensor requires an object id (e.g. target.embedding)");
+        string tensorName = pos.Length > 1 ? pos[1] : throw new CliException("change-tensor requires a tensor name (e.g. weight, 0.self_attn.q_proj.weight)");
+        string cell = pos.Length > 2 ? pos[2] : throw new CliException("change-tensor requires a cell: 'row,col' for a 2-D tensor, a flat index otherwise");
+
+        var op = ParseEditOp(args);
+        float value = ParseEditValue(args, op);
+
+        string outPatch = OptionValue(args, "--out") ?? throw new CliException("change-tensor requires '--out <patch.safetensors>'");
+        string? existingPath = File.Exists(outPatch) ? outPatch : null;
+        var existing = TensorPatchTools.LoadOrEmpty(existingPath);
+
+        using var container = Vindex3Container.Open(containerDir);
+        var shape = TensorPatchTools.ResolveShape(container, objectId, tensorName);
+        long flat = ParseCell(cell, shape, objectId, tensorName);
+
+        var result = TensorPatchTools.ApplyEdit(container, objectId, tensorName, op, value, flat, existing);
+        if (result.Removed)
+        {
+            if (existingPath is not null)
+            {
+                File.Delete(existingPath);
+                Console.WriteLine($"patch {existingPath}: '{objectId}/{tensorName}'[{cell}]\n  {result.Before:0.######} → {result.After:0.######} — back at the base value; patch cleared (no changes remain).");
+            }
+            else
+            {
+                Console.WriteLine($"'{objectId}/{tensorName}'[{cell}]: {result.Before:0.######} → {result.After:0.######} — no change, nothing written.");
+            }
+            return 0;
+        }
+
+        WeightPatch.Save(outPatch, result.Entries, container.Index.Model);
+        Console.WriteLine($"'{objectId}/{tensorName}' [{string.Join("x", result.Shape)}] {result.DtypeLabel} [{cell}] {result.Before:0.######} → {result.After:0.######} (Δ {result.After - result.Before:0.######})");
+        Console.WriteLine($"patch: {outPatch} ({result.Entries.Count} tensor{(result.Entries.Count == 1 ? string.Empty : "s")})");
+        Console.WriteLine("run a pathway with it: amql-cli route <container> A B --tokenizer <checkpoint> --patch " + outPatch);
+        return 0;
+    }
+
+    private static TensorEditOp ParseEditOp(string[] args)
+    {
+        bool set = args.Contains("--set");
+        bool add = args.Contains("--add");
+        bool scale = args.Contains("--scale");
+        bool zero = args.Contains("--zero");
+        if ((set ? 1 : 0) + (add ? 1 : 0) + (scale ? 1 : 0) + (zero ? 1 : 0) != 1)
+        {
+            throw new CliException("change-tensor requires exactly one of '--set <value>', '--add <value>', '--scale <factor>', '--zero'");
+        }
+        return zero ? TensorEditOp.Set : (set ? TensorEditOp.Set : (add ? TensorEditOp.Add : TensorEditOp.Scale));
+    }
+
+    private static float ParseEditValue(string[] args, TensorEditOp op)
+    {
+        if (op == TensorEditOp.Set && args.Contains("--zero"))
+        {
+            return 0f;
+        }
+        string name = op switch
+        {
+            TensorEditOp.Set => "--set",
+            TensorEditOp.Add => "--add",
+            TensorEditOp.Scale => "--scale",
+            _ => throw new CliException("unknown edit operation"),
+        };
+        if (!float.TryParse(OptionValue(args, name), System.Globalization.CultureInfo.InvariantCulture, out float value))
+        {
+            throw new CliException($"{name} requires a numeric value");
+        }
+        return value;
+    }
+
+    private static long ParseCell(string cell, long[] shape, string objectId, string tensorName)
+    {
+        if (shape.Length == 2 && cell.Contains(','))
+        {
+            var parts = cell.Split(',', StringSplitOptions.TrimEntries);
+            if (parts.Length != 2 || !long.TryParse(parts[0], out long row) || !long.TryParse(parts[1], out long col))
+            {
+                throw new CliException($"cell '{cell}' is not 'row,col'");
+            }
+            if (row < 0 || row >= shape[0] || col < 0 || col >= shape[1])
+            {
+                throw new CliException($"cell ({row},{col}) is outside '{objectId}/{tensorName}' [{string.Join("x", shape)}]");
+            }
+            return checked(row * shape[1] + col);
+        }
+        if (!long.TryParse(cell, out long flat))
+        {
+            throw new CliException($"cell '{cell}' is not an index");
+        }
+        return flat; // bounds are re-checked against the tensor in ApplyEdit
+    }
+
+    // ── save-lora: factor a patch into a LoRA for the original model ───────
+
+    private static int SaveLora(string[] args)
+    {
+        string patchPath = Arg(args, 0) ?? throw new CliException("save-lora requires a patch file, e.g. 'amql-cli save-lora patch.safetensors --out lora --rank 8 --alpha 16'");
+        string outDir = OptionValue(args, "--out") ?? throw new CliException("save-lora requires '--out <lora-dir>'");
+        int rank = IntOption(args, "--rank", 8);
+        double alpha = DoubleOption(args, "--alpha", 16);
+        string? containerDir = OptionValue(args, "--container");
+
+        if (containerDir is not null)
+        {
+            using var container = Vindex3Container.Open(containerDir);
+            WeightPatch.Load(patchPath).ValidateAgainst(container);
+        }
+
+        var report = LoraWriter.SaveAsLora(patchPath, outDir, rank, alpha);
+        Console.WriteLine($"LoRA: {report.OutDir}   rank {report.Rank} (scale alpha/r = {report.Alpha}/{report.Rank} = {report.Scale:0.###})   model {report.Model ?? "-"}");
+        foreach (var target in report.Targets)
+        {
+            Console.WriteLine($"  {target.ObjectId}/{target.TensorName} [{string.Join("x", target.Shape)}] → r={target.Rank}  {target.AName} {target.BName}  (reconstruction error {target.ReconstructionError:0.###e+00})");
+        }
+        foreach (var note in report.Skipped)
+        {
+            Console.WriteLine($"  skipped: {note}");
+        }
+        Console.WriteLine("apply to the base container: for each target, add scale · lora_B · lora_A to the tensor.");
+        return 0;
+    }
+
+    // ── patch option plumbing ──────────────────────────────────────────────
+
+    private static double DoubleOption(string[] args, string name, double fallback) =>
+        double.TryParse(OptionValue(args, name), System.Globalization.CultureInfo.InvariantCulture, out var v) ? v : fallback;
+
+    /// <summary>Loads and (when a container is at hand) shape-validates the
+    /// <c>--patch</c> file. Returns null when no patch was given.</summary>
+    private static WeightPatch? LoadPatch(string[] args, Vindex3Container? container)
+    {
+        string? path = OptionValue(args, "--patch");
+        if (path is null)
+        {
+            return null;
+        }
+        var patch = WeightPatch.Load(path);
+        if (container is not null)
+        {
+            patch.ValidateAgainst(container);
+        }
+        Console.WriteLine($"patch: {path} ({patch.Entries.Count} tensor{(patch.Entries.Count == 1 ? string.Empty : "s")})");
+        return patch;
     }
 
     // ── plumbing ───────────────────────────────────────────────────────────
@@ -558,15 +733,24 @@ internal static class Program
               amql-cli route <container-dir> <A> <B> --tokenizer <checkpoint-dir>
                               [--top 5] [--templates 8] [--trace-layer-start 8]
                               [--trace-layer-end 24] [--no-trace] [--corrupt the]
+                              [--patch <patch.safetensors>]
               amql-cli path <container-dir> <A> <B>
                               [--topk 6] [--max-nodes 48] [--max-depth 6]
+                              [--patch <patch.safetensors>]
               amql-cli generate <container-dir>
                               --prompt "text" --tokenizer <checkpoint-dir>
                               [--steps 8] [--temperature 0] [--top-k 0] [--top-p 0]
                               [--seed 42] [--logits K] [--component target]
+                              [--patch <patch.safetensors>]
               amql-cli inspect-token <container-dir> <token>
                               [--tokens ctx,ids] [--neighbors 5] [--logits K]
                               [--tokenizer <checkpoint-dir>] [--component target]
+                              [--patch <patch.safetensors>]
+              amql-cli change-tensor <container-dir> <object> <tensor> <cell>
+                              (--set V | --add V | --scale F | --zero)
+                              --out <patch.safetensors>
+              amql-cli save-lora <patch.safetensors> --out <lora-dir>
+                              [--rank 8] [--alpha 16] [--container <container-dir>]
               amql-cli help
 
             Example:
@@ -583,6 +767,14 @@ internal static class Program
             path searches the token-continuation graph bidirectionally
             (Dijkstra-style, meet in the middle) and returns the token chain
             without relation names.
+            change-tensor edits one cell of a weight and records the f32
+            delta in a patch file ("--add"/"--scale" compose across runs);
+            save-lora factors a patch's 2-D deltas into lora_A/lora_B with
+            alpha/r scaling for the ORIGINAL (unpatched) model weights.
+            Any pathway (route, path, generate, inspect-token, and
+            tokens/decode, which parse but cannot be affected) accepts
+            --patch to run with the patch's deltas merged into the loaded
+            weights; the container is never rewritten.
             --tokenizer is optional when the container was encoded with a
             tokenizer.json beside it (encode copies it in).
 
@@ -599,11 +791,12 @@ internal static class Program
 
     private static string? Arg(string[] args, int index) => index < args.Length ? args[index] : null;
 
-    /// <summary>First non-option argument; options that take a value are
-    /// skipped together with their value, so <c>tokens --model-dir d "text"</c>
-    /// and <c>tokens "text" --model-dir d</c> both find "text".</summary>
-    private static string? FirstPositional(string[] args, params string[] valueOptions)
+    /// <summary>All non-option arguments in order; options that take a
+    /// value are skipped together with their value, so positionals land in
+    /// the same slots regardless of where the options sit.</summary>
+    private static string[] Positionals(string[] args, params string[] valueOptions)
     {
+        var result = new List<string>();
         for (int i = 0; i < args.Length; i++)
         {
             if (args[i].StartsWith("--", StringComparison.Ordinal))
@@ -614,33 +807,25 @@ internal static class Program
                 }
                 continue;
             }
-            return args[i];
+            result.Add(args[i]);
         }
-        return null;
+        return result.ToArray();
+    }
+
+    /// <summary>First non-option argument; options that take a value are
+    /// skipped together with their value, so <c>tokens --model-dir d "text"</c>
+    /// and <c>tokens "text" --model-dir d</c> both find "text".</summary>
+    private static string? FirstPositional(string[] args, params string[] valueOptions)
+    {
+        var pos = Positionals(args, valueOptions);
+        return pos.Length > 0 ? pos[0] : null;
     }
 
     /// <summary>Second non-option argument (route's B token).</summary>
     private static string? SecondPositional(string[] args, params string[] valueOptions)
     {
-        bool found = false;
-        for (int i = 0; i < args.Length; i++)
-        {
-            if (args[i].StartsWith("--", StringComparison.Ordinal))
-            {
-                if (valueOptions.Contains(args[i]))
-                {
-                    i++;
-                }
-                continue;
-            }
-            if (!found)
-            {
-                found = true;
-                continue;
-            }
-            return args[i];
-        }
-        return null;
+        var pos = Positionals(args, valueOptions);
+        return pos.Length > 1 ? pos[1] : null;
     }
 
     private static string? OptionValue(string[] args, string name)

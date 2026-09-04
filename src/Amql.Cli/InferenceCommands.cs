@@ -20,7 +20,8 @@ public static class InferenceRunner
 {
     public static (int[] Prefill, List<StepOutcome> Steps) Generate(
         Vindex3Container container, string componentId, int[] tokens,
-        int steps, SamplingConfig config, int? showTopK = null)
+        int steps, SamplingConfig config, int? showTopK = null,
+        WeightPatch? patch = null)
     {
         using var store = container.CreateOperandStore();
         var plan = Planner.Plan(container, componentId, store);
@@ -35,7 +36,7 @@ public static class InferenceRunner
             }
         }
 
-        var session = new DecodeSession(plan, store);
+        var session = new DecodeSession(plan, store, patch);
         var rng = new Random(config.Seed);
 
         session.Prefill(tokens);
@@ -117,7 +118,7 @@ public static class TokenInspector
     public sealed record LogitReport(int Token, int Rank, double Logit, double Probability,
         IReadOnlyList<Candidate> Top);
 
-    public static EmbeddingProfile InspectEmbedding(Vindex3Container container, string componentId, int token, int neighborCount)
+    public static EmbeddingProfile InspectEmbedding(Vindex3Container container, string componentId, int token, int neighborCount, WeightPatch? patch = null)
     {
         var graph = container.Graph ??
             throw new CliException("container records no system graph — cannot locate the embedding object");
@@ -146,6 +147,7 @@ public static class TokenInspector
         }
 
         var table = BitPattern.WidenToF32(resolution.Dtype, resolution.Payload);
+        ApplyEmbeddingPatch(table, embedding.Id, patch);
         var row = new float[dim];
         Array.Copy(table, token * dim, row, 0, dim);
 
@@ -161,11 +163,11 @@ public static class TokenInspector
 
     /// <summary>Logit-space verdict for the same token at the end of
     /// <c>context</c>: its rank and probability among the vocabulary.</summary>
-    public static LogitReport InspectLogits(Vindex3Container container, string componentId, int token, int[] context, int topK)
+    public static LogitReport InspectLogits(Vindex3Container container, string componentId, int token, int[] context, int topK, WeightPatch? patch = null)
     {
         using var store = container.CreateOperandStore();
         var plan = Planner.Plan(container, componentId, store);
-        var session = new DecodeSession(plan, store);
+        var session = new DecodeSession(plan, store, patch);
         var logits = session.Prefill(context);
         var row = logits.FirstRow().ToArray();
 
@@ -189,6 +191,27 @@ public static class TokenInspector
         }
         double probability = Math.Exp(row[token] - max) / sum;
         return new LogitReport(token, rank, row[token], probability, top);
+    }
+
+    /// <summary>Merges a patched embedding delta into the widened
+    /// embedding table — the inspection path reads the table directly
+    /// (neighbours + profile) instead of through the weight loader.</summary>
+    private static void ApplyEmbeddingPatch(float[] table, string embeddingId, WeightPatch? patch)
+    {
+        if (patch is null || !patch.TryGet(embeddingId, "weight", out var entry))
+        {
+            return;
+        }
+        if (entry.Delta.Length != table.Length)
+        {
+            throw new CliException(
+                $"patch entry '{entry.Key}' holds {entry.Delta.Length} deltas but the embedding " +
+                $"'{embeddingId}' has {table.Length} elements");
+        }
+        for (int i = 0; i < table.Length; i++)
+        {
+            table[i] += entry.Delta[i];
+        }
     }
 
     private static List<Neighbor> Neighbours(float[] table, int vocab, int dim, int token, int count)

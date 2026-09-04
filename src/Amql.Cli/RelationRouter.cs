@@ -66,7 +66,8 @@ public static class RelationRouter
         string a,
         string b,
         RouteOptions options,
-        Action<string>? progress = null)
+        Action<string>? progress = null,
+        WeightPatch? patch = null)
     {
         var aIds = tokenizer.EncodeToIds(a).ToArray();
         var bIds = tokenizer.EncodeToIds(b).ToArray();
@@ -96,7 +97,7 @@ public static class RelationRouter
 
         using var store = container.CreateOperandStore();
         var plan = Planner.Plan(container, component, store);
-        var rt = new GenericRuntime(plan, store);
+        var rt = new GenericRuntime(plan, store, patch);
 
         // ── phase 1: template probing (name + propensity + coordinates) ──
         var links = new List<RouteLink>();

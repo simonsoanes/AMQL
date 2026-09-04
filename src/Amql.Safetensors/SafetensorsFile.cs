@@ -24,6 +24,7 @@ public sealed class SafetensorsFile : IDisposable
         long headerLength,
         long payloadStart,
         Dictionary<string, TensorInfo> tensors,
+        IReadOnlyDictionary<string, string>? metadata,
         MemoryMappedFile mapped,
         MemoryMappedViewAccessor accessor)
     {
@@ -31,6 +32,7 @@ public sealed class SafetensorsFile : IDisposable
         HeaderLength = headerLength;
         PayloadStart = payloadStart;
         _tensors = tensors;
+        Metadata = metadata;
         _mapped = mapped;
         _accessor = accessor;
     }
@@ -48,6 +50,10 @@ public sealed class SafetensorsFile : IDisposable
     public IReadOnlyDictionary<string, TensorInfo> Tensors => _tensors;
 
     public IReadOnlyCollection<string> TensorNames => _tensors.Keys;
+
+    /// <summary>File-level <c>__metadata__</c> entries, when the header
+    /// carries any (null when absent).</summary>
+    public IReadOnlyDictionary<string, string>? Metadata { get; }
 
     public static SafetensorsFile Open(string path)
     {
@@ -85,7 +91,7 @@ public sealed class SafetensorsFile : IDisposable
 
             var headerBytes = new byte[headerLength];
             accessor.ReadArray(HeaderLengthBytes, headerBytes, 0, checked((int)headerLength));
-            var tensors = ParseHeader(path, headerBytes);
+            var (tensors, metadata) = ParseHeader(path, headerBytes);
 
             // Validate payload bounds eagerly (header-only read; payload
             // bytes themselves stay untouched until requested).
@@ -99,7 +105,7 @@ public sealed class SafetensorsFile : IDisposable
                 }
             }
 
-            return new SafetensorsFile(path, headerLength, payloadStart, tensors, mapped, accessor);
+            return new SafetensorsFile(path, headerLength, payloadStart, tensors, metadata, mapped, accessor);
         }
         catch
         {
@@ -109,7 +115,7 @@ public sealed class SafetensorsFile : IDisposable
         }
     }
 
-    private static Dictionary<string, TensorInfo> ParseHeader(string path, byte[] headerBytes)
+    private static (Dictionary<string, TensorInfo> Tensors, IReadOnlyDictionary<string, string>? Metadata) ParseHeader(string path, byte[] headerBytes)
     {
         var result = new Dictionary<string, TensorInfo>(StringComparer.Ordinal);
 
@@ -123,6 +129,7 @@ public sealed class SafetensorsFile : IDisposable
             throw new SafetensorsException($"'{path}': malformed safetensors header JSON: {e.Message}", e);
         }
 
+        Dictionary<string, string>? metadata = null;
         using (doc)
         {
             if (doc.RootElement.ValueKind != JsonValueKind.Object)
@@ -134,6 +141,11 @@ public sealed class SafetensorsFile : IDisposable
             {
                 if (property.Name == "__metadata__" && property.Value.ValueKind == JsonValueKind.Object)
                 {
+                    metadata = new Dictionary<string, string>(StringComparer.Ordinal);
+                    foreach (var metaProperty in property.Value.EnumerateObject())
+                    {
+                        metadata[metaProperty.Name] = metaProperty.Value.GetString() ?? string.Empty;
+                    }
                     continue; // file-level metadata, not a tensor
                 }
 
@@ -166,7 +178,7 @@ public sealed class SafetensorsFile : IDisposable
             }
         }
 
-        return result;
+        return (result, metadata);
     }
 
     public bool Contains(string name) => _tensors.ContainsKey(name);
