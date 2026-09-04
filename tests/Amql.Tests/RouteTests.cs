@@ -127,4 +127,62 @@ public class RouteTests
         Assert.True(attr.LayerDelta.Any(d => d > 1e-4f),
             "expected at least one layer to carry a measurable share of the link");
     }
+
+    // ── path: bidirectional best-first search ──────────────────────────────
+
+    [Fact]
+    public void PathFinder_Connects_Two_Tokens_Deterministically()
+    {
+        using var dir = new TempDir();
+        var containerPath = WriteSynthContainer(dir);
+
+        // The container now carries its own tokenizer — resolve it from the
+        // same place the CLI falls back to.
+        Assert.True(File.Exists(Path.Combine(containerPath, "tokenizer.json")),
+            "encode must copy the checkpoint's tokenizer.json into the container");
+        var tokenizer = HfTokenizer.FromModelDir(containerPath);
+
+        using var container = Vindex3Container.Open(containerPath);
+        int a = tokenizer.EncodeToIds("a")[0]; // 1
+        int g = tokenizer.EncodeToIds("g")[0]; // 7
+
+        var first = PathFinder.Search(container, "target", tokenizer, a, g, new PathSearchOptions(TopK: 4, MaxNodes: 32, MaxDepth: 5), null);
+        var second = PathFinder.Search(container, "target", tokenizer, a, g, new PathSearchOptions(TopK: 4, MaxNodes: 32, MaxDepth: 5), null);
+
+        Assert.True(first.Found, $"demo model must connect a→{g} (forwards {first.Forwards}, visited {first.NodesVisited})");
+        Assert.Equal(a, first.Hops[0].TokenId);
+        Assert.Equal(g, first.Hops[^1].TokenId);
+        Assert.True(first.TotalCost > 0);
+        Assert.True(first.Forwards > 0);
+        foreach (var hop in first.Hops)
+        {
+            Assert.InRange(hop.TokenId, 0, 11); // demo vocab
+            Assert.True(hop.EdgeCost >= 0);
+            Assert.False(string.IsNullOrEmpty(hop.TokenText));
+        }
+        // Deterministic: the same search returns the same chain.
+        Assert.Equal(first.Hops.Select(h => h.TokenId), second.Hops.Select(h => h.TokenId));
+        Assert.Equal(first.TotalCost, second.TotalCost, 10);
+
+        // Self-connect is trivial.
+        var self = PathFinder.Search(container, "target", tokenizer, a, a, new PathSearchOptions(), null);
+        Assert.True(self.Found);
+        Assert.Single(self.Hops);
+    }
+
+    [Fact]
+    public void Encode_Report_Flags_TokenizerCopy()
+    {
+        using var dir = new TempDir();
+        var modelDir = Path.Combine(dir.Path, "model");
+        SyntheticCheckpoint.Write(modelDir);
+        var containerPath = Path.Combine(dir.Path, "container");
+        var report = ModelToContainer.Encode(modelDir, containerPath, "tok-test");
+
+        Assert.True(report.TokenizerCopied);
+        Assert.True(File.Exists(Path.Combine(containerPath, "tokenizer.json")));
+        Assert.Equal(
+            File.ReadAllBytes(Path.Combine(modelDir, "tokenizer.json")),
+            File.ReadAllBytes(Path.Combine(containerPath, "tokenizer.json")));
+    }
 }

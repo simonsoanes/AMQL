@@ -9,6 +9,7 @@ public sealed record EncodeReport(
     string Encoding,
     long PayloadBytes,
     int Tensors,
+    bool TokenizerCopied,
     IReadOnlyDictionary<string, SegmentWriteResult> Segments);
 
 /// <summary>
@@ -31,9 +32,20 @@ public static class ModelToContainer
         var spec = ArchMapper.MapToContainerSpec(modelName, facts, inventory, options ?? new ArchMapper.EncodeOptions());
         var result = ContainerEncoder.Encode(containerOut, spec);
 
+        // The tokenizer travels with the container: if the checkpoint ships
+        // tokenizer.json it is copied into the container root, so text
+        // commands can run without an explicit --tokenizer.
+        bool tokenizerCopied = false;
+        var tokenizerPath = Path.Combine(modelDir, "tokenizer.json");
+        if (File.Exists(tokenizerPath))
+        {
+            File.Copy(tokenizerPath, Path.Combine(containerOut, "tokenizer.json"), overwrite: false);
+            tokenizerCopied = true;
+        }
+
         long payload = spec.Representations.Sum(r => r.Tensors.Sum(t => (long)t.Data.Length));
         int tensors = spec.Representations.Sum(r => r.Tensors.Count);
         var encoding = result.Index.Representations.Values.FirstOrDefault()?.Encoding ?? "?";
-        return new EncodeReport(modelName, containerOut, encoding, payload, tensors, result.Segments);
+        return new EncodeReport(modelName, containerOut, encoding, payload, tensors, tokenizerCopied, result.Segments);
     }
 }

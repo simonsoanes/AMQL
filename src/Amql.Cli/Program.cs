@@ -33,6 +33,7 @@ internal static class Program
                 "tokens" => Tokens(args[1..]),
                 "decode" => Decode(args[1..]),
                 "route" => Route(args[1..]),
+                "path" => PathCmd(args[1..]),
                 "generate" => Generate(args[1..]),
                 "inspect-token" => InspectToken(args[1..]),
                 _ => throw new CliException($"unknown command '{args[0]}'"),
@@ -224,6 +225,28 @@ internal static class Program
     private static string? TokenizerDir(string[] args) =>
         OptionValue(args, "--tokenizer") ?? OptionValue(args, "--model-dir");
 
+    /// <summary>Resolves the tokenizer source for a command that already
+    /// opened a container: an explicit flag wins, then the container's own
+    /// tokenizer.json (copied in at encode time), otherwise a typed
+    /// error.</summary>
+    private static string ResolveTokenizerDir(string? containerDir, string[] args)
+    {
+        var dir = TokenizerDir(args);
+        if (dir is not null)
+        {
+            return dir;
+        }
+        if (containerDir is not null && File.Exists(Path.Combine(containerDir, "tokenizer.json")))
+        {
+            return containerDir;
+        }
+        throw new CliException(
+            "this command needs text, which requires a tokenizer — pass '--tokenizer <checkpoint-dir>' " +
+            "(alias: --model-dir), or use a container that was encoded with a tokenizer.json beside it. " +
+            "The positional argument is the VINDEX3 container directory (encode output); it carries the " +
+            "tokenizer only when encode found one in the checkpoint.");
+    }
+
     private static string RequiredModelDir(string[] args)
     {
         var modelDir = TokenizerDir(args);
@@ -242,6 +265,19 @@ internal static class Program
 
     // ── route: relationship probing between two tokens ─────────────────────
 
+    /// <summary>First token id of a word in its in-context form: the leading
+    /// space is merged into the token ("ĠFrance"), which is what the model
+    /// actually continues with; falls back to the standalone spelling.</summary>
+    private static int FirstContinuationId(HfTokenizer tokenizer, string word)
+    {
+        var spaced = tokenizer.EncodeToIds(" " + word);
+        if (spaced.Count > 0)
+        {
+            return spaced[0];
+        }
+        return tokenizer.EncodeToIds(word).FirstOrDefault(-1);
+    }
+
     private static int Route(string[] args)
     {
         var containerDir = Arg(args, 0) ?? throw new CliException("route requires a container directory");
@@ -253,7 +289,7 @@ internal static class Program
         string b = SecondPositional(rest, "--tokenizer", "--model-dir", "--top", "--templates",
             "--trace-layer-start", "--trace-layer-end", "--corrupt", "--component") ??
             throw new CliException("route requires two tokens: 'amql-cli route <container> <A> <B>'");
-        var modelDir = RequiredModelDir(args);
+        var modelDir = ResolveTokenizerDir(containerDir, args);
 
         var options = new RouteOptions(
             Top: IntOption(args, "--top", 5),
@@ -306,6 +342,61 @@ internal static class Program
         return 0;
     }
 
+    // ── path: bidirectional best-first search between two tokens ────────────
+
+    private static int PathCmd(string[] args)
+    {
+        var containerDir = Arg(args, 0) ?? throw new CliException("path requires a container directory");
+        var rest = args.Skip(1).ToArray();
+        string a = FirstPositional(rest, "--tokenizer", "--model-dir", "--topk", "--max-nodes", "--max-depth", "--component") ??
+            throw new CliException("path requires two tokens, e.g. 'amql-cli path <container> France Paris'");
+        string b = SecondPositional(rest, "--tokenizer", "--model-dir", "--topk", "--max-nodes", "--max-depth", "--component") ??
+            throw new CliException("path requires two tokens: 'amql-cli path <container> <A> <B>'");
+        var modelDir = ResolveTokenizerDir(containerDir, args);
+        var tokenizer = Tokenizer(modelDir);
+
+        // The model continues with the space-merged form ("ĠFrance") —
+        // search that spelling, falling back to the standalone token.
+        int aId = FirstContinuationId(tokenizer, a);
+        int bId = FirstContinuationId(tokenizer, b);
+        if (aId < 0 || bId < 0)
+        {
+            throw new CliException($"cannot tokenize '{a}' or '{b}'");
+        }
+
+        var options = new PathSearchOptions(
+            TopK: IntOption(args, "--topk", 6),
+            MaxNodes: IntOption(args, "--max-nodes", 48),
+            MaxDepth: IntOption(args, "--max-depth", 6),
+            Debug: args.Contains("--debug"));
+        string component = OptionValue(args, "--component") ?? "target";
+
+        using var container = Vindex3Container.Open(containerDir);
+        bool inContainer = modelDir.Equals(containerDir, StringComparison.OrdinalIgnoreCase);
+        Console.WriteLine($"container: {containerDir} (weights)   tokenizer: {modelDir} ({(inContainer ? "in container" : "checkpoint")})");
+        Console.WriteLine($"searching from '{a}' (id {aId}) toward '{b}' (id {bId}) — edges = top-{options.TopK} continuations (cost −log P) …");
+
+        var result = PathFinder.Search(container, component, tokenizer, aId, bId, options, Console.Write);
+        Console.WriteLine();
+
+        if (!result.Found)
+        {
+            Console.WriteLine($"no path found within the budget ({options.MaxNodes} expansions, depth {options.MaxDepth}).");
+            return 1;
+        }
+
+        foreach (var hop in result.Hops)
+        {
+            string costTag = hop.EdgeCost <= 0 ? "start" : $"+{hop.EdgeCost:0.00}";
+            Console.WriteLine($"  {hop.TokenId,7}  {hop.TokenText,-24} {costTag}");
+        }
+        Console.WriteLine();
+        Console.WriteLine($"meeting point: '{result.Hops[^1].TokenText}' — fwd {result.MeetingForwardCost:0.00}, bwd {result.MeetingBackwardCost:0.00}");
+        Console.WriteLine($"total cost {result.TotalCost:0.00} · {result.Forwards} model forwards · {result.NodesVisited} nodes");
+        Console.WriteLine("path = token chain only (no relation names); costs are −log P of each continuation edge.");
+        return 0;
+    }
+
     // ── generate ───────────────────────────────────────────────────────────
 
     private static int Generate(string[] args)
@@ -313,12 +404,15 @@ internal static class Program
         var containerDir = Arg(args, 0) ?? throw new CliException("generate requires a container directory");
         string? prompt = OptionValue(args, "--prompt");
 
-        // Prompt mode: the tokenizer lives with the checkpoint.
+        // Prompt mode: the tokenizer comes from --tokenizer, or from the
+        // container when encode placed a tokenizer.json beside it.
         HfTokenizer? tokenizer = null;
+        string? tokenizerSource = null;
         int[] tokens;
         if (prompt is not null)
         {
-            tokenizer = Tokenizer(RequiredModelDir(args));
+            tokenizerSource = ResolveTokenizerDir(containerDir, args);
+            tokenizer = Tokenizer(tokenizerSource);
             tokens = tokenizer.EncodeToIds(prompt).ToArray();
             if (tokens.Length == 0)
             {
@@ -343,8 +437,8 @@ internal static class Program
         using var container = Vindex3Container.Open(containerDir);
         if (tokenizer is not null)
         {
-            string tokenizerDir = OptionValue(args, "--tokenizer") ?? OptionValue(args, "--model-dir") ?? "?";
-            Console.WriteLine($"container: {containerDir} (weights)   tokenizer: {tokenizerDir} (checkpoint)");
+            bool inContainer = tokenizerSource!.Equals(containerDir, StringComparison.OrdinalIgnoreCase);
+            Console.WriteLine($"container: {containerDir} (weights)   tokenizer: {tokenizerSource} ({(inContainer ? "in container" : "checkpoint")})");
         }
         var (prefill, steps2) = InferenceRunner.Generate(
             container, component, tokens, steps, config, showTopK);
@@ -396,9 +490,14 @@ internal static class Program
         int? logitsK = IntOptionOrNull(args, "--logits");
         int[]? context = ParseOptionalIntList(OptionValue(args, "--tokens"));
         string? modelDir = TokenizerDir(args);
+        if (modelDir is null && File.Exists(Path.Combine(containerDir, "tokenizer.json")))
+        {
+            modelDir = containerDir; // the container carries its own tokenizer
+        }
         if (modelDir is not null)
         {
-            Console.WriteLine($"container: {containerDir} (weights)   tokenizer: {modelDir} (checkpoint)");
+            bool inContainer = modelDir.Equals(containerDir, StringComparison.OrdinalIgnoreCase);
+            Console.WriteLine($"container: {containerDir} (weights)   tokenizer: {modelDir} ({(inContainer ? "in container" : "checkpoint")})");
         }
 
         using var container = Vindex3Container.Open(containerDir);
@@ -459,6 +558,8 @@ internal static class Program
               amql-cli route <container-dir> <A> <B> --tokenizer <checkpoint-dir>
                               [--top 5] [--templates 8] [--trace-layer-start 8]
                               [--trace-layer-end 24] [--no-trace] [--corrupt the]
+              amql-cli path <container-dir> <A> <B>
+                              [--topk 6] [--max-nodes 48] [--max-depth 6]
               amql-cli generate <container-dir>
                               --prompt "text" --tokenizer <checkpoint-dir>
                               [--steps 8] [--temperature 0] [--top-k 0] [--top-p 0]
@@ -479,6 +580,11 @@ internal static class Program
             position) attention coordinates, and — for the strongest link —
             causal-tracing layer weights naming exactly which residual
             tensors to adjust (patch/LoRA) to change the propensity.
+            path searches the token-continuation graph bidirectionally
+            (Dijkstra-style, meet in the middle) and returns the token chain
+            without relation names.
+            --tokenizer is optional when the container was encoded with a
+            tokenizer.json beside it (encode copies it in).
 
             Two kinds of directory are involved: the CONTAINER (<container-dir>,
             encode output, holds weights only) and the CHECKPOINT

@@ -10,8 +10,6 @@ every deliberate divergence is called out below.
 It is not intended to be a complete re-implementation, it's just for research 
 and to provide assurance the Vindex3 implementation is complete.
 
-Reference: `D:\Dev\Open Source\larql` (Rust workspace), studied 2026-09-03.
-
 ---
 
 ## 1. Why .NET / what this is
@@ -258,11 +256,13 @@ byte-level BPE family — NFC normalisation, the configured regex split
 (the GPT-2-style pattern, Isolated behavior), added/special-token carving
 (they live outside the BPE vocab), greedy BPE over the GPT-2 byte-level
 characters, and ByteLevel decoding. Parity is verified against the
-reference implementation (HF `tokenizers`) on a captured golden corpus. It
-lives with the checkpoint, not the container, so text commands take
-<code>--model-dir</code>: <code>tokens</code> (text → ids + pieces),
-<code>decode</code> (ids → text), <code>generate --prompt</code>, and
-<code>inspect-token --tokenizer</code> (the token's text representation).
+reference implementation (HF `tokenizers`) on a captured golden corpus.
+The tokenizer travels **with the container**: `encode` copies the
+checkpoint's `tokenizer.json` into the container root when present, and
+every text command (`tokens`, `decode`, `generate --prompt`,
+`inspect-token`, `route`, `path`) falls back to it in preference to an
+explicit <code>--tokenizer</code> argument — the container is
+self-sufficient for text work the moment it is encoded.
 
 **Qwen3.5-0.8B executes end-to-end:** the loaded container (24 layers,
 320 tensors, ~1.4 GiB) runs the full hybrid text decoder in managed .NET
@@ -294,7 +294,8 @@ plug-and-play because every tensor is reached only through
 `OperandStore` → `WeightLoader` (the container is the deletion boundary).
 
 **Relationship probing (`route`)** — stage one of the larql-style probe
-machinery: `amql-cli route <container> <A> <B> --tokenizer <checkpoint-dir>`
+machinery: `amql-cli route <container> <A> <B>` (tokenizer resolves from
+the container, or <code>--tokenizer</code> overrides)
 names relations between two tokens with template probing (LAMA-style:
 score = max P(B), P(ĠB) after template(A) — the space-merged spelling
 differs from the standalone token id and both are scored), reports the
@@ -317,6 +318,29 @@ measures "layers above L see the clean source", the correct ROME
 semantics; a restore-every-layer run does not equal the clean run
 cell-for-cell, and the tests assert the seam's real contract (the patch
 takes effect deterministically).
+
+**Path (`path`) — bidirectional best-first search.** Where `route` names
+relations, `path` shows the *route* between two tokens without naming it:
+`amql-cli path <container> <A> <B>` returns the token chain from the
+model's own continuation graph. The graph is implicit and
+context-dependent (the next-token distribution conditions on the whole
+chain), so this is Dijkstra-style best-first search over an on-demand
+graph, not a static one: two priority queues expand cheapest-first from
+A (forward, top-K −log P continuations) and from B (backward, walking
+the reverse edges cached from every forward expansion — the same model
+defines both directions of each discovered edge), and the search stops at
+the first contact point, a token reachable from both ends. A fixed pool
+of grammatical bridge tokens (` is`, ` of`, ` the`, …) is scored with
+their true model probabilities and added to every expansion: without
+them the cheapest-first frontier drowns in punctuation — the top
+continuations of a bare token are often `,`, `.`, `:` — which is a dead
+highway for connection finding (bridges the vocab cannot even encode are
+dropped silently, keeping the search honest on toy vocabularies). The
+result is the chain with per-hop edge costs plus the meeting forward/
+backward costs, and an honest `no path within budget` when 48 forwards
+cannot connect the two ends. The current implementation is deliberately
+kept; `route` and `path` are complementary views of the same probe
+machinery.
 
 ## 6. Explicit non-goals (this slice)
 
