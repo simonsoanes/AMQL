@@ -38,6 +38,8 @@ internal static class Program
                 "inspect-token" => InspectToken(args[1..]),
                 "change-tensor" => ChangeTensor(args[1..]),
                 "save-lora" => SaveLora(args[1..]),
+                "export" => Export(args[1..]),
+                "layers" => Layers(args[1..]),
                 _ => throw new CliException($"unknown command '{args[0]}'"),
             };
         }
@@ -693,6 +695,162 @@ internal static class Program
         return 0;
     }
 
+    // ── export: materialise an HF checkpoint from the container ──────────
+
+    private static int Export(string[] args)
+    {
+        var containerDir = Arg(args, 0) ?? throw new CliException(
+            "export requires a container directory, e.g. 'amql-cli export <container-dir> --out <checkpoint-dir>'");
+        string outDir = OptionValue(args, "--out") ?? throw new CliException("export requires '--out <checkpoint-dir>'");
+
+        using var container = Vindex3Container.Open(containerDir);
+        var patch = LoadPatch(args, container);
+        var report = ModelExporter.Export(container, outDir, patch);
+
+        Console.WriteLine($"exported:  {report.OutDir}");
+        Console.WriteLine($"model:      {report.Model}");
+        Console.WriteLine($"tensors:    {report.Tensors}  ({FormatBytes(report.PayloadBytes)})");
+        foreach (var note in report.Notes)
+        {
+            Console.WriteLine($"note:       {note}");
+        }
+        string files = "model.safetensors, config.json" +
+                       (File.Exists(Path.Combine(outDir, "tokenizer.json")) ? ", tokenizer.json" : string.Empty);
+        Console.WriteLine($"wrote:      {files}");
+        Console.WriteLine("the checkpoint is the original model with any patch deltas baked in — encode it to move back into a container:");
+        Console.WriteLine($"  amql-cli encode {outDir} --out <new-container>");
+        return 0;
+    }
+
+    // ── layers: describe the per-layer policy table and tensors ──────────
+
+    private static int Layers(string[] args)
+    {
+        var containerDir = Arg(args, 0) ?? throw new CliException("layers requires a container directory");
+        string componentId = OptionValue(args, "--component") ?? "target";
+
+        using var container = Vindex3Container.Open(containerDir);
+        var graph = container.Graph ?? throw new CliException("container records no system graph — nothing to describe");
+
+        Console.WriteLine($"container: {containerDir}   model '{container.Index.Model}' ({container.Index.Family})");
+        foreach (var component in graph.Components)
+        {
+            Console.WriteLine();
+            Console.WriteLine($"component '{component.Id}' role={component.Role} source={component.SourceArtifact} layers={component.NumLayers} hidden={component.HiddenSize}");
+            if (component.Attention is { Count: > 0 } policies)
+            {
+                string census = string.Join(", ", policies.GroupBy(p => p.Operator)
+                    .Select(g => $"{g.Key} × {g.Count()}")
+                    .OrderBy(x => x, StringComparer.Ordinal));
+                Console.WriteLine($"  attention:  {census}");
+            }
+            else
+            {
+                Console.WriteLine("  attention:  no per-layer table recorded");
+            }
+            if (component.Perception is { } perception)
+            {
+                Console.WriteLine($"  perception: {perception}");
+            }
+        }
+
+        var target = graph.Components.FirstOrDefault(c => c.Id == componentId)
+            ?? throw new CliException($"system graph has no component '{componentId}'");
+        Console.WriteLine();
+        Console.WriteLine($"stack '{componentId}': {target.NumLayers} layers, hidden {target.HiddenSize}");
+
+        if (target.Execution is { } surface)
+        {
+            Console.WriteLine("  surface:");
+            if (surface.ContextLength is { } context)
+            {
+                Console.WriteLine($"    context: {context}");
+            }
+            if (surface.Attention is { } attn)
+            {
+                Console.WriteLine($"    attention: {attn.NumQHeads} q heads — {attn.NumKvHeads} kv heads, head_dim {attn.HeadDim}" +
+                                  (attn.AttentionBias == true ? ", bias" : string.Empty) +
+                                  (attn.OutputGate is not null ? ", output gate" : string.Empty));
+            }
+            if (surface.Ffn is { } ffn)
+            {
+                Console.WriteLine($"    ffn: intermediate {ffn.IntermediateSize}, {ffn.Activation}" +
+                                  (ffn.FfnType == FfnType.Gated ? " (gated)" : string.Empty));
+            }
+            if (surface.Head is { } head)
+            {
+                Console.WriteLine($"    head: vocab {head.VocabSize}" + (head.HeadReusesEmbedding ? " (tied to the embedding)" : string.Empty));
+            }
+            if (surface.LinearAttention is not null)
+            {
+                Console.WriteLine("    linear_attention: carried surface facts (declared, refused by the planner)");
+            }
+        }
+
+        if (target.Attention is { Count: > 0 } table)
+        {
+            Console.WriteLine("  layers:");
+            for (int l = 0; l < target.NumLayers; l++)
+            {
+                var policy = table[l];
+                string span = policy.Span is { } spanKind
+                    ? spanKind.ToString().ToLowerInvariant()
+                    : "declared:" + (policy.DeclaredSpan ?? "?");
+                string window = policy.Window is { } w ? $" window={w}" : string.Empty;
+                string geometry = policy.Geometry is { } geo ? $"  heads {geo.NumKvHeads}×{geo.HeadDim}" : string.Empty;
+                string vFromK = policy.VFromK ? "  (V from K)" : string.Empty;
+                Console.WriteLine($"    L{l,2}: {policy.Operator,-18} {span,-10}{window}  position {DescribePosition(policy.Position)}{geometry}{vFromK}");
+            }
+        }
+
+        // Tensor inventory per layer, from the component's decoder-stack object.
+        var stack = graph.Objects.FirstOrDefault(o => o.Component == componentId && o.Kind == ObjectKind.DecoderStack);
+        if (stack is not null)
+        {
+            using var store = container.CreateOperandStore();
+            if (store.SegmentPathFor(stack.Id) is { } segmentPath)
+            {
+                using var segment = SegmentFile.Open(Path.Combine(container.Root, segmentPath));
+                var grouped = segment.Header.Tensors
+                    .GroupBy(t => t.Name.Split('.')[0])
+                    .OrderBy(g => int.TryParse(g.Key, out int n) ? n : int.MaxValue)
+                    .ThenBy(g => g.Key, StringComparer.Ordinal);
+                Console.WriteLine($"  tensors of '{stack.Id}':");
+                foreach (var group in grouped)
+                {
+                    string details = string.Join("; ", group.OrderBy(t => t.Name, StringComparer.Ordinal)
+                        .Select(t => $"{t.Name[(group.Key.Length + 1)..]} {t.Dtype} [{string.Join("x", t.Shape)}]"));
+                    Console.WriteLine($"    L{group.Key,2}: {details}");
+                }
+            }
+        }
+
+        using (var store = container.CreateOperandStore())
+        {
+            try
+            {
+                var plan = Planner.Plan(container, componentId, store);
+                Console.WriteLine($"  runtime: [served] plans and executes — {plan.Layers.Count} layers, hidden {plan.HiddenSize}" +
+                                  $"{(plan.Embedding is null ? ", embedding none" : $", embedding {plan.Embedding.VocabSize}")}" +
+                                  $"{(plan.Output is null ? ", head none (tied?)" : $", head {plan.Output.VocabSize}")}");
+            }
+            catch (UnsupportedOperatorException e)
+            {
+                Console.WriteLine($"  runtime: [refused] {e.Message}");
+            }
+        }
+        return 0;
+    }
+
+    private static string DescribePosition(PositionPolicy position) => position switch
+    {
+        PositionNone => "none",
+        PositionRope rope => $"rope θ={rope.Theta:0.###}",
+        PositionPartialRope partial => $"partial rope θ={partial.Theta:0.###} f={partial.RotaryFactor:0.###}",
+        PositionUnresolved unresolved => $"{unresolved.Kind} (unresolved)",
+        _ => "?",
+    };
+
     // ── patch option plumbing ──────────────────────────────────────────────
 
     private static double DoubleOption(string[] args, string name, double fallback) =>
@@ -751,6 +909,9 @@ internal static class Program
                               --out <patch.safetensors>
               amql-cli save-lora <patch.safetensors> --out <lora-dir>
                               [--rank 8] [--alpha 16] [--container <container-dir>]
+              amql-cli export <container-dir> --out <checkpoint-dir>
+                              [--patch <patch.safetensors>]
+              amql-cli layers <container-dir> [--component target]
               amql-cli help
 
             Example:
@@ -771,6 +932,14 @@ internal static class Program
             delta in a patch file ("--add"/"--scale" compose across runs);
             save-lora factors a patch's 2-D deltas into lora_A/lora_B with
             alpha/r scaling for the ORIGINAL (unpatched) model weights.
+            export materialises an HF checkpoint directory (config.json +
+            model.safetensors + tokenizer.json) from the container — the
+            inverse of encode — with patch deltas baked into the stored
+            tensors (unpatched tensors are copied byte-identically), so the
+            result is a plain original model again.
+            layers lists every component and, for the selected one, the
+            per-layer attention policy table and tensor inventory, then
+            whether the planner serves the stack or refuses it by name.
             Any pathway (route, path, generate, inspect-token, and
             tokens/decode, which parse but cannot be affected) accepts
             --patch to run with the patch's deltas merged into the loaded

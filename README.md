@@ -51,6 +51,9 @@ amql-cli change-tensor <container-dir> <object> <tensor> <cell>
                 --out <patch.safetensors>
 amql-cli save-lora <patch.safetensors> --out <lora-dir>
                 [--rank 8] [--alpha 16] [--container <container-dir>]
+amql-cli export <container-dir> --out <checkpoint-dir>
+                [--patch <patch.safetensors>]
+amql-cli layers <container-dir> [--component target]
 amql-cli help
 ```
 
@@ -205,3 +208,48 @@ apply to the base container: for each target, add scale · lora_B · lora_A to t
 ```
 
 `--container` is optional; when given, the patch is shape-validated against the container's tensors before factoring.
+
+### Exporting the container back to an original model (`export`)
+
+`export` is the inverse of `encode`: it materialises a plain HF checkpoint directory (`config.json` + `model.safetensors` + `tokenizer.json`) from the container, so the model leaves the VINDEX3 world as an ordinary model again. HF tensor names are rebuilt from the graph's source bindings; `config.json` is regenerated from the judged graph facts (operator table, surface geometry, rope/position, vocabulary), and any `--patch` deltas are **baked into the stored tensors** — widened to f32, the delta added, then re-encoded to the tensor's own dtype (BF16/F32/…). Tensors a patch never touches are copied byte-identically, so an unpatched export is byte-exact; an operator without a judged `layer_types` spelling refuses the export by name rather than being approximated, and the tied output head is skipped with a note (it reuses the embedding table).
+
+```bash
+# bake every delta in patches/capital.safetensors into the weights
+amql-cli export ./containers/Qwen3.5-0.8B --out ./models/Qwen3.5-0.8B \
+  --patch patches/capital.safetensors
+
+# the exported directory is a normal checkpoint — re-encode to round trip
+amql-cli encode ./models/Qwen3.5-0.8B --out ./containers/Qwen3.5-0.8B-rebuilt
+```
+
+```
+exported:  models/Qwen3.5-0.8B
+model:      Qwen3.5-0.8B
+tensors:    685  (1.39 GiB)
+note:       object 'target.output_head': carried only (no materialised tensors) — skipped
+wrote:      model.safetensors, config.json, tokenizer.json
+```
+
+### Describing the layers (`layers`)
+
+`layers` lists every component of the container, then — for the selected one (`--component`, default `target`) — the per-layer attention policy table (operator, span/window, position policy, head geometry) from the graph's authority table, the per-layer tensor inventory (name, stored dtype, shape) from the decoder-stack segment, and whether the planner serves the stack or refuses it by name:
+
+```bash
+amql-cli layers ./containers/Qwen3.5-0.8B
+```
+
+```
+container: containers/Qwen3.5-0.8B   model 'Qwen3.5-0.8B' (qwen3_5_text)
+
+component 'target' role=PrimaryText source=model layers=28 hidden=2048
+  attention:  linear_attention × 4, softmax × 24
+...
+  layers:
+    L 0: linear_attention  full      position none (NoPE)  heads 4×128
+    L 1: softmax           full      position partial rope θ=10000 f=0.25  heads 16×128
+    ...
+  tensors of 'target.decoder_stack':
+    L 0: linear_attn.in_proj_qkv.weight BF16 [1024x2048]; linear_attn.in_proj_z.weight BF16 [512x2048]; ...
+    L 1: self_attn.q_proj.weight BF16 [2048x2048]; self_attn.k_proj.weight BF16 [512x2048]; ...
+  runtime: [refused] layer 0: linear_attention has no judged runtime — the planner refuses it by name
+```
