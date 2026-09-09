@@ -1,5 +1,7 @@
-﻿using Amql.Hf;
+﻿using System.Text.Json;
+using Amql.Hf;
 using Amql.Inference;
+using Amql.Merge;
 using Amql.Safetensors;
 using Amql.Vindex3;
 
@@ -40,6 +42,7 @@ internal static class Program
                 "save-lora" => SaveLora(args[1..]),
                 "export" => Export(args[1..]),
                 "layers" => Layers(args[1..]),
+                "import" => Import(args[1..]),
                 _ => throw new CliException($"unknown command '{args[0]}'"),
             };
         }
@@ -47,6 +50,11 @@ internal static class Program
         {
             Console.Error.WriteLine($"error: {e.Message}");
             Console.Error.WriteLine("run 'amql-cli help' for usage");
+            return 2;
+        }
+        catch (MergeException e)
+        {
+            Console.Error.WriteLine($"error: {e.Message}");
             return 2;
         }
         catch (Exception e)
@@ -754,6 +762,36 @@ internal static class Program
             }
         }
 
+        if (container.Index.TokenMap is { } tokenMapPath)
+        {
+            try
+            {
+                using var manifest = JsonDocument.Parse(
+                    File.ReadAllBytes(Path.Combine(container.Root, tokenMapPath)));
+                var root = manifest.RootElement;
+                string baseModel = root.GetProperty("base").GetProperty("model").GetString() ?? "?";
+                string importedModel = root.GetProperty("imported").GetProperty("model").GetString() ?? "?";
+                string scaffold = root.GetProperty("scaffold").GetProperty("model").GetString() ?? "?";
+                var kinds = root.GetProperty("vocab").EnumerateArray()
+                    .GroupBy(e => e.GetProperty("kind").GetString())
+                    .ToDictionary(g => g.Key ?? "?", g => g.Count());
+                int preserved = root.TryGetProperty("preserved", out var preservedProp)
+                    ? preservedProp.GetProperty("segments").GetArrayLength()
+                    : 0;
+                Console.WriteLine();
+                Console.WriteLine($"merged:     {baseModel} + {importedModel} (scaffold {scaffold}) — " +
+                                  $"{root.GetProperty("vocab").GetArrayLength()} tokens " +
+                                  $"({kinds.GetValueOrDefault("blended")} blended, " +
+                                  $"{kinds.GetValueOrDefault("aligned_new")} aligned-new, " +
+                                  $"{kinds.GetValueOrDefault("base_only")} base-only)" +
+                                  (preserved > 0 ? $", {preserved} preserved segments under segments/source/" : string.Empty));
+            }
+            catch (Exception e) when (e is IOException or JsonException or KeyNotFoundException)
+            {
+                Console.WriteLine($"  note: token-map.json is present but unreadable: {e.Message}");
+            }
+        }
+
         var target = graph.Components.FirstOrDefault(c => c.Id == componentId)
             ?? throw new CliException($"system graph has no component '{componentId}'");
         Console.WriteLine();
@@ -851,6 +889,38 @@ internal static class Program
         _ => "?",
     };
 
+    // ── import: merge a second model into the container ──────────────────
+
+    private static int Import(string[] args)
+    {
+        var containerDir = Arg(args, 0) ?? throw new CliException(
+            "import requires a container directory first, e.g. 'amql-cli import <container-dir> <model> --out <merged>'");
+        var imported = Arg(args, 1) ?? throw new CliException("import requires the model to import");
+        string outDir = OptionValue(args, "--out") ?? throw new CliException("import requires '--out <merged-dir>'");
+        bool importedIsContainer = HasOption(args, "--container");
+
+        var report = ModelMerger.Import(containerDir, imported, outDir, importedIsContainer);
+
+        Console.WriteLine($"imported:   {report.ImportedModel} into {report.BaseModel}");
+        Console.WriteLine($"result:     {report.ResultModel}");
+        Console.WriteLine($"scaffold:   {report.Scaffold}  (hidden {report.HiddenSize}, layers {report.Layers})");
+        Console.WriteLine($"vocab:      {report.BaseVocab} + {report.ImportedVocab} → {report.MergedVocab} " +
+                          $"({report.Blended} blended, {report.AlignedNew} aligned-new, {report.BaseOnly} base-only)");
+        Console.WriteLine($"storage:    {report.Dtype} × {report.HiddenSize}" + (report.HeadTied ? ", head tied" : ", head materialised"));
+        if (report.PreservedSegments > 0)
+        {
+            Console.WriteLine($"preserved:  {report.PreservedSegments} segments of the replaced stack under segments/source/");
+        }
+        foreach (var note in report.Notes)
+        {
+            Console.WriteLine($"note:       {note}");
+        }
+        Console.WriteLine("wrote:      index.json, system_graph.json, token-map.json, tokenizer.json, segments/");
+        Console.WriteLine("the merged container tracks every token relationship in token-map.json and exports as one model:");
+        Console.WriteLine($"  amql-cli export {outDir} --out <checkpoint-dir>");
+        return 0;
+    }
+
     // ── patch option plumbing ──────────────────────────────────────────────
 
     private static double DoubleOption(string[] args, string name, double fallback) =>
@@ -912,6 +982,8 @@ internal static class Program
               amql-cli export <container-dir> --out <checkpoint-dir>
                               [--patch <patch.safetensors>]
               amql-cli layers <container-dir> [--component target]
+              amql-cli import <container-dir> <model> --out <merged-dir>
+                              [--container]
               amql-cli help
 
             Example:
@@ -940,6 +1012,17 @@ internal static class Program
             layers lists every component and, for the selected one, the
             per-layer attention policy table and tensor inventory, then
             whether the planner serves the stack or refuses it by name.
+            import merges a second model into the container: the token
+            vocabularies are related by token string (the tokenization
+            mapping layer), the embedding/head grow to the union
+            vocabulary via an anchored least-squares alignment of the
+            imported space into the base space, and the stack evolves to
+            the larger shape (the bigger model scaffolds it; intermediate
+            layers are never averaged). token-map.json tracks every token
+            relationship and layer provenance; the replaced stack is
+            preserved under segments/source/. Pass --container when the
+            model to import is itself a container rather than a checkpoint
+            directory.
             Any pathway (route, path, generate, inspect-token, and
             tokens/decode, which parse but cannot be affected) accepts
             --patch to run with the patch's deltas merged into the loaded
@@ -959,6 +1042,9 @@ internal static class Program
     }
 
     private static string? Arg(string[] args, int index) => index < args.Length ? args[index] : null;
+
+    private static bool HasOption(string[] args, string name) =>
+        args.Any(a => a == name);
 
     /// <summary>All non-option arguments in order; options that take a
     /// value are skipped together with their value, so positionals land in

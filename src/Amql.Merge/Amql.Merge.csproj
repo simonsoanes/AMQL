@@ -1,20 +1,16 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <ItemGroup>
     <ProjectReference Include="..\Amql.Safetensors\Amql.Safetensors.csproj" />
     <ProjectReference Include="..\Amql.Vindex3\Amql.Vindex3.csproj" />
     <ProjectReference Include="..\Amql.Hf\Amql.Hf.csproj" />
-    <ProjectReference Include="..\Amql.Inference\Amql.Inference.csproj" />
-    <ProjectReference Include="..\Amql.Merge\Amql.Merge.csproj" />
   </ItemGroup>
 
   <PropertyGroup>
-    <OutputType>Exe</OutputType>
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-    <AssemblyName>amql-cli</AssemblyName>
-    <RootNamespace>Amql.Cli</RootNamespace>
+    <RootNamespace>Amql.Merge</RootNamespace>
   </PropertyGroup>
 
 </Project>

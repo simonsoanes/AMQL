@@ -39,7 +39,9 @@ public sealed record SegmentWriteResult(long PayloadBytes, string PayloadSha256H
 ///
 /// Table order is deterministic — sorted by name — payload written in the
 /// same order, offsets still recorded relative to the payload start. Two
-/// SHA-256s are computed in the single write pass.
+/// SHA-256s are computed incrementally during the single streaming pass
+/// (a whole-stack segment can exceed the 2 GiB single-array ceiling, so
+/// the file is never buffered whole).
 /// </summary>
 public static class SegmentWriter
 {
@@ -101,26 +103,40 @@ public static class SegmentWriter
         // `payload = 8 + storedLen` lands exactly on the aligned boundary —
         // same convention as the safetensors framing.
         int storedLength = headerJson.Length + pad;
-        long total = SegmentFormat.HeaderLengthBytes + storedLength + cursor;
-        var file = new byte[total];
-        BitConverter.TryWriteBytes(file.AsSpan(0, 8), (ulong)storedLength);
-        headerJson.CopyTo(file, 8);
-        file.AsSpan(8 + headerJson.Length, pad).Fill(0x20);
-
-        long payloadOffset = SegmentFormat.HeaderLengthBytes + headerJson.Length + pad;
-        foreach (var (tensor, from) in entries)
-        {
-            tensor.Data.CopyTo(file, payloadOffset + from);
-        }
 
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        File.WriteAllBytes(path, file);
+        using var payloadSha = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        using var fileSha = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        using (var file = File.Create(path))
+        {
+            Span<byte> length = stackalloc byte[SegmentFormat.HeaderLengthBytes];
+            BitConverter.TryWriteBytes(length, (ulong)storedLength);
+            file.Write(length);
+            fileSha.AppendData(length);
 
-        var payloadSpan = file.AsSpan((int)payloadOffset);
+            file.Write(headerJson);
+            fileSha.AppendData(headerJson);
+
+            if (pad > 0)
+            {
+                var filler = new byte[pad];
+                Array.Fill(filler, (byte)0x20);
+                file.Write(filler);
+                fileSha.AppendData(filler);
+            }
+
+            foreach (var (tensor, _) in entries)
+            {
+                file.Write(tensor.Data);
+                fileSha.AppendData(tensor.Data);
+                payloadSha.AppendData(tensor.Data);
+            }
+        }
+
         return new SegmentWriteResult(
             PayloadBytes: cursor,
-            PayloadSha256Hex: Convert.ToHexStringLower(SHA256.HashData(payloadSpan)),
-            SegmentSha256Hex: Convert.ToHexStringLower(SHA256.HashData(file)));
+            PayloadSha256Hex: Convert.ToHexStringLower(payloadSha.GetHashAndReset()),
+            SegmentSha256Hex: Convert.ToHexStringLower(fileSha.GetHashAndReset()));
     }
 }
 

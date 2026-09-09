@@ -54,6 +54,8 @@ amql-cli save-lora <patch.safetensors> --out <lora-dir>
 amql-cli export <container-dir> --out <checkpoint-dir>
                 [--patch <patch.safetensors>]
 amql-cli layers <container-dir> [--component target]
+amql-cli import <container-dir> <model> --out <merged-dir>
+                [--container]
 amql-cli help
 ```
 
@@ -253,3 +255,43 @@ component 'target' role=PrimaryText source=model layers=28 hidden=2048
     L 1: self_attn.q_proj.weight BF16 [2048x2048]; self_attn.k_proj.weight BF16 [512x2048]; ...
   runtime: [refused] layer 0: linear_attention has no judged runtime — the planner refuses it by name
 ```
+
+### Merging a second model into the container (`import`)
+
+`import` merges another model into an existing container: both models end up in one VIndex3, and `export` materialises the result as a single checkpoint. It does this through three pieces:
+
+- **The tokenization mapping layer.** The two tokenizers' vocabularies are related by token string (ids are opaque; identical strings are the only relationship this build judges). The merged vocabulary keeps the base model's ids stable and appends the imported-only tokens with fresh ids.
+- **Anchored alignment of the token interface.** The embedding (and the output head, when untied) grow to the union vocabulary. A ridge least-squares map is fitted from the imported space into the base space on the *shared-token anchors*; shared tokens get the blended row `½·(base + aligned·imported)`, imported-only tokens get `aligned·imported`, and base-only rows stay verbatim (zero-extended when the imported model is wider). Every merged row is re-encoded to the merged storage dtype (F32/BF16/F16).
+- **Shape evolution of the stack.** The model with the larger shape (hidden size, then layers) scaffolds the result — its intermediate tensors are copied byte-identically, since differently-shaped stacks cannot be averaged. A tensor kind the scaffold lacks (e.g. `q_norm`) is grown in from the other model, zero-padded. **Per-layer provenance** records the source and operation of every tensor.
+
+`token-map.json` in the merged container is the relationship tracker: every token's kind (`blended` / `aligned_new` / `base_only`) and both source ids, the anchor count and alignment residual, the per-layer provenance table, and the scaffold. The replaced (non-scaffold) stack is preserved under `segments/source/` so both models' data live in the same container. The union tokenizer replaces the base's, so every command that reads the vocabulary keeps working unchanged.
+
+```bash
+# import a bigger/hybrid model into the existing 0.8B container
+amql-cli import ./containers/Qwen3.5-0.8B ./models/Qwen3.6-2B \
+  --out ./containers/Qwen3.5-0.8B-x-Qwen3.6-2B
+
+# ...or when the second model is already a container
+amql-cli import ./containers/Qwen3.5-0.8B ./containers/other \
+  --out ./containers/merged --container
+
+# layers shows the merged provenance; export gives the plain checkpoint
+amql-cli layers ./containers/merged
+amql-cli export ./containers/merged --out ./models/merged
+```
+
+```
+imported:   Qwen3.5-2B into Qwen3.5-0.8B
+result:     Qwen3.5-0.8B+Qwen3.5-2B
+scaffold:   Qwen3.5-2B  (hidden 2048, layers 24)
+vocab:      248044 + 248044 → 248044 (248044 blended, 0 aligned-new, 0 base-only)
+storage:    BF16 × 2048, head tied
+preserved:  3 segments of the replaced stack under segments/source/
+note:       base embedding 1024→2048: rows zero-extended to the merged width
+note:       alignment: 248044 shared-token anchors, residual L² 402.1
+wrote:      index.json, system_graph.json, token-map.json, tokenizer.json, segments/
+the merged container tracks every token relationship in token-map.json and exports as one model:
+  amql-cli export ./containers/merged --out <checkpoint-dir>
+```
+
+Both Qwen3.5 sizes ship the same 248,044-token vocabulary, so an 0.8B→2B merge is all-blended; merging a model family with a *different* tokenizer produces `aligned_new` rows for its extra tokens and `base_only` rows for the base's, with the new ids appended after the base vocabulary.

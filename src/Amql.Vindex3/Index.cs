@@ -55,6 +55,13 @@ public sealed class Vindex3Index
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? DerivedFromModel { get; init; }
 
+    /// <summary>Relative path of the token-mapping manifest produced by a
+    /// model import/merge (<c>amql-cli import</c>): the per-token
+    /// relationship tracker and per-layer provenance. Absence means the
+    /// container is a plain single-model container.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? TokenMap { get; init; }
+
     [JsonExtensionData]
     public Dictionary<string, JsonElement>? Extra { get; set; }
 }

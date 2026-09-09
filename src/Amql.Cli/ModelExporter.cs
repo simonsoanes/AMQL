@@ -117,7 +117,7 @@ public static class ModelExporter
             outDir,
             container.Index.Model,
             payloads.Count,
-            payloads.Sum(p => p.Data.Length),
+            payloads.Sum(p => (long)p.Data.Length),
             notes);
     }
 
