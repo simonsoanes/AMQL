@@ -56,6 +56,14 @@ public sealed record MergeReport(
 public static class ModelMerger
 {
     public const string ManifestName = "token-map.json";
+
+    /// <summary>Cosine-agreement gate for shared tokens: rows whose two
+    /// models' aligned representations agree at or above this cosine are
+    /// blended (then restored to the scaffold's energy); below it the
+    /// scaffold's own row wins, because averaging disagreeing directions
+    /// fabricates rows neither model holds.</summary>
+    public const double AgreementThreshold = 0.5;
+
     private const string PreservedRoot = "segments/source";
 
     public static MergeReport Import(
@@ -99,9 +107,10 @@ public static class ModelMerger
             ? importedView
             : baseView;
         var other = ReferenceEquals(scaffold, baseView) ? importedView : baseView;
+        bool scaffoldIsImported = ReferenceEquals(scaffold, importedView);
         int width = Math.Max(baseView.Width, importedView.Width);
         int layers = Math.Max(baseView.Layers, importedView.Layers);
-        var mergedDtype = StorageDtype(baseView.Embedding, importedView.Embedding);
+        var mergedDtype = scaffold.Embedding.DtypeEnum;
         bool mergedTied = baseView.HeadTied;
         bool headUntied = !baseView.HeadTied;
 
@@ -117,29 +126,42 @@ public static class ModelMerger
         notes.Add($"stack scaffold: {scaffold.Model} (hidden {scaffold.Hidden}, layers {scaffold.Layers}); " +
                   $"the replaced stack of '{other.Model}' is preserved under {PreservedRoot}/");
 
-        // ── Token-interface merge (anchored alignment, then blend/append) ─
-        var baseEmbedRows = ReadWidenedRows(baseView.Embedding, width);
-        var importedEmbedRows = ReadWidenedRows(importedView.Embedding, width);
+        // ── Token-interface merge: the union lives in the SCAFFOLD model's
+        // space (the model whose stack runs). The other model's rows are
+        // mapped into it with the alignment fit; shared tokens are blended
+        // only where the two models agree (cosine gate) and the blend is
+        // then restored to the scaffold's energy — disagreements defer to
+        // the scaffold's own row instead of fabricating a direction. ──────
+        var scaffoldEmbedRows = ReadWidenedRows(scaffold.Embedding, width);
+        var otherEmbedRows = ReadWidenedRows(other.Embedding, width);
         Phase("widened embedding tables");
-        var embeddingAlignment = AlignRows(baseEmbedRows, importedEmbedRows, mapping, width);
+        var embeddingAlignment = AlignRows(
+            scaffoldEmbedRows, otherEmbedRows, mapping, scaffoldIsImported, width, AgreementThreshold);
         Phase($"fitted embedding alignment ({embeddingAlignment.Anchors} anchors)");
-        notes.Add($"alignment: {embeddingAlignment.Anchors} shared-token anchors, residual L² " +
-                  $"{embeddingAlignment.ResidualL2:g4} (ridge {embeddingAlignment.RidgeRel:g3})");
-        var embeddingPayload = MergeTable(
-            baseEmbedRows, importedEmbedRows, mapping, embeddingAlignment, width, mergedDtype);
-        Phase("merged embedding rows");
+        notes.Add($"alignment: {embeddingAlignment.Anchors} shared-token anchors into {scaffold.Model}'s space, " +
+                  $"residual L² {embeddingAlignment.ResidualL2:g4} (ridge {embeddingAlignment.RidgeRel:g3}, " +
+                  $"agreement threshold {AgreementThreshold:g2})");
+        var embeddingMerge = MergeTable(
+            scaffoldEmbedRows, otherEmbedRows, mapping, scaffoldIsImported, embeddingAlignment, width, mergedDtype);
+        Phase($"merged embedding rows (mean agreement {embeddingMerge.MeanAgreement:0.000}, " +
+              $"{embeddingMerge.ShareAboveThreshold * 100:0.0}% above threshold)");
+        notes.Add(AgreementNote(embeddingMerge, scaffold.Model));
 
         byte[]? headPayload = null;
         Dtype? headDtype = null;
         if (headUntied)
         {
-            var baseHead = baseView.OutputHead!;
-            var importedHead = importedView.OutputHead ?? importedView.Embedding;
-            headDtype = StorageDtype(baseHead, importedHead);
-            var baseHeadRows = ReadWidenedRows(baseHead, width);
-            var importedHeadRows = ReadWidenedRows(importedHead, width);
-            var headAlignment = AlignRows(baseHeadRows, importedHeadRows, mapping, width);
-            headPayload = MergeTable(baseHeadRows, importedHeadRows, mapping, headAlignment, width, headDtype.Value);
+            var scaffoldHead = scaffold.OutputHead ?? scaffold.Embedding;
+            var otherHead = other.OutputHead ?? other.Embedding;
+            headDtype = scaffoldHead.DtypeEnum;
+            var scaffoldHeadRows = ReadWidenedRows(scaffoldHead, width);
+            var otherHeadRows = ReadWidenedRows(otherHead, width);
+            var headAlignment = AlignRows(
+                scaffoldHeadRows, otherHeadRows, mapping, scaffoldIsImported, width, AgreementThreshold);
+            var headMerge = MergeTable(
+                scaffoldHeadRows, otherHeadRows, mapping, scaffoldIsImported, headAlignment, width, headDtype.Value);
+            headPayload = headMerge.Data;
+            notes.Add(AgreementNote(headMerge, scaffold.Model, "head"));
             Phase("merged output head rows");
         }
 
@@ -162,7 +184,7 @@ public static class ModelMerger
                 Name = "weight",
                 Dtype = mergedDtype,
                 Shape = new long[] { mapping.Count, width },
-                Data = embeddingPayload,
+                Data = embeddingMerge.Data,
             } });
         representations[$"target.embedding@{embeddingEncoding}"] = new RepresentationEntry
         {
@@ -228,7 +250,7 @@ public static class ModelMerger
         }
 
         var manifest = BuildManifest(baseView, importedView, mapping, width, mergedDtype, headDtype,
-            mergedTied, stack, embeddingAlignment, other.Model, preservedSegments);
+            mergedTied, stack, embeddingAlignment, embeddingMerge, other.Model, preservedSegments);
         File.WriteAllText(Path.Combine(outDir, ManifestName), manifest.ToJsonString(ViJson.Options));
 
         var appended = mapping.Entries
@@ -406,18 +428,32 @@ public static class ModelMerger
         }
     }
 
-    // ── anchored alignment + table merge ──────────────────────────────────
+    // ── anchored alignment + consensus table merge ────────────────────────
 
-    private sealed record Alignment(float[] Map, int Anchors, double ResidualL2, double RidgeRel);
+    private sealed record Alignment(
+        float[] Map,
+        int Anchors,
+        double ResidualL2,
+        double RidgeRel,
+        double Threshold);
 
-    /// <summary>Fits the least-squares map from the imported table's space
-    /// into the base table's space on the shared-token anchors; both
-    /// tables are already widened to the merged width.</summary>
+    private sealed record MergeTableResult(
+        byte[] Data,
+        double MeanAgreement,
+        double ShareAboveThreshold);
+
+    /// <summary>Fits the least-squares map from the OTHER model's table
+    /// into the SCAFFOLD model's table on the shared-token anchors; both
+    /// tables are already widened to the merged width. The scaffold model
+    /// is the one whose stack runs, so its space is where the merged row
+    /// must live.</summary>
     private static Alignment AlignRows(
-        float[] baseRows,
-        float[] importedRows,
+        float[] scaffoldRows,
+        float[] otherRows,
         TokenMapping mapping,
-        int width)
+        bool scaffoldIsImported,
+        int width,
+        double threshold)
     {
         var anchors = mapping.Anchors;
         var a = new float[anchors.Count * width];
@@ -426,23 +462,28 @@ public static class ModelMerger
         for (int k = 0; k < anchors.Count; k++)
         {
             var anchor = anchors[k];
-            Array.Copy(baseRows, anchor.BaseId!.Value * width, a, k * width, width);
-            Array.Copy(importedRows, anchor.ImportedId!.Value * width, b, k * width, width);
+            Array.Copy(scaffoldRows, (scaffoldIsImported ? anchor.ImportedId : anchor.BaseId)!.Value * width,
+                a, k * width, width);
+            Array.Copy(otherRows, (scaffoldIsImported ? anchor.BaseId : anchor.ImportedId)!.Value * width,
+                b, k * width, width);
         }
 
         var map = LeastSquares.Fit(a, b, anchors.Count, width);
-        return new Alignment(map, anchors.Count, LeastSquares.ResidualL2(a, b, anchors.Count, width, map), 1e-4);
+        return new Alignment(map, anchors.Count, LeastSquares.ResidualL2(a, b, anchors.Count, width, map), 1e-4, threshold);
     }
 
-    /// <summary>Builds the merged table for one token-interface tensor
-    /// (embedding or output head): blended rows where both models have the
-    /// token, aligned-imported rows where only the imported model does,
-    /// and verbatim base rows elsewhere. Every row is independent, so the
-    /// rows merge in parallel.</summary>
-    private static byte[] MergeTable(
-        float[] baseRows,
-        float[] importedRows,
+    /// <summary>Builds the merged table for one token-interface tensor in
+    /// the scaffold's space: shared tokens pass a cosine-agreement gate —
+    /// agree → blend the rows and restore the scaffold's energy (reinforce
+    /// consensus), disagree → keep the scaffold's row verbatim (never
+    /// fabricate a direction) — scaffold-only rows are copied verbatim and
+    /// other-only rows come through the alignment map. Every row is
+    /// independent, so the rows merge in parallel.</summary>
+    private static MergeTableResult MergeTable(
+        float[] scaffoldRows,
+        float[] otherRows,
         TokenMapping mapping,
+        bool scaffoldIsImported,
         Alignment alignment,
         int width,
         Dtype mergedDtype)
@@ -450,31 +491,70 @@ public static class ModelMerger
         var m = alignment.Map;
         var merged = new float[mapping.Count * width];
         var entries = mapping.Entries;
+        var agreement = new double[mapping.Count]; // NaN where not a shared token
 
         Parallel.For(0, mapping.Count, i =>
         {
             var entry = entries[i];
-            switch (entry.Kind)
+            int? scaffoldId = scaffoldIsImported ? entry.ImportedId : entry.BaseId;
+            int? otherId = scaffoldIsImported ? entry.BaseId : entry.ImportedId;
+            int dest = i * width;
+
+            if (scaffoldId is { } s)
             {
-                case TokenMergeKind.BaseOnly:
-                    Array.Copy(baseRows, entry.BaseId!.Value * width, merged, i * width, width);
-                    break;
-                case TokenMergeKind.AlignedNew:
-                    ApplyMap(importedRows, entry.ImportedId!.Value, merged, i, m, width);
-                    break;
-                case TokenMergeKind.Blended:
-                    ApplyMap(importedRows, entry.ImportedId!.Value, merged, i, m, width);
-                    int a = entry.BaseId!.Value * width;
-                    for (int c = 0; c < width; c++)
+                if (otherId is { } o)
+                {
+                    ApplyMap(otherRows, o, merged, i, m, width);
+                    double c = Cosine(merged, dest, scaffoldRows, s * width, width);
+                    agreement[i] = c;
+                    if (double.IsFinite(c) && c >= alignment.Threshold)
                     {
-                        merged[i * width + c] = 0.5f * (baseRows[a + c] + merged[i * width + c]);
+                        for (int k = 0; k < width; k++)
+                        {
+                            merged[dest + k] = 0.5f * (scaffoldRows[s * width + k] + merged[dest + k]);
+                        }
+                        RestoreEnergy(merged, dest, scaffoldRows, s * width, width);
                     }
-                    break;
+                    else
+                    {
+                        Array.Copy(scaffoldRows, s * width, merged, dest, width);
+                    }
+                }
+                else
+                {
+                    Array.Copy(scaffoldRows, s * width, merged, dest, width);
+                }
+            }
+            else
+            {
+                ApplyMap(otherRows, otherId!.Value, merged, i, m, width);
             }
         });
-        return EncodeToDtype(mergedDtype, merged);
+
+        int shared = 0;
+        double sum = 0;
+        int above = 0;
+        foreach (double c in agreement)
+        {
+            if (double.IsFinite(c))
+            {
+                shared++;
+                sum += c;
+                if (c >= alignment.Threshold)
+                {
+                    above++;
+                }
+            }
+        }
+
+        return new MergeTableResult(
+            EncodeToDtype(mergedDtype, merged),
+            shared == 0 ? 0 : sum / shared,
+            shared == 0 ? 0 : (double)above / shared);
     }
 
+    /// <summary>M·row: the other model's row mapped into the scaffold's
+    /// space. Writes into <c>dest[destRow]</c>.</summary>
     private static void ApplyMap(float[] source, int row, float[] dest, int destRow, float[] m, int width)
     {
         int src = row * width;
@@ -487,6 +567,58 @@ public static class ModelMerger
             }
             dest[destRow * width + r] = (float)sum;
         }
+    }
+
+    private static double Cosine(float[] a, int aOff, float[] b, int bOff, int width)
+    {
+        double dot = 0, na = 0, nb = 0;
+        for (int c = 0; c < width; c++)
+        {
+            float av = a[aOff + c];
+            float bv = b[bOff + c];
+            dot += av * bv;
+            na += av * av;
+            nb += bv * bv;
+        }
+        if (na == 0 || nb == 0)
+        {
+            return double.NaN;
+        }
+        return dot / Math.Sqrt(na * nb);
+    }
+
+    /// <summary>Scales <c>row</c> so its energy equals the reference row's —
+    /// the consensus reinforcement: agreeing blends keep the scaffold's
+    /// full logit magnitude instead of the averaging collapse.</summary>
+    private static void RestoreEnergy(float[] row, int off, float[] reference, int refOff, int width)
+    {
+        double rowEnergy = 0, refEnergy = 0;
+        for (int c = 0; c < width; c++)
+        {
+            rowEnergy += (double)row[off + c] * row[off + c];
+            refEnergy += (double)reference[refOff + c] * reference[refOff + c];
+        }
+        if (rowEnergy <= 0 || refEnergy <= 0)
+        {
+            return;
+        }
+        float scale = (float)Math.Sqrt(refEnergy / rowEnergy);
+        for (int c = 0; c < width; c++)
+        {
+            row[off + c] *= scale;
+        }
+    }
+
+    private static string AgreementNote(MergeTableResult result, string scaffoldModel, string what = "embedding")
+    {
+        if (result.ShareAboveThreshold >= 0.999)
+        {
+            return $"{what} consensus: {result.ShareAboveThreshold * 100:0.0}% of shared tokens agree " +
+                   $"(mean {result.MeanAgreement:0.000}) — blended and reinforced toward {scaffoldModel}";
+        }
+        return $"{what} consensus: {result.ShareAboveThreshold * 100:0.0}% of shared tokens agree " +
+               $"(mean {result.MeanAgreement:0.000}) — agreeing rows blend and restore {scaffoldModel}'s energy, " +
+               "disagreements defer to the scaffold's own row";
     }
 
     /// <summary>All rows of a token-interface table, widened to the merged
@@ -507,9 +639,6 @@ public static class ModelMerger
         }
         return padded;
     }
-
-    private static Dtype StorageDtype(TableView a, TableView b) =>
-        b.Width > a.Width ? b.DtypeEnum : a.DtypeEnum;
 
     // ── stack scaffold + provenance ───────────────────────────────────────
 
@@ -881,6 +1010,7 @@ public static class ModelMerger
         bool mergedTied,
         StackPlan stack,
         Alignment alignment,
+        MergeTableResult embeddingMerge,
         string? preservedModel,
         IReadOnlyList<string> preservedSegments)
     {
@@ -895,6 +1025,10 @@ public static class ModelMerger
                 ["count"] = alignment.Anchors,
                 ["ridge_rel"] = alignment.RidgeRel,
                 ["residual_l2"] = alignment.ResidualL2,
+                ["space"] = stack.ScaffoldModel,
+                ["agreement_threshold"] = alignment.Threshold,
+                ["mean_agreement"] = embeddingMerge.MeanAgreement,
+                ["share_above_threshold"] = embeddingMerge.ShareAboveThreshold,
             },
             ["embedding"] = new JsonObject
             {

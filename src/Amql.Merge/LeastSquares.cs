@@ -68,13 +68,16 @@ public static class LeastSquares
         var cross = totalCross;
 
         // Relative ridge keeps the fitted map from overfitting near-singular
-        // anchor sets while staying scale-invariant.
+        // anchor sets while staying scale-invariant; the absolute floor
+        // keeps a degenerate (zero-variance) anchor set — e.g. an imported
+        // model whose token tables are all-zero — solvable, yielding the
+        // zero map so the consensus gate defers to the scaffold.
         double trace = 0;
         for (int i = 0; i < d; i++)
         {
             trace += gram[i * d + i];
         }
-        double ridge = ridgeRel * (trace / d);
+        double ridge = ridgeRel * (trace / d) + 1e-8;
         for (int i = 0; i < d; i++)
         {
             gram[i * d + i] += ridge;

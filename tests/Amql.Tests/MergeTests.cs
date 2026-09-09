@@ -18,9 +18,50 @@ public class MergeTests
 {
     // ── fixtures ──────────────────────────────────────────────────────────
 
-    private static string BuildContainer(TempDir dir, string name, Dims dims, IReadOnlyList<string> tokens)
+    private static string BuildContainer(TempDir dir, string name, Dims dims, IReadOnlyList<string> tokens,
+        Func<float, float>? tableTransform = null)
     {
         var spec = SyntheticModel.BuildSpec(dims);
+        if (tableTransform is not null)
+        {
+            // Mutate the token-interface tables (embedding + untied head)
+            // only — the stack stays intact.
+            var mutated = spec.Representations.Select(rep => new RepresentationSpec
+            {
+                ObjectId = rep.ObjectId,
+                Encoding = rep.Encoding,
+                Tensors = rep.Tensors.Select(t =>
+                {
+                    if (t.Name != "weight" ||
+                        (rep.ObjectId != "target.embedding" && rep.ObjectId != "target.output_head"))
+                    {
+                        return t;
+                    }
+                    var values = SyntheticModel.FromBytes(t.Data);
+                    for (int i = 0; i < values.Length; i++)
+                    {
+                        values[i] = tableTransform(values[i]);
+                    }
+                    return new NamedTensorData
+                    {
+                        Name = t.Name,
+                        Dtype = t.Dtype,
+                        Shape = t.Shape,
+                        Data = SyntheticModel.ToBytes(values),
+                    };
+                }).ToList(),
+            }).ToList();
+            spec = new ContainerSpec
+            {
+                Model = spec.Model,
+                Family = spec.Family,
+                HiddenSize = spec.HiddenSize,
+                NumLayers = spec.NumLayers,
+                SystemGraph = spec.SystemGraph,
+                Representations = mutated,
+                PrecisionMap = spec.PrecisionMap,
+            };
+        }
         var renamed = new ContainerSpec
         {
             Model = name,
@@ -100,6 +141,57 @@ public class MergeTests
         return result;
     }
 
+    /// <summary>Replicates the merger's agreement gate: if cos(scaffoldRow,
+    /// W·otherRow) clears the threshold, blend and restore the scaffold's
+    /// energy; otherwise defer to the scaffold row verbatim.</summary>
+    private static float[] AgreeOrDefer(float[] scaffoldRows, int scaffoldId, float[] mappedRow, int width)
+    {
+        double c = Cosine(mappedRow, 0, scaffoldRows, scaffoldId * width, width);
+        if (!double.IsFinite(c) || c < ModelMerger.AgreementThreshold)
+        {
+            return Row(scaffoldRows, scaffoldId, width);
+        }
+        var blend = new float[width];
+        for (int i = 0; i < width; i++)
+        {
+            blend[i] = 0.5f * (scaffoldRows[scaffoldId * width + i] + mappedRow[i]);
+        }
+        float scale = Norm(scaffoldRows, scaffoldId * width, width) / Norm(blend, 0, width);
+        for (int i = 0; i < width; i++)
+        {
+            blend[i] *= scale;
+        }
+        return blend;
+    }
+
+    private static double Cosine(float[] a, int aOff, float[] b, int bOff, int width)
+    {
+        double dot = 0, na = 0, nb = 0;
+        for (int c = 0; c < width; c++)
+        {
+            float av = a[aOff + c];
+            float bv = b[bOff + c];
+            dot += av * bv;
+            na += av * av;
+            nb += bv * bv;
+        }
+        if (na == 0 || nb == 0)
+        {
+            return double.NaN;
+        }
+        return dot / Math.Sqrt(na * nb);
+    }
+
+    private static float Norm(float[] row, int off, int width)
+    {
+        double sum = 0;
+        for (int c = 0; c < width; c++)
+        {
+            sum += (double)row[off + c] * row[off + c];
+        }
+        return (float)Math.Sqrt(sum);
+    }
+
     // ── the flagship merge: union vocab, blend, shape evolution, head ─────
 
     [Fact]
@@ -169,57 +261,59 @@ public class MergeTests
             Assert.Equal(3, vocab[9].GetProperty("imported_id").GetInt32());
             Assert.Equal("synth-b", manifest.RootElement.GetProperty("scaffold").GetProperty("model").GetString());
             Assert.Equal("synth-a", manifest.RootElement.GetProperty("preserved").GetProperty("model").GetString());
+            var anchors = manifest.RootElement.GetProperty("anchors");
+            Assert.Equal("synth-b", anchors.GetProperty("space").GetString());
+            Assert.True(Math.Abs(anchors.GetProperty("agreement_threshold").GetDouble() - ModelMerger.AgreementThreshold) < 1e-9);
         }
+        Assert.Contains(report.Notes, n => n.Contains("consensus"));
 
-        // ── merged embedding rows ──────────────────────────────────────
+        // ── merged embedding rows (scaffold = imported, hidden 8) ─────
         int width = 8;
-        var (baseRows, _) = Table(basePath, "target.embedding", width);
-        var (importedRows, _) = Table(importedPath, "target.embedding", width);
+        var (scaffoldRows, _) = Table(importedPath, "target.embedding", width); // B, the scaffold
+        var (otherRows, _) = Table(basePath, "target.embedding", width);        // A, the other (padded)
         var importedByToken = importedTokens
             .Select((t, i) => (t, i))
             .ToDictionary(x => x.t, x => x.i);
         // Anchors: shared tokens a (base 1 / imported 0), b (2/1), c (3/2).
         var anchorBase = new[] { 1, 2, 3 };
-        var anchorImported = anchorBase.Select(baseId => importedByToken[baseTokens[baseId]]).ToArray();
-        var a = new float[anchorBase.Length * width];
-        var b = new float[anchorBase.Length * width];
+        var anchorScaffold = anchorBase.Select(baseId => importedByToken[baseTokens[baseId]]).ToArray();
+        // Fit A_pad → B: map minimising ‖B − M·A_pad‖ over the anchors.
+        var fitA = new float[anchorBase.Length * width]; // scaffold (B) anchor rows
+        var fitB = new float[anchorBase.Length * width]; // other (A_pad) anchor rows
         for (int k = 0; k < anchorBase.Length; k++)
         {
-            Array.Copy(baseRows, anchorBase[k] * width, a, k * width, width);
-            Array.Copy(importedRows, anchorImported[k] * width, b, k * width, width);
+            Array.Copy(scaffoldRows, anchorScaffold[k] * width, fitA, k * width, width);
+            Array.Copy(otherRows, anchorBase[k] * width, fitB, k * width, width);
         }
-        var map = LeastSquares.Fit(a, b, anchorBase.Length, width);
+        var map = LeastSquares.Fit(fitA, fitB, anchorBase.Length, width);
 
         var (mergedRows, mergedDtype) = Table(outDir, "target.embedding", width);
         Assert.Equal(Dtype.F32, mergedDtype);
-        // base-only Ġ keeps the base row, zero-extended.
-        var padG = new float[width];
-        Array.Copy(baseRows, 0, padG, 0, width);
-        AssertClose(padG, Row(mergedRows, 0, width));
-        Assert.Equal(0f, padG[4]);
-        Assert.Equal(0f, padG[7]);
-        // blended "a" = 0.5 · (base + M·imported).
-        var expectA = Mapped(map, importedRows, anchorImported[0], width, blendBaseRow: Row(baseRows, 1, width));
-        AssertClose(expectA, Row(mergedRows, 1, width));
-        // aligned-new "x" = M·imported row (imported id 3).
-        var expectX = Mapped(map, importedRows, importedByToken["x"], width);
-        AssertClose(expectX, Row(mergedRows, 9, width));
+        // base-only Ġ (only in A, the other) arrives through the map: W·A_pad.
+        AssertClose(Mapped(map, otherRows, 0, width), Row(mergedRows, 0, width));
+        // shared "a": agreement-gated — either the scaffold row verbatim or
+        // the blended row restored to the scaffold's energy.
+        var wbA = Mapped(map, otherRows, 1, width);
+        var expectedA = AgreeOrDefer(scaffoldRows, anchorScaffold[0], wbA, width);
+        AssertClose(expectedA, Row(mergedRows, 1, width));
+        // aligned-new "x" (only in B, the scaffold): the scaffold row verbatim.
+        AssertClose(Row(scaffoldRows, importedByToken["x"], width), Row(mergedRows, 9, width), tolerance: 0f);
 
         // ── merged head is fitted separately (untied) ──────────────────
-        var (baseHeadRows, _) = Table(basePath, "target.output_head", width);
-        var (importedHeadRows, _) = Table(importedPath, "target.output_head", width);
-        var aHead = new float[anchorBase.Length * width];
-        var bHead = new float[anchorBase.Length * width];
+        var (scaffoldHeadRows, _) = Table(importedPath, "target.output_head", width);
+        var (otherHeadRows, _) = Table(basePath, "target.output_head", width);
+        var fitAHead = new float[anchorBase.Length * width];
+        var fitBHead = new float[anchorBase.Length * width];
         for (int k = 0; k < anchorBase.Length; k++)
         {
-            Array.Copy(baseHeadRows, anchorBase[k] * width, aHead, k * width, width);
-            Array.Copy(importedHeadRows, anchorImported[k] * width, bHead, k * width, width);
+            Array.Copy(scaffoldHeadRows, anchorScaffold[k] * width, fitAHead, k * width, width);
+            Array.Copy(otherHeadRows, anchorBase[k] * width, fitBHead, k * width, width);
         }
-        var headMap = LeastSquares.Fit(aHead, bHead, anchorBase.Length, width);
+        var headMap = LeastSquares.Fit(fitAHead, fitBHead, anchorBase.Length, width);
         var (mergedHeadRows, _) = Table(outDir, "target.output_head", width);
-        var expectHeadA = Mapped(headMap, importedHeadRows, anchorImported[0], width,
-            blendBaseRow: Row(baseHeadRows, 1, width));
-        AssertClose(expectHeadA, Row(mergedHeadRows, 1, width));
+        var wbHeadA = Mapped(headMap, otherHeadRows, 1, width);
+        var expectedHeadA = AgreeOrDefer(scaffoldHeadRows, anchorScaffold[0], wbHeadA, width);
+        AssertClose(expectedHeadA, Row(mergedHeadRows, 1, width));
 
         // ── the stack is the scaffold's, byte-identical ────────────────
         foreach (var tensor in new[]
@@ -402,5 +496,56 @@ public class MergeTests
             ModelMerger.Import(basePath, importedPath, Path.Combine(dir.Path, "out"), importedIsContainer: true));
         Assert.Contains("no anchors", ex.Message);
         Assert.False(Directory.Exists(Path.Combine(dir.Path, "out")));
+    }
+
+    // ── consensus reinforcement: agree → blend at full energy ─────────────
+
+    [Fact]
+    public void Import_Agreement_Keeps_Identical_Rows_At_Full_Energy()
+    {
+        using var dir = new TempDir();
+        var tokens = new[] { "a", "b", "c", "d", "e", "f", "g", "h", "i" };
+        var dims = new Dims(Vocab: 9, Hidden: 4, Layers: 2);
+        var basePath = BuildContainer(dir, "synth-a", dims, tokens);
+        var importedPath = BuildContainer(dir, "synth-b", dims, tokens); // identical token tables
+        var outDir = Path.Combine(dir.Path, "merged");
+
+        var report = ModelMerger.Import(basePath, importedPath, outDir, importedIsContainer: true);
+
+        // Equal shapes → the base scaffolds; every shared token agrees
+        // (cosine ≈ 1), so the merged rows equal the scaffold's at full
+        // energy — the blend must not shrink them.
+        Assert.Equal("synth-a", report.Scaffold);
+        Assert.Contains(report.Notes, n => n.Contains("consensus") && n.Contains("100.0%"));
+        var (expected, _) = Table(basePath, "target.embedding", 4);
+        var (actual, _) = Table(outDir, "target.embedding", 4);
+        AssertClose(expected, actual, tolerance: 1e-4f);
+        var (expectedHead, _) = Table(basePath, "target.output_head", 4);
+        var (actualHead, _) = Table(outDir, "target.output_head", 4);
+        AssertClose(expectedHead, actualHead, tolerance: 1e-4f);
+    }
+
+    [Fact]
+    public void Import_Agreement_Disagreement_Defers_To_The_Scaffold()
+    {
+        using var dir = new TempDir();
+        var tokens = new[] { "a", "b", "c", "d", "e", "f", "g", "h", "i" };
+        var dims = new Dims(Vocab: 9, Hidden: 4, Layers: 2);
+        var basePath = BuildContainer(dir, "synth-a", dims, tokens);
+        // The imported model's token tables are zeroed: its aligned rows
+        // cannot agree with the scaffold (cosine undefined), so every row
+        // must defer to the scaffold verbatim instead of averaging toward
+        // zero — the failures the 50/50 blend produces.
+        var importedPath = BuildContainer(dir, "synth-b", dims, tokens, tableTransform: _ => 0f);
+        var outDir = Path.Combine(dir.Path, "merged");
+
+        ModelMerger.Import(basePath, importedPath, outDir, importedIsContainer: true);
+
+        var (expected, _) = Table(basePath, "target.embedding", 4);
+        var (actual, _) = Table(outDir, "target.embedding", 4);
+        AssertClose(expected, actual, tolerance: 1e-5f);
+        var (expectedHead, _) = Table(basePath, "target.output_head", 4);
+        var (actualHead, _) = Table(outDir, "target.output_head", 4);
+        AssertClose(expectedHead, actualHead, tolerance: 1e-5f);
     }
 }
