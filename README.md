@@ -1,20 +1,22 @@
 # AMQL - C# implementation of VIndex3 (Larql)
 
-This is a port of the VIndex3 implementation, along with support for generating it from a model (Qwen 3.5 initially) and then allowing model independent inference, token relationship route following and exploration of the model internals in order to do some research into direct model manipulation and patching, with live LORA adapters in custom inferencing.
+This was a port of the VIndex3 implementation, along with support for generating it from a model (Qwen 3.5 initially) and then allowing model independent inference, token relationship route following and exploration of the model internals in order to do some research into direct model manipulation and patching, with live LORA adapters in custom inferencing.
+
+It has now been significantly extended to add model merging (using reinforcement blending to entirely avoid training time but get the same resultant effect as if the training sets of the two models had been combined and run) and custom tensor editing features for another project.
 
 Credit for the design of the VIndex3 goes to Chris Hay.
 
 ## What is this for?
 
-While building a continuous cognition platform, I ran into the problem that all current LLMs have flaws and no way to self-improve. This project is intended to eventually become a tool for AI self-improvement.
+While building a continuous cognition platform, I ran into the problem that all current LLMs have flaws and no way to self-improve. This project is intended to support AI self-improvement and the libraries are used by my orchestrator platform.
 
 It lets you turn a model into a graph database, then query the relationships between tokens (or their text representations). Once the edges in the graph have been identified, it becomes possible to generate a specific LoRA adapter that adjusts that behaviour in the model (or rewrites the base model), effectively editing its input and output knowledge.
 
 At the current level, it's possible to remove the concept of something being associated in a particular way, or to add a new association between two items in a familiar form (PlaceA is the capital of PlaceB) - useful for correcting flaws in the embedding layer. It's also possible to correct a relationship between two things where a relationship exists but is of the wrong type.
 
-Looking at the next layer of abstraction, it's also possible to adjust relationships that humanity hasn't yet described linguistically but normally infers a connection between. This is especially useful when combined with positive and negative reinforcement derived from internal traces taken during a model's inference stage. The intent is to correct things ranging from hallucinations (where the relationship is a 'user satisfaction' signal added during post-training) to incorrect tool selection when operating agentically.
+At the next layer of abstraction, it's also possible to adjust relationships that humanity hasn't yet described linguistically but normally infers a connection between. This is especially useful when combined with positive and negative reinforcement derived from internal traces taken during a model's inference stage. The intent is to correct things ranging from hallucinations (where the relationship is a 'user satisfaction' signal added during post-training) to incorrect tool selection when operating agentically.
 
-The hope is that it eventually becomes possible to calculate the representation of an approach to a problem space - and potentially to create new ones or transpose existing ones - for example, applying first-order logic to an understanding that isn't yet fully trained into the model, whether due to a lack of source material or insufficient model density.
+By blending models we're able to increase the token-space and apply the other models problem space vector into an existing model - this allows adding concepts and solution space vectors.
 
 Combined with an automatic self-learning process, this should extend a model's understanding and intelligence beyond currently trainable human textual representations, in cases where a known construct would be better applied. That's an outcome fine-tuning alone can't achieve, since it can only generate more intelligent outcomes by relying on scenarios that are inherently gated at human-level intellect.
 
@@ -272,7 +274,7 @@ amql-cli export ./containers/merged --out ./models/merged-mxfp4 --quant mxfp4
 ```
 
 ```
-tensors:    506  (1.63 GiB)
+tensors:    505  (1.36 GiB)
 note:       186 stack projection tensors exported as MXFP4 (FP4 E2M1 grid elements, per-32-element F8_E8M0 scales) — embeddings, norms, biases and the output head keep their full precision
 wrote:      model.safetensors, config.json, tokenizer.json  (quantization: mxfp4)
 ```
