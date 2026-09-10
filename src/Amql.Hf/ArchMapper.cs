@@ -97,6 +97,15 @@ public static class ArchMapper
                 IntermediateSize = facts.IntermediateSize,
                 Activation = Activation.Silu,
                 FfnType = FfnType.Gated,
+                Moe = facts.Moe is { } moe
+                    ? new MoeSurface
+                    {
+                        Experts = moe.Experts,
+                        TopK = moe.TopK,
+                        ExpertIntermediateSize = moe.ExpertIntermediateSize,
+                        RoutingPolicy = moe.RoutingPolicy,
+                    }
+                    : null,
             },
             Norm = new NormSurface
             {

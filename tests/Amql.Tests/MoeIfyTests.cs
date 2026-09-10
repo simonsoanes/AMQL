@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Amql.Cli;
 using Amql.Hf;
 using Amql.Inference;
@@ -148,5 +149,45 @@ public class MoeIfyTests
         using var shard = SafetensorsFile.Open(Path.Combine(exported, "model.safetensors"));
         Assert.Contains("model.layers.0.mlp.router.weight", shard.TensorNames);
         Assert.Contains("model.layers.0.mlp.experts.0.gate_proj.weight", shard.TensorNames);
+    }
+
+    // ── export round trip retains the routed judgment ────────────────────
+
+    [Fact]
+    public void Export_Round_Trip_Retains_The_Routed_Judgment()
+    {
+        using var dir = new TempDir();
+        var containerPath = DemoContainer(dir);
+        var ids = DemoTokens(containerPath);
+        var moeDir = Path.Combine(dir.Path, "moe");
+        MoeIfy.Transform(containerPath, moeDir,
+            ids.Take(6).ToArray(), ids.Skip(6).Take(4).ToArray(), experts: 2, topK: 1);
+
+        var exported = Path.Combine(dir.Path, "exported");
+        using (var moe = Vindex3Container.Open(moeDir))
+        {
+            ModelExporter.Export(moe, exported, patch: null);
+        }
+
+        // The moe facts ride the export config…
+        using var config = JsonDocument.Parse(File.ReadAllBytes(Path.Combine(exported, "config.json")));
+        var moeFacts = config.RootElement.GetProperty("moe");
+        Assert.Equal(2, moeFacts.GetProperty("experts").GetInt32());
+        Assert.Equal(1, moeFacts.GetProperty("top_k").GetInt32());
+        Assert.Equal(4, moeFacts.GetProperty("expert_intermediate_size").GetInt32());
+
+        // …so a re-encoded container still judges every FFN routed.
+        var reEncoded = Path.Combine(dir.Path, "re");
+        ModelToContainer.Encode(exported, reEncoded, "demo-moe-re");
+        using var re = Vindex3Container.Open(reEncoded);
+        using var store = re.CreateOperandStore();
+        var plan = Planner.Plan(re, "target", store);
+        for (int l = 0; l < plan.Layers.Count; l++)
+        {
+            var routed = plan.Layers[l].Ffn?.Routed;
+            Assert.NotNull(routed);
+            Assert.Equal(2, routed!.NumExperts);
+            Assert.Equal(1, routed.TopK);
+        }
     }
 }

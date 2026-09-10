@@ -1,5 +1,7 @@
 using System.Text.Json;
 
+using Amql.Vindex3;
+
 namespace Amql.Hf;
 
 /// <summary>Raised when an HF checkpoint's config declares facts this build
@@ -19,6 +21,15 @@ public sealed record LinearAttentionFacts(
     int KeyHeadDim,
     int ValueHeads,
     int ValueHeadDim);
+
+/// <summary>The <c>moe</c> config block an MoE-ified export carries — the
+/// facts that make a re-encoded container judge its FFNs routed instead
+/// of dense.</summary>
+public sealed record MoeFacts(
+    int Experts,
+    int TopK,
+    int ExpertIntermediateSize,
+    ExpertRoutingPolicy RoutingPolicy);
 
 /// <summary>
 /// G1 output: architecture facts lifted from <c>config.json</c> — the
@@ -45,7 +56,8 @@ public sealed record TextArchitectureFacts(
     IReadOnlyList<string> LayerTypes,
     JsonElement RopeParameters,
     LinearAttentionFacts? LinearAttention,
-    double PartialRotaryFactor);
+    double PartialRotaryFactor,
+    MoeFacts? Moe);
 
 /// <summary>G1 reader: <c>config.json</c> → <see cref="TextArchitectureFacts"/>.</summary>
 public static class ModelConfig
@@ -106,6 +118,20 @@ public static class ModelConfig
                     ck.GetInt32(), khe.GetInt32(), khd.GetInt32(), vhe.GetInt32(), vhd.GetInt32());
             }
 
+            MoeFacts? moe = null;
+            if (text.TryGetProperty("moe", out var moeElement) &&
+                moeElement.ValueKind == JsonValueKind.Object &&
+                moeElement.TryGetProperty("experts", out var expertsEl) &&
+                moeElement.TryGetProperty("top_k", out var topKEl) &&
+                moeElement.TryGetProperty("expert_intermediate_size", out var eisEl))
+            {
+                ExpertRoutingPolicy policy = moeElement.TryGetProperty("routing_policy", out var policyEl) &&
+                    policyEl.GetString() == "normalised_over_selected"
+                    ? ExpertRoutingPolicy.NormalisedOverSelected
+                    : ExpertRoutingPolicy.SoftmaxThenSelect;
+                moe = new MoeFacts(expertsEl.GetInt32(), topKEl.GetInt32(), eisEl.GetInt32(), policy);
+            }
+
             // Partial rotary factor, in the reference's precedence
             // (`PreTrainedConfig::standardize_rope_params`, transformers 5.x):
             //  1. top-level `partial_rotary_factor` — the legacy flat form,
@@ -149,7 +175,8 @@ public static class ModelConfig
                 LayerTypes: layerTypes,
                 RopeParameters: rope,
                 LinearAttention: linear,
-                PartialRotaryFactor: partialRotaryFactor);
+                PartialRotaryFactor: partialRotaryFactor,
+                Moe: moe);
         }
     }
 

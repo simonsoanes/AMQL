@@ -469,6 +469,21 @@ internal static class ExportConfig
             ["layer_types"] = new JsonArray(layerTypes.Select(t => JsonValue.Create(t)).ToArray()),
         };
 
+        if (ffn.Moe is { } moe)
+        {
+            // The MoE facts ride the export so a re-encoded container still
+            // judges its FFNs routed instead of dense.
+            config["moe"] = new JsonObject
+            {
+                ["experts"] = moe.Experts,
+                ["top_k"] = moe.TopK,
+                ["expert_intermediate_size"] = moe.ExpertIntermediateSize,
+                ["routing_policy"] = moe.RoutingPolicy == ExpertRoutingPolicy.NormalisedOverSelected
+                    ? "normalised_over_selected"
+                    : "softmax_then_select",
+            };
+        }
+
         if (attention.AttentionBias == true)
         {
             config["attention_bias"] = true;
