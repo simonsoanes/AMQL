@@ -162,7 +162,9 @@ public sealed record NamedTensorData
             }
             elements = checked(elements * dim);
         }
-        long expected = checked(elements * Dtype.ElementSize());
+        long expected = Dtype == Dtype.FP4
+            ? checked((elements + 1) / 2) // two elements per packed byte
+            : checked(elements * Dtype.ElementSize());
         if (Data.Length != expected)
         {
             throw new ContainerException(

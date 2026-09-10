@@ -256,6 +256,36 @@ component 'target' role=PrimaryText source=model layers=28 hidden=2048
   runtime: [refused] layer 0: linear_attention has no judged runtime — the planner refuses it by name
 ```
 
+### Exporting a quantized checkpoint (`--quant nvfp4`)
+
+`export --quant nvfp4` produces an NVFP4 checkpoint: the stack's projection matrices
+(`q_proj`/`k_proj`/`v_proj`/`o_proj`/`gate_proj`/`up_proj`/`down_proj`/linear-attention
+projections) are quantised to FP4 elements packed two per byte, each with a per-2-element
+FP8 (E4M3) block scale and an FP32 tensor scale — FP4 codes at a quarter of the BF16 size
+plus FP8 block scales at another quarter, so each projection lands at roughly half its
+BF16 payload. Embeddings, norms, biases, the log-space `A_log` tensors and the output
+head keep their full precision, per the standard practice.
+
+```bash
+amql-cli export ./containers/merged --out ./models/merged-nvfp4 --quant nvfp4
+```
+
+```
+tensors:    692  (2.23 GiB)
+note:       186 stack projection tensors exported as NVFP4 (FP4 grid elements, per-2-element F8_E4M3 scales, FP32 tensor scale) — embeddings, norms, biases and the output head keep their full precision
+wrote:      model.safetensors, config.json, tokenizer.json  (quantization: nvfp4)
+```
+
+Each quantised weight becomes three safetensors tensors: `...weight` (dtype `FP4`, logical
+shape, two elements per byte), `...weight_scale` (dtype `F8_E4M3`, one scale per 2
+elements), and `...weight_global_scale` (dtype `F32`). Dequantisation is
+`x ≈ DecodeFp4(q) × DecodeE4M3(blockScale) × globalScale`, and the element grid
+`{0, 0.25, 0.5, 0.75, 1, 1.5, 2, 3}` is serialised into `config.json`
+(`quantization_config.quant_method: "nvfp4"`) so the exact scheme is self-describing.
+The quantised checkpoint is a terminal artifact for this build (the encoder reads
+full-precision dtypes); the `Nvfp4` codec in `Amql.Safetensors` is the reference
+implementation for any consumer runtime.
+
 ### Merging a second model into the container (`import`)
 
 `import` merges another model into an existing container: both models end up in one VIndex3, and `export` materialises the result as a single checkpoint. It does this through three pieces:

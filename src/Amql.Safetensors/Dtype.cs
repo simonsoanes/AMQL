@@ -20,6 +20,7 @@ public enum Dtype
     F8_E4M3,
     F8_E5M2,
     F8_E8M0,
+    FP4,
 }
 
 public static class DtypeExtensions
@@ -39,6 +40,7 @@ public static class DtypeExtensions
         ["F8_E4M3"] = Dtype.F8_E4M3,
         ["F8_E5M2"] = Dtype.F8_E5M2,
         ["F8_E8M0"] = Dtype.F8_E8M0,
+        ["FP4"] = Dtype.FP4,
     };
 
     public static string Label(this Dtype dtype) => dtype switch
@@ -56,6 +58,7 @@ public static class DtypeExtensions
         Dtype.F8_E4M3 => "F8_E4M3",
         Dtype.F8_E5M2 => "F8_E5M2",
         Dtype.F8_E8M0 => "F8_E8M0",
+        Dtype.FP4 => "FP4",
         _ => throw new ArgumentOutOfRangeException(nameof(dtype), dtype, null),
     };
 
@@ -68,7 +71,11 @@ public static class DtypeExtensions
         throw new SafetensorsException($"unknown safetensors dtype label '{label}'");
     }
 
-    /// <summary>Number of bytes one element occupies.</summary>
+    /// <summary>Number of bytes one element occupies. FP4 packs two
+    /// elements into one byte, so its linear storage length is
+    /// <c>ceil(elements / 2)</c> — callers of
+    /// <see cref="Nvfp4.PackedLength"/> must special-case it and never
+    /// size an FP4 payload with this.</summary>
     public static int ElementSize(this Dtype dtype) => dtype switch
     {
         Dtype.F64 or Dtype.I64 => 8,
@@ -81,7 +88,9 @@ public static class DtypeExtensions
     /// Whether the byte pattern can be widened to f32 by
     /// <see cref="BitPattern"/>. Mirrors the reference's
     /// <c>tensor_to_f32</c> dispatch: F16/BF16/FP8/I8 are decoded, F32 is
-    /// copied; the rest are refused rather than guessed.
+    /// copied; the rest are refused rather than guessed. FP4 is excluded —
+    /// its elements carry no scale, so dequantisation needs the tensor's
+    /// scale companions (<see cref="Nvfp4.Dequant"/>).
     /// </summary>
     public static bool IsWidenableToF32(this Dtype dtype) => dtype switch
     {

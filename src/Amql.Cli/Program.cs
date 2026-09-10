@@ -710,10 +710,15 @@ internal static class Program
         var containerDir = Arg(args, 0) ?? throw new CliException(
             "export requires a container directory, e.g. 'amql-cli export <container-dir> --out <checkpoint-dir>'");
         string outDir = OptionValue(args, "--out") ?? throw new CliException("export requires '--out <checkpoint-dir>'");
+        string quant = OptionValue(args, "--quant") ?? "none";
+        if (quant != "none" && quant != "nvfp4")
+        {
+            throw new CliException($"unknown quantization '{quant}' — this build exports 'none' (full precision) or 'nvfp4'");
+        }
 
         using var container = Vindex3Container.Open(containerDir);
         var patch = LoadPatch(args, container);
-        var report = ModelExporter.Export(container, outDir, patch);
+        var report = ModelExporter.Export(container, outDir, patch, quantizeNvfp4: quant == "nvfp4");
 
         Console.WriteLine($"exported:  {report.OutDir}");
         Console.WriteLine($"model:      {report.Model}");
@@ -724,7 +729,7 @@ internal static class Program
         }
         string files = "model.safetensors, config.json" +
                        (File.Exists(Path.Combine(outDir, "tokenizer.json")) ? ", tokenizer.json" : string.Empty);
-        Console.WriteLine($"wrote:      {files}");
+        Console.WriteLine($"wrote:      {files}  (quantization: {quant})");
         Console.WriteLine("the checkpoint is the original model with any patch deltas baked in — encode it to move back into a container:");
         Console.WriteLine($"  amql-cli encode {outDir} --out <new-container>");
         return 0;
@@ -980,7 +985,7 @@ internal static class Program
               amql-cli save-lora <patch.safetensors> --out <lora-dir>
                               [--rank 8] [--alpha 16] [--container <container-dir>]
               amql-cli export <container-dir> --out <checkpoint-dir>
-                              [--patch <patch.safetensors>]
+                              [--patch <patch.safetensors>] [--quant nvfp4]
               amql-cli layers <container-dir> [--component target]
               amql-cli import <container-dir> <model> --out <merged-dir>
                               [--container]
@@ -1008,7 +1013,11 @@ internal static class Program
             model.safetensors + tokenizer.json) from the container — the
             inverse of encode — with patch deltas baked into the stored
             tensors (unpatched tensors are copied byte-identically), so the
-            result is a plain original model again.
+            result is a plain original model again. Pass --quant nvfp4 to
+            export the stack's projection matrices in NVIDIA's NVFP4 form
+            (FP4 E2M1 elements, two per byte, per-2-element FP8 scales plus
+            an FP32 tensor scale); embeddings, norms, biases and the output
+            head keep their full precision.
             layers lists every component and, for the selected one, the
             per-layer attention policy table and tensor inventory, then
             whether the planner serves the stack or refuses it by name.

@@ -40,7 +40,9 @@ public sealed record TensorInfo
         }
     }
 
-    public long PayloadBytes => checked(Dtype.ElementSize() * ElementCount);
+    public long PayloadBytes => Dtype == Dtype.FP4
+        ? (ElementCount + 1) / 2 // two elements per packed byte
+        : checked(Dtype.ElementSize() * ElementCount);
 
     public void Validate()
     {

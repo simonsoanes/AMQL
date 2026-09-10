@@ -153,6 +153,109 @@ public static class BitPattern
     /// <summary>I8: sign-extend.</summary>
     public static float DecodeI8(byte b) => (sbyte)b;
 
+    // ── FP4 (NVFP4 element grid) ─────────────────────────────────────────────
+
+    /// <summary>The positive magnitudes of the NVFP4 element grid, indexed
+    /// by the low three bits of the nibble (bit 3 is the sign). This is
+    /// the value grid the published NVFP4 conversions carry:
+    /// <c>{0, 0.25, 0.5, 0.75, 1, 1.5, 2, 3}</c>, so the largest magnitude
+    /// is 3.0. The ecosystem labels this family both "E1M2" and "E2M1"
+    /// depending on vendor — the grid, serialised into the exported
+    /// config's <c>element_grid</c>, is the contract; a consumer with a
+    /// different table can swap this one value table.</summary>
+    public static readonly float[] Fp4PositiveGrid = { 0f, 0.25f, 0.5f, 0.75f, 1f, 1.5f, 2f, 3f };
+
+    public const float Fp4MaxValue = 3f;
+
+    /// <summary>Decode one FP4 nibble (low 4 bits of the byte).</summary>
+    public static float DecodeFp4(byte nibble)
+    {
+        float v = Fp4PositiveGrid[nibble & 0x07];
+        return (nibble & 0x08) != 0 ? -v : v;
+    }
+
+    /// <summary>Nearest FP4 nibble for a value (ties to the smaller
+    /// magnitude); anything outside the ±3.0 grid clamps.</summary>
+    public static byte EncodeFp4(float value)
+    {
+        float a = MathF.Abs(value);
+        byte index = 0;
+        float best = float.PositiveInfinity;
+        for (byte i = 0; i < Fp4PositiveGrid.Length; i++)
+        {
+            float diff = MathF.Abs(a - Fp4PositiveGrid[i]);
+            if (diff < best)
+            {
+                best = diff;
+                index = i;
+            }
+        }
+        // Sign bit via the raw pattern so −0 stays distinguishable.
+        bool negative = BitConverter.SingleToInt32Bits(value) < 0;
+        return negative ? (byte)(index | 0x08) : index;
+    }
+
+    /// <summary>f32 → E4M3 (OCP, bias 7) with round-to-nearest-even; the
+    /// inverse of <see cref="DecodeF8E4M3"/>. Used for the NVFP4 block
+    /// scales. The decoder in this file treats exponent field 15 as a
+    /// valid exponent (NaN only with mantissa 7), so the largest finite
+    /// magnitude here is <c>1.75 × 2⁸ = 448</c> (bits 0x7E).</summary>
+    public static byte EncodeF8E4M3(float value)
+    {
+        if (float.IsNaN(value))
+        {
+            return 0xFF;
+        }
+        int sign = value < 0 ? 0x80 : 0;
+        float a = MathF.Abs(value);
+        if (a == 0)
+        {
+            return (byte)sign;
+        }
+
+        // Largest finite E4M3 under this decoder is 448 (exp field 15,
+        // mantissa 6); exponent field 15 with mantissa 7 is NaN.
+        const float maxValue = 448f;
+        if (a >= maxValue)
+        {
+            return (byte)(sign | 0x7E);
+        }
+
+        double mantissa = a;
+        int exp = 0;
+        while (mantissa >= 2.0)
+        {
+            mantissa /= 2.0;
+            exp++;
+        }
+        while (mantissa < 1.0)
+        {
+            mantissa *= 2.0;
+            exp--;
+        }
+        // mantissa ∈ [1, 2), exp such that value ≈ mantissa × 2^exp,
+        // e4m3 exponent field = exp + 7.
+        int field = exp + 7;
+        if (field <= 0)
+        {
+            // Subnormal: value = m/8 × 2⁻⁶ = m × 2⁻⁹.
+            long m = (long)Math.Round(a * 512.0, MidpointRounding.ToEven);
+            return (byte)(sign | (int)Math.Clamp(m, 0, 7));
+        }
+
+        long mant = (long)Math.Round((mantissa - 1.0) * 8.0, MidpointRounding.ToEven);
+        if (mant == 8)
+        {
+            mant = 0;
+            field++;
+        }
+        if (field > 15 || (field == 15 && mant >= 7))
+        {
+            return (byte)(sign | 0x7E);
+        }
+        return (byte)(sign | (field << 3) | (int)mant);
+    }
+
     // ── Bulk widening ──────────────────────────────────────────────────────
 
     /// <summary>Widen a per-tensor byte payload to f32, matching the
