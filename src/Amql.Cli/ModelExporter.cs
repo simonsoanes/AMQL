@@ -55,8 +55,12 @@ public static class ModelExporter
         var payloads = new List<TensorPayload>();
         var names = new Dictionary<string, string>(StringComparer.Ordinal);
         var notes = new List<string>();
-        int quantized = 0;
 
+        // ── pass 1 (header-only): the work list ─────────────────────────
+        // Tensor table reads alone, so the HF name reconstruction and its
+        // collision check stay deterministic regardless of parallelism.
+        var objectPrefixes = new Dictionary<string, string>(StringComparer.Ordinal);
+        var work = new List<(string ObjectId, string SegmentPath, SegmentTensor Tensor)>();
         foreach (var obj in graph.Objects)
         {
             if (obj.Representations.Count == 0)
@@ -78,39 +82,72 @@ public static class ModelExporter
                 continue;
             }
 
-            using var segment = SegmentFile.Open(Path.Combine(container.Root, segmentPath));
-            foreach (var tensor in segment.Header.Tensors)
+            objectPrefixes[obj.Id] = prefix;
+            using (var segment = SegmentFile.Open(Path.Combine(container.Root, segmentPath)))
             {
-                string hfName = prefix + "." + tensor.Name;
-                if (names.TryGetValue(hfName, out var other))
+                foreach (var tensor in segment.Header.Tensors)
                 {
-                    throw new CliException(
-                        $"export collision: tensor name '{hfName}' rebuilt for both '{other}' and '{obj.Id}'");
-                }
-                names[hfName] = obj.Id;
-
-                if (quantizeMxfp4 && ShouldQuantize(obj.Id, tensor.Name, tensor.Shape))
-                {
-                    AddQuantizedPayloads(payloads, names, obj.Id, hfName, tensor, store, patch);
-                    quantized++;
-                }
-                else
-                {
-                    payloads.Add(BuildExportPayload(store, obj.Id, tensor, patch, hfName));
+                    string hfName = prefix + "." + tensor.Name;
+                    if (names.TryGetValue(hfName, out var other))
+                    {
+                        throw new CliException(
+                            $"export collision: tensor name '{hfName}' rebuilt for both '{other}' and '{obj.Id}'");
+                    }
+                    names[hfName] = obj.Id;
+                    work.Add((obj.Id, segmentPath, tensor));
                 }
             }
         }
+
+        if (work.Count == 0)
+        {
+            throw new CliException("the container holds no materialised tensors — nothing to export");
+        }
+
+        // ── pass 2: build the payloads in parallel ─────────────────────
+        // Widening and quantisation dominate; each worker reads through its
+        // own segment mapping (memory-mapped views are not thread-shared) so
+        // only the small payload/name bookkeeping locks.
+        int workers = WorkerCount(Environment.ProcessorCount);
+        var lockObj = new object();
+        int quantized = 0;
+        Parallel.ForEach(work, new ParallelOptions { MaxDegreeOfParallelism = workers }, item =>
+        {
+            string hfName = objectPrefixes[item.ObjectId] + "." + item.Tensor.Name;
+            bool quantizing = quantizeMxfp4 && ShouldQuantize(item.ObjectId, item.Tensor.Name, item.Tensor.Shape);
+
+            using var segment = SegmentFile.Open(Path.Combine(container.Root, item.SegmentPath));
+            IReadOnlyList<TensorPayload> produced = quantizing
+                ? BuildQuantizedPayloads(item.ObjectId, segment, item.Tensor, patch, hfName)
+                : new[] { BuildExportPayload(item.ObjectId, segment, item.Tensor, patch, hfName) };
+
+            lock (lockObj)
+            {
+                foreach (var payload in produced)
+                {
+                    if (payload.Name != hfName && names.TryGetValue(payload.Name, out var owner))
+                    {
+                        throw new CliException(
+                            $"export collision: MXFP4 companion tensor '{payload.Name}' rebuilt for both '{owner}' and '{item.ObjectId}'");
+                    }
+                    names[payload.Name] = item.ObjectId;
+                    payloads.Add(payload);
+                }
+                if (quantizing)
+                {
+                    quantized++;
+                }
+            }
+        });
 
         if (quantized > 0)
         {
             notes.Add($"{quantized} stack projection tensors exported as MXFP4 (FP4 E2M1 grid elements, " +
                       $"per-{Mxfp4.BlockElements}-element {Dtype.F8_E8M0.Label()} scales) — " +
                       "embeddings, norms, biases and the output head keep their full precision");
-        }
-
-        if (payloads.Count == 0)
-        {
-            throw new CliException("the container holds no materialised tensors — nothing to export");
+            notes.Add($"export ran with {workers} parallel workers " +
+                      $"({Environment.ProcessorCount} cores" +
+                      (Environment.ProcessorCount > 10 ? ", two left spare" : string.Empty) + ")");
         }
 
         Directory.CreateDirectory(outDir);
@@ -142,11 +179,17 @@ public static class ModelExporter
     /// is added, and the result is re-encoded to the stored dtype. Dtypes
     /// without an encode path refuse if a patch touches them.
     /// </summary>
-    private static byte[] ExportTensor(OperandStore store, string objectId, SegmentTensor tensor, WeightPatch? patch)
+    private static byte[] ExportTensor(string objectId, SegmentFile segment, SegmentTensor tensor, WeightPatch? patch)
     {
         var dtype = DtypeExtensions.FromLabel(tensor.Dtype);
-        return EncodeToDtype(dtype, WidenedValues(store, objectId, tensor, patch));
+        return EncodeToDtype(dtype, WidenedValues(segment, objectId, tensor, patch));
     }
+
+    /// <summary>Parallel workers for the export payload pass: the core
+    /// count, leaving two cores spare once more than ten exist (the
+    /// machine is usually running other work).</summary>
+    public static int WorkerCount(int processorCount) =>
+        Math.Max(1, processorCount > 10 ? processorCount - 2 : processorCount);
 
     /// <summary>Payloads beyond this size page as chunked buffers — the
     /// 2 GiB single-array ceiling bites Qwen3.8-27B's embedding and lm_head
@@ -158,7 +201,7 @@ public static class ModelExporter
     /// widen-delta-re-encode for patched tensors (chunks in both
     /// directions).</summary>
     private static TensorPayload BuildExportPayload(
-        OperandStore store, string objectId, SegmentTensor tensor, WeightPatch? patch, string name)
+        string objectId, SegmentFile segment, SegmentTensor tensor, WeightPatch? patch, string name)
     {
         var dtype = DtypeExtensions.FromLabel(tensor.Dtype);
         bool patched = patch?.TryGet(objectId, tensor.Name, out _) == true;
@@ -166,7 +209,7 @@ public static class ModelExporter
 
         if (paged)
         {
-            var chunks = store.ReadPayloadChunks(objectId, tensor.Name);
+            var chunks = ReadChunked(segment, tensor.Name, tensor.Len);
             if (patched)
             {
                 patch!.TryGet(objectId, tensor.Name, out var entry);
@@ -186,9 +229,22 @@ public static class ModelExporter
             Name = name,
             Dtype = dtype,
             Shape = tensor.Shape,
-            Data = ExportTensor(store, objectId, tensor, patch),
+            Data = ExportTensor(objectId, segment, tensor, patch),
         };
     }
+
+    private static IReadOnlyList<byte[]> ReadChunked(SegmentFile segment, string tensorName, long length)
+    {
+        var chunks = new List<byte[]>();
+        for (long done = 0; done < length; done += ChunkBytes)
+        {
+            int count = (int)Math.Min(ChunkBytes, length - done);
+            chunks.Add(segment.ReadBytes(tensorName, done, count));
+        }
+        return chunks;
+    }
+
+    private const long ChunkBytes = 512L * 1024 * 1024;
 
     /// <summary>Widens a chunked payload to f32 without ever materialising
     /// the storage bytes as one buffer (boundaries are element-aligned for
@@ -232,11 +288,10 @@ public static class ModelExporter
 
     /// <summary>The tensor's f32 values (patch deltas applied when given)
     /// — the shared input for the encode and MXFP4 paths.</summary>
-    private static float[] WidenedValues(OperandStore store, string objectId, SegmentTensor tensor, WeightPatch? patch)
+    private static float[] WidenedValues(SegmentFile segment, string objectId, SegmentTensor tensor, WeightPatch? patch)
     {
-        var resolution = store.Resolve(objectId, tensor.Name);
         var dtype = DtypeExtensions.FromLabel(tensor.Dtype);
-        var widened = BitPattern.WidenToF32(dtype, resolution.Payload);
+        var widened = BitPattern.WidenToF32(dtype, segment.ReadBytes(tensor.Name));
         if (patch is not null && patch.TryGet(objectId, tensor.Name, out var entry))
         {
             if (entry.Delta.Length != WeightPatch.ElementCount(tensor.Shape))
@@ -264,46 +319,35 @@ public static class ModelExporter
         !tensorName.Contains("A_log") &&
         !tensorName.Contains("bias");
 
-    /// <summary>Replaces one weight tensor with its MXFP4 pair: the FP4
-    /// packed weight (logical shape, two elements per byte) and the
-    /// per-32-element E8M0 block scales.</summary>
-    private static void AddQuantizedPayloads(
-        List<TensorPayload> payloads,
-        Dictionary<string, string> names,
-        string objectId,
-        string hfName,
-        SegmentTensor tensor,
-        OperandStore store,
-        WeightPatch? patch)
+    /// <summary>Builds the MXFP4 pair for one weight tensor — the FP4 packed
+    /// weight (logical shape, two elements per byte) and the per-32-element
+    /// E8M0 block scales. The weight name was registered by the caller;
+    /// the companion name's collision guard runs under the caller's lock.</summary>
+    private static IReadOnlyList<TensorPayload> BuildQuantizedPayloads(
+        string objectId, SegmentFile segment, SegmentTensor tensor, WeightPatch? patch, string hfName)
     {
-        var values = WidenedValues(store, objectId, tensor, patch);
+        var values = WidenedValues(segment, objectId, tensor, patch);
         long rows = tensor.Shape[0];
         long columns = tensor.Shape[1];
         var quantized = Mxfp4.Quantize(values, rows, columns);
 
-        // The weight name itself was registered by the caller; only the
-        // companion tensor needs its own collision guard.
-        payloads.Add(new TensorPayload
+        return new[]
         {
-            Name = hfName,
-            Dtype = Dtype.FP4,
-            Shape = tensor.Shape,
-            Data = quantized.Packed,
-        });
-        string scaleName = hfName + Mxfp4.ScaleSuffix;
-        if (names.TryGetValue(scaleName, out var owner))
-        {
-            throw new CliException(
-                $"export collision: MXFP4 companion tensor '{scaleName}' rebuilt for both '{owner}' and '{objectId}'");
-        }
-        names[scaleName] = objectId;
-        payloads.Add(new TensorPayload
-        {
-            Name = scaleName,
-            Dtype = Dtype.F8_E8M0,
-            Shape = new[] { rows, Mxfp4.BlocksPerRow(columns) },
-            Data = quantized.BlockScales,
-        });
+            new TensorPayload
+            {
+                Name = hfName,
+                Dtype = Dtype.FP4,
+                Shape = tensor.Shape,
+                Data = quantized.Packed,
+            },
+            new TensorPayload
+            {
+                Name = hfName + Mxfp4.ScaleSuffix,
+                Dtype = Dtype.F8_E8M0,
+                Shape = new[] { rows, Mxfp4.BlocksPerRow(columns) },
+                Data = quantized.BlockScales,
+            },
+        };
     }
 
     /// <summary>f32 → the tensor's stored dtype bytes. Only dtypes with a

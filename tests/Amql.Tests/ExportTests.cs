@@ -18,6 +18,16 @@ namespace Amql.Tests;
 /// </summary>
 public class ExportTests
 {
+    [Theory]
+    [InlineData(1, 1)]
+    [InlineData(4, 4)]
+    [InlineData(10, 10)]  // ten cores: full count
+    [InlineData(11, 9)]   // over ten: two left spare
+    [InlineData(32, 30)]
+    public void WorkerCount_Leaves_Two_Cores_Spare_Over_Ten(int cores, int expected)
+    {
+        Assert.Equal(expected, ModelExporter.WorkerCount(cores));
+    }
     private static string WriteSynthContainer(TempDir dir)
     {
         var modelDir = Path.Combine(dir.Path, "model");
