@@ -4,6 +4,7 @@
     <ProjectReference Include="..\Amql.Safetensors\Amql.Safetensors.csproj" />
     <ProjectReference Include="..\Amql.Vindex3\Amql.Vindex3.csproj" />
     <ProjectReference Include="..\Amql.Hf\Amql.Hf.csproj" />
+    <ProjectReference Include="..\Amql.Inference\Amql.Inference.csproj" />
   </ItemGroup>
 
   <PropertyGroup>

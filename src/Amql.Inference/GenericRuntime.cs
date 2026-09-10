@@ -108,6 +108,7 @@ public sealed class GenericRuntime
         // FFN.
         if (layerPlan.Ffn is { IsPresent: true } ffn)
         {
+            FfnInputCapture?.Invoke(layer, hf);
             Tensor2D ffnOut;
             if (ffn.Dense is { } dense)
             {
@@ -556,6 +557,11 @@ public sealed class GenericRuntime
     /// weights here. The relationship router consumes this to name which
     /// (layer, head) tensors carry a token link.</summary>
     public List<LayerHeadAttention>? AttentionTrace { get; set; }
+
+    /// <summary>When set, the pre-FFN (normed) layer input is handed out per
+    /// layer as the layer runs — the MoE-ification sampler's activation
+    /// seam (see <c>amql-cli moe-ify</c>).</summary>
+    public Action<int, Tensor2D>? FfnInputCapture { get; set; }
 
     /// <summary>
     /// A residual-stream override: after <c>Layer</c> completes (mixer +

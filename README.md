@@ -329,3 +329,36 @@ the merged container tracks every token relationship in token-map.json and expor
 ```
 
 Both Qwen3.5 sizes ship the same 248,044-token vocabulary, so an 0.8B→2B merge is all-blended; merging a model family with a *different* tokenizer produces `aligned_new` rows for its extra tokens and `base_only` rows for the base's, with the new ids appended after the base vocabulary.
+
+### Restructuring a dense model into a routed MoE (`moe-ify`)
+
+`moe-ify` turns a dense transformer container into a mixture of experts in the MoEfication
+lineage — no training, quality gated by perplexity:
+
+```bash
+amql-cli moe-ify ./containers/Qwen3.8-27B --out ./containers/Qwen3.8-27B-moe \
+  --text ./corpus/wikipedia.txt --experts 8 --top-k 2 --sample 4096 --eval 1024
+```
+
+It samples FFN inputs through the model (a runtime activation seam), clusters each layer's
+intermediate units by co-activation into `--experts` **balanced** groups (k-means, cosine),
+slices the gate/up rows and down columns into per-expert tensors, and materialises a linear
+per-layer router (each expert's row is its cluster's mean gate direction — the affinity
+`x · routerᵀ` the routed kernel scores). The container is rebuilt with
+`mlp.router.weight` + `mlp.experts.{e}.{gate,up,down}_proj.weight` per layer, so the
+planner judges every FFN routed off-the-shelf and the existing top-k expert kernel runs it
+— no new runtime. Each expert's tensors are its own segment, so experts are separable for
+offload or distributed placement, and `export` (including `--quant mxfp4`) works unchanged.
+
+The held-out perplexity gate prints `dense → moe`. Measured on the 2-layer demo container
+(top-1, 2 experts): `dense 49.96 → moе 49.88 (−0.2%)`. The 27B is the real measurement —
+expect a larger PPL cost at sparsity, and the per-expert slices are a natural starting point
+for MoE-adaptation fine-tuning.
+
+```
+moе-ified:  demo-model-moe2x1
+routing:    2 experts × top-1 (expert intermediate 4) over 2 layers
+note:       sampled 6 tokens; 2 layers clustered into 2 balanced experts of 4 units
+note:       perplexity over 4 held-out tokens: dense 49.96 → moе 49.88 (-0.2%)
+wrote:      index.json, system_graph.json, segments/, tokenizer.json
+```

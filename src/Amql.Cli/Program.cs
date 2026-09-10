@@ -43,6 +43,7 @@ internal static class Program
                 "export" => Export(args[1..]),
                 "layers" => Layers(args[1..]),
                 "import" => Import(args[1..]),
+                "moe-ify" => MoeIfy(args[1..]),
                 _ => throw new CliException($"unknown command '{args[0]}'"),
             };
         }
@@ -933,6 +934,59 @@ internal static class Program
         return 0;
     }
 
+    // ── moe-ify: restructure a dense container into a routed MoE ──────────
+
+    private static int MoeIfy(string[] args)
+    {
+        var containerDir = Arg(args, 0) ?? throw new CliException(
+            "moe-ify requires a container directory, e.g. 'amql-cli moe-ify <container-dir> --out <moe-dir> --text <corpus.txt>'");
+        string outDir = OptionValue(args, "--out") ?? throw new CliException("moe-ify requires '--out <moe-dir>'");
+        string textPath = OptionValue(args, "--text") ?? throw new CliException("moe-ify requires '--text <corpus.txt>'");
+        int experts = IntOption(args, "--experts", 8);
+        int topK = IntOption(args, "--top-k", 2);
+        int sample = IntOption(args, "--sample", 4096);
+        int eval = IntOption(args, "--eval", 1024);
+        bool renormalise = (OptionValue(args, "--policy") ?? "softmax") == "renormalise";
+
+        string text;
+        try
+        {
+            text = File.ReadAllText(textPath);
+        }
+        catch (IOException e)
+        {
+            throw new CliException($"cannot read corpus '{textPath}': {e.Message}");
+        }
+        var tokenizer = HfTokenizer.FromModelDir(containerDir);
+        var ids = tokenizer.EncodeToIds(text);
+        if (ids.Count < sample + eval)
+        {
+            throw new CliException(
+                $"corpus encodes to {ids.Count} tokens — need at least {sample + eval} for sampling and evaluation");
+        }
+        var clusterTokens = ids.Take(sample).ToList();
+        var evalTokens = ids.Skip(sample).Take(eval).ToList();
+
+        var policy = renormalise
+            ? ExpertRoutingPolicy.NormalisedOverSelected
+            : ExpertRoutingPolicy.SoftmaxThenSelect;
+        var report = Amql.Merge.MoeIfy.Transform(
+            containerDir, outDir, clusterTokens, evalTokens, experts, topK, policy);
+
+        Console.WriteLine($"moе-ified:  {report.Model}");
+        Console.WriteLine($"routing:    {report.Experts} experts × top-{report.TopK} " +
+                          $"(expert intermediate {report.ExpertIntermediateSize}) over {report.Layers} layers");
+        foreach (var note in report.Notes)
+        {
+            Console.WriteLine($"note:       {note}");
+        }
+        Console.WriteLine("wrote:      index.json, system_graph.json, segments/, tokenizer.json");
+        Console.WriteLine("every FFN is now judged routed and runs the top-k expert kernel — verify and export as usual:");
+        Console.WriteLine($"  amql-cli verify {outDir}");
+        Console.WriteLine($"  amql-cli export {outDir} --out <checkpoint-dir> [--quant mxfp4]");
+        return 0;
+    }
+
     // ── patch option plumbing ──────────────────────────────────────────────
 
     private static double DoubleOption(string[] args, string name, double fallback) =>
@@ -996,6 +1050,9 @@ internal static class Program
               amql-cli layers <container-dir> [--component target]
               amql-cli import <container-dir> <model> --out <merged-dir>
                               [--container]
+              amql-cli moe-ify <container-dir> --out <moe-dir> --text <corpus.txt>
+                              [--experts 8] [--top-k 2] [--sample 4096] [--eval 1024]
+                              [--policy softmax|renormalise]
               amql-cli help
 
             Example:
@@ -1040,6 +1097,17 @@ internal static class Program
             preserved under segments/source/. Pass --container when the
             model to import is itself a container rather than a checkpoint
             directory.
+            moe-ify restructures a DENSE container into a routed mixture
+            of experts: it samples FFN inputs through the model, clusters
+            each layer's intermediate units by co-activation into
+            balanced --experts, slices the gate/up rows and down columns
+            into per-expert tensors (each expert its own segment — the
+            "separate enough to run as such" guarantee), materialises a
+            linear per-layer router (--policy softmax|renormalise), and
+            rebuilds the container so every FFN is judged routed and runs
+            the top-k expert kernel. The held-out perplexity gate prints
+            dense → moе for the chosen --eval tokens; --sample tokens
+            drive the clustering.
             Any pathway (route, path, generate, inspect-token, and
             tokens/decode, which parse but cannot be affected) accepts
             --patch to run with the patch's deltas merged into the loaded
