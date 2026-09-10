@@ -175,6 +175,7 @@ public sealed class Vindex3Container : IDisposable
     {
         var checks = new List<IntegrityCheck>();
         bool ok = true;
+        var lengthBytes = new byte[8];
 
         foreach (var (representationId, entry) in Index.Representations)
         {
@@ -186,44 +187,60 @@ public sealed class Vindex3Container : IDisposable
                 continue;
             }
 
-            byte[] fileBytes;
             try
             {
-                fileBytes = File.ReadAllBytes(segmentFile);
+                // A segment can exceed the 2 GiB single-array ceiling
+                // (Qwen3.8-27B's decoder stack is 48 GB), so the hashes are
+                // computed over streams, never over a whole-file buffer.
+                using (var stream = File.OpenRead(segmentFile))
+                {
+                    int read = stream.ReadAtLeast(lengthBytes, lengthBytes.Length);
+                    if (read != lengthBytes.Length)
+                    {
+                        checks.Add(new IntegrityCheck(representationId, false, "segment file truncated (header)"));
+                        ok = false;
+                        continue;
+                    }
+
+                    // Re-derive payload bounds from the segment header,
+                    // exactly what the writer produced.
+                    long headerLength = BitConverter.ToInt64(lengthBytes);
+                    long payloadStart = checked(8 + headerLength);
+
+                    string whole;
+                    string payload;
+                    using (var wholeStream = File.OpenRead(segmentFile))
+                    {
+                        whole = Convert.ToHexStringLower(SHA256.HashData(wholeStream));
+                    }
+                    using (var payloadStream = File.OpenRead(segmentFile))
+                    {
+                        payloadStream.Position = payloadStart;
+                        payload = Convert.ToHexStringLower(SHA256.HashData(payloadStream));
+                    }
+
+                    bool wholeOk = whole == entry.SegmentSha256;
+                    bool payloadOk = payload == entry.PayloadSha256;
+                    if (!wholeOk || !payloadOk)
+                    {
+                        ok = false;
+                        string wholeDetail = wholeOk ? "✓" : $"✗ (actual {whole})";
+                        string payloadDetail = payloadOk ? "✓" : $"✗ (actual {payload})";
+                        checks.Add(new IntegrityCheck(
+                            representationId,
+                            false,
+                            $"segment_sha256 {wholeDetail} | payload_sha256 {payloadDetail}"));
+                    }
+                    else
+                    {
+                        checks.Add(new IntegrityCheck(representationId, true, null));
+                    }
+                }
             }
             catch (IOException e)
             {
                 checks.Add(new IntegrityCheck(representationId, false, $"unreadable: {e.Message}"));
                 ok = false;
-                continue;
-            }
-
-            // Re-derive payload bounds from the segment header, exactly what
-            // the writer produced.
-            long headerLength = BitConverter.ToInt64(fileBytes, 0);
-            long payloadStart = checked(8 + headerLength);
-
-            string whole = Convert.ToHexStringLower(SHA256.HashData(fileBytes));
-            string payload = payloadStart >= fileBytes.Length
-                ? string.Empty
-                : Convert.ToHexStringLower(SHA256.HashData(
-                    fileBytes.AsSpan((int)payloadStart).ToArray()));
-
-            bool wholeOk = whole == entry.SegmentSha256;
-            bool payloadOk = payload == entry.PayloadSha256;
-            if (!wholeOk || !payloadOk)
-            {
-                ok = false;
-                string wholeDetail = wholeOk ? "✓" : $"✗ (actual {whole})";
-                string payloadDetail = payloadOk ? "✓" : $"✗ (actual {payload})";
-                checks.Add(new IntegrityCheck(
-                    representationId,
-                    false,
-                    $"segment_sha256 {wholeDetail} | payload_sha256 {payloadDetail}"));
-            }
-            else
-            {
-                checks.Add(new IntegrityCheck(representationId, true, null));
             }
         }
 

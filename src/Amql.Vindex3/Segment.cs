@@ -61,7 +61,7 @@ public static class SegmentWriter
         foreach (var tensor in ordered)
         {
             entries.Add((tensor, cursor));
-            cursor += tensor.Data.Length;
+            cursor += tensor.PayloadLength;
         }
 
         // ── header JSON ──────────────────────────────────────────────────
@@ -86,7 +86,7 @@ public static class SegmentWriter
                 }
                 writer.WriteEndArray();
                 writer.WriteNumber("offset", from);
-                writer.WriteNumber("len", tensor.Data.Length);
+                writer.WriteNumber("len", tensor.PayloadLength);
                 writer.WriteEndObject();
             }
             writer.WriteEndArray();
@@ -127,9 +127,21 @@ public static class SegmentWriter
 
             foreach (var (tensor, _) in entries)
             {
-                file.Write(tensor.Data);
-                fileSha.AppendData(tensor.Data);
-                payloadSha.AppendData(tensor.Data);
+                if (tensor.Chunks is { } chunks)
+                {
+                    foreach (var chunk in chunks)
+                    {
+                        file.Write(chunk);
+                        fileSha.AppendData(chunk);
+                        payloadSha.AppendData(chunk);
+                    }
+                }
+                else
+                {
+                    file.Write(tensor.Data);
+                    fileSha.AppendData(tensor.Data);
+                    payloadSha.AppendData(tensor.Data);
+                }
             }
         }
 
@@ -147,7 +159,18 @@ public sealed record NamedTensorData
     public required string Name { get; init; }
     public required Dtype Dtype { get; init; }
     public required long[] Shape { get; init; }
-    public required byte[] Data { get; init; }
+
+    /// <summary>The raw payload.</summary>
+    public byte[] Data { get; init; } = Array.Empty<byte>();
+
+    /// <summary>Chunked payload for tensors beyond the 2 GiB single-buffer
+    /// ceiling — when present its concatenation IS the payload and
+    /// <see cref="Data"/> is ignored.</summary>
+    public IReadOnlyList<byte[]>? Chunks { get; init; }
+
+    public long PayloadLength => Chunks is { } chunks
+        ? chunks.Sum(c => (long)c.Length)
+        : Data.Length;
 
     /// <summary>Shape/dtype/payload agreement — the reference's tensor
     /// fact validation.</summary>
@@ -165,10 +188,10 @@ public sealed record NamedTensorData
         long expected = Dtype == Dtype.FP4
             ? checked((elements + 1) / 2) // two elements per packed byte
             : checked(elements * Dtype.ElementSize());
-        if (Data.Length != expected)
+        if (PayloadLength != expected)
         {
             throw new ContainerException(
-                $"tensor '{Name}': payload has {Data.Length} bytes but dtype {Dtype.Label()} " +
+                $"tensor '{Name}': payload has {PayloadLength} bytes but dtype {Dtype.Label()} " +
                 $"shape [{string.Join(",", Shape)}] requires {expected}");
         }
     }
@@ -284,6 +307,25 @@ public sealed class SegmentFile : IDisposable
         if (tensor.Len > 0)
         {
             _accessor.ReadArray(checked(PayloadStart + tensor.Offset), buffer, 0, checked((int)tensor.Len));
+        }
+        return buffer;
+    }
+
+    /// <summary>Copies a sub-range of a tensor payload out of the mapping —
+    /// chunked reads for operands beyond the 2 GiB single-buffer ceiling
+    /// (Qwen3.8-27B's 2.37 GiB embedding).</summary>
+    public byte[] ReadBytes(string name, long offset, int count)
+    {
+        var tensor = GetTensor(name);
+        if (offset < 0 || count < 0 || offset + count > tensor.Len)
+        {
+            throw new ContainerException(
+                $"segment '{Path}': range [{offset}, {offset + count}) is outside '{name}' ({tensor.Len} bytes)");
+        }
+        var buffer = new byte[count];
+        if (count > 0)
+        {
+            _accessor.ReadArray(checked(PayloadStart + tensor.Offset + offset), buffer, 0, count);
         }
         return buffer;
     }

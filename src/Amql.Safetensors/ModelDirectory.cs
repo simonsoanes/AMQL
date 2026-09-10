@@ -81,6 +81,14 @@ public sealed class ModelDirectory : IDisposable
 
     public byte[] ReadRawBytes(string name) => Get(name).File.ReadBytes(name);
 
+    /// <summary>Reads a sub-range of a shard tensor's payload — chunked
+    /// reads for tensors beyond the 2 GiB single-buffer ceiling.</summary>
+    public byte[] ReadBytes(string name, long offset, int count)
+    {
+        var (file, info) = Get(name);
+        return file.ReadBytes(info, offset, count);
+    }
+
     public float[] DecodeF32(string name) => Get(name).File.DecodeF32(name);
 
     /// <summary>

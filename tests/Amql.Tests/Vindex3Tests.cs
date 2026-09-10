@@ -50,6 +50,97 @@ public class Vindex3Tests
     }
 
     [Fact]
+    public void Segment_Writes_Chunked_Payloads_Verbatim()
+    {
+        using var dir = new TempDir();
+        var path = Path.Combine(dir.Path, "segments", "chunked.bin");
+
+        // The 2.5 GiB embedding belongs to no single byte[]: the encoder
+        // hands the writer 512 MB chunks and the payload must come back
+        // byte-identical, hashes included.
+        var chunks = new List<byte[]>();
+        long total = 0;
+        var random = new Random(4);
+        for (int c = 0; c < 3; c++)
+        {
+            var chunk = new byte[4 * 1024 * 1024];
+            random.NextBytes(chunk);
+            chunks.Add(chunk);
+            total += chunk.Length;
+        }
+        var expected = chunks.SelectMany(c => c).ToArray();
+
+        var result = SegmentWriter.Write(path, "target.embedding@BF16", new[]
+        {
+            new NamedTensorData
+            {
+                Name = "weight",
+                Dtype = Dtype.BF16,
+                Shape = new long[] { total / 2, 1 },
+                Data = Array.Empty<byte>(),
+                Chunks = chunks,
+            },
+        });
+        Assert.Equal(total, result.PayloadBytes);
+
+        using var segment = SegmentFile.Open(path);
+        var tensor = Assert.Single(segment.Header.Tensors);
+        Assert.Equal(total, tensor.Len);
+        Assert.Equal(expected, segment.ReadBytes("weight"));
+
+        // The on-disk segment hash is computed over the same bytes as the
+        // un-chunked writer would produce.
+        var single = SegmentWriter.Write(
+            Path.Combine(dir.Path, "segments", "chunked-single.bin"),
+            "target.embedding@BF16",
+            new[]
+            {
+                new NamedTensorData
+                {
+                    Name = "weight",
+                    Dtype = Dtype.BF16,
+                    Shape = new long[] { total / 2, 1 },
+                    Data = expected,
+                },
+            });
+        Assert.Equal(result.PayloadSha256Hex, single.PayloadSha256Hex);
+        Assert.Equal(result.SegmentSha256Hex, single.SegmentSha256Hex);
+    }
+
+    [Fact]
+    public void Segment_Pages_Ranged_Reads_Equal_The_Whole_Payload()
+    {
+        using var dir = new TempDir();
+        var path = Path.Combine(dir.Path, "segments", "paged.bin");
+
+        var random = new Random(9);
+        var expected = new byte[16 * 1024 * 1024];
+        random.NextBytes(expected);
+        SegmentWriter.Write(path, "target.embedding@F32", new[]
+        {
+            new NamedTensorData
+            {
+                Name = "weight",
+                Dtype = Dtype.F32,
+                Shape = new long[] { expected.Length / 4, 1 },
+                Data = expected,
+            },
+        });
+
+        using var segment = SegmentFile.Open(path);
+        var chunks = new List<byte[]>();
+        for (long done = 0; done < expected.Length; done += 3 * 1024 * 1024)
+        {
+            int count = (int)Math.Min(3 * 1024 * 1024, expected.Length - done);
+            chunks.Add(segment.ReadBytes("weight", done, count));
+        }
+        Assert.Equal(expected, chunks.SelectMany(c => c).ToArray());
+
+        var ex = Assert.Throws<ContainerException>(() => segment.ReadBytes("weight", expected.Length - 1, 2));
+        Assert.Contains("outside", ex.Message);
+    }
+
+    [Fact]
     public void Segment_Refuses_WrongSchema()
     {
         // Build a header with schema 99 and confirm the reader refuses

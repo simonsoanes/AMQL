@@ -67,6 +67,39 @@ public sealed class OperandStore : IDisposable
         return new OperandResolution(DtypeExtensions.FromLabel(tensor.Dtype), tensor.Shape, payload);
     }
 
+    /// <summary>Reads a tensor payload as chunked buffers (each up to
+    /// <paramref name="chunkBytes"/> long, concatenated in order) — a
+    /// single operand can exceed the 2 GiB array ceiling (Qwen3.8-27B's
+    /// 2.37 GiB embedding), and chunked consumers never materialise it as
+    /// one buffer.</summary>
+    public IReadOnlyList<byte[]> ReadPayloadChunks(
+        string objectId, string tensorName, int chunkBytes = 512 * 1024 * 1024)
+    {
+        ThrowIfDisposed();
+
+        var representationId = _container.CanonicalRepresentationId(objectId);
+        if (!_container.Index.Representations.TryGetValue(representationId, out var entry))
+        {
+            throw new ContainerException(
+                $"object '{objectId}' has no representation entry '{representationId}' in index.representations");
+        }
+
+        var segment = OpenSegment(entry.Segment);
+        var tensor = segment.GetTensor(tensorName);
+        long remaining = tensor.Len;
+        var chunks = new List<byte[]>();
+        for (long done = 0; done < tensor.Len; done += chunkBytes)
+        {
+            int count = (int)Math.Min(chunkBytes, remaining);
+            chunks.Add(segment.ReadBytes(tensorName, done, count));
+            remaining -= count;
+        }
+
+        _touched.Add(objectId);
+        Loads++;
+        return chunks;
+    }
+
     /// <summary>Whether the object's segment carries the named tensor.
     /// Operand-closure probing: the planner binds what actually exists and
     /// refuses what is missing — never guesses a spelling.</summary>

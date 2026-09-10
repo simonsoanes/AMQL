@@ -54,7 +54,7 @@ amql-cli change-tensor <container-dir> <object> <tensor> <cell>
 amql-cli save-lora <patch.safetensors> --out <lora-dir>
                 [--rank 8] [--alpha 16] [--container <container-dir>]
 amql-cli export <container-dir> --out <checkpoint-dir>
-                [--patch <patch.safetensors>]
+                [--patch <patch.safetensors>] [--quant mxfp4]
 amql-cli layers <container-dir> [--component target]
 amql-cli import <container-dir> <model> --out <merged-dir>
                 [--container]
@@ -215,7 +215,9 @@ apply to the base container: for each target, add scale · lora_B · lora_A to t
 
 ### Exporting the container back to an original model (`export`)
 
-`export` is the inverse of `encode`: it materialises a plain HF checkpoint directory (`config.json` + `model.safetensors` + `tokenizer.json`) from the container, so the model leaves the VINDEX3 world as an ordinary model again. HF tensor names are rebuilt from the graph's source bindings; `config.json` is regenerated from the judged graph facts (operator table, surface geometry, rope/position, vocabulary), and any `--patch` deltas are **baked into the stored tensors** — widened to f32, the delta added, then re-encoded to the tensor's own dtype (BF16/F32/…). Tensors a patch never touches are copied byte-identically, so an unpatched export is byte-exact; an operator without a judged `layer_types` spelling refuses the export by name rather than being approximated, and the tied output head is skipped with a note (it reuses the embedding table).
+`export` is the inverse of `encode`: it materialises a plain HF checkpoint directory (`config.json` + `model.safetensors` + `tokenizer.json`) from the container, so the model leaves the VINDEX3 world as an ordinary model again. HF tensor names are rebuilt from the graph's source bindings; `config.json` is regenerated from the judged graph facts (operator table, surface geometry, rope/position, vocabulary), and any `--patch` deltas are **baked into the stored tensors** — widened to f32, the delta added, then re-encoded to the tensor's own dtype (BF16/F32/…). Tensors a patch never touches are copied byte-identically, so an unpatched export is byte-exact; an operator without a judged `layer_types` spelling refuses the export by name rather than being approximated, and the tied output head is skipped with a note (it reuses the embedding table). Pass `--quant mxfp4` to export the
+model as a 4-bit quantized checkpoint instead — see the "Exporting a quantized checkpoint"
+section below.
 
 ```bash
 # bake every delta in patches/capital.safetensors into the weights

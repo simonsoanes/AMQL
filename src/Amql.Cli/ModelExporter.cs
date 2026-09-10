@@ -96,13 +96,7 @@ public static class ModelExporter
                 }
                 else
                 {
-                    payloads.Add(new TensorPayload
-                    {
-                        Name = hfName,
-                        Dtype = DtypeExtensions.FromLabel(tensor.Dtype),
-                        Shape = tensor.Shape,
-                        Data = ExportTensor(store, obj.Id, tensor, patch),
-                    });
+                    payloads.Add(BuildExportPayload(store, obj.Id, tensor, patch, hfName));
                 }
             }
         }
@@ -137,7 +131,7 @@ public static class ModelExporter
             outDir,
             container.Index.Model,
             payloads.Count,
-            payloads.Sum(p => (long)p.Data.Length),
+            payloads.Sum(p => p.PayloadLength),
             notes);
     }
 
@@ -152,6 +146,88 @@ public static class ModelExporter
     {
         var dtype = DtypeExtensions.FromLabel(tensor.Dtype);
         return EncodeToDtype(dtype, WidenedValues(store, objectId, tensor, patch));
+    }
+
+    /// <summary>Payloads beyond this size page as chunked buffers — the
+    /// 2 GiB single-array ceiling bites Qwen3.8-27B's embedding and lm_head
+    /// (2.37 GiB each).</summary>
+    private const long LargePayloadThresholdBytes = 1L << 30; // 1 GiB
+
+    /// <summary>Pages a tensor's payload for the shard: verbatim for
+    /// unpatched tensors (single buffer below the ceiling, chunks above),
+    /// widen-delta-re-encode for patched tensors (chunks in both
+    /// directions).</summary>
+    private static TensorPayload BuildExportPayload(
+        OperandStore store, string objectId, SegmentTensor tensor, WeightPatch? patch, string name)
+    {
+        var dtype = DtypeExtensions.FromLabel(tensor.Dtype);
+        bool patched = patch?.TryGet(objectId, tensor.Name, out _) == true;
+        bool paged = tensor.Len > LargePayloadThresholdBytes;
+
+        if (paged)
+        {
+            var chunks = store.ReadPayloadChunks(objectId, tensor.Name);
+            if (patched)
+            {
+                patch!.TryGet(objectId, tensor.Name, out var entry);
+                return new TensorPayload
+                {
+                    Name = name,
+                    Dtype = dtype,
+                    Shape = tensor.Shape,
+                    Chunks = EncodeChunks(dtype, ApplyDelta(WidenFromChunks(chunks, dtype), entry.Delta)),
+                };
+            }
+            return new TensorPayload { Name = name, Dtype = dtype, Shape = tensor.Shape, Chunks = chunks };
+        }
+
+        return new TensorPayload
+        {
+            Name = name,
+            Dtype = dtype,
+            Shape = tensor.Shape,
+            Data = ExportTensor(store, objectId, tensor, patch),
+        };
+    }
+
+    /// <summary>Widens a chunked payload to f32 without ever materialising
+    /// the storage bytes as one buffer (boundaries are element-aligned for
+    /// every byte size this build widens).</summary>
+    private static float[] WidenFromChunks(IReadOnlyList<byte[]> chunks, Dtype dtype)
+    {
+        long elements = chunks.Sum(c => (long)c.Length) / dtype.ElementSize();
+        var values = new float[elements];
+        int offset = 0;
+        foreach (var chunk in chunks)
+        {
+            var widened = BitPattern.WidenToF32(dtype, chunk);
+            Array.Copy(widened, 0, values, offset, widened.Length);
+            offset += widened.Length;
+        }
+        return values;
+    }
+
+    private static float[] ApplyDelta(float[] values, float[] delta)
+    {
+        for (int i = 0; i < values.Length; i++)
+        {
+            values[i] += delta[i];
+        }
+        return values;
+    }
+
+    /// <summary>Re-encodes in pages so the result never exceeds the 2 GiB
+    /// ceiling (each page covers <paramref name="pageElements"/> elements,
+    /// ~256 MiB of storage).</summary>
+    private static IReadOnlyList<byte[]> EncodeChunks(Dtype dtype, float[] values, int pageElements = 1 << 26)
+    {
+        var chunks = new List<byte[]>();
+        for (int start = 0; start < values.Length; start += pageElements)
+        {
+            int count = Math.Min(pageElements, values.Length - start);
+            chunks.Add(EncodeToDtype(dtype, values.AsSpan(start, count).ToArray()));
+        }
+        return chunks;
     }
 
     /// <summary>The tensor's f32 values (patch deltas applied when given)

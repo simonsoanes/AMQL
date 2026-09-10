@@ -48,6 +48,28 @@ public sealed class HfInventory : IDisposable
     /// <summary>Raw payload bytes — read verbatim from the mapping.</summary>
     public byte[] ReadBytes(string fullName) => _model.ReadRawBytes(fullName);
 
+    /// <summary>Maximum payload actually buffered as one array. Tensors
+    /// larger than this are handed to the encoder as chunks, because a
+    /// single byte[] cannot exceed the 2 GiB ceiling (Qwen3.8-27B's
+    /// 2.5 GiB embedding).</summary>
+    public const long MaxBufferedPayloadBytes = 1L << 30; // 1 GiB
+
+    /// <summary>Reads a tensor's raw payload as chunked buffers (each up to
+    /// <paramref name="chunkBytes"/> long), concatenated in order.</summary>
+    public IReadOnlyList<byte[]> ReadChunks(string fullName, int chunkBytes = 512 * 1024 * 1024)
+    {
+        var info = Get(fullName);
+        var chunks = new List<byte[]>();
+        long remaining = info.DataLength;
+        for (long done = 0; done < info.DataLength; done += chunkBytes)
+        {
+            int count = (int)Math.Min(chunkBytes, remaining);
+            chunks.Add(_model.ReadBytes(fullName, done, count));
+            remaining -= count;
+        }
+        return chunks;
+    }
+
     /// <summary>Number of tensors whose name starts with the prefix.</summary>
     public int CountUnder(string prefix) => _model.TensorNames.Count(n => n.StartsWith(prefix, StringComparison.Ordinal));
 

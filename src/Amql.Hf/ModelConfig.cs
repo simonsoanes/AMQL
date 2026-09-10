@@ -44,23 +44,8 @@ public sealed record TextArchitectureFacts(
     long MaxPositionEmbeddings,
     IReadOnlyList<string> LayerTypes,
     JsonElement RopeParameters,
-    LinearAttentionFacts? LinearAttention)
-{
-    /// <summary>Rotary subspace: the partial factor (0.25 for this family)
-    /// times the head dim — the width the MRoPE sections rotate.</summary>
-    public double PartialRotaryFactor
-    {
-        get
-        {
-            if (RopeParameters.ValueKind == JsonValueKind.Object &&
-                RopeParameters.TryGetProperty("partial_rotary_factor", out var pf))
-            {
-                return pf.GetDouble();
-            }
-            return 1.0;
-        }
-    }
-}
+    LinearAttentionFacts? LinearAttention,
+    double PartialRotaryFactor);
 
 /// <summary>G1 reader: <c>config.json</c> → <see cref="TextArchitectureFacts"/>.</summary>
 public static class ModelConfig
@@ -121,6 +106,31 @@ public static class ModelConfig
                     ck.GetInt32(), khe.GetInt32(), khd.GetInt32(), vhe.GetInt32(), vhd.GetInt32());
             }
 
+            // Partial rotary factor, in the reference's precedence
+            // (`PreTrainedConfig::standardize_rope_params`, transformers 5.x):
+            //  1. top-level `partial_rotary_factor` — the legacy flat form,
+            //     which the reference copies INTO rope_parameters;
+            //  2. rope_parameters.full_attention.partial_rotary_factor — the
+            //     per-layer-type form (Gemma 4);
+            //  3. rope_parameters.partial_rotary_factor — the 5.x flat form.
+            // Qwen3.8 writes forms 1 and 3 together (both 0.25); reading form
+            // 1 first matches the reference exactly.
+            double partialRotaryFactor = 1.0;
+            if (text.TryGetProperty("partial_rotary_factor", out var topLevelPf))
+            {
+                partialRotaryFactor = topLevelPf.GetDouble();
+            }
+            else if (rope.TryGetProperty("full_attention", out var fa) &&
+                     fa.ValueKind == JsonValueKind.Object &&
+                     fa.TryGetProperty("partial_rotary_factor", out var faPf))
+            {
+                partialRotaryFactor = faPf.GetDouble();
+            }
+            else if (rope.TryGetProperty("partial_rotary_factor", out var flatPf))
+            {
+                partialRotaryFactor = flatPf.GetDouble();
+            }
+
             return new TextArchitectureFacts(
                 ModelType: text.GetProperty("model_type").GetString() ?? "unknown",
                 HiddenSize: Int(text, "hidden_size"),
@@ -138,7 +148,8 @@ public static class ModelConfig
                 MaxPositionEmbeddings: Long(text, "max_position_embeddings"),
                 LayerTypes: layerTypes,
                 RopeParameters: rope,
-                LinearAttention: linear);
+                LinearAttention: linear,
+                PartialRotaryFactor: partialRotaryFactor);
         }
     }
 

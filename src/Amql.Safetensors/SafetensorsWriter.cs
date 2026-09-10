@@ -12,7 +12,18 @@ public sealed record TensorPayload
 
     public required long[] Shape { get; init; }
 
-    public required byte[] Data { get; init; }
+    /// <summary>The raw payload. Tensors beyond the 2 GiB single-buffer
+    /// ceiling travel as <see cref="Chunks"/> instead (concatenated in
+    /// order); <see cref="Data"/> is then empty.</summary>
+    public byte[] Data { get; init; } = Array.Empty<byte>();
+
+    /// <summary>Chunked payload; when present its concatenation IS the
+    /// payload and <see cref="Data"/> is ignored.</summary>
+    public IReadOnlyList<byte[]>? Chunks { get; init; }
+
+    public long PayloadLength => Chunks is { } chunks
+        ? chunks.Sum(c => (long)c.Length)
+        : Data.Length;
 
     public void Validate()
     {
@@ -22,7 +33,7 @@ public sealed record TensorPayload
             Dtype = Dtype,
             Shape = Shape,
             DataStart = 0,
-            DataLength = Data.Length,
+            DataLength = PayloadLength,
         };
         info.Validate();
     }
@@ -67,7 +78,17 @@ public static class SafetensorsWriter
         }
         foreach (var tensor in ordered)
         {
-            file.Write(tensor.Data);
+            if (tensor.Chunks is { } chunks)
+            {
+                foreach (var chunk in chunks)
+                {
+                    file.Write(chunk);
+                }
+            }
+            else
+            {
+                file.Write(tensor.Data);
+            }
         }
     }
 
@@ -84,7 +105,7 @@ public static class SafetensorsWriter
         long cursor = 0;
         foreach (var tensor in ordered)
         {
-            cursor += tensor.Data.Length;
+            cursor += tensor.PayloadLength;
         }
 
         int storedLength = headerJson.Length + pad;
@@ -96,7 +117,19 @@ public static class SafetensorsWriter
         long payloadOffset = SafetensorsFile.HeaderLengthBytes + headerJson.Length + pad;
         foreach (var tensor in ordered)
         {
-            tensor.Data.CopyTo(file, payloadOffset);
+            if (tensor.Chunks is { } chunks)
+            {
+                foreach (var chunk in chunks)
+                {
+                    chunk.CopyTo(file, payloadOffset);
+                    payloadOffset += chunk.Length;
+                }
+            }
+            else
+            {
+                tensor.Data.CopyTo(file, payloadOffset);
+                payloadOffset += tensor.Data.Length;
+            }
         }
         return file;
     }
@@ -110,8 +143,8 @@ public static class SafetensorsWriter
         long cursor = 0;
         foreach (var tensor in ordered)
         {
-            entries[tensor.Name] = (cursor, cursor + tensor.Data.Length);
-            cursor += tensor.Data.Length;
+            entries[tensor.Name] = (cursor, cursor + tensor.PayloadLength);
+            cursor += tensor.PayloadLength;
         }
 
         using var buffer = new MemoryStream();

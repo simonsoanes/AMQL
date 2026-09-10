@@ -129,6 +129,43 @@ public class SafetensorsTests
     }
 
     [Fact]
+    public void Writer_Pages_Chunked_Payloads_Verbatim()
+    {
+        using var dir = new TempDir();
+        var path = Path.Combine(dir.Path, "paged.safetensors");
+
+        // Above the 2 GiB single-buffer ceiling a tensor arrives as chunks;
+        // their concatenation must land byte-identical with correct header
+        // offsets (the Qwen3.8-27B embedding is 2.37 GiB).
+        var random = new Random(5);
+        var chunks = new List<byte[]>();
+        long total = 0;
+        for (int c = 0; c < 3; c++)
+        {
+            var chunk = new byte[4 * 1024 * 1024];
+            random.NextBytes(chunk);
+            chunks.Add(chunk);
+            total += chunk.Length;
+        }
+        var expected = chunks.SelectMany(c => c).ToArray();
+
+        SafetensorsWriter.Write(path, new[]
+        {
+            new TensorPayload
+            {
+                Name = "weight",
+                Dtype = Dtype.BF16,
+                Shape = new long[] { total / 2, 1 },
+                Chunks = chunks,
+            },
+        });
+
+        using var file = SafetensorsFile.Open(path);
+        Assert.Equal(total, file.GetTensor("weight").DataLength);
+        Assert.Equal(expected, file.ReadBytes("weight"));
+    }
+
+    [Fact]
     public void Empty_Header_Has_No_Tensors_And_Reads_Fail_Loudly()
     {
         using var dir = new TempDir();

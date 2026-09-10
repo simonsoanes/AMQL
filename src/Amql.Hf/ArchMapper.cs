@@ -133,6 +133,11 @@ public static class ArchMapper
         Dtype encodingDtype = DtypeExtensions.FromLabel(encoding);
 
         // ── logical objects ──────────────────────────────────────────────
+        // Qwen3.5 ships the output head either tied to the embedding (no
+        // lm_head tensor) or — as Qwen3.8 does — untied, with the 248k-row
+        // lm_head named at the TOP level of the wrapper checkpoint, not
+        // under the text prefix.
+        bool untied = !facts.TieWordEmbeddings;
         var objects = new List<LogicalObject>
         {
             TextObject("target.embedding", ObjectKind.Embedding, prefix, "embed_tokens", encoding),
@@ -143,8 +148,18 @@ public static class ArchMapper
                 Id = "target.output_head",
                 Component = "target",
                 Kind = ObjectKind.OutputHead,
-                SourceBindings = new List<SourceBinding>(),
-                Representations = new List<Representation>(), // tied: no dedicated segment
+                SourceBindings = untied
+                    ? new List<SourceBinding>
+                    {
+                        new() { Artifact = prefix, TensorPrefix = "lm_head", Tensors = 1, Bytes = 0 },
+                    }
+                    : new List<SourceBinding>(),
+                Representations = untied
+                    ? new List<Representation>
+                    {
+                        new() { Encoding = encoding, Fidelity = Fidelity.Canonical },
+                    }
+                    : new List<Representation>(), // tied: no dedicated segment
             },
         };
 
@@ -242,6 +257,10 @@ public static class ArchMapper
             Rep("target.final_norm", encoding,
                 BindOne(inventory, prefix, "norm.weight")),
         };
+        if (untied)
+        {
+            reps.Add(Rep("target.output_head", encoding, BindOutputHead(inventory, prefix)));
+        }
 
         // Stored-precision policy: the canonical encoding is the stack
         // majority; tensors deliberately kept in another dtype (Qwen3.5
@@ -399,15 +418,35 @@ public static class ArchMapper
         return new List<NamedTensorData> { ToTensorData(inventory, fullName, "weight") };
     }
 
+    /// <summary>Binds an untied output head. The Qwen3.5 multimodal wrapper
+    /// ships <c>lm_head.weight</c> at the TOP level of the checkpoint (no
+    /// text prefix); the in-prefix spelling covers bare-text checkpoints.</summary>
+    private static List<NamedTensorData> BindOutputHead(HfInventory inventory, string prefix)
+    {
+        foreach (var fullName in new[] { "lm_head.weight", $"{prefix}.lm_head.weight" })
+        {
+            if (inventory.TryGet(fullName, out _))
+            {
+                return new List<NamedTensorData> { ToTensorData(inventory, fullName, "weight") };
+            }
+        }
+        throw new ModelConfigException(
+            "tie_word_embeddings is false but neither 'lm_head.weight' nor '<prefix>.lm_head.weight' is in the inventory");
+    }
+
     private static NamedTensorData ToTensorData(HfInventory inventory, string fullName, string relative)
     {
         var info = inventory.Get(fullName);
+        // Tensors beyond the 2 GiB single-buffer ceiling (Qwen3.8-27B's
+        // 2.5 GiB embedding / lm_head) travel as chunks.
+        bool chunked = info.DataLength > HfInventory.MaxBufferedPayloadBytes;
         return new NamedTensorData
         {
             Name = relative,
             Dtype = info.Dtype,
             Shape = info.Shape,
-            Data = inventory.ReadBytes(fullName),
+            Data = chunked ? Array.Empty<byte>() : inventory.ReadBytes(fullName),
+            Chunks = chunked ? inventory.ReadChunks(fullName) : null,
         };
     }
 

@@ -209,6 +209,19 @@ public sealed class SafetensorsFile : IDisposable
         return buffer;
     }
 
+    /// <summary>Copies a sub-range of a tensor's payload out of the mapping —
+    /// chunked reads for tensors whose payload exceeds the 2 GiB single
+    /// buffer ceiling (Qwen3.8-27B's 2.5 GiB embedding).</summary>
+    public byte[] ReadBytes(TensorInfo info, long offset, int count)
+    {
+        var buffer = new byte[count];
+        if (count > 0)
+        {
+            _accessor.ReadArray(checked(PayloadStart + info.DataStart + offset), buffer, 0, count);
+        }
+        return buffer;
+    }
+
     /// <summary>Widens a tensor's payload to f32. Refuses dtypes that have
     /// no widening path instead of guessing.</summary>
     public float[] DecodeF32(string name)

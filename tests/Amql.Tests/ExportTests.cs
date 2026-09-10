@@ -1,3 +1,5 @@
+using System.Text.Json;
+using System.Text.Json.Nodes;
 using Amql.Cli;
 using Amql.Hf;
 using Amql.Inference;
@@ -23,6 +25,72 @@ public class ExportTests
         var containerPath = Path.Combine(dir.Path, "container");
         ModelToContainer.Encode(modelDir, containerPath, "synth-export");
         return containerPath;
+    }
+
+    // ── untied head: Qwen3.8 ships lm_head.weight at the top level ────────
+
+    [Fact]
+    public void Encode_Untied_Head_Materialises_The_LmHead()
+    {
+        using var dir = new TempDir();
+        var modelDir = Path.Combine(dir.Path, "model");
+        SyntheticCheckpoint.Write(modelDir);
+
+        // Untie: flip tie_word_embeddings in the wrapper AND the text
+        // config, then drop a top-level lm_head shard (the Qwen3.8-27B
+        // convention: "lm_head.weight" without any text prefix).
+        var config = JsonNode.Parse(File.ReadAllText(Path.Combine(modelDir, "config.json")))!.AsObject();
+        config["tie_word_embeddings"] = false;
+        config["text_config"]!["tie_word_embeddings"] = false;
+        File.WriteAllText(Path.Combine(modelDir, "config.json"), config.ToJsonString(ViJson.Options));
+
+        var lmHead = new float[SyntheticCheckpoint.Vocab * SyntheticCheckpoint.Hidden];
+        for (int i = 0; i < lmHead.Length; i++)
+        {
+            lmHead[i] = 0.01f * (i % 37);
+        }
+        SafetensorsWriter.Write(Path.Combine(modelDir, "lm_head.safetensors"), new[]
+        {
+            new TensorPayload
+            {
+                Name = "lm_head.weight",
+                Dtype = Dtype.F32,
+                Shape = new long[] { SyntheticCheckpoint.Vocab, SyntheticCheckpoint.Hidden },
+                Data = SyntheticModel.ToBytes(lmHead),
+            },
+        });
+
+        var containerPath = Path.Combine(dir.Path, "container");
+        ModelToContainer.Encode(modelDir, containerPath, "synth-untied");
+
+        using (var container = Vindex3Container.Open(containerPath))
+        {
+            Assert.Contains(container.Index.Representations.Keys, k => k == "target.output_head@F32");
+            var head = container.Graph!.Objects.Single(o => o.Kind == ObjectKind.OutputHead);
+            Assert.Single(head.Representations);
+            Assert.Equal("lm_head", Assert.Single(head.SourceBindings).TensorPrefix);
+
+            using var store = container.CreateOperandStore();
+            Assert.Equal(
+                SyntheticModel.ToBytes(lmHead),
+                store.Resolve("target.output_head", "weight").Payload);
+        }
+
+        // And the export round-trips the untied head back to "lm_head.weight".
+        var exported = Path.Combine(dir.Path, "exported");
+        using (var container = Vindex3Container.Open(containerPath))
+        {
+            ModelExporter.Export(container, exported, patch: null);
+        }
+        using var file = SafetensorsFile.Open(Path.Combine(exported, "model.safetensors"));
+        Assert.Equal(
+            SyntheticModel.ToBytes(lmHead),
+            file.ReadBytes("lm_head.weight"));
+        using var exportedConfig = JsonDocument.Parse(File.ReadAllBytes(Path.Combine(exported, "config.json")));
+        // Falsy facts are omitted — the encoder default is false, so the
+        // untied head must re-encode as untied.
+        Assert.False(exportedConfig.RootElement.TryGetProperty("tie_word_embeddings", out var tie) &&
+                     tie.GetBoolean());
     }
 
     private static byte[] Payload(string containerPath, string objectId, string tensor)
