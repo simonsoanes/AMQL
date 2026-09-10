@@ -150,22 +150,35 @@ public static class BitPattern
     /// mantissa. Value = 2^(byte − 127); 0xFF is NaN.</summary>
     public static float DecodeF8E8M0(byte b) => b == 0xFF ? float.NaN : MathF.Pow(2f, b - 127);
 
+    /// <summary>f32 → E8M0 scale byte (2^(byte − 127), 0xFF = NaN): the
+    /// nearest power of two, round-to-nearest-even. The inverse of
+    /// <see cref="DecodeF8E8M0"/>; used for the MXFP4 block scales.</summary>
+    public static byte EncodeF8E8M0(float value)
+    {
+        if (float.IsNaN(value) || value <= 0)
+        {
+            return 0;
+        }
+        double exponent = Math.Log2(value);
+        long field = (long)Math.Round(exponent, MidpointRounding.ToEven) + 127;
+        return (byte)Math.Clamp(field, 0, 254);
+    }
+
     /// <summary>I8: sign-extend.</summary>
     public static float DecodeI8(byte b) => (sbyte)b;
 
-    // ── FP4 (NVFP4 element grid) ─────────────────────────────────────────────
+    // ── FP4 (the MXFP4 element grid: E2M1) ─────────────────────────────────
 
-    /// <summary>The positive magnitudes of the NVFP4 element grid, indexed
+    /// <summary>The positive magnitudes of the MXFP4 element grid, indexed
     /// by the low three bits of the nibble (bit 3 is the sign). This is
-    /// the value grid the published NVFP4 conversions carry:
-    /// <c>{0, 0.25, 0.5, 0.75, 1, 1.5, 2, 3}</c>, so the largest magnitude
-    /// is 3.0. The ecosystem labels this family both "E1M2" and "E2M1"
-    /// depending on vendor — the grid, serialised into the exported
-    /// config's <c>element_grid</c>, is the contract; a consumer with a
-    /// different table can swap this one value table.</summary>
-    public static readonly float[] Fp4PositiveGrid = { 0f, 0.25f, 0.5f, 0.75f, 1f, 1.5f, 2f, 3f };
+    /// the OCP microscaling E2M1 table (2 exponent bits, bias 1, 1
+    /// mantissa bit): <c>{0, 0.5, 1, 1.5, 2, 3, 4, 6}</c>, so the largest
+    /// magnitude is 6.0 — the grid the MXFP4 standard (and its MLX/GGML
+    /// implementations) carry. The grid, serialised into the exported
+    /// config's <c>element_grid</c>, is the contract.</summary>
+    public static readonly float[] Fp4PositiveGrid = { 0f, 0.5f, 1f, 1.5f, 2f, 3f, 4f, 6f };
 
-    public const float Fp4MaxValue = 3f;
+    public const float Fp4MaxValue = 6f;
 
     /// <summary>Decode one FP4 nibble (low 4 bits of the byte).</summary>
     public static float DecodeFp4(byte nibble)

@@ -711,14 +711,14 @@ internal static class Program
             "export requires a container directory, e.g. 'amql-cli export <container-dir> --out <checkpoint-dir>'");
         string outDir = OptionValue(args, "--out") ?? throw new CliException("export requires '--out <checkpoint-dir>'");
         string quant = OptionValue(args, "--quant") ?? "none";
-        if (quant != "none" && quant != "nvfp4")
+        if (quant != "none" && quant != "mxfp4")
         {
-            throw new CliException($"unknown quantization '{quant}' — this build exports 'none' (full precision) or 'nvfp4'");
+            throw new CliException($"unknown quantization '{quant}' — this build exports 'none' (full precision) or 'mxfp4'");
         }
 
         using var container = Vindex3Container.Open(containerDir);
         var patch = LoadPatch(args, container);
-        var report = ModelExporter.Export(container, outDir, patch, quantizeNvfp4: quant == "nvfp4");
+        var report = ModelExporter.Export(container, outDir, patch, quantizeMxfp4: quant == "mxfp4");
 
         Console.WriteLine($"exported:  {report.OutDir}");
         Console.WriteLine($"model:      {report.Model}");
@@ -730,8 +730,15 @@ internal static class Program
         string files = "model.safetensors, config.json" +
                        (File.Exists(Path.Combine(outDir, "tokenizer.json")) ? ", tokenizer.json" : string.Empty);
         Console.WriteLine($"wrote:      {files}  (quantization: {quant})");
-        Console.WriteLine("the checkpoint is the original model with any patch deltas baked in — encode it to move back into a container:");
-        Console.WriteLine($"  amql-cli encode {outDir} --out <new-container>");
+        if (quant == "mxfp4")
+        {
+            Console.WriteLine("the MXFP4 checkpoint is a terminal artifact — the encoder reads full-precision dtypes; the Mxfp4 codec is the reference for consumer runtimes");
+        }
+        else
+        {
+            Console.WriteLine("the checkpoint is the original model with any patch deltas baked in — encode it to move back into a container:");
+            Console.WriteLine($"  amql-cli encode {outDir} --out <new-container>");
+        }
         return 0;
     }
 
@@ -985,7 +992,7 @@ internal static class Program
               amql-cli save-lora <patch.safetensors> --out <lora-dir>
                               [--rank 8] [--alpha 16] [--container <container-dir>]
               amql-cli export <container-dir> --out <checkpoint-dir>
-                              [--patch <patch.safetensors>] [--quant nvfp4]
+                              [--patch <patch.safetensors>] [--quant mxfp4]
               amql-cli layers <container-dir> [--component target]
               amql-cli import <container-dir> <model> --out <merged-dir>
                               [--container]
@@ -1013,11 +1020,12 @@ internal static class Program
             model.safetensors + tokenizer.json) from the container — the
             inverse of encode — with patch deltas baked into the stored
             tensors (unpatched tensors are copied byte-identically), so the
-            result is a plain original model again. Pass --quant nvfp4 to
-            export the stack's projection matrices in NVIDIA's NVFP4 form
-            (FP4 E2M1 elements, two per byte, per-2-element FP8 scales plus
-            an FP32 tensor scale); embeddings, norms, biases and the output
-            head keep their full precision.
+            result is a plain original model again. Pass --quant mxfp4 to
+            export the stack's projection matrices in the OCP MXFP4 form
+            (FP4 E2M1 elements, two per byte, per-32-element E8M0 scales);
+            embeddings, norms, biases and the output head keep their full
+            precision, and the quantized checkpoint is terminal for this
+            build (the encoder reads full-precision dtypes).
             layers lists every component and, for the selected one, the
             per-layer attention policy table and tensor inventory, then
             whether the planner serves the stack or refuses it by name.

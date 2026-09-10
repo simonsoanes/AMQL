@@ -38,7 +38,7 @@ public static class ModelExporter
         Vindex3Container container,
         string outDir,
         WeightPatch? patch,
-        bool quantizeNvfp4 = false)
+        bool quantizeMxfp4 = false)
     {
         if (Directory.Exists(outDir))
         {
@@ -47,7 +47,7 @@ public static class ModelExporter
 
         // Build config.json first: an unjudged operator refuses here,
         // before anything is written.
-        string configJson = ExportConfig.BuildJson(container, quantizeNvfp4);
+        string configJson = ExportConfig.BuildJson(container, quantizeMxfp4);
         var graph = container.Graph
             ?? throw new CliException("container records no system graph — cannot rebuild HF tensor names");
 
@@ -89,7 +89,7 @@ public static class ModelExporter
                 }
                 names[hfName] = obj.Id;
 
-                if (quantizeNvfp4 && ShouldQuantize(obj.Id, tensor.Name, tensor.Shape))
+                if (quantizeMxfp4 && ShouldQuantize(obj.Id, tensor.Name, tensor.Shape))
                 {
                     AddQuantizedPayloads(payloads, names, obj.Id, hfName, tensor, store, patch);
                     quantized++;
@@ -109,8 +109,8 @@ public static class ModelExporter
 
         if (quantized > 0)
         {
-            notes.Add($"{quantized} stack projection tensors exported as NVFP4 (FP4 grid elements, " +
-                      $"per-{Nvfp4.BlockElements}-element {Dtype.F8_E4M3.Label()} scales, FP32 tensor scale) — " +
+            notes.Add($"{quantized} stack projection tensors exported as MXFP4 (FP4 E2M1 grid elements, " +
+                      $"per-{Mxfp4.BlockElements}-element {Dtype.F8_E8M0.Label()} scales) — " +
                       "embeddings, norms, biases and the output head keep their full precision");
         }
 
@@ -155,7 +155,7 @@ public static class ModelExporter
     }
 
     /// <summary>The tensor's f32 values (patch deltas applied when given)
-    /// — the shared input for the encode and NVFP4 paths.</summary>
+    /// — the shared input for the encode and MXFP4 paths.</summary>
     private static float[] WidenedValues(OperandStore store, string objectId, SegmentTensor tensor, WeightPatch? patch)
     {
         var resolution = store.Resolve(objectId, tensor.Name);
@@ -177,7 +177,7 @@ public static class ModelExporter
         return widened;
     }
 
-    /// <summary>NVFP4 quantises the stack's projection matrices: 2-D
+    /// <summary>MXFP4 quantises the stack's projection matrices: 2-D
     /// per-layer weights in the decoder stack, leaving the synthetic
     /// log-space A_log tensor and any biases at full precision.</summary>
     private static bool ShouldQuantize(string objectId, string tensorName, long[] shape) =>
@@ -188,9 +188,9 @@ public static class ModelExporter
         !tensorName.Contains("A_log") &&
         !tensorName.Contains("bias");
 
-    /// <summary>Replaces one weight tensor with its NVFP4 triple: the FP4
-    /// packed weight (logical shape, two elements per byte), the
-    /// per-2-element FP8 block scales, and the FP32 tensor scale.</summary>
+    /// <summary>Replaces one weight tensor with its MXFP4 pair: the FP4
+    /// packed weight (logical shape, two elements per byte) and the
+    /// per-32-element E8M0 block scales.</summary>
     private static void AddQuantizedPayloads(
         List<TensorPayload> payloads,
         Dictionary<string, string> names,
@@ -201,12 +201,12 @@ public static class ModelExporter
         WeightPatch? patch)
     {
         var values = WidenedValues(store, objectId, tensor, patch);
-        long elements = tensor.Shape[0] * tensor.Shape[1];
-        var quantized = Nvfp4.Quantize(values, elements);
+        long rows = tensor.Shape[0];
         long columns = tensor.Shape[1];
+        var quantized = Mxfp4.Quantize(values, rows, columns);
 
         // The weight name itself was registered by the caller; only the
-        // companion tensors need their own collision guard.
+        // companion tensor needs its own collision guard.
         payloads.Add(new TensorPayload
         {
             Name = hfName,
@@ -214,21 +214,20 @@ public static class ModelExporter
             Shape = tensor.Shape,
             Data = quantized.Packed,
         });
-        AddCompanion(hfName + Nvfp4.ScaleSuffix, Dtype.F8_E4M3,
-            new[] { tensor.Shape[0], (columns + 1) / 2 }, quantized.BlockScales);
-        AddCompanion(hfName + Nvfp4.GlobalScaleSuffix, Dtype.F32, new[] { 1L },
-            BitConverter.GetBytes(quantized.GlobalScale));
-
-        void AddCompanion(string name, Dtype dtype, long[] shape, byte[] data)
+        string scaleName = hfName + Mxfp4.ScaleSuffix;
+        if (names.TryGetValue(scaleName, out var owner))
         {
-            if (names.TryGetValue(name, out var owner))
-            {
-                throw new CliException(
-                    $"export collision: NVFP4 companion tensor '{name}' rebuilt for both '{owner}' and '{objectId}'");
-            }
-            names[name] = objectId;
-            payloads.Add(new TensorPayload { Name = name, Dtype = dtype, Shape = shape, Data = data });
+            throw new CliException(
+                $"export collision: MXFP4 companion tensor '{scaleName}' rebuilt for both '{owner}' and '{objectId}'");
         }
+        names[scaleName] = objectId;
+        payloads.Add(new TensorPayload
+        {
+            Name = scaleName,
+            Dtype = Dtype.F8_E8M0,
+            Shape = new[] { rows, Mxfp4.BlocksPerRow(columns) },
+            Data = quantized.BlockScales,
+        });
     }
 
     /// <summary>f32 → the tensor's stored dtype bytes. Only dtypes with a
@@ -283,7 +282,7 @@ public static class ModelExporter
 /// </summary>
 internal static class ExportConfig
 {
-    public static string BuildJson(Vindex3Container container, bool quantizeNvfp4 = false)
+    public static string BuildJson(Vindex3Container container, bool quantizeMxfp4 = false)
     {
         var graph = container.Graph
             ?? throw new CliException("container records no system graph — cannot regenerate config.json");
@@ -382,17 +381,16 @@ internal static class ExportConfig
             config["rope_parameters"] = rope;
         }
 
-        if (quantizeNvfp4)
+        if (quantizeMxfp4)
         {
             config["quantization_config"] = new JsonObject
             {
-                ["quant_method"] = "nvfp4",
+                ["quant_method"] = "mxfp4",
                 ["element_dtype"] = "FP4",
                 ["element_grid"] = new JsonArray(BitPattern.Fp4PositiveGrid
                     .Select(v => JsonValue.Create(v)).ToArray()),
-                ["block_elements"] = Nvfp4.BlockElements,
-                ["block_scale_dtype"] = "F8_E4M3",
-                ["global_scale_dtype"] = "F32",
+                ["block_elements"] = Mxfp4.BlockElements,
+                ["block_scale_dtype"] = "F8_E8M0",
             };
         }
 

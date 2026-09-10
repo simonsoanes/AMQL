@@ -18,7 +18,7 @@ The hope is that it eventually becomes possible to calculate the representation 
 
 Combined with an automatic self-learning process, this should extend a model's understanding and intelligence beyond currently trainable human textual representations, in cases where a known construct would be better applied. That's an outcome fine-tuning alone can't achieve, since it can only generate more intelligent outcomes by relying on scenarios that are inherently gated at human-level intellect.
 
-Generating genuinely novel solution vectors for a problem space is a separate challenge requiring its own approach, but this project does allow alternate solution vectors to be applied once they've been identified.
+Generating genuinely novel solution vectors for a problem space is a separate challenge requiring its own approach, but this project does allow alternate solution vectors to be applied once they've been identified and the merging of solution vectors and knowledge between models.
 
 ## Usage
 
@@ -256,34 +256,34 @@ component 'target' role=PrimaryText source=model layers=28 hidden=2048
   runtime: [refused] layer 0: linear_attention has no judged runtime — the planner refuses it by name
 ```
 
-### Exporting a quantized checkpoint (`--quant nvfp4`)
+### Exporting a quantized checkpoint (`--quant mxfp4`)
 
-`export --quant nvfp4` produces an NVFP4 checkpoint: the stack's projection matrices
-(`q_proj`/`k_proj`/`v_proj`/`o_proj`/`gate_proj`/`up_proj`/`down_proj`/linear-attention
-projections) are quantised to FP4 elements packed two per byte, each with a per-2-element
-FP8 (E4M3) block scale and an FP32 tensor scale — FP4 codes at a quarter of the BF16 size
-plus FP8 block scales at another quarter, so each projection lands at roughly half its
-BF16 payload. Embeddings, norms, biases, the log-space `A_log` tensors and the output
-head keep their full precision, per the standard practice.
+`export --quant mxfp4` produces an MXFP4 checkpoint (the OCP microscaling standard):
+the stack's projection matrices (`q_proj`/`k_proj`/`v_proj`/`o_proj`/`gate_proj`/
+`up_proj`/`down_proj`/linear-attention projections) are quantised to FP4 E2M1 elements
+packed two per byte, with one FP8-E8M0 scale (a pure shared exponent) per 32-element
+block — FP4 codes at a quarter of the BF16 size plus negligible E8M0 scales, so each
+projection lands at roughly a quarter of its BF16 payload. Embeddings, norms, biases,
+the log-space `A_log` tensors and the output head keep their full precision, per the
+standard practice.
 
 ```bash
-amql-cli export ./containers/merged --out ./models/merged-nvfp4 --quant nvfp4
+amql-cli export ./containers/merged --out ./models/merged-mxfp4 --quant mxfp4
 ```
 
 ```
-tensors:    692  (2.23 GiB)
-note:       186 stack projection tensors exported as NVFP4 (FP4 grid elements, per-2-element F8_E4M3 scales, FP32 tensor scale) — embeddings, norms, biases and the output head keep their full precision
-wrote:      model.safetensors, config.json, tokenizer.json  (quantization: nvfp4)
+tensors:    506  (1.63 GiB)
+note:       186 stack projection tensors exported as MXFP4 (FP4 E2M1 grid elements, per-32-element F8_E8M0 scales) — embeddings, norms, biases and the output head keep their full precision
+wrote:      model.safetensors, config.json, tokenizer.json  (quantization: mxfp4)
 ```
 
-Each quantised weight becomes three safetensors tensors: `...weight` (dtype `FP4`, logical
-shape, two elements per byte), `...weight_scale` (dtype `F8_E4M3`, one scale per 2
-elements), and `...weight_global_scale` (dtype `F32`). Dequantisation is
-`x ≈ DecodeFp4(q) × DecodeE4M3(blockScale) × globalScale`, and the element grid
-`{0, 0.25, 0.5, 0.75, 1, 1.5, 2, 3}` is serialised into `config.json`
-(`quantization_config.quant_method: "nvfp4"`) so the exact scheme is self-describing.
+Each quantised weight becomes two safetensors tensors: `...weight` (dtype `FP4`, logical
+shape, two elements per byte) and `...weight_scale` (dtype `F8_E8M0`, one per
+32-element block, laid out per row). Dequantisation is `x ≈ DecodeFp4(q) × DecodeE8M0(scale)`,
+and the element grid `{0, 0.5, 1, 1.5, 2, 3, 4, 6}` is serialised into `config.json`
+(`quantization_config.quant_method: "mxfp4"`) so the exact scheme is self-describing.
 The quantised checkpoint is a terminal artifact for this build (the encoder reads
-full-precision dtypes); the `Nvfp4` codec in `Amql.Safetensors` is the reference
+full-precision dtypes); the `Mxfp4` codec in `Amql.Safetensors` is the reference
 implementation for any consumer runtime.
 
 ### Merging a second model into the container (`import`)
