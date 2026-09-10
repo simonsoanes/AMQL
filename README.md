@@ -1,8 +1,8 @@
 # AMQL - C# implementation of VIndex3 (Larql)
 
-This was a port of the VIndex3 implementation, along with support for generating it from a model (Qwen 3.5 initially) and then allowing model independent inference, token relationship route following and exploration of the model internals in order to do some research into direct model manipulation and patching, with live LORA adapters in custom inferencing.
+This was a port of the VIndex3 implementation, along with support for generating it from a model (Qwen 3.5-3.8 primarily) and then allowing model independent inference, token relationship route following and exploration of the model internals in order to do some research into direct model manipulation and patching, with live LORA adapters in custom inferencing.
 
-It has now been significantly extended to add model merging (using reinforcement blending to entirely avoid training time but get the same resultant effect as if the training sets of the two models had been combined and run) and custom tensor editing features for another project.
+This implementation supports model merging (using reinforcement blending to avoid training time but get the same resultant effect as if the training sets of the two models had been combined and run) and custom tensor editing features for another project.
 
 Credit for the design of the VIndex3 goes to Chris Hay.
 
@@ -58,6 +58,8 @@ amql-cli export <container-dir> --out <checkpoint-dir>
 amql-cli layers <container-dir> [--component target]
 amql-cli import <container-dir> <model> --out <merged-dir>
                 [--container]
+amql-cli moe-ify <container-dir> --out <moe-dir> --text <corpus.txt>
+                [--experts 8] [--top-k 2] [--sample 4096] [--eval 1024]
 amql-cli help
 ```
 
