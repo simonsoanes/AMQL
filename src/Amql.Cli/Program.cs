@@ -42,6 +42,7 @@ internal static class Program
                 "save-lora" => SaveLora(args[1..]),
                 "export" => Export(args[1..]),
                 "export-mtp" => ExportMtp(args[1..]),
+                "generate-mtp" => GenerateMtp(args[1..]),
                 "layers" => Layers(args[1..]),
                 "import" => Import(args[1..]),
                 "moe-ify" => MoeIfy(args[1..]),
@@ -926,6 +927,47 @@ internal static class Program
         return 0;
     }
 
+    // ── generate-mtp: bootstrap an MTP drafter for a model without one ──────
+
+    private static int GenerateMtp(string[] args)
+    {
+        var containerDir = Arg(args, 0) ?? throw new CliException(
+            "generate-mtp requires a container directory, e.g. 'amql-cli generate-mtp <container-dir> --out <out>'");
+        string outDir = OptionValue(args, "--out") ?? throw new CliException("generate-mtp requires '--out <out>'");
+        int sample = IntOption(args, "--sample", 1024);
+        int use = sample == int.MaxValue ? 1024 : sample;
+
+        IReadOnlyList<int> tokens = Array.Empty<int>();
+        if (OptionValue(args, "--text") is { } textPath)
+        {
+            string text;
+            try
+            {
+                text = File.ReadAllText(textPath);
+            }
+            catch (IOException e)
+            {
+                throw new CliException($"cannot read corpus '{textPath}': {e.Message}");
+            }
+            tokens = HfTokenizer.FromModelDir(containerDir).EncodeToIds(text);
+        }
+
+        var report = Amql.Merge.GenerateMtp.Transform(containerDir, outDir, tokens, use);
+
+        Console.WriteLine($"generated:  {report.Model} + MTP drafter");
+        Console.WriteLine($"trunk:      a copy of full-attention layer {report.TrunkLayer} " +
+                          $"({report.Tensors} module tensors)");
+        foreach (var note in report.Notes)
+        {
+            Console.WriteLine($"note:       {note}");
+        }
+        Console.WriteLine("wrote:      index.json, system_graph.json, segments/, tokenizer.json");
+        Console.WriteLine("the drafter is part of the container now — export emits it automatically:");
+        Console.WriteLine($"  amql-cli export {outDir} --out <checkpoint-dir>");
+        Console.WriteLine($"  amql-cli verify {outDir}");
+        return 0;
+    }
+
     // ── import: merge a second model into the container ──────────────────
 
     private static int Import(string[] args)
@@ -1072,6 +1114,8 @@ internal static class Program
               amql-cli export <container-dir> --out <checkpoint-dir>
                               [--patch <patch.safetensors>] [--quant mxfp4]
               amql-cli export-mtp <container-dir> --out <drafter-dir>
+              amql-cli generate-mtp <container-dir> --out <out>
+                              [--text <corpus.txt>] [--sample 1024]
               amql-cli layers <container-dir> [--component target]
               amql-cli import <container-dir> <model> --out <merged-dir>
                               [--container]
@@ -1137,6 +1181,14 @@ internal static class Program
             the top-k expert kernel. The held-out perplexity gate prints
             dense → moе for the chosen --eval tokens; --sample tokens
             drive the clustering.
+            generate-mtp boots an MTP drafter for a dense model that has
+            none: the trunk is a copy of the model's last full-attention
+            layer, the drafter/final norms copy the final norm, the fc
+            projector boots as the mean-combination 0.5·(norm(h)+norm(e)),
+            and the shared embedding/head compose the rest. The module is
+            materialised into the container (mtp.stack), so export emits
+            the companion automatically; --text provides the corpus for
+            the zero-shot draft-acceptance gate, --sample bounds it.
             Any pathway (route, path, generate, inspect-token, and
             tokens/decode, which parse but cannot be affected) accepts
             --patch to run with the patch's deltas merged into the loaded

@@ -386,3 +386,41 @@ without the source tensors the objects stay carried, per the "leave it" rule.
 tensors:    1184  (50.96 GiB)       note:       17 mtp drafter tensors exported alongside as mtp.safetensors (5.9 GiB)
 wrote:      model.safetensors, config.json, mtp.safetensors, mtp.config.json, tokenizer.json
 ```
+
+### Generating an MTP drafter for a model without one (`generate-mtp`)
+
+Models that ship no MTP (e.g. Qwen3.5-0.8B) can get one **generated entirely from their
+own weights** — the bootstrapping init the MTP line uses, no training:
+
+```bash
+amql-cli generate-mtp ./containers/Qwen3.5-0.8B --out ./containers/Qwen3.5-0.8B-mtp \
+  --text ./corpus/wikipedia.txt --sample 1024
+```
+
+- the **trunk layer** is a verbatim copy of the model's **last full-attention layer**
+  (the MTP trunk is always a softmax layer), self-attn + MLP + both norms;
+- the **two `pre_fc_norm_*` norms and the drafter's `norm.weight`** copy the model's
+  final norm;
+- the **`fc` projector [2h → h]** boots deterministically as the mean-combination
+  `0.5·(norm(h_t) + norm(e_{t+1}))`;
+- the head and the conditioning embedding are the model's **shared tables**
+  (`mtp_use_dedicated_embeddings: false`).
+
+The module materialises as `mtp.stack` in a new container, so `export` emits
+`mtp.safetensors` + `mtp.config.json` automatically. The **zero-shot draft-acceptance
+gate** runs the drafter's real pipeline — pre-fc norms, projector, one trunk attention+FFN
+pass, shared head — against the model's hidden states over `--sample` corpus tokens and
+reports the share of positions where the drafter's top-1 second-next-token draft matches
+the model, honestly labelled as a warm start: trained adapters (frozen model) are the
+next step.
+
+```
+generated:  demo-model + MTP drafter
+trunk:      a copy of full-attention layer 1 (13 module tensors)
+note:       zero-shot draft acceptance over 62 positions: 1.6% — the bootstrapped
+            drafter is a warm start; training (frozen model) is the next step
+```
+
+(Measured on the demo container; expect a higher but still modest zero-shot acceptance on
+a real model — the untrained boot is a structure-and-warm-start deliverable, and the
+frozen-model adaptation pass is the follow-up.)
