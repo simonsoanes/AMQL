@@ -415,12 +415,13 @@ the model, honestly labelled as a warm start: trained adapters (frozen model) ar
 next step.
 
 ```
-generated:  demo-model + MTP drafter
-trunk:      a copy of full-attention layer 1 (13 module tensors)
-note:       zero-shot draft acceptance over 62 positions: 1.6% — the bootstrapped
+generated:  Qwen3.5-0.8B + MTP drafter
+trunk:      a copy of full-attention layer 23 (15 module tensors)
+note:       zero-shot draft acceptance over 794 positions: 0.3% — the bootstrapped
             drafter is a warm start; training (frozen model) is the next step
 ```
 
-(Measured on the demo container; expect a higher but still modest zero-shot acceptance on
-a real model — the untrained boot is a structure-and-warm-start deliverable, and the
-frozen-model adaptation pass is the follow-up.)
+(Measured on the real Qwen3.5-0.8B. A 0.3% draft acceptance is above the random baseline
+but far below a useful speculative drafter — the untrained boot is a
+structure-and-warm-start deliverable, and the frozen-model adaptation pass is the
+follow-up that turns it into a real drafter.)
