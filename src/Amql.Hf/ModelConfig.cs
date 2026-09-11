@@ -31,6 +31,10 @@ public sealed record MoeFacts(
     int ExpertIntermediateSize,
     ExpertRoutingPolicy RoutingPolicy);
 
+/// <summary>The wrapper config's <c>vision_config</c> dimensionality — the
+/// tower's judged facts (read from the checkpoint, never invented).</summary>
+public sealed record VisionFacts(int HiddenSize, int NumLayers);
+
 /// <summary>
 /// G1 output: architecture facts lifted from <c>config.json</c> — the
 /// read-only inputs the graph/surface builder turns into a system graph.
@@ -57,7 +61,8 @@ public sealed record TextArchitectureFacts(
     JsonElement RopeParameters,
     LinearAttentionFacts? LinearAttention,
     double PartialRotaryFactor,
-    MoeFacts? Moe);
+    MoeFacts? Moe,
+    VisionFacts? Vision);
 
 /// <summary>G1 reader: <c>config.json</c> → <see cref="TextArchitectureFacts"/>.</summary>
 public static class ModelConfig
@@ -132,6 +137,24 @@ public static class ModelConfig
                 moe = new MoeFacts(expertsEl.GetInt32(), topKEl.GetInt32(), eisEl.GetInt32(), policy);
             }
 
+            VisionFacts? vision = null;
+            if (root.TryGetProperty("vision_config", out var visionElement) &&
+                visionElement.ValueKind == JsonValueKind.Object)
+            {
+                int? vHidden = visionElement.TryGetProperty("hidden_size", out var vh) ? vh.GetInt32() : null;
+                // The Qwen3.5 vision config names its depth field "depth"
+                // ("num_hidden_layers" is the standard HF spelling).
+                int? vLayers = visionElement.TryGetProperty("num_hidden_layers", out var vl)
+                    ? vl.GetInt32()
+                    : visionElement.TryGetProperty("depth", out var vd)
+                        ? vd.GetInt32()
+                        : null;
+                if (vHidden is int vh2 && vLayers is int vl2)
+                {
+                    vision = new VisionFacts(vh2, vl2);
+                }
+            }
+
             // Partial rotary factor, in the reference's precedence
             // (`PreTrainedConfig::standardize_rope_params`, transformers 5.x):
             //  1. top-level `partial_rotary_factor` — the legacy flat form,
@@ -176,7 +199,8 @@ public static class ModelConfig
                 RopeParameters: rope,
                 LinearAttention: linear,
                 PartialRotaryFactor: partialRotaryFactor,
-                Moe: moe);
+                Moe: moe,
+                Vision: vision);
         }
     }
 

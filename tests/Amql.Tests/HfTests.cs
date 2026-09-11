@@ -54,6 +54,40 @@ public class HfTests
         Assert.Equal(128, facts.LinearAttention.ValueHeadDim);
     }
 
+    // ── the vision tower's judged facts ───────────────────────────────────
+
+    [Fact]
+    public void Wrapper_Config_Vision_Facts_Read_Depth()
+    {
+        using var dir = new TempDir();
+        var configPath = Path.Combine(dir.Path, "config.json");
+        // The Qwen3.5 vision config names its depth field "depth"; the
+        // standard HF spelling is num_hidden_layers — both must read.
+        File.WriteAllText(configPath, """
+        {
+          "model_type": "qwen3_5",
+          "text_config": {
+            "model_type": "qwen3_5_text",
+            "hidden_size": 4,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 2,
+            "intermediate_size": 8,
+            "vocab_size": 12,
+            "max_position_embeddings": 2048,
+            "layer_types": ["full_attention"]
+          },
+          "vision_config": { "hidden_size": 1152, "depth": 27 }
+        }
+        """);
+
+        var facts = ModelConfig.ReadTextFacts(configPath);
+        Assert.NotNull(facts.Vision);
+        Assert.Equal(1152, facts.Vision!.HiddenSize);
+        Assert.Equal(27, facts.Vision.NumLayers);
+    }
+
     // ── synthetic multimodal checkpoint → container ────────────────────────
 
     [Fact]
@@ -71,7 +105,11 @@ public class HfTests
         using var container = Vindex3Container.Open(containerPath);
         var index = container.Index;
         Assert.Equal(Vindex3Index.CurrentSchema, index.Version);
-        Assert.Equal(3, index.Representations.Count);
+        // The carried modules materialise when the source holds them: the
+        // vision tower and the MTP drafter join the three text objects.
+        Assert.Equal(5, index.Representations.Count);
+        Assert.Contains(index.Representations.Keys, k => k == "vision.perception_tower@F16");
+        Assert.Contains(index.Representations.Keys, k => k == "mtp.stack@F16");
         Assert.NotNull(index.PrecisionMap);
         Assert.Contains("0.linear_attn.A_log", index.PrecisionMap!.Exceptions);
         Assert.Contains("0.linear_attn.norm.weight", index.PrecisionMap.Exceptions);

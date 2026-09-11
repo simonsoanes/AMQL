@@ -364,3 +364,25 @@ note:       sampled 6 tokens; 2 layers clustered into 2 balanced experts of 4 un
 note:       perplexity over 4 held-out tokens: dense 49.96 → moе 49.88 (-0.2%)
 wrote:      index.json, system_graph.json, segments/, tokenizer.json
 ```
+
+### The MTP drafter and vision tower on export
+
+The encoder **materialises the carried modules** whenever the source checkpoint holds
+them: the `mtp.` tensors (fc projector, pre-fc norms, the single trunk layer, the pre-head
+norm) land in a segment under `mtp.stack`, and the `model.visual.*` tower under
+`vision.perception_tower`. The container becomes self-contained for the whole model;
+without the source tensors the objects stay carried, per the "leave it" rule.
+
+`export` then produces the complete artifact set:
+
+- **`model.safetensors`** — the text model **and** the vision tower (it is part of the
+  model), under `model.visual.*`, with `vision_config` carrying the tower's judged facts.
+- **`mtp.safetensors` + `mtp.config.json`** — the MTP drafter, exported **automatically
+  alongside** when materialised: the module under its original `mtp.` names composed with
+  the shared embedding and head (`mtp_use_dedicated_embeddings: false`), a standalone
+  checkpoint for speculative decoding. `export-mtp` emits it alone into its own directory.
+
+```
+tensors:    1184  (50.96 GiB)       note:       17 mtp drafter tensors exported alongside as mtp.safetensors (5.9 GiB)
+wrote:      model.safetensors, config.json, mtp.safetensors, mtp.config.json, tokenizer.json
+```

@@ -59,9 +59,16 @@ public static class ModelExporter
         // ── pass 1 (header-only): the work list ─────────────────────────
         // Tensor table reads alone, so the HF name reconstruction and its
         // collision check stay deterministic regardless of parallelism.
+        // The PRIMARY text component exports into the model shard together
+        // with a materialised VISION tower (the tower is part of the model);
+        // an MTP drafter stays out — it exports automatically as the mtp
+        // companion below.
+        string primaryId = graph.Components.First(c => c.Role == ComponentRole.PrimaryText).Id;
+        string? visionId = graph.Components.FirstOrDefault(c => c.Role == ComponentRole.Perception)?.Id;
         var objectPrefixes = new Dictionary<string, string>(StringComparer.Ordinal);
         var work = new List<(string ObjectId, string SegmentPath, SegmentTensor Tensor)>();
-        foreach (var obj in graph.Objects)
+        foreach (var obj in graph.Objects.Where(o =>
+                     o.Component == primaryId || (visionId is not null && o.Component == visionId)))
         {
             if (obj.Representations.Count == 0)
             {
@@ -164,12 +171,186 @@ public static class ModelExporter
             File.Copy(tokenizerPath, Path.Combine(outDir, "tokenizer.json"));
         }
 
+        // A materialised MTP drafter rides the same export as a companion:
+        // mtp.safetensors + mtp.config.json beside the model's shard.
+        var mtp = graph.Objects.FirstOrDefault(o => o.Component == "mtp" && o.Kind == ObjectKind.DecoderStack);
+        if (mtp is { Representations.Count: > 0 })
+        {
+            var companion = ExportMtp(container, outDir, shardName: "mtp.safetensors", configName: "mtp.config.json", copyTokenizer: false);
+            notes.Add($"MTP drafter exported alongside: mtp.safetensors + mtp.config.json " +
+                      $"({companion.Tensors} tensors, {companion.PayloadBytes} bytes)");
+        }
+
         return new ExportReport(
             outDir,
             container.Index.Model,
             payloads.Count,
             payloads.Sum(p => p.PayloadLength),
             notes);
+    }
+
+    /// <summary>Everything a drafter export wrote.</summary>
+    public sealed record MtpExportReport(
+        string OutDir,
+        string Model,
+        int Tensors,
+        long PayloadBytes,
+        bool TiedHead,
+        IReadOnlyList<string> Notes);
+
+    /// <summary>
+    /// Exports the MTP drafter as a standalone checkpoint: the module's
+    /// tensors under their original <c>mtp.</c> names (fc projector, the
+    /// two pre-fc norms, the single trunk layer, the pre-head norm), plus
+    /// the SHARED embedding (the conditioning token) and the SHARED head —
+    /// the 27B reuses the main model's embed_tokens and lm_head
+    /// (<c>mtp_use_dedicated_embeddings: false</c>), so the drafter is
+    /// composed from the container's own tables. Requires a container
+    /// encoded from a checkpoint that carries mtp tensors.
+    /// <paramref name="shardName"/>/<paramref name="configName"/> let the
+    /// parent export emit the drafter as a companion
+    /// (<c>mtp.safetensors</c> + <c>mtp.config.json</c>) in the same
+    /// directory; the standalone <c>export-mtp</c> command uses the
+    /// defaults and also copies the tokenizer.</summary>
+    public static MtpExportReport ExportMtp(
+        Vindex3Container container,
+        string outDir,
+        string shardName = "model.safetensors",
+        string configName = "config.json",
+        bool copyTokenizer = true)
+    {
+        if (File.Exists(Path.Combine(outDir, shardName)) || File.Exists(Path.Combine(outDir, configName)))
+        {
+            throw new CliException($"export-mtp output '{Path.Combine(outDir, shardName)}' already exists");
+        }
+
+        var graph = container.Graph ?? throw new CliException("container records no system graph");
+        var mtp = graph.Objects.FirstOrDefault(o => o.Component == "mtp" && o.Kind == ObjectKind.DecoderStack);
+        if (mtp is null || mtp.Representations.Count == 0)
+        {
+            throw new CliException(
+                "the container carries no materialised MTP drafter — encode a checkpoint that has mtp tensors");
+        }
+        string mtpRep = container.CanonicalRepresentationId(mtp.Id);
+        if (!container.Index.Representations.TryGetValue(mtpRep, out var mtpEntry))
+        {
+            throw new CliException($"the container records no representation '{mtpRep}'");
+        }
+        string primaryId = graph.Components.First(c => c.Role == ComponentRole.PrimaryText).Id;
+        var embeddings = graph.Objects.First(o => o.Component == primaryId && o.Kind == ObjectKind.Embedding);
+        var headObject = graph.Objects.FirstOrDefault(o => o.Component == primaryId && o.Kind == ObjectKind.OutputHead);
+
+        var payloads = new List<TensorPayload>();
+        using (var segment = SegmentFile.Open(Path.Combine(container.Root, mtpEntry.Segment)))
+        {
+            foreach (var tensor in segment.Header.Tensors)
+            {
+                payloads.Add(PagedPayload(segment, tensor, DtypeExtensions.FromLabel(tensor.Dtype), "mtp." + tensor.Name));
+            }
+        }
+
+        // The shared embedding table feeds the conditioning token.
+        CopyObjectPayloads(container, embeddings, overrideName: null, payloads);
+
+        // The output head (materialised when untied; the embedding table
+        // otherwise) produces the predicted token.
+        bool tied = headObject is not { Representations.Count: > 0 };
+        if (tied)
+        {
+            CopyObjectPayloads(container, embeddings, "lm_head.weight", payloads);
+        }
+        else
+        {
+            CopyObjectPayloads(container, headObject!, overrideName: null, payloads);
+        }
+
+        Directory.CreateDirectory(outDir);
+        SafetensorsWriter.Write(Path.Combine(outDir, shardName), payloads, new Dictionary<string, string>
+        {
+            ["format"] = ExportFormat,
+            ["model"] = container.Index.Model + " (mtp drafter)",
+        });
+
+        // The drafter shares the text geometry; its module is one
+        // full-attention trunk layer, and its projection/embeddings are
+        // shared — never routed, regardless of the source's FFN surface.
+        var config = JsonNode.Parse(ExportConfig.BuildJson(container))!.AsObject();
+        config.Remove("moe");
+        config["num_hidden_layers"] = 1;
+        config["layer_types"] = new JsonArray(JsonValue.Create("full_attention")!);
+        config["mtp"] = new JsonObject
+        {
+            ["num_hidden_layers"] = 1,
+            ["use_dedicated_embeddings"] = false,
+        };
+        File.WriteAllText(Path.Combine(outDir, configName),
+            config.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+
+        if (copyTokenizer)
+        {
+            var tokenizerPath = Path.Combine(container.Root, "tokenizer.json");
+            if (File.Exists(tokenizerPath))
+            {
+                File.Copy(tokenizerPath, Path.Combine(outDir, "tokenizer.json"));
+            }
+        }
+
+        return new MtpExportReport(
+            outDir,
+            container.Index.Model,
+            payloads.Count,
+            payloads.Sum(p => p.PayloadLength),
+            tied,
+            new List<string>
+            {
+                $"drafter module: {mtpEntry.TensorCount} mtp.* tensors (fc projector, trunk layer, norms) + shared embedding and " +
+                (tied ? "head (tied to the embedding)" : "un-tied lm_head"),
+            });
+    }
+
+    /// <summary>Copies one object's segment payloads into the output; a tensor
+    /// name is rebuilt from the object's binding prefix (embedding
+    /// <c>…embed_tokens.weight</c>, head <c>lm_head.weight</c>), or
+    /// replaced wholesale by <paramref name="overrideName"/> (the tied head
+    /// reuses the shared embedding table under <c>lm_head.weight</c>).</summary>
+    private static void CopyObjectPayloads(
+        Vindex3Container container, LogicalObject obj, string? overrideName, List<TensorPayload> payloads)
+    {
+        string bindingPrefix = obj.SourceBindings.FirstOrDefault()?.TensorPrefix
+            ?? throw new CliException($"object '{obj.Id}' declares no binding tensor prefix");
+        string rep = container.CanonicalRepresentationId(obj.Id);
+        var entry = container.Index.Representations[rep];
+        using var segment = SegmentFile.Open(Path.Combine(container.Root, entry.Segment));
+        foreach (var tensor in segment.Header.Tensors)
+        {
+            payloads.Add(PagedPayload(
+                segment, tensor, DtypeExtensions.FromLabel(tensor.Dtype),
+                overrideName ?? bindingPrefix + "." + tensor.Name));
+        }
+    }
+
+    /// <summary>One payload with the 2 GiB ceiling paged as chunks when the
+    /// tensor exceeds it (the shared embedding and lm_head are 2.37 GiB on
+    /// the 27B).</summary>
+    private static TensorPayload PagedPayload(SegmentFile segment, SegmentTensor tensor, Dtype dtype, string name)
+    {
+        if (tensor.Len > LargePayloadThresholdBytes)
+        {
+            return new TensorPayload
+            {
+                Name = name,
+                Dtype = dtype,
+                Shape = tensor.Shape,
+                Chunks = ReadChunked(segment, tensor.Name, tensor.Len),
+            };
+        }
+        return new TensorPayload
+        {
+            Name = name,
+            Dtype = dtype,
+            Shape = tensor.Shape,
+            Data = segment.ReadBytes(tensor.Name),
+        };
     }
 
     /// <summary>
@@ -527,6 +708,30 @@ internal static class ExportConfig
                 ["block_elements"] = Mxfp4.BlockElements,
                 ["block_scale_dtype"] = "F8_E8M0",
             };
+        }
+
+        // A materialised vision tower is part of the model: the export's
+        // config carries its judged facts (dimensionality from the
+        // component, the carried transform descriptor) alongside the text
+        // facts, and the tower's tensors ride the same shard under the
+        // binding's model.visual prefix.
+        var perception = graph.Components.FirstOrDefault(c => c.Role == ComponentRole.Perception);
+        if (perception is { } vision &&
+            graph.Objects.Any(o => o.Component == vision.Id && o.Representations.Count > 0))
+        {
+            var visionConfig = new JsonObject
+            {
+                ["modality"] = "image",
+                ["hidden_size"] = vision.HiddenSize,
+                ["num_hidden_layers"] = vision.NumLayers,
+            };
+            if (vision.Perception is { } perceptionFacts &&
+                perceptionFacts.ValueKind == JsonValueKind.Object &&
+                perceptionFacts.TryGetProperty("transform", out var transform))
+            {
+                visionConfig["transform"] = JsonNode.Parse(transform.GetRawText());
+            }
+            config["vision_config"] = visionConfig;
         }
 
         return config.ToJsonString(new JsonSerializerOptions { WriteIndented = true });

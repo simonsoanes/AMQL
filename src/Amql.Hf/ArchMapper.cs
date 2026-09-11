@@ -189,6 +189,8 @@ public static class ArchMapper
         if (options.IncludeVision)
         {
             const string visionPrefix = "model.visual";
+            int visionTensors = inventory.CountUnder(visionPrefix + ".");
+            bool visionMaterialised = visionTensors > 0;
             objects.Add(new LogicalObject
             {
                 Id = "vision.perception_tower",
@@ -199,20 +201,28 @@ public static class ArchMapper
                     new()
                     {
                         Artifact = visionPrefix,
-                        TensorPrefix = visionPrefix + ".",
-                        Tensors = inventory.CountUnder(visionPrefix + "."),
+                        TensorPrefix = visionPrefix,
+                        Tensors = visionTensors,
                         Bytes = inventory.BytesUnder(visionPrefix + "."),
                     },
                 },
-                Representations = new List<Representation>(), // carried, not materialised
+                // The tower is part of the model: with tensors in the source
+                // it is materialised so export can include it; without them
+                // the object stays carried.
+                Representations = visionMaterialised
+                    ? new List<Representation>
+                    {
+                        new() { Encoding = encoding, Fidelity = Fidelity.Canonical },
+                    }
+                    : new List<Representation>(),
             });
             components.Add(new Component
             {
                 Id = "vision",
                 Role = ComponentRole.Perception,
                 SourceArtifact = visionPrefix,
-                NumLayers = 12,
-                HiddenSize = 768,
+                NumLayers = facts.Vision?.NumLayers ?? 12,
+                HiddenSize = facts.Vision?.HiddenSize ?? 768,
                 Perception = JsonSerializer.SerializeToElement(
                     new { modality = "image", transform = new { kind = "encoder" } }, ViJson.Options),
             });
@@ -221,6 +231,8 @@ public static class ArchMapper
         if (options.IncludeMtp)
         {
             const string mtpPrefix = "mtp";
+            int mtpTensors = inventory.CountUnder(mtpPrefix + ".");
+            bool mtpMaterialised = mtpTensors > 0;
             objects.Add(new LogicalObject
             {
                 Id = "mtp.stack",
@@ -231,12 +243,21 @@ public static class ArchMapper
                     new()
                     {
                         Artifact = mtpPrefix,
-                        TensorPrefix = mtpPrefix + ".",
-                        Tensors = inventory.CountUnder(mtpPrefix + "."),
+                        TensorPrefix = mtpPrefix,
+                        Tensors = mtpTensors,
                         Bytes = inventory.BytesUnder(mtpPrefix + "."),
                     },
                 },
-                Representations = new List<Representation>(),
+                // With mtp tensors in the checkpoint, the drafter's module
+                // is materialised into its own segment (the container
+                // becomes self-contained for export-mtp). Without them, the
+                // object stays carried: nothing to bind.
+                Representations = mtpMaterialised
+                    ? new List<Representation>
+                    {
+                        new() { Encoding = encoding, Fidelity = Fidelity.Canonical },
+                    }
+                    : new List<Representation>(),
             });
             components.Add(new Component
             {
@@ -269,6 +290,14 @@ public static class ArchMapper
         if (untied)
         {
             reps.Add(Rep("target.output_head", encoding, BindOutputHead(inventory, prefix)));
+        }
+        if (options.IncludeMtp && inventory.CountUnder("mtp.") > 0)
+        {
+            reps.Add(Rep("mtp.stack", encoding, BindUnder(inventory, "mtp.")));
+        }
+        if (options.IncludeVision && inventory.CountUnder("model.visual.") > 0)
+        {
+            reps.Add(Rep("vision.perception_tower", encoding, BindUnder(inventory, "model.visual.")));
         }
 
         // Stored-precision policy: the canonical encoding is the stack
@@ -442,6 +471,16 @@ public static class ArchMapper
         throw new ModelConfigException(
             "tie_word_embeddings is false but neither 'lm_head.weight' nor '<prefix>.lm_head.weight' is in the inventory");
     }
+
+    /// <summary>Binds a carried module (the MTP drafter's <c>mtp.</c> stem or
+    /// the vision tower's <c>model.visual.</c> stem) verbatim: every tensor
+    /// under the stem, as object-relative names — the stem IS the binding's
+    /// tensor prefix, so export rebuilds the original checkpoint names.</summary>
+    private static List<NamedTensorData> BindUnder(HfInventory inventory, string stem) =>
+        inventory.TensorNames
+            .Where(n => n.StartsWith(stem, StringComparison.Ordinal))
+            .Select(n => ToTensorData(inventory, n, n[stem.Length..]))
+            .ToList();
 
     private static NamedTensorData ToTensorData(HfInventory inventory, string fullName, string relative)
     {

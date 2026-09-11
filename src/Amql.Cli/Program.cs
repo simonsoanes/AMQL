@@ -41,6 +41,7 @@ internal static class Program
                 "change-tensor" => ChangeTensor(args[1..]),
                 "save-lora" => SaveLora(args[1..]),
                 "export" => Export(args[1..]),
+                "export-mtp" => ExportMtp(args[1..]),
                 "layers" => Layers(args[1..]),
                 "import" => Import(args[1..]),
                 "moe-ify" => MoeIfy(args[1..]),
@@ -902,6 +903,29 @@ internal static class Program
         _ => "?",
     };
 
+    // ── export-mtp: emit the MTP drafter as a standalone checkpoint ─────────
+
+    private static int ExportMtp(string[] args)
+    {
+        var containerDir = Arg(args, 0) ?? throw new CliException(
+            "export-mtp requires a container directory, e.g. 'amql-cli export-mtp <container-dir> --out <drafter-dir>'");
+        string outDir = OptionValue(args, "--out") ?? throw new CliException("export-mtp requires '--out <drafter-dir>'");
+
+        using var container = Vindex3Container.Open(containerDir);
+        var report = ModelExporter.ExportMtp(container, outDir);
+
+        Console.WriteLine($"drafter:    {report.Model}");
+        Console.WriteLine($"tensors:    {report.Tensors}  ({FormatBytes(report.PayloadBytes)})");
+        foreach (var note in report.Notes)
+        {
+            Console.WriteLine($"note:       {note}");
+        }
+        Console.WriteLine("wrote:      model.safetensors, config.json" +
+                          (File.Exists(Path.Combine(outDir, "tokenizer.json")) ? ", tokenizer.json" : string.Empty));
+        Console.WriteLine("the drafter is the MTP module composed with the shared embedding and head — a standalone checkpoint for speculative decoding");
+        return 0;
+    }
+
     // ── import: merge a second model into the container ──────────────────
 
     private static int Import(string[] args)
@@ -1047,6 +1071,7 @@ internal static class Program
                               [--rank 8] [--alpha 16] [--container <container-dir>]
               amql-cli export <container-dir> --out <checkpoint-dir>
                               [--patch <patch.safetensors>] [--quant mxfp4]
+              amql-cli export-mtp <container-dir> --out <drafter-dir>
               amql-cli layers <container-dir> [--component target]
               amql-cli import <container-dir> <model> --out <merged-dir>
                               [--container]
@@ -1082,7 +1107,11 @@ internal static class Program
             (FP4 E2M1 elements, two per byte, per-32-element E8M0 scales);
             embeddings, norms, biases and the output head keep their full
             precision, and the quantized checkpoint is terminal for this
-            build (the encoder reads full-precision dtypes).
+            build (the encoder reads full-precision dtypes). A materialised
+            VISION tower rides the same shard under model.visual.* (it is
+            part of the model), and a materialised MTP drafter exports
+            automatically alongside as mtp.safetensors + mtp.config.json —
+            or standalone via export-mtp.
             layers lists every component and, for the selected one, the
             per-layer attention policy table and tensor inventory, then
             whether the planner serves the stack or refuses it by name.
