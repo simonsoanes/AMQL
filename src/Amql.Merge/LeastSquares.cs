@@ -87,8 +87,8 @@ public static class LeastSquares
         // construction with the ridge).
         var chol = Cholesky(gram, d);
         var x = new double[d * d];
-        SolveLower(chol, x, cross, d);
-        SolveUpperTranspose(chol, x, d);
+        SolveLower(chol, x, cross, d, d);
+        SolveUpperTranspose(chol, x, d, d);
 
         var result = new float[d * d];
         for (int i = 0; i < d * d; i++)
@@ -135,6 +135,71 @@ public static class LeastSquares
         return total;
     }
 
+    /// <summary>
+    /// Rectangular ridge least squares: minimises Σ‖a_i − W·b_i‖² +
+    /// ridge·‖W‖²_F over W ∈ R^{dOut × dIn} via its closed-form normal
+    /// equations W = (Σ a_i b_iᵀ)·(Σ b_i b_iᵀ + λI)⁻¹. This is the
+    /// calculated MTP projector fit (Phase 1 of the fit): the drafter's
+    /// free block, fitted from the collected continuation pairs,
+    /// closed-form and order-independent.
+    /// </summary>
+    public static float[] FitProjection(
+        float[] a, float[] b, int n, int dOut, int dIn, double ridgeRel = 1e-4)
+    {
+        if (n <= 0)
+        {
+            throw new MergeException("no pairs to fit the MTP projector");
+        }
+        if (a.Length != n * dOut || b.Length != n * dIn)
+        {
+            throw new MergeException($"projection pairs do not match (n={n}, in={dIn}, out={dOut})");
+        }
+
+        var gram = new double[dIn * dIn];   // Σ x_i x_iᵀ
+        var cross = new double[dIn * dOut]; // Σ x_i y_iᵀ
+        for (int i = 0; i < n; i++)
+        {
+            for (int r = 0; r < dIn; r++)
+            {
+                double xr = b[i * dIn + r];
+                for (int c = 0; c < dIn; c++)
+                {
+                    gram[r * dIn + c] += xr * b[i * dIn + c];
+                }
+                for (int c = 0; c < dOut; c++)
+                {
+                    cross[r * dOut + c] += xr * a[i * dOut + c];
+                }
+            }
+        }
+
+        double trace = 0;
+        for (int i = 0; i < dIn; i++)
+        {
+            trace += gram[i * dIn + i];
+        }
+        double ridge = ridgeRel * (trace / dIn) + 1e-8;
+        for (int i = 0; i < dIn; i++)
+        {
+            gram[i * dIn + i] += ridge;
+        }
+
+        var chol = Cholesky(gram, dIn);
+        var x = new double[dIn * dOut]; // Wᵀ = (S + λI)⁻¹ · C
+        SolveLower(chol, x, cross, dIn, dOut);
+        SolveUpperTranspose(chol, x, dIn, dOut);
+
+        var w = new float[dOut * dIn];
+        for (int o = 0; o < dOut; o++)
+        {
+            for (int j = 0; j < dIn; j++)
+            {
+                w[o * dIn + j] = (float)x[j * dOut + o];
+            }
+        }
+        return w;
+    }
+
     private static double[] Cholesky(double[] a, int d)
     {
         var l = new double[d * d];
@@ -165,38 +230,38 @@ public static class LeastSquares
         return l;
     }
 
-    /// <summary>In-place forward substitution L·x = b (b row-major d×d,
-    /// columns solved independently).</summary>
-    private static void SolveLower(double[] l, double[] x, double[] b, int d)
+    /// <summary>In-place forward substitution L·x = b (b row-major
+    /// rows×cols, columns solved independently).</summary>
+    private static void SolveLower(double[] l, double[] x, double[] b, int rows, int cols)
     {
-        for (int col = 0; col < d; col++)
+        for (int col = 0; col < cols; col++)
         {
-            for (int i = 0; i < d; i++)
+            for (int i = 0; i < rows; i++)
             {
-                double sum = b[i * d + col];
+                double sum = b[i * cols + col];
                 for (int k = 0; k < i; k++)
                 {
-                    sum -= l[i * d + k] * x[k * d + col];
+                    sum -= l[i * rows + k] * x[k * cols + col];
                 }
-                x[i * d + col] = sum / l[i * d + i];
+                x[i * cols + col] = sum / l[i * rows + i];
             }
         }
     }
 
     /// <summary>In-place back substitution Lᵀ·x = b (x already holds the
     /// forward solution).</summary>
-    private static void SolveUpperTranspose(double[] l, double[] x, int d)
+    private static void SolveUpperTranspose(double[] l, double[] x, int rows, int cols)
     {
-        for (int col = 0; col < d; col++)
+        for (int col = 0; col < cols; col++)
         {
-            for (int i = d - 1; i >= 0; i--)
+            for (int i = rows - 1; i >= 0; i--)
             {
-                double sum = x[i * d + col];
-                for (int k = i + 1; k < d; k++)
+                double sum = x[i * cols + col];
+                for (int k = i + 1; k < rows; k++)
                 {
-                    sum -= l[k * d + i] * x[k * d + col];
+                    sum -= l[k * rows + i] * x[k * cols + col];
                 }
-                x[i * d + col] = sum / l[i * d + i];
+                x[i * cols + col] = sum / l[i * rows + i];
             }
         }
     }

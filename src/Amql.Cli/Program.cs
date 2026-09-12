@@ -44,6 +44,7 @@ internal static class Program
                 "export-mtp" => ExportMtp(args[1..]),
                 "generate-mtp" => GenerateMtp(args[1..]),
                 "collect-mtp" => CollectMtp(args[1..]),
+                "fit-mtp" => FitMtp(args[1..]),
                 "layers" => Layers(args[1..]),
                 "import" => Import(args[1..]),
                 "moe-ify" => MoeIfy(args[1..]),
@@ -1002,6 +1003,27 @@ internal static class Program
         return 0;
     }
 
+    // ── fit-mtp: the calculated drafter's projector fit (phase 1) ────────
+
+    private static int FitMtp(string[] args)
+    {
+        var containerDir = Arg(args, 0) ?? throw new CliException(
+            "fit-mtp requires a container directory (a generate-mtp output), e.g. 'amql-cli fit-mtp <container> --pairs <pairs-dir>'");
+        string pairsDir = OptionValue(args, "--pairs") ?? throw new CliException("fit-mtp requires '--pairs <pairs-dir>'");
+        double ridge = DoubleOption(args, "--ridge", 1e-4);
+
+        var report = Amql.Merge.MtpFitter.FitAndAssemble(containerDir, pairsDir, ridge);
+
+        Console.WriteLine($"fit:        {report.FitCount} pairs, hidden {report.Hidden}, ridge {report.LambdaRel:g3}");
+        foreach (var note in report.Notes)
+        {
+            Console.WriteLine($"note:       {note}");
+        }
+        Console.WriteLine("the fitted projector has replaced fc.weight in the container — export emits the drafter companion:");
+        Console.WriteLine($"  amql-cli export {containerDir} --out <checkpoint-dir>");
+        return 0;
+    }
+
     // ── import: merge a second model into the container ──────────────────
 
     private static int Import(string[] args)
@@ -1152,6 +1174,8 @@ internal static class Program
                               [--text <corpus.txt>] [--sample 1024]
               amql-cli collect-mtp <container-dir> --out <pairs-dir> --text <corpus.txt>
                               [--fit 512] [--gate 256]
+              amql-cli fit-mtp <container-dir> --pairs <pairs-dir>
+                              [--ridge 1e-4]
               amql-cli layers <container-dir> [--component target]
               amql-cli import <container-dir> <model> --out <merged-dir>
                               [--container]

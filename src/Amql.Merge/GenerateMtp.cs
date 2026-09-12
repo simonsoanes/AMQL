@@ -237,6 +237,30 @@ public static class GenerateMtp
 
     // ── the acceptance gate ────────────────────────────────────────────────
 
+    /// <summary>Zero-shot draft acceptance over the first <paramref name="sample"/>
+    /// corpus tokens, measured through the runtime path — the same gate the
+    /// boot and the fit use.</summary>
+    public static double MeasureDraftAcceptance(string containerDir, IReadOnlyList<int> tokens, int sample)
+    {
+        using var container = Vindex3Container.Open(containerDir);
+        using var store = container.CreateOperandStore();
+        var plan = Planner.Plan(container, "target", store);
+        int trunk = LastFullAttentionLayer(plan);
+        return MeasureDraftAcceptance(container, containerDir, plan, trunk, sample, tokens);
+    }
+
+    internal static int LastFullAttentionLayer(ComponentOpPlan plan)
+    {
+        for (int l = plan.Layers.Count - 1; l >= 0; l--)
+        {
+            if (plan.Layers[l].Attention is not null)
+            {
+                return l;
+            }
+        }
+        throw new MergeException("no full-attention layer to serve as the MTP trunk");
+    }
+
     /// <summary>Runs the drafter's real pipeline over the sample: capture
     /// the model's final-normed hidden states, norm and project
     /// (concat + fc), push the whole sequence through one trunk
