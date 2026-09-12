@@ -425,3 +425,47 @@ note:       zero-shot draft acceptance over 794 positions: 0.3% — the bootstra
 but far below a useful speculative drafter — the untrained boot is a
 structure-and-warm-start deliverable, and the frozen-model adaptation pass is the
 follow-up that turns it into a real drafter.)
+
+### The calculated fit — "pre-trained" by calculation, no training
+
+The follow-up replaces "training (frozen model)" with **calculation**: one forward pass
+collects the model's own continuation map, and a **closed-form ridge least-squares solve**
+fits the drafter's free block — no autograd, no SGD, no random seeds in the learning path
+(same inputs → byte-identical weights; verified by a determinism test). Three commands
+run it, or `generate-mtp --fit` runs the whole pipeline in one shot:
+
+```bash
+amql-cli generate-mtp ./containers/Qwen3.5-0.8B --out ./containers/Qwen3.5-0.8B-mtp \
+  --text ./corpus/wikipedia.txt --sample 4096 --fit --eval 1024
+```
+
+1. **`collect-mtp` (phase 0)** — one dense forward over the corpus exports the pairs
+   `x_t = concat(pre_fc_norm_hidden(final_norm(h_t)), pre_fc_norm_embedding(e_{t+1}))`
+   (2h) and the regression target `y_t` = the model's **pre-final-norm residual at t+1**
+   (h), with the **fit/gate split fixed in the sink** — the acceptance gate is never
+   measured on fitted positions.
+2. **`fit-mtp` (phase 1)** — the single ridge projector `W* = (XᵀX+λI)⁻¹XᵀY`
+   (`λ` relative `1e-4`), written back into `mtp.stack` as `fc.weight`, re-encoded to the
+   segment dtype.
+3. **`fit-mtp --sweep 1,4,8` (phase 2)** — the **K-projector mixture**: the fit rows are
+   clustered into K balanced groups (deterministic farthest-first k-means), one ridge
+   projector is fit per cluster, and a linear router (L2-normalised cluster-mean rows, the
+   moe-ify convention) picks the expert per row. The free block materialises as
+   `fc.router.weight` + `fc.experts.{{e}}.weight` — the export and the acceptance gate
+   resolve the routed structure by name, so it survives export → re-encode. The held-out
+   acceptance gate decides the shipped K.
+
+**Measured on the real Qwen3.5-0.8B** (512 fit + 256 held-out positions, split fixed in
+the collector; the gate runs the drafter's real pipeline): boot 0.0% → fitted **14.8%**
+(K=1) → **16.4%** (K=4) → **16.8%** (K=8, shipped — the gate's winner). R² over the fit
+split is ≈1.0 (the system is under-determined at 512 rows < 2h dims — the held-out gate,
+not R², is the evidence of generalisation; K=1's in-memory 14.8% reproduces the
+materialised container's number exactly). The demo model tie-breaks to fewer clusters
+(1), so ties at equal acceptance prefer the smaller K. `verify` passes on the fitted
+container and `export` emits the drafter companion automatically.
+
+```
+fit:        K ∈ {1, 4, 8}: K=1 R² 1.000 acc 14.8%; K=4 R² 0.917 acc 16.4%; K=8 R² 0.941 acc 16.8%
+note:       shipped K=8 (the acceptance gate's winner; ties prefer fewer clusters); weights 3e30e9c8…
+note:       held-out draft acceptance over 256 positions: boot 0.0% → fitted 16.8%
+```

@@ -936,8 +936,13 @@ internal static class Program
         var containerDir = Arg(args, 0) ?? throw new CliException(
             "generate-mtp requires a container directory, e.g. 'amql-cli generate-mtp <container-dir> --out <out>'");
         string outDir = OptionValue(args, "--out") ?? throw new CliException("generate-mtp requires '--out <out>'");
-        int sample = IntOption(args, "--sample", 1024);
-        int use = sample == int.MaxValue ? 1024 : sample;
+        int sample = IntOption(args, "--sample", 4096);
+        int use = sample == int.MaxValue ? 4096 : sample;
+        int eval = IntOption(args, "--eval", 1024);
+        double ridge = DoubleOption(args, "--ridge", 1e-4);
+        int? clusters = IntOptionOrNull(args, "--clusters");
+        string? sweep = OptionValue(args, "--sweep");
+        bool fitMode = HasOption(args, "--fit");
 
         IReadOnlyList<int> tokens = Array.Empty<int>();
         if (OptionValue(args, "--text") is { } textPath)
@@ -964,6 +969,47 @@ internal static class Program
             Console.WriteLine($"note:       {note}");
         }
         Console.WriteLine("wrote:      index.json, system_graph.json, segments/, tokenizer.json");
+
+        // --fit runs the calculated path (phases 0–2) in one command —
+        // "pre-trained" by calculation, no training: collect the model's
+        // continuation pairs from the boot the drafter just got, then fit
+        // the free block (single projector, or the K-projector mixture
+        // {1,4,8} whose acceptance gate decides the shipped K).
+        if (fitMode)
+        {
+            if (tokens.Count == 0)
+            {
+                throw new CliException("generate-mtp --fit requires '--text <corpus.txt>'");
+            }
+            int fitCount = use - eval - 2;
+            if (fitCount < 1)
+            {
+                throw new CliException(
+                    $"--sample {use} with --eval {eval} leaves no fit pairs — need sample >= eval + 3");
+            }
+            if (tokens.Count < use)
+            {
+                throw new CliException(
+                    $"the corpus has {tokens.Count} tokens but --sample {use} needs {fitCount + eval + 2} — pass a smaller --sample");
+            }
+            var pairsDir = $"{outDir}-pairs";
+            Amql.Merge.PairCollector.Collect(outDir, pairsDir, tokens, fitCount, eval);
+
+            var candidates = sweep is not null
+                ? sweep.Split(',').Select(s => int.Parse(s.Trim())).ToArray()
+                : clusters is { } c
+                    ? new[] { c }
+                    : new[] { 1, 4, 8 };
+            var kReport = Amql.Merge.MtpKProjectors.SweepAndFit(outDir, pairsDir, candidates, ridge);
+            Console.WriteLine($"fit:        K ∈ {{{string.Join(", ", kReport.Sweep.Select(e => e.Clusters))}}}: " +
+                string.Join("; ", kReport.Sweep.Select(e => $"K={e.Clusters} R² {e.R2:0.000} acc {e.GateAcceptance:0.0%}")));
+            foreach (var note in kReport.Notes)
+            {
+                Console.WriteLine($"note:       {note}");
+            }
+            Console.WriteLine("the fitted free block has replaced the boot projector in the container.");
+        }
+
         Console.WriteLine("the drafter is part of the container now — export emits it automatically:");
         Console.WriteLine($"  amql-cli export {outDir} --out <checkpoint-dir>");
         Console.WriteLine($"  amql-cli verify {outDir}");
@@ -1194,7 +1240,9 @@ internal static class Program
                               [--patch <patch.safetensors>] [--quant mxfp4]
               amql-cli export-mtp <container-dir> --out <drafter-dir>
               amql-cli generate-mtp <container-dir> --out <out>
-                              [--text <corpus.txt>] [--sample 1024]
+                              [--text <corpus.txt>] [--sample 4096] [--fit]
+                              [--eval 1024] [--clusters K | --sweep K1,K2,K3]
+                              [--ridge 1e-4]
               amql-cli collect-mtp <container-dir> --out <pairs-dir> --text <corpus.txt>
                               [--fit 512] [--gate 256]
               amql-cli fit-mtp <container-dir> --pairs <pairs-dir>
@@ -1272,6 +1320,12 @@ internal static class Program
             materialised into the container (mtp.stack), so export emits
             the companion automatically; --text provides the corpus for
             the zero-shot draft-acceptance gate, --sample bounds it.
+            --fit runs the calculated path in one command: collect the
+            model's continuation pairs (fit = --sample − --eval − 2,
+            held-out = --eval) and fit the free block by closed-form ridge
+            least squares — the single projector, or the K-projector
+            mixture {1,4,8} whose held-out acceptance gate ships the
+            winner (--clusters K / --sweep override the candidates).
             Any pathway (route, path, generate, inspect-token, and
             tokens/decode, which parse but cannot be affected) accepts
             --patch to run with the patch's deltas merged into the loaded
