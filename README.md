@@ -365,6 +365,71 @@ note:       perplexity over 4 held-out tokens: dense 49.96 → moе 49.88 (-0.2%
 wrote:      index.json, system_graph.json, segments/, tokenizer.json
 ```
 
+### Pruning a container down to a byte budget (`prune`)
+
+`prune` shrinks a container to a target total on-disk size by dropping **whole decoder
+layers** — the only dimension a merge actually grows that can be removed without touching
+the vocabulary. The vocabulary (embedding/head), the tokenizer, the token-map, and every
+non-layer file are copied byte-identically; the stack segment is rebuilt without the
+dropped layers, the kept layers are renumbered 0..K−1, and the graph, index and token-map
+layer table are rewritten to match. The result is a **complete, mergeable container**: the
+planner runs it, `export` materialises it, and `import` accepts it as either side of a
+merge — which is what makes the prune→merge loop below work.
+
+```bash
+# drop as many layers as needed to get the whole container under 14.5 GiB
+amql-cli prune ./containers/merged --out ./containers/merged-pruned --target-bytes 14.5GiB
+
+# corpus-ranked: keep the layers whose removal changes the hidden state least
+amql-cli prune ./containers/merged --out ./containers/merged-pruned \
+  --target-bytes 14.5GiB --approach corpus --text ./corpus/wikipedia.txt
+
+# seeded random baseline for ablations
+amql-cli prune ./containers/merged --out ./containers/merged-pruned \
+  --target-bytes 14.5GiB --approach random --seed 7
+```
+
+`--target-bytes` accepts bare bytes or `B`/`KB`/`MB`/`GB`/`TB`, `KiB`/`MiB`/`GiB`/`TiB`
+suffixes (case-insensitive; `--target` is an accepted alias). The three approaches rank
+which layers drop first, and the prune takes the **smallest prefix of that order** that
+gets under the budget (never below `--min-layers`, default 1):
+
+- **`provenance`** (default, deterministic, no corpus) — reads `token-map.json`'s
+  per-layer provenance: layers whose tensors were *grown* (zero-padded from the other
+  model during the merge) drop first as the least authentic, then by position — the top of
+  the stack goes before the input-proximal layers. Without a token-map every layer ties
+  and the ranking is purely positional.
+- **`corpus`** — one forward pass over `--text` (needs a BPE tokenizer beside the
+  container, which `encode` copies in) scores each layer's residual delta
+  ‖h(l+1) − h(l)‖², mean over positions and tokens; the layers that change the hidden
+  state least drop first. One-shot: scores come from the full stack, they are not
+  re-measured after each drop.
+- **`random`** — a seeded uniform layer order (`--seed`, default 42) as the ablation
+  baseline.
+
+Selection and the commit are exact: each candidate's rebuilt stack segment and JSON files
+are sized before anything is written, the exact total is re-verified before the copies
+land, and a target below the `--min-layers` floor refuses with the floor size rather than
+shipping an over-budget container. The dropped layers are recorded in the index
+(`prune.dropped_layers`), and an MTP drafter carried by the container is not a blocker —
+its plain note records that its trunk (a copied layer) is now stale.
+
+```
+pruned:    ./containers/merged-pruned
+model:     Qwen3.5-0.8B+Qwen3.5-2B
+approach:  provenance     seed: 42
+layers:    24 → 14  (dropped 10: 14,15,16,17,18,19,20,21,22,23)
+bytes:     20.10 GiB → 13.20 GiB  (target 14.00 GiB, saved 6.90 GiB)
+note:      an MTP drafter is present and its trunk is now stale …
+the pruned container is a complete model — verify, export and import it as usual:
+  amql-cli verify ./containers/merged-pruned
+  amql-cli import ./containers/merged-pruned <smaller-model> --out <result>
+```
+
+The workflow this enables: merge two large models, prune the result to a target size, then
+merge a smaller model into the pruned container — the prune output participates in `import`
+as any complete container, so the chain closes on a fresh, verifiable merge.
+
 ### The MTP drafter and vision tower on export
 
 The encoder **materialises the carried modules** whenever the source checkpoint holds

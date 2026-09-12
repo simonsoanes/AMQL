@@ -48,6 +48,7 @@ internal static class Program
                 "layers" => Layers(args[1..]),
                 "import" => Import(args[1..]),
                 "moe-ify" => MoeIfy(args[1..]),
+                "prune" => Prune(args[1..]),
                 _ => throw new CliException($"unknown command '{args[0]}'"),
             };
         }
@@ -1178,6 +1179,102 @@ internal static class Program
         return 0;
     }
 
+    // ── prune: drop decoder layers to meet a byte budget ──────────────────
+
+    private static int Prune(string[] args)
+    {
+        var containerDir = Arg(args, 0) ?? throw new CliException(
+            "prune requires a container directory, e.g. 'amql-cli prune <container-dir> --out <pruned> --target-bytes 2GiB'");
+        string outDir = OptionValue(args, "--out") ?? throw new CliException("prune requires '--out <pruned-dir>'");
+        string targetRaw = OptionValue(args, "--target-bytes") ?? OptionValue(args, "--target")
+            ?? throw new CliException("prune requires '--target-bytes <size>' (bare bytes, or with B/KB/MB/GB/TB, KiB/MiB/GiB/TiB)");
+        long targetBytes = ParseByteSize(targetRaw, "--target-bytes");
+        string approachRaw = OptionValue(args, "--approach") ?? "provenance";
+        var approach = approachRaw switch
+        {
+            "provenance" => PruneApproach.Provenance,
+            "corpus" => PruneApproach.Corpus,
+            "random" => PruneApproach.Random,
+            _ => throw new CliException($"unknown pruning approach '{approachRaw}' — use provenance, corpus, or random"),
+        };
+        int seed = IntOption(args, "--seed", 42);
+        int sample = IntOption(args, "--sample", 8192);
+        int minLayers = IntOption(args, "--min-layers", 1);
+        string? text = null;
+        if (OptionValue(args, "--text") is { } textPath)
+        {
+            try
+            {
+                text = File.ReadAllText(textPath);
+            }
+            catch (IOException e)
+            {
+                throw new CliException($"cannot read corpus '{textPath}': {e.Message}");
+            }
+        }
+
+        var report = LayerPruner.Prune(containerDir, outDir, new PruneOptions(
+            TargetBytes: targetBytes,
+            Approach: approach,
+            Seed: seed,
+            CorpusText: text,
+            SampleCap: sample,
+            MinLayers: minLayers));
+
+        Console.WriteLine($"pruned:    {report.OutDir}");
+        Console.WriteLine($"model:     {report.Model}");
+        Console.WriteLine($"approach:  {report.Approach}     seed: {seed}");
+        Console.WriteLine($"layers:    {report.OriginalLayers} → {report.KeptLayers}  (dropped {report.DroppedLayers.Count}: {CompactList(report.DroppedLayers)})");
+        Console.WriteLine($"bytes:     {FormatBytes(report.OriginalBytes)} → {FormatBytes(report.FinalBytes)}  " +
+                          $"(target {FormatBytes(report.TargetBytes)}, saved {FormatBytes(report.OriginalBytes - report.FinalBytes)})");
+        foreach (var note in report.Notes)
+        {
+            Console.WriteLine($"note:      {note}");
+        }
+        Console.WriteLine("the pruned container is a complete model — verify, export and import it as usual:");
+        Console.WriteLine($"  amql-cli verify {outDir}");
+        Console.WriteLine($"  amql-cli import {outDir} <smaller-model> --out <result>");
+        return 0;
+    }
+
+    /// <summary>Byte size from user spelling: a bare count or with an
+    /// IEC/SI suffix (case-insensitive), e.g. <c>2GiB</c>, <c>512MiB</c>,
+    /// <c>1.5GB</c>, <c>800KB</c>, <c>10B</c>.</summary>
+    private static long ParseByteSize(string raw, string flag)
+    {
+        string text = raw.Trim();
+        int digits = 0;
+        while (digits < text.Length && (char.IsDigit(text[digits]) || text[digits] == '.'))
+        {
+            digits++;
+        }
+        string number = text[..digits];
+        string unit = text[digits..].Trim().ToUpperInvariant();
+        if (!double.TryParse(number, System.Globalization.CultureInfo.InvariantCulture, out double value) || value <= 0)
+        {
+            throw new CliException($"{flag} '{raw}' is not a positive byte size");
+        }
+        long multiplier = unit switch
+        {
+            "" or "B" => 1,
+            "K" or "KB" or "KIB" => 1024,
+            "M" or "MB" or "MIB" => 1024L * 1024,
+            "G" or "GB" or "GIB" => 1024L * 1024 * 1024,
+            "T" or "TB" or "TIB" => 1024L * 1024 * 1024 * 1024,
+            _ => throw new CliException($"{flag} '{raw}': unit '{unit}' is not recognized " +
+                                        "(use B/KB/MB/GB/TB, KiB/MiB/GiB/TiB, or a bare byte count)"),
+        };
+        double bytes = value * multiplier;
+        if (bytes > long.MaxValue)
+        {
+            throw new CliException($"{flag} '{raw}' overflows a 64-bit byte count");
+        }
+        return (long)bytes;
+    }
+
+    private static string CompactList(IReadOnlyList<int> values) =>
+        values.Count <= 24 ? string.Join(",", values) : string.Join(",", values.Take(24)) + ",…";
+
     // ── patch option plumbing ──────────────────────────────────────────────
 
     private static double DoubleOption(string[] args, string name, double fallback) =>
@@ -1253,6 +1350,9 @@ internal static class Program
               amql-cli moe-ify <container-dir> --out <moe-dir> --text <corpus.txt>
                               [--experts 8] [--top-k 2] [--sample 4096] [--eval 1024]
                               [--policy softmax|renormalise]
+              amql-cli prune <container-dir> --out <pruned-dir> --target-bytes <size>
+                              [--approach provenance|corpus|random] [--seed 42]
+                              [--text <corpus.txt>] [--sample 8192] [--min-layers 1]
               amql-cli help
 
             Example:
@@ -1312,6 +1412,21 @@ internal static class Program
             the top-k expert kernel. The held-out perplexity gate prints
             dense → moе for the chosen --eval tokens; --sample tokens
             drive the clustering.
+            prune shrinks a container down to a byte budget by dropping
+            whole decoder layers (the vocabulary and every non-layer file
+            are untouched, the kept layers are renumbered, and the result
+            is a complete, mergeable container). --target-bytes accepts
+            bare bytes or B/KB/MB/GB/TB, KiB/MiB/GiB/TiB suffixes. The
+            approach ranks which layers drop first: "provenance" uses
+            token-map.json layer provenance (grown tensors first, then
+            top of the stack — deterministic, no corpus), "corpus" scores
+            each layer's residual delta on one forward pass over --text
+            (needs a tokenizer beside the container), and "random" is a
+            seeded uniform order (--seed) for ablation baselines. The
+            prune drops exactly as many layers as needed to get under the
+            budget (never below --min-layers), verifies the exact rebuilt
+            sizes before writing, and refuses when the target is below
+            the floor.
             generate-mtp boots an MTP drafter for a dense model that has
             none: the trunk is a copy of the model's last full-attention
             layer, the drafter/final norms copy the final norm, the fc
