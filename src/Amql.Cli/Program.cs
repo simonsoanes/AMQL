@@ -1003,7 +1003,7 @@ internal static class Program
         return 0;
     }
 
-    // ── fit-mtp: the calculated drafter's projector fit (phase 1) ────────
+    // ── fit-mtp: the calculated drafter's projector fit (phases 1–2) ──────
 
     private static int FitMtp(string[] args)
     {
@@ -1011,6 +1011,29 @@ internal static class Program
             "fit-mtp requires a container directory (a generate-mtp output), e.g. 'amql-cli fit-mtp <container> --pairs <pairs-dir>'");
         string pairsDir = OptionValue(args, "--pairs") ?? throw new CliException("fit-mtp requires '--pairs <pairs-dir>'");
         double ridge = DoubleOption(args, "--ridge", 1e-4);
+        string? sweep = OptionValue(args, "--sweep");
+        int? clusters = IntOptionOrNull(args, "--clusters");
+
+        // Phase 2: the K-projector mixture. --sweep 1,4,8 measures the
+        // candidates and ships the acceptance winner; --clusters K fits and
+        // ships a single routed block. The plain fit (phase 1) stays the
+        // single ridge projector.
+        if (sweep is not null || clusters is > 1)
+        {
+            var candidates = sweep is not null
+                ? sweep.Split(',').Select(s => int.Parse(s.Trim())).ToArray()
+                : new[] { clusters!.Value };
+            var kReport = Amql.Merge.MtpKProjectors.SweepAndFit(containerDir, pairsDir, candidates, ridge);
+            Console.WriteLine($"sweep:      K ∈ {{{string.Join(", ", kReport.Sweep.Select(e => e.Clusters))}}}: " +
+                string.Join("; ", kReport.Sweep.Select(e => $"K={e.Clusters} R² {e.R2:0.000} acc {e.GateAcceptance:0.0%}")));
+            foreach (var note in kReport.Notes)
+            {
+                Console.WriteLine($"note:       {note}");
+            }
+            Console.WriteLine("the fitted free block has replaced the projector in the container — export emits the drafter companion:");
+            Console.WriteLine($"  amql-cli export {containerDir} --out <checkpoint-dir>");
+            return 0;
+        }
 
         var report = Amql.Merge.MtpFitter.FitAndAssemble(containerDir, pairsDir, ridge);
 
@@ -1175,7 +1198,7 @@ internal static class Program
               amql-cli collect-mtp <container-dir> --out <pairs-dir> --text <corpus.txt>
                               [--fit 512] [--gate 256]
               amql-cli fit-mtp <container-dir> --pairs <pairs-dir>
-                              [--ridge 1e-4]
+                              [--ridge 1e-4] [--clusters K] [--sweep K1,K2,K3]
               amql-cli layers <container-dir> [--component target]
               amql-cli import <container-dir> <model> --out <merged-dir>
                               [--container]

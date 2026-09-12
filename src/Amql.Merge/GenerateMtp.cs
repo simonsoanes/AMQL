@@ -213,8 +213,8 @@ public static class GenerateMtp
             int sampled = Math.Min(sampleLimit, acceptanceTokens.Count);
             if (sampled >= 4)
             {
-                acceptance = MeasureDraftAcceptance(
-                    container, outDir, plan, trunk, sampled, acceptanceTokens);
+                using var acceptanceCtx = new DraftContext(outDir, acceptanceTokens, sampled);
+                acceptance = acceptanceCtx.Score();
                 notes.Add($"zero-shot draft acceptance over {sampled - 2} positions: " +
                           $"{(double.IsNaN(acceptance) ? "n/a" : acceptance.ToString("0.0%"))} — " +
                           "the bootstrapped drafter is a warm start; training (frozen model) is the next step");
@@ -242,11 +242,8 @@ public static class GenerateMtp
     /// boot and the fit use.</summary>
     public static double MeasureDraftAcceptance(string containerDir, IReadOnlyList<int> tokens, int sample)
     {
-        using var container = Vindex3Container.Open(containerDir);
-        using var store = container.CreateOperandStore();
-        var plan = Planner.Plan(container, "target", store);
-        int trunk = LastFullAttentionLayer(plan);
-        return MeasureDraftAcceptance(container, containerDir, plan, trunk, sample, tokens);
+        using var ctx = new DraftContext(containerDir, tokens, sample);
+        return ctx.Score();
     }
 
     internal static int LastFullAttentionLayer(ComponentOpPlan plan)
@@ -261,104 +258,8 @@ public static class GenerateMtp
         throw new MergeException("no full-attention layer to serve as the MTP trunk");
     }
 
-    /// <summary>Runs the drafter's real pipeline over the sample: capture
-    /// the model's final-normed hidden states, norm and project
-    /// (concat + fc), push the whole sequence through one trunk
-    /// attention+FFN pass (rebound plan over mtp.stack), apply the shared
-    /// head, and score how often the top-1 draft equals the model's actual
-    /// second-next token.</summary>
-    private static double MeasureDraftAcceptance(
-        Vindex3Container source,
-        string generatedDir,
-        ComponentOpPlan densePlan,
-        int trunk,
-        int sampled,
-        IReadOnlyList<int> tokens)
-    {
-        int hidden = densePlan.HiddenSize;
-        int useable = sampled - 2;
-        var normed = new float[useable * hidden];
-        var embeddings = new float[useable * hidden];
-
-        using (var denseStore = source.CreateOperandStore())
-        {
-            var dense = new GenericRuntime(densePlan, denseStore);
-            var finalNormWeight = BitPattern.WidenToF32(
-                denseStore.Resolve(densePlan.FinalNorm.Weight.ObjectId, densePlan.FinalNorm.Weight.TensorName).Dtype,
-                denseStore.Resolve(densePlan.FinalNorm.Weight.ObjectId, densePlan.FinalNorm.Weight.TensorName).Payload);
-            var table = dense.Weights.Matrix(densePlan.Embedding!.Table, densePlan.Embedding.VocabSize, densePlan.Embedding.HiddenSize);
-
-            for (int t = 0; t < sampled; t++)
-            {
-                var h = dense.StepForward(tokens[t]);
-                if (t < useable)
-                {
-                    var n = (float[])h.Data.Clone();
-                    var view = new Tensor2D(n, h.Rows, h.Cols);
-                    Norms.ApplyInPlace(view, densePlan.FinalNorm.Kind, densePlan.FinalNorm.Eps,
-                        finalNormWeight, densePlan.FinalNorm.WeightOffset);
-                    Array.Copy(n, 0, normed, t * hidden, hidden);
-                    var embedRow = TensorOps.GatherRows(table, new[] { tokens[t + 1] });
-                    Array.Copy(embedRow.Data, 0, embeddings, t * hidden, hidden);
-                }
-            }
-        }
-
-        // The drafter's trunk plan: layer 0 = the copied full-attention
-        // layer, rebound onto mtp.stack; the shared embedding/head remain.
-        var trunkPlan = BuildTrunkPlan(source, generatedDir, densePlan, trunk, hidden);
-
-        using var generated = Vindex3Container.Open(generatedDir);
-        using var trunkStore = generated.CreateOperandStore();
-        var trunkRuntime = new GenericRuntime(trunkPlan, trunkStore);
-        var preFcNorm = BitPattern.WidenToF32(
-            trunkStore.Resolve("mtp.stack", "pre_fc_norm_hidden.weight").Dtype,
-            trunkStore.Resolve("mtp.stack", "pre_fc_norm_hidden.weight").Payload);
-        var fcMatrix = trunkRuntime.Weights.Matrix(new OperandRef("mtp.stack", "fc.weight"), hidden, 2 * hidden);
-
-        var input = new float[useable * 2 * hidden];
-        for (int t = 0; t < useable; t++)
-        {
-            // Each half is normalised with the copied final-norm weights
-            // (pre_fc_norm_hidden and pre_fc_norm_embedding).
-            var halfH = new float[hidden];
-            var halfE = new float[hidden];
-            Array.Copy(normed, t * hidden, halfH, 0, hidden);
-            Array.Copy(embeddings, t * hidden, halfE, 0, hidden);
-            Norms.ApplyInPlace(new Tensor2D(halfH, 1, hidden), NormType.RmsNorm,
-                densePlan.FinalNorm.Eps, preFcNorm, densePlan.FinalNorm.WeightOffset);
-            Norms.ApplyInPlace(new Tensor2D(halfE, 1, hidden), NormType.RmsNorm,
-                densePlan.FinalNorm.Eps, preFcNorm, densePlan.FinalNorm.WeightOffset);
-            Array.Copy(halfH, 0, input, t * 2 * hidden, hidden);
-            Array.Copy(halfE, 0, input, t * 2 * hidden + hidden, hidden);
-        }
-
-        var projected = TensorOps.MatMulTransposedB(new Tensor2D(input, useable, 2 * hidden), fcMatrix);
-        var positions = Enumerable.Range(0, useable).ToArray();
-        var trunkOut = trunkRuntime.RunLayerInternal(projected, 0, positions, positions, appendKv: true);
-        var logits = trunkRuntime.FinalNormAndHead(trunkOut);
-
-        int matches = 0;
-        for (int t = 0; t < useable; t++)
-        {
-            var row = logits.Row(t);
-            int best = 0;
-            for (int i = 1; i < row.Length; i++)
-            {
-                if (row[i] > row[best])
-                {
-                    best = i;
-                }
-            }
-            if (best == tokens[t + 2])
-            {
-                matches++;
-            }
-        }
-        return (double)matches / useable;
-    }
-
-    private static ComponentOpPlan BuildTrunkPlan(
+    
+    internal static ComponentOpPlan BuildTrunkPlan(
         Vindex3Container source, string generatedDir, ComponentOpPlan densePlan, int trunk, int hidden)
     {
         var src = densePlan.Layers[trunk];

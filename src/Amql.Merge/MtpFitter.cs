@@ -149,34 +149,74 @@ public static class MtpFitter
             });
     }
 
-    /// <summary>Replaces <c>fc.weight</c> in the container's mtp.stack with
-    /// the fitted block (re-encoded to the fc's stored dtype), rewriting
-    /// the segment and its index entry hashes. The source mapping is
-    /// released before the rewrite so the segment can be recreated.</summary>
-    private static void ReplaceFc(Vindex3Container container, float[] w)
+    /// <summary>Replaces the drafter's free block in the container's
+    /// mtp.stack (re-encoded to the fc's stored dtype), rewriting the
+    /// segment and its index entry hashes. The source mapping is released
+    /// before the rewrite so the segment can be recreated. The single-map
+    /// form writes <c>fc.weight</c>; the routed form (phase 2's K-projector
+    /// mixture) writes <c>fc.router.weight</c> + <c>fc.experts.{{e}}.weight</c>
+    /// — the names the acceptance path and the export resolve by shape.</summary>
+    internal static void ReplaceFc(Vindex3Container container, float[] w)
+    {
+        int hidden = (int)Math.Sqrt(w.Length / 2.0);
+        ReplaceFreeBlock(container,
+            new[] { ("fc.weight", w) },
+            new[] { new[] { (long)hidden, 2L * hidden } });
+    }
+
+    internal static void ReplaceFcRouted(Vindex3Container container, float[] router, float[][] experts)
+    {
+        int hidden = (int)Math.Sqrt(experts[0].Length / 2.0);
+        int k = experts.Length;
+        var names = new List<(string Name, float[] Values)> { ("fc.router.weight", router) };
+        var shapes = new List<long[]> { new[] { (long)k, 2L * hidden } };
+        for (int e = 0; e < k; e++)
+        {
+            names.Add(($"fc.experts.{e}.weight", experts[e]));
+            shapes.Add(new[] { (long)hidden, 2L * hidden });
+        }
+        ReplaceFreeBlock(container, names, shapes);
+    }
+
+    private static void ReplaceFreeBlock(
+        Vindex3Container container,
+        IReadOnlyList<(string Name, float[] Values)> blocks,
+        IReadOnlyList<long[]> shapes)
     {
         string repId = container.CanonicalRepresentationId("mtp.stack");
         var entry = container.Index.Representations[repId];
         var segmentPath = Path.Combine(container.Root, entry.Segment);
 
-        List<NamedTensorData> rebuilt;
         Dtype fcDtype;
+        List<NamedTensorData> rebuilt;
         using (var segment = SegmentFile.Open(segmentPath))
         {
             fcDtype = Dtype.F32;
-            rebuilt = new List<NamedTensorData>(segment.Header.Tensors.Count);
+            rebuilt = new List<NamedTensorData>(segment.Header.Tensors.Count + blocks.Count);
             foreach (var tensor in segment.Header.Tensors)
             {
-                if (tensor.Name == "fc.weight")
+                if (tensor.Name is "fc.weight" or "fc.router.weight" ||
+                    tensor.Name.StartsWith("fc.experts.", StringComparison.Ordinal))
                 {
                     fcDtype = DtypeExtensions.FromLabel(tensor.Dtype);
+                    continue;
                 }
                 rebuilt.Add(new NamedTensorData
                 {
                     Name = tensor.Name,
                     Dtype = DtypeExtensions.FromLabel(tensor.Dtype),
                     Shape = tensor.Shape,
-                    Data = tensor.Name == "fc.weight" ? EncodeToDtype(fcDtype, w) : segment.ReadBytes(tensor.Name),
+                    Data = segment.ReadBytes(tensor.Name),
+                });
+            }
+            for (int i = 0; i < blocks.Count; i++)
+            {
+                rebuilt.Add(new NamedTensorData
+                {
+                    Name = blocks[i].Name,
+                    Dtype = fcDtype,
+                    Shape = shapes[i],
+                    Data = EncodeToDtype(fcDtype, blocks[i].Values),
                 });
             }
         }
@@ -262,7 +302,7 @@ public static class MtpFitter
         return bytes;
     }
 
-    private static float[] ReadF32(string path)
+    internal static float[] ReadF32(string path)
     {
         var bytes = File.ReadAllBytes(path);
         var values = new float[bytes.Length / 4];
@@ -270,7 +310,7 @@ public static class MtpFitter
         return values;
     }
 
-    private static int[] ReadI32(string path)
+    internal static int[] ReadI32(string path)
     {
         var bytes = File.ReadAllBytes(path);
         var values = new int[bytes.Length / 4];
