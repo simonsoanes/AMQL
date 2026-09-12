@@ -43,6 +43,7 @@ internal static class Program
                 "export" => Export(args[1..]),
                 "export-mtp" => ExportMtp(args[1..]),
                 "generate-mtp" => GenerateMtp(args[1..]),
+                "collect-mtp" => CollectMtp(args[1..]),
                 "layers" => Layers(args[1..]),
                 "import" => Import(args[1..]),
                 "moe-ify" => MoeIfy(args[1..]),
@@ -968,6 +969,39 @@ internal static class Program
         return 0;
     }
 
+    // ── collect-mtp: the calculated drafter's data contract (phase 0) ────
+
+    private static int CollectMtp(string[] args)
+    {
+        var containerDir = Arg(args, 0) ?? throw new CliException(
+            "collect-mtp requires a container directory, e.g. 'amql-cli collect-mtp <container-dir> --out <pairs-dir> --text <corpus.txt>'");
+        string outDir = OptionValue(args, "--out") ?? throw new CliException("collect-mtp requires '--out <pairs-dir>'");
+        string textPath = OptionValue(args, "--text") ?? throw new CliException("collect-mtp requires '--text <corpus.txt>'");
+        int fit = IntOption(args, "--fit", 512);
+        int gate = IntOption(args, "--gate", 256);
+
+        string text;
+        try
+        {
+            text = File.ReadAllText(textPath);
+        }
+        catch (IOException e)
+        {
+            throw new CliException($"cannot read corpus '{textPath}': {e.Message}");
+        }
+        var ids = HfTokenizer.FromModelDir(containerDir).EncodeToIds(text);
+
+        var data = Amql.Merge.PairCollector.Collect(containerDir, outDir, ids, fit, gate);
+
+        Console.WriteLine($"pairs:      {data.FitCount} fit + {data.GateCount} held-out (shape [n, {2 * data.Hidden}] → [n, {data.Hidden}])");
+        foreach (var note in data.Notes)
+        {
+            Console.WriteLine($"note:       {note}");
+        }
+        Console.WriteLine("wrote:      manifest.json, fit.x.bin, fit.y.bin, tokens.bin");
+        return 0;
+    }
+
     // ── import: merge a second model into the container ──────────────────
 
     private static int Import(string[] args)
@@ -1116,6 +1150,8 @@ internal static class Program
               amql-cli export-mtp <container-dir> --out <drafter-dir>
               amql-cli generate-mtp <container-dir> --out <out>
                               [--text <corpus.txt>] [--sample 1024]
+              amql-cli collect-mtp <container-dir> --out <pairs-dir> --text <corpus.txt>
+                              [--fit 512] [--gate 256]
               amql-cli layers <container-dir> [--component target]
               amql-cli import <container-dir> <model> --out <merged-dir>
                               [--container]
