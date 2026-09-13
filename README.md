@@ -60,6 +60,12 @@ amql-cli import <container-dir> <model> --out <merged-dir>
                 [--container]
 amql-cli moe-ify <container-dir> --out <moe-dir> --text <corpus.txt>
                 [--experts 8] [--top-k 2] [--sample 4096] [--eval 1024]
+amql-cli prune <container-dir> --out <pruned-dir> --target-bytes <size>
+                [--approach provenance|corpus|random] [--seed 42]
+                [--text <corpus.txt>] [--sample 8192] [--min-layers 1]
+amql-cli generate-mtp <container-dir> --out <out>
+                --text <corpus.txt> [--sample 4096] [--eval 1024]
+                [--clusters K | --sweep K1,K2,K3] [--ridge 1e-4]
 amql-cli help
 ```
 
