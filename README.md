@@ -1,11 +1,75 @@
 # AMQL - C# implementation of VIndex3 (Larql)
 
+[![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![.NET 10.0](https://img.shields.io/badge/.NET-10.0-purple.svg)](https://dotnet.microsoft.com/download/dotnet)
+[![Research — Pre 1.0](https://img.shields.io/badge/status-research%20%7C%20pre--1.0-orange.svg)
+
 This was a port of the VIndex3 implementation, along with support for generating it from a model (Qwen 3.5-3.8 primarily) and then allowing model independent inference, token relationship route following and exploration of the model internals in order to do some research into direct model manipulation and patching, with live LORA adapters in custom inferencing.
 
 This implementation supports model merging (using reinforcement blending to avoid training time but get the same resultant effect as if the training sets of the two models had been combined and run) and custom tensor editing features for another project.
 
 Credit for the design of the VIndex3 goes to Chris Hay.
 
+
+## Table of Contents
+
+- [What is this for?](#what-is-this-for)
+- [Architecture](#architecture)
+- [Prerequisites](#prerequisites)
+- [Project Structure](#project-structure)
+- [Usage](#usage)
+  - [Quick start](#quick-start)
+  - [Encoding and verifying](#encoding-and-verifying)
+  - [LoRA patching and exporting](#lora-patching-and-exporting)
+  - [Model merging](#model-merging)
+  - [Pruning and MoE](#pruning-and-moe)
+  - [Inspection](#inspection)
+- [Code Examples](#code-examples)
+- [Q&A](#qa)
+- [Research](#research)
+- [Contributing](#contributing)
+- [Documentation](#documentation)
+
+## Prerequisites
+
+- [.NET 10.0 SDK](https://dotnet.microsoft.com/download/dotnet/10.0) (latest LTS)
+- Git
+
+## Architecture
+
+AMQL is structured as a five-project solution with a single CLI front-end:
+
+| Project | Purpose |
+|---------|---------|
+| `Amql.Cli` | CLI front-end (`amql-cli`) — entry point for encoding, inference, patching, merging, and inspection |
+| `Amql.Vindex3` | Core VIndex3 container graph, schema, and token-index management |
+| `Amql.Safetensors` | Safetensors I/O and MXFP4 / NVFP4 quantisation codecs |
+| `Amql.Inference` | Tensor inference engine, tracing, and LoRA adapter execution |
+| `Amql.Hf` | Hugging Face checkpoint loading and conversion |
+| `Amql.Merge` | Multi-model consensus-gated merging with token alignment and provenance |
+
+**Dependency flow:** `Amql.Cli` depends on all others. `Amql.Merge` depends on Safetensors, Vindex3, Hf, and Inference. `Amql.Hf` and `Amql.Inference` both depend on Safetensors and Vindex3.
+
+## Project Structure
+
+```
+AMQL/
+├── src/
+│   ├── Amql.Cli/        # CLI front-end (amql-cli)
+│   ├── Amql.Safetensors/ # Safetensors I/O & MXFP4 codec
+│   ├── Amql.Vindex3/     # VIndex3 container graph & schema
+│   ├── Amql.Inference/   # Tensor inference engine & tracing
+│   ├── Amql.Hf/          # Hugging Face checkpoint integration
+│   └── Amql.Merge/       # Model merging (token alignment, provenance)
+├── tests/
+│   └── Amql.Tests/       # Unit & integration tests
+├── scripts/
+│   └── publish-exe.cmd   # Windows standalone publish script
+├── README.md
+├── CONTRIBUTING.md
+├── CHANGELOG.md
+└── LICENSE
+```
 ## What is this for?
 
 While building a continuous cognition platform, I ran into the problem that all current LLMs have flaws and no way to self-improve. This project is intended to support AI self-improvement and the libraries are used by my orchestrator platform.
@@ -571,3 +635,11 @@ fit:        K ∈ {1, 4, 8}: K=1 R² 1.000 acc 14.8%; K=4 R² 0.917 acc 16.4%; K
 note:       shipped K=8 (the acceptance gate's winner; ties prefer fewer clusters); weights 3e30e9c8…
 note:       held-out draft acceptance over 256 positions: boot 0.0% → fitted 16.8%
 ```
+
+## Documentation
+
+Deeper technical reference is available in the [docs/](docs/) directory:
+
+- [VIndex3 Overview — container format, schema, segment layout](docs/vindex3-overview.md)
+- [System Architecture — layered design, component responsibilities, runtime model](docs/architecture.md)
+
