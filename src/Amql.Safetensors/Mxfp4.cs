@@ -89,21 +89,29 @@ public static class Mxfp4
         return new Quantized(packed, scales);
     }
 
-    /// <summary>Dequantises a packed MXFP4 tensor back to f32.</summary>
+    /// <summary>Dequantises a packed MXFP4 tensor back to f32. The E8M0
+    /// scale is decoded once per 32-element block (not once per element —
+    /// a power-2 evaluation per element was the hot-loop tax).</summary>
     public static float[] Dequant(byte[] packed, byte[] blockScales, long rows, long columns)
     {
         long blocksPerRow = BlocksPerRow(columns);
         var result = new float[rows * columns];
         for (long row = 0; row < rows; row++)
         {
-            for (long c = 0; c < columns; c++)
+            long rowBase = row * columns;
+            long scaleBase = row * blocksPerRow;
+            for (long b = 0; b < blocksPerRow; b++)
             {
-                long index = row * columns + c;
-                byte scale = blockScales[row * blocksPerRow + c / BlockElements];
-                byte nibble = (index & 1) == 0
-                    ? (byte)(packed[index / 2] & 0x0F)
-                    : (byte)((packed[index / 2] >> 4) & 0x0F);
-                result[index] = BitPattern.DecodeFp4(nibble) * BitPattern.DecodeF8E8M0(scale);
+                float scale = BitPattern.DecodeF8E8M0(blockScales[scaleBase + b]);
+                long blockStart = rowBase + b * BlockElements;
+                long blockEnd = Math.Min(blockStart + BlockElements, rowBase + columns);
+                for (long index = blockStart; index < blockEnd; index++)
+                {
+                    byte nibble = (index & 1) == 0
+                        ? (byte)(packed[index / 2] & 0x0F)
+                        : (byte)((packed[index / 2] >> 4) & 0x0F);
+                    result[index] = BitPattern.DecodeFp4(nibble) * scale;
+                }
             }
         }
         return result;

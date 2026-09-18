@@ -225,6 +225,23 @@ public static class MoeIfy
         }
         CopyTokenizer(container, outDir);
 
+        // The moе-ified container keeps every segment the rebuild does not
+        // touch — the vision tower, a carried MTP drafter, anything else
+        // the encoder materialised. The graph already references those
+        // objects unchanged; index entries and segment files must follow
+        // or the container is structurally incomplete.
+        foreach (var (repId, entry) in container.Index.Representations)
+        {
+            if (representations.ContainsKey(repId))
+            {
+                continue;
+            }
+            Directory.CreateDirectory(Path.GetDirectoryName(Path.Combine(outDir, entry.Segment))!);
+            File.Copy(Path.Combine(container.Root, entry.Segment), Path.Combine(outDir, entry.Segment), overwrite: true);
+            representations[repId] = entry;
+            segments[entry.Segment[..^4]] = 1;
+        }
+
         var moeSurface = new MoeSurface
         {
             Experts = experts,

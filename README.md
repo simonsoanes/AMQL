@@ -103,6 +103,37 @@ amql-cli generate ./containers/Qwen3.5-0.8B --prompt "The capital of France is" 
   --tokenizer ./Qwen3.5-0.8B --steps 8 --logits 5
 ```
 
+### Memory-efficient working sets and optional CUDA acceleration
+
+The runtime widens stored BF16 weights to f32, so a large model's working
+set doubles its payload (~94 GiB for the full 27B — enough to thrash a
+127 GiB machine). Three weight working-set modes are available, chosen by
+`AMQL_WEIGHTS` and inherited automatically by every runtime consumer
+(generate, route, path, moe-ify sampling, MTP collection, prune corpus
+scoring):
+
+| `AMQL_WEIGHTS` | What stays resident | Numerics vs f32 |
+|---|---|---|
+| `f32` (default) | every tensor widened to f32 | byte-exact reference |
+| `bf16` | stack projections as stored bytes, widened into a bounded LRU on access | bit-exact (~2× smaller) |
+| `mxfp4` | stack projections as MXFP4 packs (~13% of f32), dequantised into the LRU | deterministic, tolerance-gated (~4× smaller) |
+
+Embeddings, the output head, norms and `A_log` stay f32-resident in every
+mode (precision-sensitive, small by comparison). The LRU cap is
+`AMQL_F32_CACHE_GB` (default a quarter of the memory budget); the memory
+and core budgets themselves are `AMQL_MEMORY_GB` and `AMQL_CORES`.
+
+With an NVIDIA GPU and the native backend built
+(`native\amql_cuda\build-cuda.cmd` — nvcc + MSVC, targeting
+5090/Blackwell `sm_120`), set `AMQL_GPU=1` together with
+`AMQL_WEIGHTS=mxfp4`: the MXFP4 packs are
+dequantised once to FP16 on the device (lossless) and the GEMMs run on
+FP16 tensor cores with FP32 accumulate. Large-projection GEMMs route per
+call; small ops and any failure fall back to the managed path, so the GPU
+is never a correctness dependency. See `docs/CUDA_PLAN.md` for the fuller
+roadmap (elementwise/attention/gated-delta kernels on device, KV on
+device, streams/overlap).
+
 ### Probing token relationships (`route`)
 
 `route` names the relationship between two tokens using template probing, reports the (layer, head, position) attention coordinates carrying one token into the other's prediction, and — via causal tracing — the per-layer weights naming exactly which residual tensors to patch or LoRA to change that propensity:

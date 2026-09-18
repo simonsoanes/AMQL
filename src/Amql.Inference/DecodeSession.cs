@@ -15,9 +15,9 @@ public sealed class DecodeSession
 {
     private readonly GenericRuntime _runtime;
 
-    public DecodeSession(ComponentOpPlan plan, OperandStore store, WeightPatch? patch = null)
+    public DecodeSession(ComponentOpPlan plan, OperandStore store, WeightPatch? patch = null, WeightWorkingSet? workingSet = null)
     {
-        _runtime = new GenericRuntime(plan, store, patch);
+        _runtime = new GenericRuntime(plan, store, patch, workingSet);
     }
 
     public GenericRuntime Runtime => _runtime;

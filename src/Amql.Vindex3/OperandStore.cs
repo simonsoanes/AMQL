@@ -7,6 +7,14 @@ namespace Amql.Vindex3;
 /// f32 — the format layer does not know numerics.</summary>
 public sealed record OperandResolution(Dtype Dtype, long[] Shape, byte[] Payload);
 
+/// <summary>An operand widened to f32 in one buffer: the storage dtype,
+/// logical shape and the whole tensor as <c>float[]</c>. Tensors beyond
+/// the 2 GiB raw-payload ceiling (Qwen3.8-27B's 2.37 GiB embedding and
+/// lm_head) are read chunked and widened chunk-by-chunk — the widened
+/// element count is below the array ceiling even when the storage bytes
+/// are not, so a single buffer is legal.</summary>
+public sealed record WidenedResolution(Dtype Dtype, long[] Shape, float[] Values);
+
 /// <summary>
 /// Operand resolution for execution: <c>object id → representation →
 /// segment → tensor table entry → payload bytes</c>. Segments are opened
@@ -114,6 +122,68 @@ public sealed class OperandStore : IDisposable
     }
 
     public OperandResolution Resolve(OperandRef operand) => Resolve(operand.ObjectId, operand.TensorName);
+
+    /// <summary>Resolves an operand widened to f32 in a single buffer.
+    /// Storage payloads over the array ceiling are read chunked and
+    /// widened chunk-by-chunk — consumers that only need the f32 values
+    /// (weight loaders, merge alignment, inspection) never materialise a
+    /// raw byte[] that cannot exist.</summary>
+    public WidenedResolution ResolveWidened(string objectId, string tensorName)
+    {
+        ThrowIfDisposed();
+
+        var representationId = _container.CanonicalRepresentationId(objectId);
+        if (!_container.Index.Representations.TryGetValue(representationId, out var entry))
+        {
+            throw new ContainerException(
+                $"object '{objectId}' has no representation entry '{representationId}' in index.representations");
+        }
+
+        var segment = OpenSegment(entry.Segment);
+        var tensor = segment.GetTensor(tensorName);
+        var dtype = DtypeExtensions.FromLabel(tensor.Dtype);
+        if (!dtype.IsWidenableToF32())
+        {
+            throw new ContainerException(
+                $"operand '{objectId}/{tensorName}' dtype {dtype.Label()} has no f32 widening path");
+        }
+
+        long elements = 1;
+        foreach (var dim in tensor.Shape)
+        {
+            elements = checked(elements * dim);
+        }
+        var values = new float[elements];
+        if (tensor.Len <= ChunkedReadThresholdBytes)
+        {
+            var widened = BitPattern.WidenToF32(dtype, segment.ReadBytes(tensorName));
+            Array.Copy(widened, values, widened.Length);
+        }
+        else
+        {
+            int offset = 0;
+            for (long done = 0; done < tensor.Len; done += ChunkedReadBytes)
+            {
+                int count = (int)Math.Min(ChunkedReadBytes, tensor.Len - done);
+                var widened = BitPattern.WidenToF32(dtype, segment.ReadBytes(tensorName, done, count));
+                Array.Copy(widened, 0, values, offset, widened.Length);
+                offset += widened.Length;
+            }
+        }
+
+        _touched.Add(objectId);
+        Loads++;
+        return new WidenedResolution(dtype, tensor.Shape, values);
+    }
+
+    public WidenedResolution ResolveWidened(OperandRef operand) =>
+        ResolveWidened(operand.ObjectId, operand.TensorName);
+
+    /// <summary>Raw payloads up to this size resolve as one buffer; larger
+    /// tensors go through the chunked widened path. Below the 2 GiB array
+    /// ceiling, with headroom for the widened allocation.</summary>
+    private const long ChunkedReadThresholdBytes = 1L << 30; // 1 GiB
+    private const long ChunkedReadBytes = 512L * 1024 * 1024; // 512 MiB
 
     private SegmentFile OpenSegment(string relativePath)
     {

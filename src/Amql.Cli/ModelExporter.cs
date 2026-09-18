@@ -366,11 +366,11 @@ public static class ModelExporter
         return EncodeToDtype(dtype, WidenedValues(segment, objectId, tensor, patch));
     }
 
-    /// <summary>Parallel workers for the export payload pass: the core
-    /// count, leaving two cores spare once more than ten exist (the
-    /// machine is usually running other work).</summary>
+    /// <summary>Parallel workers for the export payload pass: the process
+    /// compute budget's core count, so the budgeted spare cores stay free
+    /// (the machine is usually running other work).</summary>
     public static int WorkerCount(int processorCount) =>
-        Math.Max(1, processorCount > 10 ? processorCount - 2 : processorCount);
+        Math.Max(1, Math.Min(ComputeBudget.Cores, processorCount));
 
     /// <summary>Payloads beyond this size page as chunked buffers — the
     /// 2 GiB single-array ceiling bites Qwen3.8-27B's embedding and lm_head

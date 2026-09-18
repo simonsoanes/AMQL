@@ -303,10 +303,16 @@ public sealed class SegmentFile : IDisposable
     public byte[] ReadBytes(string name)
     {
         var tensor = GetTensor(name);
-        var buffer = new byte[tensor.Len];
+        if (tensor.Len > int.MaxValue)
+        {
+            throw new ContainerException(
+                $"tensor '{name}' is {tensor.Len} bytes — over the single-buffer ceiling; " +
+                "read it chunked (ReadBytes(name, offset, count))");
+        }
+        var buffer = new byte[(int)tensor.Len];
         if (tensor.Len > 0)
         {
-            _accessor.ReadArray(checked(PayloadStart + tensor.Offset), buffer, 0, checked((int)tensor.Len));
+            _accessor.ReadArray(checked(PayloadStart + tensor.Offset), buffer, 0, (int)tensor.Len);
         }
         return buffer;
     }

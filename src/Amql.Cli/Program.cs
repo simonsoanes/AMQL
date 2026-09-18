@@ -66,6 +66,7 @@ internal static class Program
         catch (Exception e)
         {
             Console.Error.WriteLine($"error: {e.Message}");
+            Console.Error.WriteLine(e.ToString());
             return 2;
         }
     }
@@ -477,6 +478,19 @@ internal static class Program
         {
             bool inContainer = tokenizerSource!.Equals(containerDir, StringComparison.OrdinalIgnoreCase);
             Console.WriteLine($"container: {containerDir} (weights)   tokenizer: {tokenizerSource} ({(inContainer ? "in container" : "checkpoint")})");
+        }
+        var workingSet = WeightWorkingSetExtensions.FromEnv();
+        if (workingSet == WeightWorkingSet.Mxfp4 && CudaShim.Enabled)
+        {
+            Console.WriteLine("cuda:      MXFP4 packs resident on device — GEMMs run on the GPU (FP16 tensor cores, FP32 accumulate)");
+        }
+        else if (workingSet == WeightWorkingSet.Mxfp4)
+        {
+            Console.WriteLine("weights:   MXFP4 working set (dequantised to f32 on CPU)");
+        }
+        else
+        {
+            Console.WriteLine($"weights:   {workingSet} (managed f32 path)");
         }
         var (prefill, steps2) = InferenceRunner.Generate(
             container, component, tokens, steps, config, showTopK, patch);

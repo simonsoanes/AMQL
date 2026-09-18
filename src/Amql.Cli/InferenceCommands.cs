@@ -128,7 +128,7 @@ public static class TokenInspector
                 $"component '{componentId}' owns no embedding object — nothing to inspect");
 
         using var store = container.CreateOperandStore();
-        var resolution = store.Resolve(embedding.Id, "weight");
+        var resolution = store.ResolveWidened(embedding.Id, "weight");
         if (resolution.Shape.Length != 2)
         {
             throw new CliException(
@@ -140,13 +140,8 @@ public static class TokenInspector
         {
             throw new CliException($"token {token} is outside the vocabulary [0, {vocab})");
         }
-        if (!resolution.Dtype.IsWidenableToF32())
-        {
-            throw new CliException(
-                $"embedding '{embedding.Id}' dtype {resolution.Dtype.Label()} has no f32 widening path");
-        }
 
-        var table = BitPattern.WidenToF32(resolution.Dtype, resolution.Payload);
+        var table = resolution.Values;
         ApplyEmbeddingPatch(table, embedding.Id, patch);
         var row = new float[dim];
         Array.Copy(table, token * dim, row, 0, dim);

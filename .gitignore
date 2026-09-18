@@ -32,4 +32,7 @@ Thumbs.db
 ## Containers
 containers/
 
+## Native CUDA backend build output (rebuild via native\amql_cuda\build-cuda.cmd)
+native/amql_cuda/bin/
+
 .qwen/

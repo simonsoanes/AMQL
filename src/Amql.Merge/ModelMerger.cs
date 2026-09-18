@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Amql.Hf;
+using Amql.Inference;
 using Amql.Safetensors;
 using Amql.Vindex3;
 
@@ -227,6 +228,23 @@ public static class ModelMerger
                 SegmentSha256 = headResult.SegmentSha256Hex,
             };
             segments["segments/target.output_head"] = 1;
+        }
+
+        // The merged container keeps every scaffold segment the merge does
+        // not rebuild — the vision tower, a carried MTP drafter, anything
+        // else the encoder materialised. The output graph references those
+        // objects unchanged; index entries and segment files must follow
+        // or the merged container is structurally incomplete.
+        foreach (var (repId, entry) in scaffold.Index.Representations)
+        {
+            if (representations.ContainsKey(repId))
+            {
+                continue;
+            }
+            Directory.CreateDirectory(Path.GetDirectoryName(Path.Combine(outDir, entry.Segment))!);
+            File.Copy(Path.Combine(scaffold.Container.Root, entry.Segment), Path.Combine(outDir, entry.Segment), overwrite: true);
+            representations[repId] = entry;
+            segments[entry.Segment[..^4]] = 1;
         }
 
         // The replaced stack is preserved inside the same container; the
@@ -493,7 +511,11 @@ public static class ModelMerger
         var entries = mapping.Entries;
         var agreement = new double[mapping.Count]; // NaN where not a shared token
 
-        Parallel.For(0, mapping.Count, i =>
+        Parallel.For(
+            0,
+            mapping.Count,
+            new ParallelOptions { MaxDegreeOfParallelism = ComputeBudget.Cores },
+            i =>
         {
             var entry = entries[i];
             int? scaffoldId = scaffoldIsImported ? entry.ImportedId : entry.BaseId;
@@ -626,8 +648,8 @@ public static class ModelMerger
     private static float[] ReadWidenedRows(TableView table, int width)
     {
         using var store = table.Container.CreateOperandStore();
-        var resolution = store.Resolve(table.ObjectId, "weight");
-        var values = BitPattern.WidenToF32(resolution.Dtype, resolution.Payload);
+        var resolution = store.ResolveWidened(table.ObjectId, "weight");
+        var values = resolution.Values;
         if (table.Width == width)
         {
             return values;

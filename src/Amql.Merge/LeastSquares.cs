@@ -1,3 +1,5 @@
+using Amql.Inference;
+
 namespace Amql.Merge;
 
 /// <summary>
@@ -38,20 +40,45 @@ public static class LeastSquares
         Parallel.For(
             0,
             n,
-            () => (Gram: new double[d * d], Cross: new double[d * d]),
+            new ParallelOptions { MaxDegreeOfParallelism = ComputeBudget.Cores },
+            () => (Gram: new double[d * d], Cross: new double[d * d], RowB: new double[d], RowA: new double[d]),
             (i, _, local) =>
             {
                 var gram = local.Gram;
                 var cross = local.Cross;
                 int bRow = i * d;
+                int aRow = i * d;
+                // Hoist the anchor rows once: the original loop re-read the
+                // same 40 KB rows from the float table d times (once per r)
+                // and widened them per element; the double buffers below are
+                // read d times from L1 instead. Rank-1 accumulation, so the
+                // arithmetic per accumulator element is unchanged — the map
+                // is bit-identical to the scalar form.
+                var rowB = local.RowB;
+                var rowA = local.RowA;
+                for (int c = 0; c < d; c++)
+                {
+                    rowB[c] = b[bRow + c];
+                    rowA[c] = a[aRow + c];
+                }
+                int vec = System.Numerics.Vector<double>.Count;
                 for (int r = 0; r < d; r++)
                 {
-                    double br = b[bRow + r];
+                    double br = rowB[r];
                     int rowBase = r * d;
-                    for (int c = 0; c < d; c++)
+                    var brv = new System.Numerics.Vector<double>(br);
+                    int c = 0;
+                    for (; c + vec <= d; c += vec)
                     {
-                        gram[rowBase + c] += br * b[bRow + c];
-                        cross[rowBase + c] += br * a[bRow + c];
+                        (new System.Numerics.Vector<double>(gram, rowBase + c) + brv * new System.Numerics.Vector<double>(rowB, c))
+                            .CopyTo(gram, rowBase + c);
+                        (new System.Numerics.Vector<double>(cross, rowBase + c) + brv * new System.Numerics.Vector<double>(rowA, c))
+                            .CopyTo(cross, rowBase + c);
+                    }
+                    for (; c < d; c++)
+                    {
+                        gram[rowBase + c] += br * rowB[c];
+                        cross[rowBase + c] += br * rowA[c];
                     }
                 }
                 return local;
@@ -108,6 +135,7 @@ public static class LeastSquares
         Parallel.For(
             0,
             n,
+            new ParallelOptions { MaxDegreeOfParallelism = ComputeBudget.Cores },
             () => 0.0,
             (i, _, local) =>
             {

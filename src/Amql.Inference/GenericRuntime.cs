@@ -14,10 +14,10 @@ public sealed class GenericRuntime
     private readonly WeightLoader _weights;
     private readonly Dictionary<int, LayerKvGeometry> _kvGeometry = new();
 
-    public GenericRuntime(ComponentOpPlan plan, OperandStore store, WeightPatch? patch = null)
+    public GenericRuntime(ComponentOpPlan plan, OperandStore store, WeightPatch? patch = null, WeightWorkingSet? workingSet = null)
     {
         _plan = plan;
-        _weights = new WeightLoader(store, patch);
+        _weights = new WeightLoader(store, patch, workingSet);
     }
 
     public ComponentOpPlan Plan => _plan;

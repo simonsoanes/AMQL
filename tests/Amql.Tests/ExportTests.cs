@@ -21,12 +21,22 @@ public class ExportTests
     [Theory]
     [InlineData(1, 1)]
     [InlineData(4, 4)]
-    [InlineData(10, 10)]  // ten cores: full count
-    [InlineData(11, 9)]   // over ten: two left spare
-    [InlineData(32, 30)]
-    public void WorkerCount_Leaves_Two_Cores_Spare_Over_Ten(int cores, int expected)
+    [InlineData(10, 10)]  // under the budget: full count
+    public void WorkerCount_Caps_At_The_Compute_Budget(int cores, int expected)
     {
         Assert.Equal(expected, ModelExporter.WorkerCount(cores));
+    }
+
+    [Fact]
+    public void WorkerCount_Never_Exceeds_Budget_Or_Requested_Cores()
+    {
+        // The old "leave two spare over ten" heuristic is superseded by
+        // the process compute budget: the budget reserves a core margin
+        // for the machine, and a single call cannot exceed either the
+        // budget or the requested count.
+        Assert.Equal(ComputeBudget.Cores, ModelExporter.WorkerCount(ComputeBudget.Cores + 64));
+        Assert.Equal(ComputeBudget.Cores, ModelExporter.WorkerCount(int.MaxValue));
+        Assert.True(ModelExporter.WorkerCount(1) >= 1);
     }
     private static string WriteSynthContainer(TempDir dir)
     {

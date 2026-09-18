@@ -69,17 +69,12 @@ public static class TensorPatchTools
         IReadOnlyList<WeightPatchEntry> existing)
     {
         using var store = container.CreateOperandStore();
-        var resolution = store.Resolve(objectId, tensorName);
+        var resolution = store.ResolveWidened(objectId, tensorName);
         if (resolution.Shape.Length is not (1 or 2))
         {
             throw new CliException(
                 $"tensor '{objectId}/{tensorName}' is {resolution.Shape.Length}-D " +
                 $"([{string.Join("x", resolution.Shape)}]) — patches edit 1-D vectors and 2-D matrices");
-        }
-        if (!resolution.Dtype.IsWidenableToF32())
-        {
-            throw new CliException(
-                $"tensor '{objectId}/{tensorName}' dtype {resolution.Dtype.Label()} has no f32 widening path");
         }
 
         long count = WeightPatch.ElementCount(resolution.Shape);
@@ -90,7 +85,7 @@ public static class TensorPatchTools
                 $"[{string.Join("x", resolution.Shape)}] ({count} elements)");
         }
 
-        var baseValues = BitPattern.WidenToF32(resolution.Dtype, resolution.Payload);
+        var baseValues = resolution.Values;
         var current = (float[])baseValues.Clone();
         var entries = existing.ToList();
         string key = objectId + "/" + tensorName;
