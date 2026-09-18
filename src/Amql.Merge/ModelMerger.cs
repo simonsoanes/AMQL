@@ -56,6 +56,12 @@ public sealed record MergeReport(
 /// </summary>
 public static class ModelMerger
 {
+    /// <summary>Class-level clock for progress lines emitted from static
+    /// helpers (AlignRows) where the Merge method's Phase local function
+    /// is out of scope; mirrors the Phase format so the log stays uniform.</summary>
+    private static readonly System.Diagnostics.Stopwatch ProgressClock =
+        System.Diagnostics.Stopwatch.StartNew();
+
     public const string ManifestName = "token-map.json";
 
     /// <summary>Cosine-agreement gate for shared tokens: rows whose two
@@ -148,7 +154,7 @@ public static class ModelMerger
               $"{embeddingMerge.ShareAboveThreshold * 100:0.0}% above threshold)");
         notes.Add(AgreementNote(embeddingMerge, scaffold.Model));
 
-        byte[]? headPayload = null;
+        IReadOnlyList<byte[]>? headChunks = null;
         Dtype? headDtype = null;
         if (headUntied)
         {
@@ -161,7 +167,7 @@ public static class ModelMerger
                 scaffoldHeadRows, otherHeadRows, mapping, scaffoldIsImported, width, AgreementThreshold);
             var headMerge = MergeTable(
                 scaffoldHeadRows, otherHeadRows, mapping, scaffoldIsImported, headAlignment, width, headDtype.Value);
-            headPayload = headMerge.Data;
+            headChunks = headMerge.Chunks;
             notes.Add(AgreementNote(headMerge, scaffold.Model, "head"));
             Phase("merged output head rows");
         }
@@ -185,7 +191,7 @@ public static class ModelMerger
                 Name = "weight",
                 Dtype = mergedDtype,
                 Shape = new long[] { mapping.Count, width },
-                Data = embeddingMerge.Data,
+                Chunks = embeddingMerge.Chunks,
             } });
         representations[$"target.embedding@{embeddingEncoding}"] = new RepresentationEntry
         {
@@ -215,7 +221,7 @@ public static class ModelMerger
                     Name = "weight",
                     Dtype = headDtype.Value,
                     Shape = new long[] { mapping.Count, width },
-                    Data = headPayload!,
+                    Chunks = headChunks!,
                 } });
             representations[$"target.output_head@{headEncoding}"] = new RepresentationEntry
             {
@@ -456,7 +462,7 @@ public static class ModelMerger
         double Threshold);
 
     private sealed record MergeTableResult(
-        byte[] Data,
+        IReadOnlyList<byte[]> Chunks,
         double MeanAgreement,
         double ShareAboveThreshold);
 
@@ -486,6 +492,21 @@ public static class ModelMerger
                 b, k * width, width);
         }
 
+        if (anchors.Count == 0)
+        {
+            Console.Error.WriteLine($"[{ProgressClock.Elapsed.TotalSeconds,7:0.0}s] alignment fit: no shared-token anchors");
+            Console.Error.Flush();
+        }
+        else if (MergeGpu.Enabled)
+        {
+            Console.Error.WriteLine($"[{ProgressClock.Elapsed.TotalSeconds,7:0.0}s] alignment fit on GPU ({anchors.Count} anchors x {width})");
+            Console.Error.Flush();
+        }
+        else
+        {
+            Console.Error.WriteLine($"[{ProgressClock.Elapsed.TotalSeconds,7:0.0}s] alignment fit on CPU ({anchors.Count} anchors x {width})");
+            Console.Error.Flush();
+        }
         var map = LeastSquares.Fit(a, b, anchors.Count, width);
         return new Alignment(map, anchors.Count, LeastSquares.ResidualL2(a, b, anchors.Count, width, map), 1e-4, threshold);
     }
@@ -596,9 +617,25 @@ public static class ModelMerger
         }
 
         return new MergeTableResult(
-            EncodeToDtype(mergedDtype, merged),
+            EncodeChunks(mergedDtype, merged),
             shared == 0 ? 0 : sum / shared,
             shared == 0 ? 0 : (double)above / shared);
+    }
+
+    /// <summary>Re-encodes the merged f32 table in pages so no encoded
+    /// chunk ever approaches the 2 GiB single-array ceiling: the merged
+    /// embedding/head can exceed 2.5 GiB of BF16 (5 GiB f32) and a whole
+    /// payload would overflow the byte[] length arithmetic. Mirrors the
+    /// exporter's page size (2²⁶ elements ≈ 256 MiB of stored bytes).</summary>
+    private static IReadOnlyList<byte[]> EncodeChunks(Dtype dtype, float[] values, int pageElements = 1 << 26)
+    {
+        var chunks = new List<byte[]>();
+        for (int start = 0; start < values.Length; start += pageElements)
+        {
+            int count = Math.Min(pageElements, values.Length - start);
+            chunks.Add(EncodeToDtype(dtype, values.AsSpan(start, count).ToArray()));
+        }
+        return chunks;
     }
 
     /// <summary>M·row: the other model's row mapped into the scaffold's
