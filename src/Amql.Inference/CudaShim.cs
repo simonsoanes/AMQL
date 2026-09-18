@@ -96,6 +96,19 @@ public static class CudaShim
     private static Dictionary<(string, string), IntPtr> _deviceWeights = new();
     private static bool _deviceFailed;
 
+    /// <summary>How many weight matrices currently hold a device FP16
+    /// copy (diagnostics and test observation only).</summary>
+    public static int DeviceWeightCount
+    {
+        get
+        {
+            lock (Lock)
+            {
+                return _deviceWeights.Count;
+            }
+        }
+    }
+
     public static bool TryGetDeviceWeight(string objectId, string tensor, out IntPtr device, out long elements)
     {
         device = IntPtr.Zero;
@@ -195,7 +208,9 @@ public static class CudaShim
             return false;
         }
         var c = new float[m * n];
-        if (amql_cuda_gemm_transposed_b(a, wF16, c, m, k, n, 0) != 0)
+        int code = amql_cuda_gemm_transposed_b(a, wF16, c, m, k, n, 0);
+        LastNativeError = code;
+        if (code != 0)
         {
             _deviceFailed = true;
             return false;

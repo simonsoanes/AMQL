@@ -66,7 +66,19 @@ __global__ void dequant_mxfp4_to_f16(
 //
 // The runtime's dominant call is MatMulTransposedB(x, w): x = [m,k],
 // w = [n,k] (rows are the output space), result C = [m,n] = x @ wᵀ.
-// cuBLASLt row-major layout + opB=transpose implements this directly.
+// Classical cublas GemmEx, FP16 × FP16 with FP32 accumulate: the resident
+// weights are FP16 and the activations are cast to FP16 on the device
+// (cuBLAS gives NOT_SUPPORTED for an FP32-A × FP16-B mix on this
+// platform/driver — neither cuBLASLt's heuristic nor GemmEx accepts it).
+
+__global__ void cast_f32_to_f16(const float* __restrict__ src, __half* __restrict__ dst, long count)
+{
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count)
+    {
+        dst[i] = __float2half_rn(src[i]);
+    }
+}
 
 struct GpuContext
 {
@@ -79,6 +91,12 @@ struct GpuContext
     size_t scratchABytes;
     void* scratchC;      // reusable device→host staging for C (grows)
     size_t scratchCBytes;
+    void* scratchPack;   // the MXFP4 dequant's device copy of the pack (grows)
+    size_t scratchPackBytes;
+    void* scratchScale;  // ...and the block scales (grows)
+    size_t scratchScaleBytes;
+    void* scratchAF16;   // inference activations cast to FP16 for the GEMM (grows)
+    size_t scratchAF16Bytes;
 };
 
 static GpuContext gCtx{};
@@ -125,6 +143,21 @@ static int ctx_ensure()
     {
         return -3;
     }
+    if (cudaMalloc(&gCtx.scratchPack, 1u << 20) != cudaSuccess)
+    {
+        return -19;
+    }
+    gCtx.scratchPackBytes = 1u << 20;
+    if (cudaMalloc(&gCtx.scratchScale, 1u << 20) != cudaSuccess)
+    {
+        return -20;
+    }
+    gCtx.scratchScaleBytes = 1u << 20;
+    if (cudaMalloc(&gCtx.scratchAF16, 1u << 20) != cudaSuccess)
+    {
+        return -21;
+    }
+    gCtx.scratchAF16Bytes = 1u << 20;
     gCtxValid = true;
     return 0;
 }
@@ -266,6 +299,9 @@ AMQL_EXPORT void amql_cuda_shutdown(void)
     if (gCtx.workspace) cudaFree(gCtx.workspace);
     if (gCtx.scratchA) cudaFree(gCtx.scratchA);
     if (gCtx.scratchC) cudaFree(gCtx.scratchC);
+    if (gCtx.scratchPack) cudaFree(gCtx.scratchPack);
+    if (gCtx.scratchScale) cudaFree(gCtx.scratchScale);
+    if (gCtx.scratchAF16) cudaFree(gCtx.scratchAF16);
     cudaStreamDestroy(gCtx.stream);
     cublasLtDestroy(gCtx.lt);
     cublasDestroy(gCtx.cublas);
@@ -313,7 +349,35 @@ AMQL_EXPORT int amql_cuda_dequant_to_f16(
     int threads = 256;
     int blocks = (int)((total + threads - 1) / threads);
     cudaStream_t stream = streamOrdinal == 0 ? gCtx.stream : 0;
-    dequant_mxfp4_to_f16<<<blocks, threads, 0, stream>>>(packed, scales, out, rows, cols);
+
+    // The kernel runs on the device, so it needs DEVICE copies of the
+    // pack and scale bytes — the caller hands in host pointers (the
+    // P/Invoke side pins byte[] as host memory). Up to the dequant-rework
+    // of this function the raw host pointers were passed straight to the
+    // kernel, which on a discrete GPU is an illegal memory access from
+    // every thread; the fault was asynchronous, silently corrupted the
+    // context (error 700), and every later upload fell back to CPU — the
+    // GPU inference path never actually engaged. The copies go through
+    // the stream-ordered scratch, so consecutive uploads reuse the same
+    // device buffers without a per-call synchronise (the next memcpy on
+    // the stream is ordered after the previous kernel consumed them).
+    size_t packedBytes = (size_t)((total + 1) / 2);
+    size_t scaleBytes = (size_t)rows * ((cols + 31) / 32);
+    if (scratch_reserve(&gCtx.scratchPack, &gCtx.scratchPackBytes, packedBytes) != 0)
+    {
+        return -2;
+    }
+    if (scratch_reserve(&gCtx.scratchScale, &gCtx.scratchScaleBytes, scaleBytes) != 0)
+    {
+        return -3;
+    }
+    if (cudaMemcpyAsync(gCtx.scratchPack, packed, packedBytes, cudaMemcpyHostToDevice, stream) != cudaSuccess ||
+        cudaMemcpyAsync(gCtx.scratchScale, scales, scaleBytes, cudaMemcpyHostToDevice, stream) != cudaSuccess)
+    {
+        return -4;
+    }
+    dequant_mxfp4_to_f16<<<blocks, threads, 0, stream>>>(
+        (const unsigned char*)gCtx.scratchPack, (const unsigned char*)gCtx.scratchScale, out, rows, cols);
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
 
@@ -349,32 +413,42 @@ AMQL_EXPORT int amql_cuda_gemm_transposed_b(
     {
         return -4;
     }
+    if (scratch_reserve(&gCtx.scratchAF16, &gCtx.scratchAF16Bytes, (size_t)m * k * 2) != 0)
+    {
+        return -5;
+    }
+    void* aF16 = gCtx.scratchAF16;
+    long actCount = (long)m * k;
+    int actThreads = 256;
+    int actBlocks = (int)((actCount + actThreads - 1) / actThreads);
+    cast_f32_to_f16<<<actBlocks, actThreads, 0, stream>>>(
+        (const float*)aD, (__half*)aF16, actCount);
+    if (cudaGetLastError() != cudaSuccess)
+    {
+        return -6;
+    }
 
-    // Row-major: C[m,n] = A[m,k] @ W[n,k]ᵀ. FP32 accumulate over FP16
-    // weights; the cuBLASLt plan (desc + layouts + heuristic algo) is
-    // cached per (m,k,n) so repeated decode GEMMs skip the setup.
+    // C[m,n] = A[m,k] @ W[n,k]ᵀ with both operands FP16 and FP32
+    // accumulate (the only mixed-format configuration this platform
+    // supports). The column-major formulation mirrors
+    // amql_cuda_gemm_transposed_b_f32: D[n,m] = W[n,k]·Aᵀ[k,m] with both
+    // operands viewed column-major at ld=k; D stored with ldc=n lands at
+    // j + i·n, exactly the row-major [m,n] host output.
     float alpha = 1.0f, beta = 0.0f;
-    LtPlan* plan = nullptr;
-    int planStatus = plan_get_ext(m, k, n, CUBLAS_OP_N, CUBLAS_OP_T, CUDA_R_16F, &plan);
-    if (planStatus != 0 || plan == nullptr)
-    {
-        return planStatus != 0 ? planStatus : -8;
-    }
-
-    const cublasLtMatmulAlgo_t* algoPtr = nullptr;
-    if (plan->valid)
-    {
-        algoPtr = &plan->algo;
-    }
-
-    cublasStatus_t status = cublasLtMatmul(
-        gCtx.lt, plan->desc, &alpha, aD, plan->a, w, plan->b, &beta,
-        cD, plan->c, cD, plan->c, algoPtr, gCtx.workspace, gCtx.workspaceBytes, stream);
+    cublasStatus_t status = cublasGemmEx(
+        gCtx.cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+        n, m, k,
+        &alpha,
+        (const void*)w, CUDA_R_16F, k,
+        (const void*)aF16, CUDA_R_16F, k,
+        &beta,
+        (void*)cD, CUDA_R_32F, n,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
 
     cudaMemcpyAsync(c, cD, (size_t)m * n * 4, cudaMemcpyDeviceToHost, stream);
     cudaStreamSynchronize(stream);
 
-    return status == CUBLAS_STATUS_SUCCESS ? 0 : -5;
+    return status == CUBLAS_STATUS_SUCCESS ? 0 : -7;
 }
 
 // ── FP32 GEMM: C[m,n] = A[m,k] @ W[n,k]ᵀ, all row-major, FP32 × FP32 ─────
