@@ -30,7 +30,19 @@ public static class LeastSquares
             throw new MergeException("anchor rows do not match (n, d) — alignment is corrupt");
         }
 
-        // Normal equations in double precision, accumulated in parallel
+        // CUDA path: the normal-equation Gram/Cross over the anchors is a
+        // pair of blocked fp32 GEMMs (BᵀB, BᵀA) that the 5090 computes in
+        // seconds where the fp64 CPU accumulation below takes ~40 minutes
+        // at 27B scale. The fp64 per-block partials sum on the host, so
+        // the Cholesky solve and the fitted map stay the fp64 authority.
+        if (MergeGpu.TryGramCross(a, b, n, d, out var gpuGram, out var gpuCross))
+        {
+            var gram = gpuGram!;
+            var cross = gpuCross!;
+            return SolveNormalEquations(gram, cross, d, ridgeRel);
+        }
+
+        // CPU normal equations in double precision, accumulated in parallel
         // over anchor chunks. Each chunk's partial matrices are reduced at
         // the end; the anchor range per worker walks the row-major input
         // sequentially, so the reduction stays cache-friendly for the
@@ -91,9 +103,17 @@ public static class LeastSquares
                     totalCross[k] += local.Cross[k];
                 }
             });
-        var gram = totalGram;
-        var cross = totalCross;
+        var g = totalGram;
+        var x = totalCross;
+        return SolveNormalEquations(g, x, d, ridgeRel);
+    }
 
+    /// <summary>Shared tail of the alignment fit: relative ridge, Cholesky
+    /// factorisation and the two triangular solves, in fp64. The GPU path
+    /// and the CPU path both land here, so the fitted map is the same
+    /// authority regardless of where the Gram/Cross products were formed.</summary>
+    private static float[] SolveNormalEquations(double[] gram, double[] cross, int d, double ridgeRel)
+    {
         // Relative ridge keeps the fitted map from overfitting near-singular
         // anchor sets while staying scale-invariant; the absolute floor
         // keeps a degenerate (zero-variance) anchor set — e.g. an imported
@@ -130,6 +150,13 @@ public static class LeastSquares
     /// accumulate in parallel).</summary>
     public static double ResidualL2(float[] a, float[] b, int n, int d, float[] m)
     {
+        // CUDA path: aligned = b @ Mᵀ in one blocked GEMM, then the
+        // Σ‖a − aligned‖² reduction on the host.
+        if (MergeGpu.TryResidualL2(a, b, n, d, m, out var gpuResidual))
+        {
+            return gpuResidual;
+        }
+
         double total = 0;
         var sync = new object();
         Parallel.For(

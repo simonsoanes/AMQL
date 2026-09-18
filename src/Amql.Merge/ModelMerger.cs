@@ -511,6 +511,18 @@ public static class ModelMerger
         var entries = mapping.Entries;
         var agreement = new double[mapping.Count]; // NaN where not a shared token
 
+        // CUDA path: the per-token ApplyMap (M·other, a d×d matvec per
+        // shared token ≈ O(n·d²) — the other ~40-minute CPU phase at 27B
+        // scale) is one blocked GEMM aligned = otherRows @ Mᵀ over all
+        // rows; the token loop below then copies the precomputed aligned
+        // row instead of running the matvec. Falls back to the managed
+        // ApplyMap on any GPU failure.
+        float[]? alignedRows = null;
+        if (MergeGpu.TryMapApply(otherRows, otherRows.Length / width, width, m, out alignedRows))
+        {
+            alignedRows ??= Array.Empty<float>();
+        }
+
         Parallel.For(
             0,
             mapping.Count,
@@ -526,7 +538,14 @@ public static class ModelMerger
             {
                 if (otherId is { } o)
                 {
-                    ApplyMap(otherRows, o, merged, i, m, width);
+                    if (alignedRows is { Length: > 0 })
+                    {
+                        Array.Copy(alignedRows, o * width, merged, dest, width);
+                    }
+                    else
+                    {
+                        ApplyMap(otherRows, o, merged, i, m, width);
+                    }
                     double c = Cosine(merged, dest, scaffoldRows, s * width, width);
                     agreement[i] = c;
                     if (double.IsFinite(c) && c >= alignment.Threshold)
@@ -549,7 +568,14 @@ public static class ModelMerger
             }
             else
             {
-                ApplyMap(otherRows, otherId!.Value, merged, i, m, width);
+                if (alignedRows is { Length: > 0 })
+                {
+                    Array.Copy(alignedRows, otherId!.Value * width, merged, dest, width);
+                }
+                else
+                {
+                    ApplyMap(otherRows, otherId!.Value, merged, i, m, width);
+                }
             }
         });
 

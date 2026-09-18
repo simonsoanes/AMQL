@@ -11,7 +11,12 @@ namespace Amql.Tests;
 /// and produce the same forward pass as the managed f32 path within the
 /// quantisation tolerance. Skipped when no device/native lib is
 /// available so the suite stays green on CPU-only machines.
+/// Shares the shared-collection "gpu" with <see cref="MergeGpuTests"/>:
+/// the native context is a single device/stream and must not be driven
+/// concurrently by two test classes (parallel class execution broke
+/// device allocations inside the merge Gram/Cross).
 /// </summary>
+[Collection("gpu")]
 public class CudaTests
 {
     private static readonly Dims Big = new(

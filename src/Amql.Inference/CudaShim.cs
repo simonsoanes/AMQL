@@ -80,6 +80,11 @@ public static class CudaShim
         }
     }
 
+    /// <summary>True once any native call has failed in this process and
+    /// the backend has latched into managed fallback. Diagnostics and the
+    /// test seam only — the latch is the session's safety net.</summary>
+    public static bool DeviceFailed => _deviceFailed;
+
     /// <summary>
     /// Device-resident FP16 copy of one weight matrix, cached by its
     /// container operand so a session's repeated projection calls reuse
@@ -137,6 +142,47 @@ public static class CudaShim
         }
     }
 
+    /// <summary>Allocates a device buffer (bytes) and returns its pointer;
+    /// 0 on failure or when the backend is disabled.</summary>
+    public static int AllocDevice(long bytes, out IntPtr ptr)
+    {
+        ptr = IntPtr.Zero;
+        if (!Enabled || _deviceFailed || bytes <= 0)
+        {
+            return -1;
+        }
+        return amql_cuda_malloc(out ptr, checked((nuint)bytes));
+    }
+
+    /// <summary>Frees a device buffer from a previous AllocDevice.</summary>
+    public static void FreeDevice(IntPtr ptr)
+    {
+        if (ptr != IntPtr.Zero)
+        {
+            amql_cuda_free(ptr);
+        }
+    }
+
+    /// <summary>Copies bytes host → device; 0 on success.</summary>
+    public static int CopyHostToDevice(IntPtr dst, byte[] src, long bytes)
+    {
+        if (!Enabled || _deviceFailed)
+        {
+            return -1;
+        }
+        return amql_cuda_host_to_device(dst, src, checked((nuint)bytes));
+    }
+
+    /// <summary>Copies an fp32 array host → device; 0 on success.</summary>
+    public static int CopyHostToDevice(IntPtr dst, float[] src, long bytes)
+    {
+        if (!Enabled || _deviceFailed)
+        {
+            return -1;
+        }
+        return amql_cuda_host_to_device_f32(dst, src, checked((nuint)bytes));
+    }
+
     /// <summary>Calls the transposed-B GEMM (C[m,n] = A[m,k]·W[n,k]ᵀ with
     /// A host f32, W device FP16) and copies the result back. Returns true
     /// when the kernel ran; false leaves <paramref name="result"/> set to
@@ -158,6 +204,83 @@ public static class CudaShim
         return true;
     }
 
+    /// <summary>FP32 transposed-B GEMM streamed over A in row blocks —
+    /// the merge path's map-apply (aligned = other @ Mᵀ). Returns true on
+    /// success; the caller falls back to the managed ApplyMap otherwise.</summary>
+    public static bool TryGemmTransposedBF32(
+        float[] a, int m, int k, IntPtr wF32, int n, out float[]? result, int blockRows = 4096)
+    {
+        result = null;
+        if (!Enabled || _deviceFailed)
+        {
+            return false;
+        }
+        var c = new float[m * n];
+        if (amql_cuda_gemm_transposed_b_f32(a, wF32, c, m, k, n, blockRows, 0) != 0)
+        {
+            _deviceFailed = true;
+            return false;
+        }
+        result = c;
+        return true;
+    }
+
+    /// <summary>Map-apply with the map uploaded inside the native call, on
+    /// the cublas stream — the merge path never straddles a sync copy with
+    /// cublas work (see the native function's contract). Returns true on
+    /// success; the caller falls back to the managed path otherwise.</summary>
+    public static bool TryGemmTransposedBF32WithMap(
+        float[] a, float[] w, int m, int k, int n, out float[]? result, int blockRows = 8192)
+    {
+        result = null;
+        if (!Enabled || _deviceFailed)
+        {
+            return false;
+        }
+        var c = new float[m * n];
+        if (amql_cuda_gemm_transposed_b_f32_u(a, w, c, m, k, n, blockRows, 0) != 0)
+        {
+            _deviceFailed = true;
+            return false;
+        }
+        result = c;
+        return true;
+    }
+
+    /// <summary>The last native error code (or 0) — diagnostics for the merge
+    /// path where a GEMM failure must not crash the import.</summary>
+    public static int LastNativeError { get; private set; }
+
+    /// <summary>Blocked Gram/Cross for the merge alignment:
+    /// gram = BᵀB and cross = BᵀA over n fp32 rows of width d, each block
+    /// computed as a pair of cuBLAS GEMMs and fp64-accumulated on the
+    /// host (matching the managed normal-equation authority). Returns true
+    /// on success.</summary>
+    public static bool TryGramCross(
+        float[] a, float[] b, int n, int d,
+        out double[]? gram, out double[]? cross, int blockRows = 8192)
+    {
+        gram = null;
+        cross = null;
+        LastNativeError = 0;
+        if (!Enabled || _deviceFailed)
+        {
+            return false;
+        }
+        var g = new double[d * d];
+        var x = new double[d * d];
+        int code = amql_cuda_gram_cross(a, b, g, x, n, d, blockRows, 0);
+        LastNativeError = code;
+        if (code != 0)
+        {
+            _deviceFailed = true;
+            return false;
+        }
+        gram = g;
+        cross = x;
+        return true;
+    }
+
     // ── native surface ────────────────────────────────────────────────────
 
     [DllImport("amql_cuda")]
@@ -173,10 +296,28 @@ public static class CudaShim
     private static extern int amql_cuda_free(IntPtr ptr);
 
     [DllImport("amql_cuda")]
+    private static extern int amql_cuda_host_to_device(IntPtr dst, byte[] src, nuint bytes);
+
+    [DllImport("amql_cuda")]
+    private static extern int amql_cuda_host_to_device_f32(IntPtr dst, float[] src, nuint bytes);
+
+    [DllImport("amql_cuda")]
     private static extern int amql_cuda_dequant_to_f16(
         byte[] packed, byte[] scales, IntPtr outF16, int rows, int cols, int streamOrdinal);
 
     [DllImport("amql_cuda")]
     private static extern int amql_cuda_gemm_transposed_b(
         float[] a, IntPtr wF16, float[] c, int m, int k, int n, int streamOrdinal);
+
+    [DllImport("amql_cuda")]
+    private static extern int amql_cuda_gemm_transposed_b_f32(
+        float[] a, IntPtr wF32, float[] c, int m, int k, int n, int blockRows, int streamOrdinal);
+
+    [DllImport("amql_cuda")]
+    private static extern int amql_cuda_gemm_transposed_b_f32_u(
+        float[] a, float[] w, float[] c, int m, int k, int n, int blockRows, int streamOrdinal);
+
+    [DllImport("amql_cuda")]
+    private static extern int amql_cuda_gram_cross(
+        float[] a, float[] b, double[] gram, double[] cross, int n, int d, int blockRows, int streamOrdinal);
 }
