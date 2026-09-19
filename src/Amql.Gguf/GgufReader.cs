@@ -21,6 +21,7 @@ public sealed class GgufReader : IDisposable
     private readonly Dictionary<string, GgufValue> _metadata = new(StringComparer.Ordinal);
     private readonly Dictionary<string, (GgufTensor Tensor, long DataBytes)> _tensors = new(StringComparer.Ordinal);
     private readonly List<GgufTensor> _ordered = new();
+    private long _dataSectionStart;
 
     private GgufReader(Stream input)
     {
@@ -90,6 +91,16 @@ public sealed class GgufReader : IDisposable
             _ordered.Add(tensor);
             _tensors[name] = (tensor, dataBytes);
         }
+
+        // Offsets are stored relative to the data-section start (llama.cpp
+        // semantics: first tensor 0, contiguous aligned); the data section
+        // begins at the aligned end of the metadata + tensor-info block.
+        uint alignment = 32;
+        if (_metadata.TryGetValue("general.alignment", out var a) && a.Kind == GgufValueType.Uint32)
+        {
+            alignment = a.AsUInt32();
+        }
+        _dataSectionStart = (long)(((ulong)_input.Position + alignment - 1) / alignment * alignment);
     }
 
     public bool Contains(string name) => _tensors.ContainsKey(name);
@@ -108,7 +119,7 @@ public sealed class GgufReader : IDisposable
     {
         var (tensor, dataBytes) = _tensors[name];
         var buffer = new byte[dataBytes];
-        _input.Position = (long)tensor.Offset;
+        _input.Position = _dataSectionStart + (long)tensor.Offset;
         _input.ReadExactly(buffer);
         return buffer;
     }
