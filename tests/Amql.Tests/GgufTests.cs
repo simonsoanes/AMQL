@@ -116,8 +116,8 @@ public class GgufTests
 
         using var reader = GgufReader.Open(outFile);
         var gate = reader.GetTensor("blk.0.ffn_gate_exps.weight");
-        // logical [experts, mid, emb] — llama.cpp's ne[] order
-        Assert.Equal(new long[] { Experts, ExpertMid, Hidden }, gate.Dims);
+        // expert slices stacked; file dims are llama.cpp's ne[] order [s1, s0, n_expert]
+        Assert.Equal(new long[] { Hidden, ExpertMid, Experts }, gate.Dims);
         Assert.Equal(GgufType.F16, gate.Type);
 
         var bytes = reader.ReadBytes("blk.0.ffn_gate_exps.weight");
