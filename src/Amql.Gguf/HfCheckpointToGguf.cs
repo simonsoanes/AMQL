@@ -268,7 +268,7 @@ public static class GgufConverter
         }
         writer.Kv($"{arch}.rope.dimension_count", GgufValue.Uint32((uint)Math.Round(headDim * (partialRotary > 0 ? partialRotary : 1.0f))));
 
-        if (anyLinear && linearKeyHeads > 0)
+        if (qwen35 && linearKeyHeads > 0)
         {
             writer.Kv($"{arch}.ssm.conv_kernel", GgufValue.Uint32((uint)linearConvKernel));
             writer.Kv($"{arch}.ssm.state_size", GgufValue.Uint32((uint)linearKeyHeadDim));
@@ -277,7 +277,9 @@ public static class GgufConverter
             writer.Kv($"{arch}.ssm.inner_size", GgufValue.Uint32((uint)(linearValueHeadDim * linearValueHeads)));
             writer.Kv($"{arch}.attention.recurrent_layers",
                 GgufValue.BoolArray(layerTypes.Select(t => t.Contains("linear", StringComparison.OrdinalIgnoreCase)).ToList()));
-            writer.Kv($"{arch}.attention.full_attention_interval", GgufValue.Uint32(4));
+            int fullCount = layerTypes.Count(t => !t.Contains("linear", StringComparison.OrdinalIgnoreCase));
+            writer.Kv($"{arch}.attention.full_attention_interval",
+                GgufValue.Uint32((uint)(fullCount > 0 ? layers / fullCount : layers)));
         }
 
         if (hasMoe && experts > 0)
@@ -350,11 +352,13 @@ public static class GgufConverter
         => entry.Transform switch
         {
             Transform.Zeros => GgufType.F16,
-            // llama.cpp's Qwen3-Next reference keeps the ssm decay/delta
-            // tensors in float32 (they are float in the HF checkpoints);
-            // the graph's binary ops mix them with f32 states, so writing
-            // them f16 trips ggml's "unsupported types" in build.
-            Transform.Q35ALog or Transform.Q35Dt => GgufType.F32,
+            // llama.cpp's Qwen3-Next reference keeps the per-value-head
+            // ssm scalar params (A_log/dt/in_proj_a/in_proj_b) in float32
+            // — they are float in the HF checkpoints and the graph mixes
+            // them with f32 states; f16 writes trip ggml's mixed-type
+            // binary ops in build.
+            Transform.Q35ALog or Transform.Q35Dt or Transform.Q35A or Transform.Q35B or Transform.Q35Conv
+                or Transform.Q35Out or Transform.Q35Qkv or Transform.Q35Z => GgufType.F32,
             _ => entry.Source!.Info.Dtype switch
             {
                 Dtype.F32 => GgufType.F32,
@@ -435,16 +439,14 @@ public static class GgufConverter
                 // split rows into q | k | v, reorder v tiled, concatenate, transpose
                 var info = entry.Source.Info;
                 long qDim = (long)numKHeads * headVDim;
-                long kDim = (long)numKHeads * headVDim;
-                long vDim = (long)numVHeads * headVDim;
-                ReorderRowsAndTranspose(writer, entry, index, qDim, kDim, vDim, vPerK, numKHeads, headVDim);
+                WriteF32RowOrderAndTranspose(writer, entry, index, 2 * qDim, numKHeads, headVDim, vPerK);
                 break;
             case Transform.Q35Z:
-                ReorderRowsAndTranspose(writer, entry, index, 0, 0, entry.Source.Info.Shape[0], vPerK, numKHeads, headVDim);
+                WriteF32RowOrderAndTranspose(writer, entry, index, 0, numKHeads, headVDim, vPerK);
                 break;
             case Transform.Q35A:
             case Transform.Q35B:
-                ReorderRowsAndTranspose(writer, entry, index, 0, 0, entry.Source.Info.Shape[0], vPerK, numKHeads, 1);
+                WriteF32RowOrderAndTranspose(writer, entry, index, 0, numKHeads, 1, vPerK);
                 break;
             case Transform.Q35ALog:
                 // 1-D per-value-head decay: reorder, value = -exp
@@ -503,44 +505,94 @@ public static class GgufConverter
     {
         var info = entry.Source.Info;
         long rows = info.Shape[0], cols = info.Shape[1];
-        int elem = info.Dtype == Dtype.F32 ? 4 : 2;
         long basePosition = (long)writer.TensorOffset(index);
+        bool asF32 = GgufTypeFor(entry) == GgufType.F32;
 
-        if (rows * cols * elem <= 512L << 20)
+        long spanBytes = rows * cols * (info.Dtype == Dtype.F32 ? 4 : 2);
+        if (spanBytes <= 512L << 20)
         {
-            byte[] bytes = entry.Source.File.ReadBytes(info);
-            byte[] converted = info.Dtype == Dtype.BF16 ? new byte[bytes.Length] : bytes;
-            if (info.Dtype == Dtype.BF16)
+            float[] f = LoadFloats(entry.Source, rows * cols);
+            if (addOne)
             {
-                ConvertBf16ToF16(bytes, converted);
-                if (addOne)
+                for (long i = 0; i < f.Length; i++)
                 {
-                    AddOneToF16(converted);
+                    f[i] += 1.0f;
                 }
             }
             if (columnReorder is { } cr)
             {
-                converted = ReorderColumns(converted, rows, cols, elem, cr.VPerK, cr.NumKHeads, cr.HeadVDim);
+                f = ReorderColumnsFloats(f, rows, cols, cr.VPerK, cr.NumKHeads, cr.HeadVDim);
             }
-            var colRun = new byte[rows * elem];
-            for (long c = 0; c < cols; c++)
-            {
-                for (long r = 0; r < rows; r++)
-                {
-                    long src = (r * cols + c) * elem;
-                    for (int b = 0; b < elem; b++)
-                    {
-                        colRun[(int)(r * elem) + b] = converted[(int)src + b];
-                    }
-                }
-                writer.SeekAbsolute(basePosition + c * rows * elem);
-                writer.Data.Write(colRun, 0, (int)(rows * elem));
-            }
+            WriteTransposedFloats(writer, basePosition, f, rows, cols, asF32);
         }
         else
         {
             WriteTransposedBlocked(writer, entry, basePosition, rows, cols, addOne);
         }
+    }
+
+    private static float[] LoadFloats(Source source, long count)
+    {
+        byte[] bytes = source.File.ReadBytes(source.Info);
+        var floats = new float[count];
+        if (source.Info.Dtype == Dtype.F32)
+        {
+            for (long i = 0; i < count; i++)
+            {
+                floats[i] = BitConverter.Int32BitsToSingle(BinaryPrimitives.ReadInt32LittleEndian(bytes.AsSpan((int)(i * 4))));
+            }
+        }
+        else
+        {
+            for (long i = 0; i < count; i++)
+            {
+                floats[i] = BitConverter.UInt32BitsToSingle(
+                    (uint)((ushort)(bytes[(int)(i * 2)] | (bytes[(int)(i * 2) + 1] << 8)) << 16));
+            }
+        }
+        return floats;
+    }
+
+    private static void WriteTransposedFloats(GgufWriter writer, long basePosition, float[] values, long rows, long cols, bool asF32)
+    {
+        int elem = asF32 ? 4 : 2;
+        var colRun = new byte[rows * elem];
+        for (long c = 0; c < cols; c++)
+        {
+            for (long r = 0; r < rows; r++)
+            {
+                if (asF32)
+                {
+                    BinaryPrimitives.WriteSingleLittleEndian(colRun.AsSpan((int)(r * 4)), values[r * cols + c]);
+                }
+                else
+                {
+                    BinaryPrimitives.WriteUInt16LittleEndian(colRun.AsSpan((int)(r * 2)), BitConverter.HalfToUInt16Bits((Half)values[r * cols + c]));
+                }
+            }
+            writer.SeekAbsolute(basePosition + c * rows * elem);
+            writer.Data.Write(colRun, 0, (int)(rows * elem));
+        }
+    }
+
+    private static float[] ReorderColumnsFloats(float[] values, long rows, long cols, int vPerK, int numKHeads, int headVDim)
+    {
+        var reordered = new float[values.Length];
+        long vPerKCols = (long)vPerK * headVDim;
+        for (long c = 0; c < cols; c++)
+        {
+            long k = c / vPerKCols;
+            long inner = c % vPerKCols;
+            long vp = inner / headVDim;
+            long headCol = inner % headVDim;
+            long tiled = vp * numKHeads + k;
+            long srcCol = tiled * headVDim + headCol;
+            for (long r = 0; r < rows; r++)
+            {
+                reordered[r * cols + c] = values[r * cols + srcCol];
+            }
+        }
+        return reordered;
     }
 
     private static void WriteTransposedBlocked(GgufWriter writer, PlanEntry entry, long basePosition, long rows, long cols, bool addOne)
@@ -583,52 +635,57 @@ public static class GgufConverter
 
     // ── Qwen3.5 linear-attention transforms ────────────────────────────────
 
-    /// <summary>Reads the source 2-D matrix, applies the V-row tiled reorder
-    /// over the given row window, and writes it transposed.</summary>
-    private static void ReorderRowsAndTranspose(GgufWriter writer, PlanEntry entry, int index,
-        long qRows, long kRows, long vRows, int vPerK, int numKHeads, int headVDim)
+    private static void WriteF32RowOrderAndTranspose(GgufWriter writer, PlanEntry entry, int index,
+        long qkRows, int numKHeads, int headVDim, int vPerK)
     {
         var info = entry.Source.Info;
         long rows = info.Shape[0], cols = info.Shape[1];
         byte[] bytes = entry.Source.File.ReadBytes(info);
-        byte[] converted = new byte[bytes.Length];
-        ConvertBf16ToF16(bytes, converted);
-        byte[] reordered = new byte[converted.Length];
-
-        long dest = 0;
-        long copy = qRows + kRows; // the untouched head of the matrix (q + k, or empty)
-        if (copy > 0)
+        var f32 = new float[rows * cols];
+        for (long i = 0; i < rows * cols; i++)
         {
-            Buffer.BlockCopy(converted, 0, reordered, 0, (int)(copy * cols * 2));
-            dest = copy;
+            f32[i] = info.Dtype == Dtype.F32
+                ? BitConverter.Int32BitsToSingle(BinaryPrimitives.ReadInt32LittleEndian(bytes.AsSpan((int)(i * 4))))
+                : BitConverter.UInt32BitsToSingle((uint)((ushort)(bytes[(int)(i * 2)] | (bytes[(int)(i * 2) + 1] << 8)) << 16));
         }
-        // v window: rows [qRows+kRows, rows), reorder tiled
-        long vStart = qRows + kRows;
-        long vCount = rows - vStart;
-        long group = (long)numKHeads * headVDim;     // how many rows per K group
-        long vPerKRows = (long)vPerK * headVDim;     // rows per K-group's V block
-        for (long vRow = 0; vRow < vCount; vRow++)
+
+        // rows before qkRows keep their place; the V window (rows qkRows..)
+        // is reordered grouped → tiled (rows = num_v_heads * head_dim)
+        var reordered = new float[rows * cols];
+        for (long r = 0; r < qkRows; r++)
         {
-            long k = vRow / vPerKRows;
-            long inner = vRow % vPerKRows;
+            for (long c = 0; c < cols; c++)
+            {
+                reordered[r * cols + c] = f32[r * cols + c];
+            }
+        }
+        long vPerKRows = (long)vPerK * headVDim;
+        for (long r = qkRows; r < rows; r++)
+        {
+            long rr = r - qkRows;
+            long k = rr / vPerKRows;
+            long inner = rr % vPerKRows;
             long vp = inner / headVDim;
             long headRow = inner % headVDim;
-            long tiledK = vp * numKHeads + k;        // tiled order
-            long srcRow = vStart + vRow;
-            long dstRow = dest + tiledK * headVDim + headRow;
-            Buffer.BlockCopy(converted, (int)(srcRow * cols * 2), reordered, (int)(dstRow * cols * 2), (int)(cols * 2));
+            long tiled = vp * numKHeads + k;
+            long dstRow = qkRows + tiled * headVDim + headRow;
+            for (long c = 0; c < cols; c++)
+            {
+                reordered[dstRow * cols + c] = f32[r * cols + c];
+            }
         }
 
-        var colRun = new byte[rows * 2];
+        // transpose into the file, 4-byte strided writes per output row
+        var colRun = new byte[rows * 4];
+        long basePosition = (long)writer.TensorOffset(index);
         for (long c = 0; c < cols; c++)
         {
             for (long r = 0; r < rows; r++)
             {
-                colRun[(int)(r * 2)] = reordered[(int)((r * cols + c) * 2)];
-                colRun[(int)(r * 2) + 1] = reordered[(int)((r * cols + c) * 2) + 1];
+                BinaryPrimitives.WriteSingleLittleEndian(colRun.AsSpan((int)(r * 4)), reordered[r * cols + c]);
             }
-            writer.SeekAbsolute((long)writer.TensorOffset(index) + c * rows * 2);
-            writer.Data.Write(colRun, 0, (int)(rows * 2));
+            writer.SeekAbsolute(basePosition + c * rows * 4);
+            writer.Data.Write(colRun, 0, (int)(rows * 4));
         }
     }
 
@@ -666,32 +723,24 @@ public static class GgufConverter
         // squeeze [C, 1, K] → [C, K]
         long c = info.Shape[0], k = info.Shape[2];
         byte[] bytes = entry.Source.File.ReadBytes(info);
-        var conv = new byte[c * k * 2];
-        for (long i = 0; i < c; i++)
+        var conv = new float[c * k];
+        for (long i = 0; i < c * k; i++)
         {
-            for (long j = 0; j < k; j++)
-            {
-                long srcIdx = (i * k + j) * 2;
-                conv[(int)((i * k + j) * 2)] = bytes[(int)((i * k + j) * 2)];
-                conv[(int)((i * k + j) * 2) + 1] = bytes[(int)((i * k + j) * 2) + 1];
-            }
+            conv[i] = info.Dtype == Dtype.F32
+                ? BitConverter.Int32BitsToSingle(BinaryPrimitives.ReadInt32LittleEndian(bytes.AsSpan((int)(i * 4))))
+                : BitConverter.UInt32BitsToSingle((uint)((ushort)(bytes[(int)(i * 2)] | (bytes[(int)(i * 2) + 1] << 8)) << 16));
         }
-        // squash: the payload is already [C, K] contiguous from [C,1,K]
-        byte[] converted = new byte[conv.Length];
-        ConvertBf16ToF16(conv, converted);
 
         long qkChannels = (long)numKHeads * headVDim * 2;
         long vChannels = c - qkChannels;
         if (vChannels <= 0)
         {
-            // nothing to reorder — write as-is (GGUF dims [K, C] reversed)
-            writer.Data.Write(converted, 0, converted.Length);
+            writer.Data.Write(MakeF32Bytes(conv));
             return;
         }
-        long group = (long)numKHeads * headVDim;      // rows per K-group
         long vPerKRows = (long)vPerK * headVDim;
-        var reordered = new byte[converted.Length];
-        Buffer.BlockCopy(converted, 0, reordered, 0, (int)(qkChannels * k * 2));
+        var reordered = new float[conv.Length];
+        Buffer.BlockCopy(conv, 0, reordered, 0, (int)qkChannels * (int)k * 4);
         for (long vRow = 0; vRow < vChannels; vRow++)
         {
             long kk = vRow / vPerKRows;
@@ -701,36 +750,19 @@ public static class GgufConverter
             long tiledK = vp * numKHeads + kk;
             long srcRow = qkChannels + vRow;
             long dstRow = qkChannels + tiledK * headVDim + headRow;
-            Buffer.BlockCopy(converted, (int)(srcRow * k * 2), reordered, (int)(dstRow * k * 2), (int)(k * 2));
+            Buffer.BlockCopy(conv, (int)(srcRow * k * 4), reordered, (int)(dstRow * k * 4), (int)(k * 4));
         }
-        writer.Data.Write(reordered, 0, reordered.Length);
+        writer.Data.Write(MakeF32Bytes(reordered));
     }
 
-    private static byte[] ReorderColumns(byte[] converted, long rows, long cols, int elem, int vPerK, int numKHeads, int headVDim)
+    private static byte[] MakeF32Bytes(float[] values)
     {
-        // out_proj [rows = hidden, cols = num_v_heads*head_v_dim]: tiled reorder of columns
-        var reordered = new byte[converted.Length];
-        long group = (long)numKHeads * headVDim;
-        long vPerKCols = (long)vPerK * headVDim;
-        for (long c = 0; c < cols; c++)
+        var bytes = new byte[values.Length * 4];
+        for (int i = 0; i < values.Length; i++)
         {
-            long k = c / vPerKCols;
-            long inner = c % vPerKCols;
-            long vp = inner / headVDim;
-            long headCol = inner % headVDim;
-            long tiled = vp * numKHeads + k;
-            long srcCol = tiled * headVDim + headCol;
-            for (long r = 0; r < rows; r++)
-            {
-                long si = (r * cols + srcCol) * elem;
-                long di = (r * cols + c) * elem;
-                for (int b = 0; b < elem; b++)
-                {
-                    reordered[di + b] = converted[si + b];
-                }
-            }
+            BinaryPrimitives.WriteSingleLittleEndian(bytes.AsSpan(i * 4), values[i]);
         }
-        return reordered;
+        return bytes;
     }
 
     private static void AddOneToF16(Span<byte> data)
