@@ -99,6 +99,9 @@ public sealed class GgufValue
     public static GgufValue FloatArray(IReadOnlyList<float> items)
         => new(GgufValueType.Array, (GgufValueType.Float32, Box(items)));
 
+    public static GgufValue BoolArray(IReadOnlyList<bool> items)
+        => new(GgufValueType.Array, (GgufValueType.Bool, Box(items)));
+
     private static IReadOnlyList<object> Box<T>(IReadOnlyList<T> items)
     {
         var result = new object[items.Count];

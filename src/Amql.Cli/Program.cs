@@ -1431,17 +1431,19 @@ internal static class Program
             or standalone via export-mtp.
             to-gguf converts an exported HF checkpoint directory
             (config.json + model.safetensors + tokenizer.json) into a
-            GGUF v3 file for llama.cpp / LM Studio. The converter follows
-            llama.cpp's tensor and metadata conventions for the Qwen3-Next
-            family: hybrid linear/full-attention layers, MoE FFNs (per-
-            layer expert tensors stacked into 3-D gate/up/down tensors
-            plus the transposed router), partial rotary, and projections
-            transposed to the [in, out] GGUF layout. Weights are written
-            as F16 (BF16 sources convert losslessly in the normal range)
-            and F32 tensors (the routers) stay F32; the vision tower is
-            skipped (an LLM-only GGUF) and the MTP drafter companion
-            stays a separate shard. Validate the hybrid architecture by
-            loading the file in the target llama.cpp build.
+            GGUF v3 file for llama.cpp / LM Studio. Qwen3.5-family
+            checkpoints (hybrid linear/full attention, optional MoE) are
+            emitted as the qwen35 / qwen35moe architectures following
+            llama.cpp's converter: linear-attention tensors map to
+            attn_qkv / attn_gate / ssm_* with the V-head tiled reorder and
+            the value transforms (-exp A_log, norms +1, conv squeeze),
+            MoE experts stack into 3-D ffn_*_exps with the transposed
+            router, full-attention layers keep attn_q/k/v/output, and the
+            required Qwen3.5 MRoPE section + ssm/recurrent metadata are
+            written. Weights are F16 (BF16 sources, lossless in the normal
+            range); the vision tower is skipped and the MTP drafter stays
+            a separate shard. Validate by loading the file in the target
+            llama.cpp build.
             layers lists every component and, for the selected one, the
             per-layer attention policy table and tensor inventory, then
             whether the planner serves the stack or refuses it by name.

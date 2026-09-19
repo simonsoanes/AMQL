@@ -28,19 +28,32 @@ public class GgufTests
         string outFile = Path.Combine(temp.Path, "model.gguf");
         var report = GgufConverter.Convert(temp.Path, outFile);
 
-        Assert.Equal("qwen3nextmoe", report.Architecture);
+        Assert.Equal("qwen35moe", report.Architecture);
         Assert.True(report.TensorsWritten > 0);
 
         using var reader = GgufReader.Open(outFile);
-        Assert.Equal("qwen3nextmoe", reader.Arch);
-        Assert.Equal(2u, reader.Get("qwen3nextmoe.block_count").AsUInt32());
-        Assert.Equal((uint)Hidden, reader.Get("qwen3nextmoe.embedding_length").AsUInt32());
-        Assert.Equal(4u, reader.Get("qwen3nextmoe.attention.head_count").AsUInt32());
-        Assert.Equal(2u, reader.Get("qwen3nextmoe.attention.head_count_kv").AsUInt32());
-        Assert.Equal((uint)Experts, reader.Get("qwen3nextmoe.expert_count").AsUInt32());
-        Assert.Equal(2u, reader.Get("qwen3nextmoe.expert_used_count").AsUInt32());
-        Assert.Equal(10_000f, reader.Get("qwen3nextmoe.rope.freq_base").AsFloat());
-        Assert.Equal(0.25f, reader.Get("qwen3nextmoe.rope.partial_rotary_factor").AsFloat());
+        Assert.Equal("qwen35moe", reader.Arch);
+        Assert.Equal(2u, reader.Get("qwen35moe.block_count").AsUInt32());
+        Assert.Equal((uint)Hidden, reader.Get("qwen35moe.embedding_length").AsUInt32());
+        Assert.Equal(4u, reader.Get("qwen35moe.attention.head_count").AsUInt32());
+        Assert.Equal(2u, reader.Get("qwen35moe.attention.head_count_kv").AsUInt32());
+        Assert.Equal((uint)Experts, reader.Get("qwen35moe.expert_count").AsUInt32());
+        Assert.Equal(2u, reader.Get("qwen35moe.expert_used_count").AsUInt32());
+        Assert.Equal(10_000f, reader.Get("qwen35moe.rope.freq_base").AsFloat());
+        Assert.Equal(2u, reader.Get("qwen35moe.rope.dimension_count").AsUInt32()); // head_dim 8 × 0.25
+
+        // required Qwen3.5 MRoPE section + the ssm/recurrent metadata
+        var sections = reader.Get("qwen35moe.rope.dimension_sections").AsArray().Items;
+        Assert.Equal(4, sections.Count);
+        Assert.Equal(11u, (uint)sections[0]);
+        Assert.Equal(11u, (uint)sections[1]);
+        Assert.Equal(10u, (uint)sections[2]);
+        Assert.Equal(4u, reader.Get("qwen35moe.ssm.conv_kernel").AsUInt32());
+        Assert.Equal(4u, reader.Get("qwen35moe.ssm.state_size").AsUInt32());
+        var recurrent = reader.Get("qwen35moe.attention.recurrent_layers").AsArray().Items;
+        Assert.Equal(2, recurrent.Count);
+        Assert.Equal(true, recurrent[0]);
+        Assert.Equal(false, recurrent[1]);
 
         // every registered tensor offset is 32-byte aligned
         foreach (var tensor in reader.Tensors)
@@ -241,20 +254,21 @@ public class GgufTests
 
             if (linear)
             {
-                Add(p + "linear_attn.in_proj_qkv.weight", 64, Hidden);
-                Add(p + "linear_attn.in_proj_a.weight", 8, Hidden);
-                Add(p + "linear_attn.in_proj_b.weight", 8, Hidden);
+                // consistent with the head config: q(2×4) + k(2×4) + v(4×4) = 32 rows
+                Add(p + "linear_attn.in_proj_qkv.weight", 32, Hidden);
+                Add(p + "linear_attn.in_proj_a.weight", 4, Hidden);
+                Add(p + "linear_attn.in_proj_b.weight", 4, Hidden);
                 Add(p + "linear_attn.in_proj_z.weight", 16, Hidden);
                 Add(p + "linear_attn.out_proj.weight", Hidden, 16);
                 tensors.Add(new TensorPayload
                 {
                     Name = p + "linear_attn.conv1d.weight",
                     Dtype = Dtype.BF16,
-                    Shape = new long[] { 16, 1, 4 },
-                    Data = Bf16(Enumerable.Range(0, 64).Select(i => SourceValue(i)).ToArray()),
+                    Shape = new long[] { 32, 1, 4 },
+                    Data = Bf16(Enumerable.Range(0, 128).Select(i => SourceValue(i)).ToArray()),
                 });
-                Add(p + "linear_attn.A_log", 1, 16);
-                Add(p + "linear_attn.dt_bias", 1, 16);
+                Add1D(p + "linear_attn.A_log", 4);
+                Add1D(p + "linear_attn.dt_bias", 4);
                 Add1D(p + "linear_attn.norm.weight", 8);
             }
             else
