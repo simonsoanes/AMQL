@@ -32,6 +32,9 @@ Thumbs.db
 ## Containers
 containers/
 
+## Exported checkpoints and GGUF artifacts
+exports/
+
 ## Native CUDA backend build output (rebuild via native\amql_cuda\build-cuda.cmd)
 native/amql_cuda/bin/
 native/amql_cuda/probe/out/

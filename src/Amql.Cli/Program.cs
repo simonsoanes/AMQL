@@ -1,4 +1,5 @@
 ﻿using System.Text.Json;
+using Amql.Gguf;
 using Amql.Hf;
 using Amql.Inference;
 using Amql.Merge;
@@ -41,6 +42,7 @@ internal static class Program
                 "change-tensor" => ChangeTensor(args[1..]),
                 "save-lora" => SaveLora(args[1..]),
                 "export" => Export(args[1..]),
+                "to-gguf" => ToGguf(args[1..]),
                 "export-mtp" => ExportMtp(args[1..]),
                 "generate-mtp" => GenerateMtp(args[1..]),
                 "collect-mtp" => CollectMtp(args[1..]),
@@ -762,6 +764,31 @@ internal static class Program
         return 0;
     }
 
+    // ── to-gguf: convert an exported HF checkpoint to GGUF ──────────────
+
+    private static int ToGguf(string[] args)
+    {
+        var checkpointDir = Arg(args, 0) ?? throw new CliException(
+            "to-gguf requires a checkpoint directory, e.g. 'amql-cli to-gguf <checkpoint-dir> --out <model.gguf>'");
+        string outFile = OptionValue(args, "--out") ?? throw new CliException("to-gguf requires '--out <file.gguf>'");
+        if (File.Exists(outFile))
+        {
+            throw new CliException($"output '{outFile}' already exists");
+        }
+
+        var report = GgufConverter.Convert(checkpointDir, outFile);
+
+        Console.WriteLine($"converted: {report.OutputPath}");
+        Console.WriteLine($"arch:       {report.Architecture}");
+        Console.WriteLine($"tensors:    {report.TensorsWritten}  ({FormatBytes(report.OutputBytes)})");
+        foreach (var note in report.Notes)
+        {
+            Console.WriteLine($"note:       {note}");
+        }
+        Console.WriteLine("load it with llama.cpp / LM Studio, e.g. 'llama-cli -m <file.gguf> -p \"hello\"' — validate the hybrid arch on the target build");
+        return 0;
+    }
+
     // ── layers: describe the per-layer policy table and tensors ──────────
 
     private static int Layers(string[] args)
@@ -1349,6 +1376,7 @@ internal static class Program
                               [--rank 8] [--alpha 16] [--container <container-dir>]
               amql-cli export <container-dir> --out <checkpoint-dir>
                               [--patch <patch.safetensors>] [--quant mxfp4]
+              amql-cli to-gguf <checkpoint-dir> --out <file.gguf>
               amql-cli export-mtp <container-dir> --out <drafter-dir>
               amql-cli generate-mtp <container-dir> --out <out>
                               [--text <corpus.txt>] [--sample 4096] [--fit]
@@ -1401,6 +1429,19 @@ internal static class Program
             part of the model), and a materialised MTP drafter exports
             automatically alongside as mtp.safetensors + mtp.config.json —
             or standalone via export-mtp.
+            to-gguf converts an exported HF checkpoint directory
+            (config.json + model.safetensors + tokenizer.json) into a
+            GGUF v3 file for llama.cpp / LM Studio. The converter follows
+            llama.cpp's tensor and metadata conventions for the Qwen3-Next
+            family: hybrid linear/full-attention layers, MoE FFNs (per-
+            layer expert tensors stacked into 3-D gate/up/down tensors
+            plus the transposed router), partial rotary, and projections
+            transposed to the [in, out] GGUF layout. Weights are written
+            as F16 (BF16 sources convert losslessly in the normal range)
+            and F32 tensors (the routers) stay F32; the vision tower is
+            skipped (an LLM-only GGUF) and the MTP drafter companion
+            stays a separate shard. Validate the hybrid architecture by
+            loading the file in the target llama.cpp build.
             layers lists every component and, for the selected one, the
             per-layer attention policy table and tensor inventory, then
             whether the planner serves the stack or refuses it by name.

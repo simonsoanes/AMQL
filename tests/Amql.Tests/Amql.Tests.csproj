@@ -20,6 +20,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\Amql.Safetensors\Amql.Safetensors.csproj" />
+    <ProjectReference Include="..\..\src\Amql.Gguf\Amql.Gguf.csproj" />
     <ProjectReference Include="..\..\src\Amql.Vindex3\Amql.Vindex3.csproj" />
     <ProjectReference Include="..\..\src\Amql.Inference\Amql.Inference.csproj" />
     <ProjectReference Include="..\..\src\Amql.Hf\Amql.Hf.csproj" />
