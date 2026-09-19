@@ -105,8 +105,11 @@ public sealed class GgufWriter : IDisposable
         _out.Write(scratch, 0, 8);
 
         _out.Write(kvBytes.ToArray());
-        PadTo(DefaultAlignment);
 
+        // The tensor-info table follows the metadata IMMEDIATELY — llama.cpp
+        // does not pad between them (it aligns only the data section, via
+        // GGML_PAD after the last tensor info). A pad here makes its reader
+        // interpret padding bytes as the first tensor's name.
         for (int i = 0; i < _tensors.Count; i++)
         {
             var (name, type, dims, _) = _tensors[i];

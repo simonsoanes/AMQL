@@ -65,9 +65,9 @@ public sealed class GgufReader : IDisposable
             _metadata[key] = value;
         }
 
-        // The writer pads the metadata block to the 32-byte alignment
-        // before the tensor-info table — skip the pad so the table parses.
-        SkipPad(32);
+        // No padding between the metadata and the tensor-info table —
+        // llama.cpp parses the infos immediately after the kv section and
+        // only aligns before the data section.
 
         for (ulong i = 0; i < tensorCount; i++)
         {
@@ -204,15 +204,6 @@ public sealed class GgufReader : IDisposable
             elements *= d;
         }
         return elements;
-    }
-
-    private void SkipPad(uint alignment)
-    {
-        long pad = (long)(((ulong)_input.Position + alignment - 1) / alignment * alignment - (ulong)_input.Position);
-        if (pad > 0)
-        {
-            _input.Position += pad;
-        }
     }
 
     private static long ElementSize(GgufType type) => type switch
