@@ -55,6 +55,7 @@ public static class GgufConverter
         Copy,
         Transpose,
         Stack,
+        Zeros,
         Q35Qkv,     // in_proj_qkv: transpose + tiled V-row reorder
         Q35Z,       // in_proj_z:   transpose + row reorder
         Q35A,       // in_proj_a:   transpose + row reorder (head dim 1)
@@ -146,8 +147,11 @@ public static class GgufConverter
                 throw new GgufException($"source tensor '{sourceName}' missing from the checkpoint");
             }
             var (file, info) = directory.Get(sourceName);
-            plan.Add(new PlanEntry(new Source(file, info), ggufName, transform, addOne, stack));
+            plan.Add(new PlanEntry(new Source(file, info), ggufName, transform, addOne, stack, null));
         }
+
+        void AddZeros(string ggufName, params long[] neDims)
+            => plan.Add(new PlanEntry(null, ggufName, Transform.Zeros, false, null, neDims));
 
         void Stack(string expertPrefix, string projKind, string ggufName)
         {
@@ -177,7 +181,9 @@ public static class GgufConverter
             bool linear = kind.Contains("linear", StringComparison.OrdinalIgnoreCase);
 
             Add(b + "input_layernorm.weight", blk + "attn_norm.weight", qwen35 ? Transform.Q35Norm : Transform.Copy);
-            Add(b + "post_attention_layernorm.weight", blk + "ffn_norm.weight", qwen35 ? Transform.Q35Norm : Transform.Copy);
+            Add(b + "post_attention_layernorm.weight",
+                qwen35 ? blk + "post_attention_norm.weight" : blk + "ffn_norm.weight",
+                qwen35 ? Transform.Q35Norm : Transform.Copy);
 
             if (linear)
             {
@@ -185,7 +191,7 @@ public static class GgufConverter
                     reorderLinear ? Transform.Q35Qkv : Transform.Transpose);
                 Add(b + "linear_attn.in_proj_z.weight", blk + "attn_gate.weight",
                     reorderLinear ? Transform.Q35Z : Transform.Transpose);
-                Add(b + "linear_attn.in_proj_a.weight", blk + "ssm_ba.weight",
+                Add(b + "linear_attn.in_proj_a.weight", blk + "ssm_alpha.weight",
                     reorderLinear ? Transform.Q35A : Transform.Transpose);
                 Add(b + "linear_attn.in_proj_b.weight", blk + "ssm_beta.weight",
                     reorderLinear ? Transform.Q35B : Transform.Transpose);
@@ -193,7 +199,7 @@ public static class GgufConverter
                     reorderLinear ? Transform.Q35Out : Transform.Transpose);
                 Add(b + "linear_attn.conv1d.weight", blk + "ssm_conv1d.weight",
                     reorderLinear ? Transform.Q35Conv : Transform.Transpose);
-                Add(b + "linear_attn.A_log", blk + "ssm_a.weight",
+                Add(b + "linear_attn.A_log", blk + "ssm_a",
                     reorderLinear ? Transform.Q35ALog : Transform.Q35ALog);
                 Add(b + "linear_attn.dt_bias", blk + "ssm_dt.bias",
                     reorderLinear ? Transform.Q35Dt : Transform.Q35Dt);
@@ -215,6 +221,18 @@ public static class GgufConverter
                 Stack(b + "mlp.experts.", "gate_proj", blk + "ffn_gate_exps.weight");
                 Stack(b + "mlp.experts.", "up_proj", blk + "ffn_up_exps.weight");
                 Stack(b + "mlp.experts.", "down_proj", blk + "ffn_down_exps.weight");
+                if (qwen35)
+                {
+                    // the qwen35moe arch carries shared experts in its tensor
+                    // set unconditionally; this model has none, so emit inert
+                    // (zero) shared-expert tensors to satisfy the loader —
+                    // a zero shared-expert contribution is neutral in the
+                    // routed sum. One shared "expert" of expert width.
+                    AddZeros(blk + "ffn_gate_inp_shexp.weight", hidden, 1);
+                    AddZeros(blk + "ffn_gate_shexp.weight", hidden, expertIntermediate);
+                    AddZeros(blk + "ffn_up_shexp.weight", hidden, expertIntermediate);
+                    AddZeros(blk + "ffn_down_shexp.weight", expertIntermediate, hidden);
+                }
             }
         }
 
@@ -230,11 +248,18 @@ public static class GgufConverter
         writer.Kv($"{arch}.context_length", GgufValue.Uint32((uint)maxPos));
         writer.Kv($"{arch}.embedding_length", GgufValue.Uint32((uint)hidden));
         writer.Kv($"{arch}.feed_forward_length", GgufValue.Uint32((uint)expertIntermediate));
+        if (hasMoe && experts > 0)
+        {
+            writer.Kv($"{arch}.expert_feed_forward_length", GgufValue.Uint32((uint)expertIntermediate));
+        }
         writer.Kv($"{arch}.attention.head_count", GgufValue.Uint32((uint)heads));
         writer.Kv($"{arch}.attention.head_count_kv", GgufValue.Uint32((uint)kvHeads));
         writer.Kv($"{arch}.attention.key_length", GgufValue.Uint32((uint)headDim));
         writer.Kv($"{arch}.attention.value_length", GgufValue.Uint32((uint)headDim));
-        writer.Kv($"{arch}.attention.norm_rms_epsilon", GgufValue.Float32(rmsEps));
+        // the qwen35 family reads layer_norm_rms_epsilon (the newer key
+        // convention); the qwen3-family fallback keeps norm_rms_epsilon
+        writer.Kv(qwen35 ? $"{arch}.attention.layer_norm_rms_epsilon" : $"{arch}.attention.norm_rms_epsilon",
+            GgufValue.Float32(rmsEps));
         writer.Kv($"{arch}.attention.gate_use_softmax", GgufValue.Bool(attnOutputGate));
         writer.Kv($"{arch}.rope.freq_base", GgufValue.Float32(ropeTheta));
         if (qwen35)
@@ -259,13 +284,15 @@ public static class GgufConverter
         {
             writer.Kv($"{arch}.expert_count", GgufValue.Uint32((uint)experts));
             writer.Kv($"{arch}.expert_used_count", GgufValue.Uint32((uint)topK));
+            writer.Kv($"{arch}.expert_shared_count", GgufValue.Uint32(1));
         }
 
         var (tokens, scores, tokenTypes, merges) = LoadTokenizer(Path.Combine(checkpointDir, "tokenizer.json"), vocab);
         writer.Kv("tokenizer.ggml.model", GgufValue.String("gpt2"));
+        writer.Kv("tokenizer.ggml.pre", GgufValue.String("default"));
         writer.Kv("tokenizer.ggml.tokens", GgufValue.StringArray(tokens));
         writer.Kv("tokenizer.ggml.scores", GgufValue.FloatArray(scores));
-        writer.Kv("tokenizer.ggml.token_type", GgufValue.Uint32Array(tokenTypes));
+        writer.Kv("tokenizer.ggml.token_type", GgufValue.Int32Array(tokenTypes.Select(t => (int)t).ToArray()));
         if (merges.Length > 0)
         {
             writer.Kv("tokenizer.ggml.merges", GgufValue.StringArray(merges));
@@ -310,28 +337,42 @@ public static class GgufConverter
     private sealed record Source(SafetensorsFile File, TensorInfo Info);
 
     private sealed record PlanEntry(
-        Source Source,
+        Source? Source,
         string Name,
         Transform Transform,
         bool AddOne,
-        IReadOnlyList<Source>? StackSlices);
+        IReadOnlyList<Source>? StackSlices,
+        long[]? ExplicitDims);
 
     // ── descriptors ────────────────────────────────────────────────────────
 
     private static GgufType GgufTypeFor(PlanEntry entry)
-        => entry.Source.Info.Dtype switch
+        => entry.Transform switch
         {
-            Dtype.F32 => GgufType.F32,
-            Dtype.BF16 or Dtype.F16 => GgufType.F16,
-            _ => throw new GgufException($"source tensor '{entry.Source.Info.Name}' dtype {entry.Source.Info.Dtype.Label()} is not convertible"),
+            Transform.Zeros => GgufType.F16,
+            // llama.cpp's Qwen3-Next reference keeps the ssm decay/delta
+            // tensors in float32 (they are float in the HF checkpoints);
+            // the graph's binary ops mix them with f32 states, so writing
+            // them f16 trips ggml's "unsupported types" in build.
+            Transform.Q35ALog or Transform.Q35Dt => GgufType.F32,
+            _ => entry.Source!.Info.Dtype switch
+            {
+                Dtype.F32 => GgufType.F32,
+                Dtype.BF16 or Dtype.F16 => GgufType.F16,
+                _ => throw new GgufException($"source tensor '{entry.Source.Info.Name}' dtype {entry.Source.Info.Dtype.Label()} is not convertible"),
+            },
         };
 
     private static long[] GgufDims(PlanEntry entry, bool reorderLinear)
     {
-        var shape = entry.Source.Info.Shape;
+        var shape = entry.Source?.Info.Shape ?? Array.Empty<long>();
         switch (entry.Transform)
         {
+            case Transform.Zeros:
+                return entry.ExplicitDims!;
             case Transform.Stack:
+                // expert slices stacked as [experts, s0, s1]; the file dims
+                // are llama.cpp's ne[] order: [s1, s0, experts]
                 return new[] { shape[1], shape[0], (long)entry.StackSlices!.Count };
             case Transform.Transpose:
             case Transform.Q35Qkv:
@@ -339,16 +380,15 @@ public static class GgufConverter
             case Transform.Q35A:
             case Transform.Q35B:
             case Transform.Q35Out:
-                if (shape.Length != 2)
-                {
-                    throw new GgufException($"cannot transpose non-2-D tensor '{entry.Source.Info.Name}'");
-                }
-                return new[] { shape[0], shape[1] };
             case Transform.Q35Conv:
-                // conv1d squeezed to [C, K]; GGUF keeps the conv order [C, K]
+                // conv1d [C, 1, K] is squeezed: file dims [K, C] (ne order)
+                if (shape.Length == 3)
+                {
+                    return new[] { shape[2], shape[0] };
+                }
                 return new[] { shape[1], shape[0] };
             default:
-                return shape.Reverse().ToArray();
+                return shape.ToArray();
         }
     }
 
@@ -361,6 +401,21 @@ public static class GgufConverter
 
         switch (entry.Transform)
         {
+            case Transform.Zeros:
+                long elements = 1;
+                foreach (long d in entry.ExplicitDims!)
+                {
+                    elements *= d;
+                }
+                byte[] zeroBuf = new byte[Math.Min(elements * 2, 1 << 20)];
+                long zeroLeft = elements * 2;
+                while (zeroLeft > 0)
+                {
+                    int take = (int)Math.Min(zeroLeft, zeroBuf.Length);
+                    writer.Data.Write(zeroBuf, 0, take);
+                    zeroLeft -= take;
+                }
+                break;
             case Transform.Copy:
                 CopyRaw(entry.Source, writer.Data, entry.AddOne);
                 break;
@@ -581,8 +636,8 @@ public static class GgufConverter
     {
         var info = entry.Source.Info;
         byte[] bytes = entry.Source.File.ReadBytes(info);
-        var outBytes = new byte[bytes.Length];
-        int n = (int)bytes.Length / 2;
+        int n = info.Shape[0] > 0 ? (int)info.Shape[0] : (int)(bytes.Length / 2);
+        var outBytes = new byte[n * 4];
         for (int i = 0; i < n; i++)
         {
             ushort bf = (ushort)(bytes[i * 2] | (bytes[i * 2 + 1] << 8));
@@ -591,9 +646,7 @@ public static class GgufConverter
             {
                 f = -MathF.Exp(f);
             }
-            ushort f16 = BitConverter.HalfToUInt16Bits((Half)f);
-            outBytes[i * 2] = (byte)(f16 & 0xFF);
-            outBytes[i * 2 + 1] = (byte)(f16 >> 8);
+            BinaryPrimitives.WriteSingleLittleEndian(outBytes.AsSpan(i * 4), f);
         }
         // reorder: grouped → tiled over the value heads
         var reordered = new byte[outBytes.Length];
@@ -602,8 +655,7 @@ public static class GgufConverter
             int k = v / vPerK;
             int vp = v % vPerK;
             int tiled = vp * numKHeads + k;
-            reordered[tiled * 2] = outBytes[v * 2];
-            reordered[tiled * 2 + 1] = outBytes[v * 2 + 1];
+            Buffer.BlockCopy(outBytes, v * 4, reordered, tiled * 4, 4);
         }
         writer.Data.Write(reordered, 0, reordered.Length);
     }

@@ -96,6 +96,9 @@ public sealed class GgufValue
     public static GgufValue Uint32Array(IReadOnlyList<uint> items)
         => new(GgufValueType.Array, (GgufValueType.Uint32, Box(items)));
 
+    public static GgufValue Int32Array(IReadOnlyList<int> items)
+        => new(GgufValueType.Array, (GgufValueType.Int32, Box(items)));
+
     public static GgufValue FloatArray(IReadOnlyList<float> items)
         => new(GgufValueType.Array, (GgufValueType.Float32, Box(items)));
 

@@ -87,7 +87,8 @@ public class GgufTests
         var kBytes = reader.ReadBytes("blk.1.attn_k.weight");
         Assert.Equal(32 * 16 * 2, kBytes.Length);
         var tensor = reader.GetTensor("blk.1.attn_k.weight");
-        Assert.Equal(new long[] { 16, 32 }, tensor.Dims);
+        // stored in llama.cpp's ne[] order: [in, out] for the transposed k
+        Assert.Equal(new long[] { 32, 16 }, tensor.Dims);
         for (int r = 0; r < 16; r++)
         {
             for (int c = 0; c < 32; c++)
@@ -98,11 +99,10 @@ public class GgufTests
             }
         }
 
-        // the F32 router is transposed to [hidden, experts], kept F32;
-        // the stored GGUF dims are the reversed logical order [experts, hidden]
+        // the F32 router is transposed to [hidden, experts] (llama.cpp's ne[] order)
         var router = reader.GetTensor("blk.0.ffn_gate_inp.weight");
         Assert.Equal(GgufType.F32, router.Type);
-        Assert.Equal(new long[] { Experts, Hidden }, router.Dims);
+        Assert.Equal(new long[] { Hidden, Experts }, router.Dims);
     }
 
     [Fact]
@@ -116,8 +116,8 @@ public class GgufTests
 
         using var reader = GgufReader.Open(outFile);
         var gate = reader.GetTensor("blk.0.ffn_gate_exps.weight");
-        // logical [experts, mid, emb] stored reversed: [emb, mid, experts]
-        Assert.Equal(new long[] { Hidden, ExpertMid, Experts }, gate.Dims);
+        // logical [experts, mid, emb] — llama.cpp's ne[] order
+        Assert.Equal(new long[] { Experts, ExpertMid, Hidden }, gate.Dims);
         Assert.Equal(GgufType.F16, gate.Type);
 
         var bytes = reader.ReadBytes("blk.0.ffn_gate_exps.weight");
