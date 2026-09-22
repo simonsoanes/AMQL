@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>amql-gui</AssemblyName>
+    <RootNamespace>Amql.Gui</RootNamespace>
+    <Description>WPF project-based front-end for amql-cli. Deliberately references no AMQL library: it drives the CLI as a child process so it stays decoupled from in-flight core changes.</Description>
+  </PropertyGroup>
+
+</Project>

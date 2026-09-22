@@ -8,9 +8,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- **feat:** `amql-cli --progress` (or `AMQL_PROGRESS=1`) — a machine-readable progress/result protocol on stdout: newline-delimited `##amql-progress` and `##amql-result` JSON lines, so front-ends bind progress exactly instead of scraping percentages out of prose
+- **feat:** `amql-cli --verbose` — full stack traces for unexpected errors are now opt-in
+- **feat:** `to-gguf --force` overwrites an existing output file (idempotent re-runs)
+- **docs:** the exit-code table is documented in `amql-cli help`: 0 success, 1 a legitimate negative result (`path` found nothing within budget, `verify` integrity failed), 2 usage/runtime error
+
 ### Changed
 
+- **cli:** `change-tensor` collects every argument-validation problem and reports them in one run instead of one error per invocation
+- **cli:** `verify` skips shape-specific operand probes that the container does not have (e.g. the 2-layer `synth-model` demo, a stack without linear attention) instead of failing after integrity passed
+- **cli:** `route` and `path` progress fragments are newline-terminated and flushed under redirected stdout, so a piped consumer sees updates as they happen
+- **gui:** AMQL Studio requests the progress protocol, binds the bar to it (heuristic parsing kept as fallback), and records exit 1 as `Negative` rather than `Failed`
+- **build:** the solution builds warning-clean — the eight `HfCheckpointToGguf` nullability warnings are gone (`PlanEntry.RequiredSource` throws a typed error on a malformed plan)
+
 ### Removed
+
+- **cli:** unexpected errors no longer print a full stack trace by default — one `error: …` line plus a hint to re-run with `--verbose`
 
 ---
 

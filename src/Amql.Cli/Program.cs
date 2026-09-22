@@ -1,4 +1,4 @@
-﻿using System.Text.Json;
+using System.Text.Json;
 using Amql.Gguf;
 using Amql.Hf;
 using Amql.Inference;
@@ -23,24 +23,30 @@ internal static class Program
         if (args.Length == 0 || args[0] is "-h" or "--help" or "help")
         {
             PrintHelp();
-            return args.Length == 0 ? 1 : 0;
+            return args.Length == 0 ? ExitUsage : ExitOk;
         }
 
         // Parse global --cpu / --gpu before any command runs so the probe
         // honours the forced mode on the very first CudaShim.Enabled read.
+        // --progress turns on the machine-readable protocol (also via
+        // AMQL_PROGRESS=1); --verbose restores full stack traces on errors.
         bool forceCpu = false;
         bool forceGpu = false;
+        bool progress = Environment.GetEnvironmentVariable("AMQL_PROGRESS") is "1" or "true";
+        bool verbose = false;
         var filtered = new List<string>();
         foreach (var a in args)
         {
             if (a == "--cpu") { forceCpu = true; continue; }
             if (a == "--gpu") { forceGpu = true; continue; }
+            if (a == "--progress") { progress = true; continue; }
+            if (a == "--verbose") { verbose = true; continue; }
             filtered.Add(a);
         }
         if (forceCpu && forceGpu)
         {
             Console.Error.WriteLine("error: --cpu and --gpu are mutually exclusive");
-            return 2;
+            return ExitUsage;
         }
         if (forceCpu)
         {
@@ -55,10 +61,12 @@ internal static class Program
         // When neither flag is given, CudaShim auto-detects (the default).
 
         args = filtered.ToArray();
+        CliProgress.Configure(args[0], progress, verbose);
 
+        int result;
         try
         {
-            return args[0] switch
+            result = args[0] switch
             {
                 "encode" => Encode(args[1..]),
                 "verify" => Verify(args[1..]),
@@ -89,20 +97,46 @@ internal static class Program
         {
             Console.Error.WriteLine($"error: {e.Message}");
             Console.Error.WriteLine("run 'amql-cli help' for usage");
-            return 2;
+            result = ExitUsage;
         }
         catch (MergeException e)
         {
             Console.Error.WriteLine($"error: {e.Message}");
-            return 2;
+            result = ExitUsage;
         }
         catch (Exception e)
         {
+            // A clean single-line error by default; the stack trace is a
+            // debugging aid, so it is reserved for --verbose (TODO.md item 2).
             Console.Error.WriteLine($"error: {e.Message}");
-            Console.Error.WriteLine(e.ToString());
-            return 2;
+            if (CliProgress.Verbose)
+            {
+                Console.Error.WriteLine(e.ToString());
+            }
+            else
+            {
+                Console.Error.WriteLine("re-run with --verbose for the full stack trace");
+            }
+            result = ExitUsage;
         }
+        CliProgress.EndFragmentLine();
+        return result;
     }
+
+    /// <summary>Documented exit codes (TODO.md item 6):</summary>
+    /// <remarks>
+    ///   0 — success (the command produced its answer, whatever it was);
+    ///   1 — a legitimate negative result: the command ran fine and the
+    ///       answer is 'not found' / 'not satisfied' (path found no chain
+    ///       within budget, verify's integrity check failed). Emit a
+    ///       ##amql-result line so front-ends can read the reason;
+    ///   2 — usage or runtime error (bad arguments, unreadable input, an
+    ///       unsupported operator, an exception).
+    /// </remarks>
+    private const int ExitOk = 0;
+    private const int ExitNegativeResult = 1;
+    private const int ExitUsage = 2;
+
 
     // ── encode ──────────────────────────────────────────────────────────────
 
@@ -116,7 +150,9 @@ internal static class Program
         }
 
         Console.WriteLine($"encoding '{modelDir}' → '{outDir}'");
+        CliProgress.Phase("encode");
         var report = ModelToContainer.Encode(modelDir, outDir);
+        CliProgress.Complete($"{report.Tensors} tensors, {report.PayloadBytes} bytes");
 
         Console.WriteLine();
         Console.WriteLine($"model:        {report.ModelId}");
@@ -154,24 +190,50 @@ internal static class Program
         if (!report.Ok)
         {
             Console.Error.WriteLine("integrity verification FAILED — the container diverges from its index");
-            return 1;
+            CliProgress.Result(new { integrity = false, failed = report.Checks.Count(c => !c.Ok), checks = report.Checks.Count });
+            return ExitNegativeResult; // a real answer: the container is diverged
         }
 
         // Operand resolution on real weights: tensor tables, shapes, stored
         // dtypes and payload widening all exercised from the container alone.
         using var store = container.CreateOperandStore();
         Console.WriteLine("operands:");
-        var qProj = store.Resolve("target.decoder_stack", "3.self_attn.q_proj.weight");
-        Console.WriteLine($"  3.self_attn.q_proj.weight: {qProj.Dtype.Label()} shape=[{string.Join("x", qProj.Shape)}]");
-        var kvIn = store.Resolve("target.decoder_stack", "0.linear_attn.in_proj_qkv.weight");
-        Console.WriteLine($"  0.linear_attn.in_proj_qkv.weight: {kvIn.Dtype.Label()} shape=[{string.Join("x", kvIn.Shape)}]");
-        var aLog = store.Resolve("target.decoder_stack", "0.linear_attn.A_log");
-        Console.WriteLine($"  0.linear_attn.A_log: {aLog.Dtype.Label()} shape=[{string.Join("x", aLog.Shape)}] (precision exception)");
-        var norms = store.Resolve("target.final_norm", "weight");
-        var widened = Amql.Safetensors.BitPattern.WidenToF32(norms.Dtype, norms.Payload);
-        float firstNorm = widened[0];
-        Console.WriteLine($"  final_norm/weight: {widened.Length} f32 values (first={firstNorm:F4}, dtype {norms.Dtype.Label()})");
-        Console.WriteLine($"operand store: {store.TouchedObjects.Count} objects touched, {store.Loads} loads");
+        // The probes are shape-specific (a Qwen3.5-style stack with at least
+        // four layers and linear attention). Containers that legitimately do
+        // not have those tensors — the 2-layer synth-model, a merged or pruned
+        // stack — skip the probes instead of failing verification (TODO.md item 4).
+        int probed = 0;
+        void Probe(string objectId, string tensorName, string? note = null)
+        {
+            try
+            {
+                var operand = store.Resolve(objectId, tensorName);
+                Console.WriteLine($"  {objectId}/{tensorName}: {operand.Dtype.Label()} shape=[{string.Join("x", operand.Shape)}]{(note is null ? string.Empty : $" ({note})")}");
+                probed++;
+            }
+            catch (Exception e) when (e is not OutOfMemoryException)
+            {
+                Console.WriteLine($"  {objectId}/{tensorName}: [skipped — {e.Message}]");
+            }
+        }
+        Probe("target.decoder_stack", "3.self_attn.q_proj.weight");
+        Probe("target.decoder_stack", "0.linear_attn.in_proj_qkv.weight");
+        Probe("target.decoder_stack", "0.linear_attn.A_log", "precision exception");
+        try
+        {
+            var norms = store.Resolve("target.final_norm", "weight");
+            var widened = Amql.Safetensors.BitPattern.WidenToF32(norms.Dtype, norms.Payload);
+            float firstNorm = widened[0];
+            Console.WriteLine($"  final_norm/weight: {widened.Length} f32 values (first={firstNorm:F4}, dtype {norms.Dtype.Label()})");
+            probed++;
+        }
+        catch (Exception e) when (e is not OutOfMemoryException)
+        {
+            Console.WriteLine($"  final_norm/weight: [skipped — {e.Message}]");
+        }
+        Console.WriteLine(probed == 0
+            ? "operand store: no shape-specific probe matched this container (integrity above is unaffected)"
+            : $"operand store: {store.TouchedObjects.Count} objects touched, {store.Loads} loads ({probed} probes)");
 
         // Runtime readiness: plan the primary text component and report the
         // operator boundary — which persisted primitives this build serves
@@ -374,7 +436,8 @@ internal static class Program
         Console.WriteLine($"container: {containerDir} (weights)   tokenizer: {modelDir} (checkpoint)");
         var tokenizer = Tokenizer(modelDir);
 
-        var (links, notes) = RelationRouter.Route(container, component, tokenizer, a, b, options, Console.Write, patch);
+        CliProgress.Phase("probe", options.MaxTemplates);
+        var (links, notes) = RelationRouter.Route(container, component, tokenizer, a, b, options, CliProgress.FragmentWriter, patch);
         foreach (var note in notes)
         {
             Console.WriteLine($"note: {note}");
@@ -447,13 +510,17 @@ internal static class Program
         Console.WriteLine($"container: {containerDir} (weights)   tokenizer: {modelDir} ({(inContainer ? "in container" : "checkpoint")})");
         Console.WriteLine($"searching from '{a}' (id {aId}) toward '{b}' (id {bId}) — edges = top-{options.TopK} continuations (cost −log P) …");
 
-        var result = PathFinder.Search(container, component, tokenizer, aId, bId, options, Console.Write, patch);
+        CliProgress.Phase("search", options.MaxNodes);
+        var result = PathFinder.Search(container, component, tokenizer, aId, bId, options, CliProgress.FragmentWriter, patch);
         Console.WriteLine();
 
         if (!result.Found)
         {
             Console.WriteLine($"no path found within the budget ({options.MaxNodes} expansions, depth {options.MaxDepth}).");
-            return 1;
+            // Exit 1 = a legitimate negative result, not an error (TODO.md item 6);
+            // the result line lets a front-end read the reason without parsing prose.
+            CliProgress.Result(new { found = false, nodes = result.NodesVisited, forwards = result.Forwards, budgetNodes = options.MaxNodes, budgetDepth = options.MaxDepth });
+            return ExitNegativeResult;
         }
 
         foreach (var hop in result.Hops)
@@ -465,7 +532,9 @@ internal static class Program
         Console.WriteLine($"meeting point: '{result.Hops[^1].TokenText}' — fwd {result.MeetingForwardCost:0.00}, bwd {result.MeetingBackwardCost:0.00}");
         Console.WriteLine($"total cost {result.TotalCost:0.00} · {result.Forwards} model forwards · {result.NodesVisited} nodes");
         Console.WriteLine("path = token chain only (no relation names); costs are −log P of each continuation edge.");
-        return 0;
+        CliProgress.Result(new { found = true, cost = Math.Round(result.TotalCost, 4), hops = result.Hops.Count, nodes = result.NodesVisited, forwards = result.Forwards });
+        CliProgress.Complete();
+        return ExitOk;
     }
 
     // ── generate ───────────────────────────────────────────────────────────
@@ -634,40 +703,65 @@ internal static class Program
         var containerDir = Arg(args, 0) ?? throw new CliException(
             "change-tensor requires a container directory, e.g. 'amql-cli change-tensor <container> target.embedding weight 3,1 --set 0.5 --out patch.safetensors'");
         var pos = Positionals(args.Skip(1).ToArray(), "--out", "--set", "--add", "--scale", "--zero", "--patch");
-        string objectId = pos.Length > 0 ? pos[0] : throw new CliException("change-tensor requires an object id (e.g. target.embedding)");
-        string tensorName = pos.Length > 1 ? pos[1] : throw new CliException("change-tensor requires a tensor name (e.g. weight, 0.self_attn.q_proj.weight)");
-        string cell = pos.Length > 2 ? pos[2] : throw new CliException("change-tensor requires a cell: 'row,col' for a 2-D tensor, a flat index otherwise");
-
-        var op = ParseEditOp(args);
-        float value = ParseEditValue(args, op);
-
-        string outPatch = OptionValue(args, "--out") ?? throw new CliException("change-tensor requires '--out <patch.safetensors>'");
-        string? existingPath = File.Exists(outPatch) ? outPatch : null;
+        // Collect EVERY problem before throwing, so one run surfaces all of
+        // them instead of one fix per invocation (TODO.md item 3).
+        var problems = new List<string>();
+        string? objectId = pos.Length > 0 ? pos[0] : null;
+        string? tensorName = pos.Length > 1 ? pos[1] : null;
+        string? cell = pos.Length > 2 ? pos[2] : null;
+        if (objectId is null) problems.Add("missing object id (e.g. target.embedding)");
+        if (tensorName is null) problems.Add("missing tensor name (e.g. weight, 0.self_attn.q_proj.weight)");
+        if (cell is null) problems.Add("missing cell: 'row,col' for a 2-D tensor, a flat index otherwise");
+        string? outPatch = OptionValue(args, "--out");
+        if (outPatch is null) problems.Add("missing '--out <patch.safetensors>'");
+        TensorEditOp op = TensorEditOp.Set;
+        float value = 0f;
+        try
+        {
+            op = ParseEditOp(args);
+            value = ParseEditValue(args, op);
+        }
+        catch (CliException e)
+        {
+            problems.Add(e.Message);
+        }
+        if (problems.Count > 0)
+        {
+            throw new CliException("change-tensor is missing or rejects arguments:" + Environment.NewLine +
+                string.Join(Environment.NewLine, problems.Select(p => "  - " + p)));
+        }
+        // Validation above guarantees these are non-null; copy into non-nullable
+        // locals so the flow analysis agrees (and the call sites stay clean).
+        string obj = objectId!;
+        string tensor = tensorName!;
+        string cellArg = cell!;
+        string patchOut = outPatch!;
+        string? existingPath = File.Exists(patchOut) ? patchOut : null;
         var existing = TensorPatchTools.LoadOrEmpty(existingPath);
 
         using var container = Vindex3Container.Open(containerDir);
-        var shape = TensorPatchTools.ResolveShape(container, objectId, tensorName);
-        long flat = ParseCell(cell, shape, objectId, tensorName);
+        var shape = TensorPatchTools.ResolveShape(container, obj, tensor);
+        long flat = ParseCell(cellArg, shape, obj, tensor);
 
-        var result = TensorPatchTools.ApplyEdit(container, objectId, tensorName, op, value, flat, existing);
+        var result = TensorPatchTools.ApplyEdit(container, obj, tensor, op, value, flat, existing);
         if (result.Removed)
         {
             if (existingPath is not null)
             {
                 File.Delete(existingPath);
-                Console.WriteLine($"patch {existingPath}: '{objectId}/{tensorName}'[{cell}]\n  {result.Before:0.######} → {result.After:0.######} — back at the base value; patch cleared (no changes remain).");
+                Console.WriteLine($"patch {existingPath}: '{obj}/{tensor}'[{cellArg}]\n  {result.Before:0.######} → {result.After:0.######} — back at the base value; patch cleared (no changes remain).");
             }
             else
             {
-                Console.WriteLine($"'{objectId}/{tensorName}'[{cell}]: {result.Before:0.######} → {result.After:0.######} — no change, nothing written.");
+                Console.WriteLine($"'{obj}/{tensor}'[{cellArg}]: {result.Before:0.######} → {result.After:0.######} — no change, nothing written.");
             }
             return 0;
         }
 
-        WeightPatch.Save(outPatch, result.Entries, container.Index.Model);
-        Console.WriteLine($"'{objectId}/{tensorName}' [{string.Join("x", result.Shape)}] {result.DtypeLabel} [{cell}] {result.Before:0.######} → {result.After:0.######} (Δ {result.After - result.Before:0.######})");
-        Console.WriteLine($"patch: {outPatch} ({result.Entries.Count} tensor{(result.Entries.Count == 1 ? string.Empty : "s")})");
-        Console.WriteLine("run a pathway with it: amql-cli route <container> A B --tokenizer <checkpoint> --patch " + outPatch);
+        WeightPatch.Save(patchOut, result.Entries, container.Index.Model);
+        Console.WriteLine($"'{obj}/{tensor}' [{string.Join("x", result.Shape)}] {result.DtypeLabel} [{cellArg}] {result.Before:0.######} → {result.After:0.######} (Δ {result.After - result.Before:0.######})");
+        Console.WriteLine($"patch: {patchOut} ({result.Entries.Count} tensor{(result.Entries.Count == 1 ? string.Empty : "s")})");
+        Console.WriteLine("run a pathway with it: amql-cli route <container> A B --tokenizer <checkpoint> --patch " + patchOut);
         return 0;
     }
 
@@ -804,7 +898,12 @@ internal static class Program
         string outFile = OptionValue(args, "--out") ?? throw new CliException("to-gguf requires '--out <file.gguf>'");
         if (File.Exists(outFile))
         {
-            throw new CliException($"output '{outFile}' already exists");
+            // --force makes re-runs idempotent (TODO.md item 7).
+            if (!HasOption(args, "--force"))
+            {
+                throw new CliException($"output '{outFile}' already exists — pass --force to overwrite");
+            }
+            File.Delete(outFile);
         }
 
         var report = GgufConverter.Convert(checkpointDir, outFile);
@@ -1447,7 +1546,7 @@ internal static class Program
             then run and inspect inference against it
 
             USAGE:
-              amql-cli [--cpu | --gpu] <command> [args]
+              amql-cli [--cpu | --gpu] [--progress] [--verbose] <command> [args]
 
             Commands:
               amql-cli encode <model-dir> --out <container-dir>   map + materialise
@@ -1478,7 +1577,7 @@ internal static class Program
                               [--rank 8] [--alpha 16] [--container <container-dir>]
               amql-cli export <container-dir> --out <checkpoint-dir>
                               [--patch <patch.safetensors>] [--quant mxfp4]
-              amql-cli to-gguf <checkpoint-dir> --out <file.gguf>
+              amql-cli to-gguf <checkpoint-dir> --out <file.gguf> [--force]
               amql-cli export-mtp <container-dir> --out <drafter-dir>
               amql-cli generate-mtp <container-dir> --out <out>
                               [--text <corpus.txt>] [--sample 4096] [--fit]
@@ -1631,6 +1730,22 @@ internal static class Program
             weights on the device).  AMQL_GPU=0 is equivalent to --cpu;
             AMQL_GPU=1 is the same auto-probe as the default.  --cpu and
             --gpu take priority over the env var.
+            --progress turns on the machine-readable protocol (also via
+            AMQL_PROGRESS=1): one JSON object per line on stdout, prefixed
+            '##amql-progress ' for phase/done/total/percent updates and
+            '##amql-result ' for the command's terminal outcome, so a
+            front-end can bind progress exactly instead of scraping text.
+            --verbose prints full stack traces for unexpected errors;
+            without it a failure is one 'error: …' line on stderr.
+
+            EXIT CODES:
+              0  success — the command produced its answer, whatever it was;
+              1  a legitimate negative result: the command ran fine and the
+                 answer is 'not found'/'not satisfied' (path found no chain
+                 within budget, verify's integrity check failed). A
+                 ##amql-result line carries the reason when --progress is on;
+              2  usage or runtime error — bad arguments, unreadable input,
+                 an unsupported operator, an exception.
 
             Two kinds of directory are involved: the CONTAINER (<container-dir>,
             encode output, holds weights only) and the CHECKPOINT

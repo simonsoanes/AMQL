@@ -1,0 +1,64 @@
+<Window x:Class="Amql.Gui.Dialogs.NewProjectDialog"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="New AMQL Project" Height="420" Width="560"
+        WindowStartupLocation="CenterOwner" ResizeMode="NoResize">
+    <Grid Margin="16">
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="150"/>
+            <ColumnDefinition Width="*"/>
+            <ColumnDefinition Width="Auto"/>
+        </Grid.ColumnDefinitions>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <TextBlock Grid.Row="0" Grid.Column="0" Text="Project name" Style="{StaticResource FieldLabel}"/>
+        <TextBox Grid.Row="0" Grid.Column="1" Grid.ColumnSpan="2" x:Name="NameBox" Text="My AMQL Project"/>
+
+        <TextBlock Grid.Row="1" Grid.Column="0" Text="Project file" Style="{StaticResource FieldLabel}"/>
+        <TextBox Grid.Row="1" Grid.Column="1" x:Name="PathBox"/>
+        <Button Grid.Row="1" Grid.Column="2" Content="…" Padding="8,3" Click="OnBrowsePath"/>
+
+        <TextBlock Grid.Row="2" Grid.Column="0" Text="AMQL repo path" Style="{StaticResource FieldLabel}"/>
+        <TextBox Grid.Row="2" Grid.Column="1" x:Name="RepoBox"/>
+        <Button Grid.Row="2" Grid.Column="2" Content="…" Padding="8,3" Click="OnBrowseRepo"/>
+
+        <TextBlock Grid.Row="3" Grid.Column="0" Text="or CLI exe" Style="{StaticResource FieldLabel}"/>
+        <TextBox Grid.Row="3" Grid.Column="1" x:Name="ExeBox"/>
+        <Button Grid.Row="3" Grid.Column="2" Content="…" Padding="8,3" Click="OnBrowseExe"/>
+
+        <TextBlock Grid.Row="4" Grid.Column="0" Text="Container dir" Style="{StaticResource FieldLabel}"
+                   ToolTip="Default VINDEX3 container directory (encode output)"/>
+        <TextBox Grid.Row="4" Grid.Column="1" x:Name="ContainerBox"/>
+        <Button Grid.Row="4" Grid.Column="2" Content="…" Padding="8,3" Click="OnBrowseContainer"/>
+
+        <TextBlock Grid.Row="5" Grid.Column="0" Text="Tokenizer dir" Style="{StaticResource FieldLabel}"
+                   ToolTip="Default HF checkpoint directory containing tokenizer.json"/>
+        <TextBox Grid.Row="5" Grid.Column="1" x:Name="TokenizerBox"/>
+        <Button Grid.Row="5" Grid.Column="2" Content="…" Padding="8,3" Click="OnBrowseTokenizer"/>
+
+        <TextBlock Grid.Row="6" Grid.Column="0" Text="Device" Style="{StaticResource FieldLabel}"/>
+        <ComboBox Grid.Row="6" Grid.Column="1" x:Name="DeviceBox">
+            <ComboBoxItem Content="auto" IsSelected="True"/>
+            <ComboBoxItem Content="cpu"/>
+            <ComboBoxItem Content="gpu"/>
+        </ComboBox>
+
+        <TextBlock Grid.Row="7" Grid.Column="0" Grid.ColumnSpan="3" TextWrapping="Wrap" Foreground="Gray" Margin="2,10,2,0"
+                   Text="The repo path lets the GUI run the CLI via 'dotnet run --project src/Amql.Cli' (always current code); a built amql-cli.exe is faster to start. All values are stored in the .amqlproj and can be changed later from Project ▸ CLI Settings."/>
+
+        <StackPanel Grid.Row="8" Grid.Column="0" Grid.ColumnSpan="3" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
+            <Button Content="Create" Width="100" IsDefault="True" Click="OnCreate"/>
+            <Button Content="Cancel" Width="100" IsCancel="True"/>
+        </StackPanel>
+    </Grid>
+</Window>

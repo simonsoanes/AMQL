@@ -344,7 +344,13 @@ public static class GgufConverter
         Transform Transform,
         bool AddOne,
         IReadOnlyList<Source>? StackSlices,
-        long[]? ExplicitDims);
+        long[]? ExplicitDims)
+    {
+        /// <summary>The source tensor for transforms that require one, with a
+        /// typed error instead of a null dereference when the plan is malformed.</summary>
+        public Source RequiredSource => Source ?? throw new GgufException(
+            $"transform {Transform} for '{Name}' has no source tensor");
+    }
 
     // ── descriptors ────────────────────────────────────────────────────────
 
@@ -421,7 +427,7 @@ public static class GgufConverter
                 }
                 break;
             case Transform.Copy:
-                CopyRaw(entry.Source, writer.Data, entry.AddOne);
+                CopyRaw(entry.RequiredSource, writer.Data, entry.AddOne);
                 break;
             case Transform.Stack:
                 foreach (var slice in entry.StackSlices!)
@@ -433,11 +439,11 @@ public static class GgufConverter
                 WriteTransposed(writer, entry, index, addOne: entry.AddOne, columnReorder: null);
                 break;
             case Transform.Q35Norm:
-                CopyRaw(entry.Source, writer.Data, addOne: true);
+                CopyRaw(entry.RequiredSource, writer.Data, addOne: true);
                 break;
             case Transform.Q35Qkv:
                 // split rows into q | k | v, reorder v tiled, concatenate, transpose
-                var info = entry.Source.Info;
+                var info = entry.RequiredSource.Info;
                 long qDim = (long)numKHeads * headVDim;
                 WriteF32RowOrderAndTranspose(writer, entry, index, 2 * qDim, numKHeads, headVDim, vPerK);
                 break;
@@ -503,7 +509,8 @@ public static class GgufConverter
     private static void WriteTransposed(GgufWriter writer, PlanEntry entry, int index, bool addOne,
         (int NumVHeads, int NumKHeads, int HeadVDim, int VPerK)? columnReorder = null)
     {
-        var info = entry.Source.Info;
+        var source = entry.RequiredSource;
+        var info = source.Info;
         long rows = info.Shape[0], cols = info.Shape[1];
         long basePosition = (long)writer.TensorOffset(index);
         bool asF32 = GgufTypeFor(entry) == GgufType.F32;
@@ -511,7 +518,7 @@ public static class GgufConverter
         long spanBytes = rows * cols * (info.Dtype == Dtype.F32 ? 4 : 2);
         if (spanBytes <= 512L << 20)
         {
-            float[] f = LoadFloats(entry.Source, rows * cols);
+            float[] f = LoadFloats(source, rows * cols);
             if (addOne)
             {
                 for (long i = 0; i < f.Length; i++)
@@ -597,7 +604,8 @@ public static class GgufConverter
 
     private static void WriteTransposedBlocked(GgufWriter writer, PlanEntry entry, long basePosition, long rows, long cols, bool addOne)
     {
-        var info = entry.Source.Info;
+        var source = entry.RequiredSource;
+        var info = source.Info;
         if (info.Dtype != Dtype.BF16)
         {
             throw new GgufException($"blocked transpose of non-BF16 tensor '{info.Name}' is unsupported");
@@ -612,7 +620,7 @@ public static class GgufConverter
             int b = (int)Math.Min(blockRows, rows - r0);
             for (long r = 0; r < b; r++)
             {
-                byte[] row = entry.Source.File.ReadBytes(info, (r0 + r) * rowBytes, (int)rowBytes);
+                byte[] row = source.File.ReadBytes(info, (r0 + r) * rowBytes, (int)rowBytes);
                 row.CopyTo(block, (int)(r * cols * 2));
             }
             ConvertBf16ToF16(block.AsSpan(0, b * (int)cols * 2), block.AsSpan(0, b * (int)cols * 2));
@@ -638,9 +646,10 @@ public static class GgufConverter
     private static void WriteF32RowOrderAndTranspose(GgufWriter writer, PlanEntry entry, int index,
         long qkRows, int numKHeads, int headVDim, int vPerK)
     {
-        var info = entry.Source.Info;
+        var source = entry.RequiredSource;
+        var info = source.Info;
         long rows = info.Shape[0], cols = info.Shape[1];
-        byte[] bytes = entry.Source.File.ReadBytes(info);
+        byte[] bytes = source.File.ReadBytes(info);
         var f32 = new float[rows * cols];
         for (long i = 0; i < rows * cols; i++)
         {
@@ -691,8 +700,9 @@ public static class GgufConverter
 
     private static void ReorderScalar1D(GgufWriter writer, PlanEntry entry, int index, bool negateExp, int vPerK, int numKHeads)
     {
-        var info = entry.Source.Info;
-        byte[] bytes = entry.Source.File.ReadBytes(info);
+        var source = entry.RequiredSource;
+        var info = source.Info;
+        byte[] bytes = source.File.ReadBytes(info);
         int n = info.Shape[0] > 0 ? (int)info.Shape[0] : (int)(bytes.Length / 2);
         var outBytes = new byte[n * 4];
         for (int i = 0; i < n; i++)
@@ -719,10 +729,11 @@ public static class GgufConverter
 
     private static void ReorderConvRows(GgufWriter writer, PlanEntry entry, int index, int numKHeads, int headVDim, int vPerK)
     {
-        var info = entry.Source.Info;
+        var source = entry.RequiredSource;
+        var info = source.Info;
         // squeeze [C, 1, K] → [C, K]
         long c = info.Shape[0], k = info.Shape[2];
-        byte[] bytes = entry.Source.File.ReadBytes(info);
+        byte[] bytes = source.File.ReadBytes(info);
         var conv = new float[c * k];
         for (long i = 0; i < c * k; i++)
         {
