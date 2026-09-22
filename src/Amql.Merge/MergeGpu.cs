@@ -20,6 +20,32 @@ namespace Amql.Merge;
 /// </summary>
 public static class MergeGpu
 {
+    /// <summary>
+    /// Forced mode: null = auto (respect <c>AMQL_MERGE_GPU</c>),
+    /// true = always enabled when <c>CudaShim.Enabled</c> is true,
+    /// false = disabled.  The CLI sets this from <c>--gpu</c> / <c>--cpu</c>.
+    /// </summary>
+    private static bool? _forceMode;
+
+    /// <summary>
+    /// Enables the merge GPU path unconditionally (when the CUDA device
+    /// is available).  Call once before the first merge, typically from
+    /// the CLI after parsing <c>--gpu</c>.
+    /// </summary>
+    public static void ForceEnable()
+    {
+        _forceMode = true;
+    }
+
+    /// <summary>
+    /// Disables the merge GPU path.  Call once before the first merge,
+    /// typically from the CLI after parsing <c>--cpu</c>.
+    /// </summary>
+    public static void ForceDisable()
+    {
+        _forceMode = false;
+    }
+
     /// <summary>Whether the merge should route its hot loops to CUDA:
     /// explicitly requested by <c>AMQL_MERGE_GPU</c> (1/on/true) AND the
     /// device/native shim is actually usable.</summary>
@@ -27,6 +53,14 @@ public static class MergeGpu
     {
         get
         {
+            if (_forceMode == false)
+            {
+                return false;
+            }
+            if (_forceMode == true)
+            {
+                return CudaShim.Enabled;
+            }
             string raw = Environment.GetEnvironmentVariable("AMQL_MERGE_GPU") ?? string.Empty;
             bool requested = raw.Trim().ToLowerInvariant() is "1" or "on" or "true" or "yes";
             return requested && CudaShim.Enabled;

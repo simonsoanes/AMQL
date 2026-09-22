@@ -26,6 +26,36 @@ internal static class Program
             return args.Length == 0 ? 1 : 0;
         }
 
+        // Parse global --cpu / --gpu before any command runs so the probe
+        // honours the forced mode on the very first CudaShim.Enabled read.
+        bool forceCpu = false;
+        bool forceGpu = false;
+        var filtered = new List<string>();
+        foreach (var a in args)
+        {
+            if (a == "--cpu") { forceCpu = true; continue; }
+            if (a == "--gpu") { forceGpu = true; continue; }
+            filtered.Add(a);
+        }
+        if (forceCpu && forceGpu)
+        {
+            Console.Error.WriteLine("error: --cpu and --gpu are mutually exclusive");
+            return 2;
+        }
+        if (forceCpu)
+        {
+            CudaShim.ForceDisable();
+            MergeGpu.ForceDisable();
+        }
+        else if (forceGpu)
+        {
+            CudaShim.ForceEnable();
+            MergeGpu.ForceEnable();
+        }
+        // When neither flag is given, CudaShim auto-detects (the default).
+
+        args = filtered.ToArray();
+
         try
         {
             return args[0] switch
@@ -1417,6 +1447,9 @@ internal static class Program
             then run and inspect inference against it
 
             USAGE:
+              amql-cli [--cpu | --gpu] <command> [args]
+
+            Commands:
               amql-cli encode <model-dir> --out <container-dir>   map + materialise
               amql-cli verify <container-dir>                     integrity + readiness
               amql-cli synth-model <dir>                          write an executable demo checkpoint
@@ -1590,6 +1623,14 @@ internal static class Program
             weights; the container is never rewritten.
             --tokenizer is optional when the container was encoded with a
             tokenizer.json beside it (encode copies it in).
+            --cpu forces the CPU path even when a GPU is present.
+            --gpu requires the GPU and fails when the device or the
+            native DLL is unavailable.  Without either flag the device is
+            auto-detected: a CUDA-capable GPU with the native DLL present
+            enables itself automatically (set AMQL_WEIGHTS=mxfp4 to put
+            weights on the device).  AMQL_GPU=0 is equivalent to --cpu;
+            AMQL_GPU=1 is the same auto-probe as the default.  --cpu and
+            --gpu take priority over the env var.
 
             Two kinds of directory are involved: the CONTAINER (<container-dir>,
             encode output, holds weights only) and the CHECKPOINT

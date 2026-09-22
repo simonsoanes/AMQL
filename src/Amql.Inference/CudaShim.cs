@@ -7,9 +7,17 @@ namespace Amql.Inference;
 /// backend. Loaded lazily on first probe; every call is graceful: when the
 /// native library is absent, the device is absent, or the process budget
 /// says no, <see cref="Enabled"/> is false and the managed kernels run
-/// unchanged. Enable via <c>AMQL_GPU</c> (<c>0</c>/<c>off</c> disables,
-/// <c>1</c>/<c>on</c> requires and enables, anything else probes the
-/// device). The GEMM path additionally requires the MXFP4 weight working
+/// unchanged.
+///
+/// By default the device is auto-detected: a CUDA-capable GPU with the
+/// native DLL present enables itself automatically.  The <c>AMQL_GPU</c>
+/// env var (<c>0</c>/<c>off</c> disables, <c>1</c>/<c>on</c> requires)
+/// overrides the auto-probe.  The <c>--cpu</c> and <c>--gpu</c> CLI flags
+/// take priority over the env var: <c>--cpu</c> forces the managed path,
+/// <c>--gpu</c> requires the device and fails the command when it is
+/// unavailable.
+///
+/// The GEMM path additionally requires the MXFP4 weight working
 /// set (<c>AMQL_WEIGHTS=mxfp4</c>) so the resident packs are the device's
 /// input — see <see cref="GpuDispatch"/>. Only GEMMs above the small-op
 /// cutoff ever reach the device; everything else stays managed.
@@ -19,6 +27,13 @@ public static class CudaShim
     private static readonly object Lock = new();
     private static bool _probed;
     private static bool _enabled;
+
+    /// <summary>Forced mode: null = auto (default), true = GPU required,
+    /// false = CPU forced.  Set once before the first probe — the CLI
+    /// reads <c>--cpu</c>/<c>--gpu</c> and calls
+    /// <see cref="ForceDisable"/> or <see cref="ForceEnable"/> before any
+    /// command runs.</summary>
+    private static bool? _forceMode;
 
     /// <summary>Whether the CUDA backend is loaded and primed.</summary>
     public static bool Enabled
@@ -37,29 +52,94 @@ public static class CudaShim
         }
     }
 
+    /// <summary>
+    /// Forces the CPU path for this process — must be called before the
+    /// first <see cref="Enabled"/> read (typically from the CLI after
+    /// parsing <c>--cpu</c>).  Takes priority over <c>AMQL_GPU</c>.
+    /// </summary>
+    public static void ForceDisable()
+    {
+        lock (Lock)
+        {
+            if (_probed)
+            {
+                throw new InvalidOperationException(
+                    "CudaShim has already probed — ForceDisable must be called before any CUDA access");
+            }
+            _forceMode = false;
+        }
+    }
+
+    /// <summary>
+    /// Requires the GPU for this process — must be called before the
+    /// first <see cref="Enabled"/> read (typically from the CLI after
+    /// parsing <c>--gpu</c>).  Takes priority over <c>AMQL_GPU</c>.
+    /// When the device or the native DLL is absent the probe throws
+    /// rather than silently falling back to the CPU path.
+    /// </summary>
+    public static void ForceEnable()
+    {
+        lock (Lock)
+        {
+            if (_probed)
+            {
+                throw new InvalidOperationException(
+                    "CudaShim has already probed — ForceEnable must be called before any CUDA access");
+            }
+            _forceMode = true;
+        }
+    }
+
     private static bool Probe()
     {
+        // --cpu / --gpu take priority over the env var.
+        if (_forceMode == false)
+        {
+            return false;
+        }
+
         string raw = Environment.GetEnvironmentVariable("AMQL_GPU")?.Trim().ToLowerInvariant() ?? "auto";
         if (raw is "0" or "off" or "no" or "false")
         {
             return false;
         }
+
+        bool required = _forceMode == true;
         try
         {
             if (amql_cuda_available() != 1)
             {
+                if (required)
+                {
+                    throw new InvalidOperationException(
+                        "CUDA device not found — --gpu was requested but no compatible GPU is present. " +
+                        "Install the NVIDIA driver and ensure the device is visible to nvidia-smi.");
+                }
                 return false;
             }
-            return amql_cuda_init() == 0;
+            int initCode = amql_cuda_init();
+            if (initCode != 0)
+            {
+                if (required)
+                {
+                    throw new InvalidOperationException(
+                        $"cuBLAS initialisation failed (code {initCode}) — --gpu was requested but the " +
+                        "CUDA runtime could not start. Check that the driver matches the CUDA toolkit version.");
+                }
+                return false;
+            }
+            return true;
         }
-        catch (DllNotFoundException)
+        catch (DllNotFoundException) when (!required)
         {
             return false;
         }
-        catch (EntryPointNotFoundException)
+        catch (EntryPointNotFoundException) when (!required)
         {
             return false;
         }
+        // When --gpu is set, DllNotFoundException / EntryPointNotFoundException
+        // propagate as typed errors (not swallowed).
     }
 
     /// <summary>Forces a fresh probe on the next <see cref="Enabled"/>
@@ -71,6 +151,7 @@ public static class CudaShim
         {
             _probed = false;
             _enabled = false;
+            _forceMode = null;
             foreach (var device in _deviceWeights.Values)
             {
                 amql_cuda_free(device);
