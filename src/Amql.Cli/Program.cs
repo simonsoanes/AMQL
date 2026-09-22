@@ -51,6 +51,7 @@ internal static class Program
                 "import" => Import(args[1..]),
                 "moe-ify" => MoeIfy(args[1..]),
                 "prune" => Prune(args[1..]),
+                "fine-tune" => FineTune(args[1..]),
                 _ => throw new CliException($"unknown command '{args[0]}'"),
             };
         }
@@ -1321,6 +1322,60 @@ internal static class Program
     private static double DoubleOption(string[] args, string name, double fallback) =>
         double.TryParse(OptionValue(args, name), System.Globalization.CultureInfo.InvariantCulture, out var v) ? v : fallback;
 
+    // ── fine-tune: teacher-forced output-head adaptation ───────────────────
+
+    private static int FineTune(string[] args)
+    {
+        var containerDir = Arg(args, 0) ?? throw new CliException(
+            "fine-tune requires a container directory");
+        string dataPath = OptionValue(args, "--data") ?? throw new CliException(
+            "fine-tune requires '--data <pairs.tsv>' — a tab-separated file of prompt<TAB>completion lines");
+        string outPatch = OptionValue(args, "--out") ?? throw new CliException(
+            "fine-tune requires '--out <patch.safetensors>'");
+        string? modelDir = TokenizerDir(args);
+        if (modelDir is null && File.Exists(Path.Combine(containerDir, "tokenizer.json")))
+        {
+            modelDir = containerDir;
+        }
+        if (modelDir is null)
+        {
+            throw new CliException(
+                "fine-tune needs a tokenizer — pass '--tokenizer <checkpoint-dir>' or " +
+                "use a container that was encoded with a tokenizer.json beside it");
+        }
+        string component = OptionValue(args, "--component") ?? "target";
+        double lr = DoubleOption(args, "--lr", 1e-4);
+        int epochs = IntOption(args, "--epochs", 1);
+
+        using var container = Vindex3Container.Open(containerDir);
+        var tokenizer = HfTokenizer.FromModelDir(modelDir);
+
+        bool inContainer = modelDir.Equals(containerDir, StringComparison.OrdinalIgnoreCase);
+        Console.WriteLine($"container: {containerDir} (weights)   tokenizer: {modelDir} ({(inContainer ? "in container" : "checkpoint")})");
+        Console.WriteLine($"data:      {dataPath}");
+
+        var report = ModelFinetuner.FineTune(
+            container, component, dataPath, outPatch, tokenizer, lr, epochs);
+
+        Console.WriteLine();
+        Console.WriteLine($"component:  {report.ComponentId}");
+        Console.WriteLine($"head:       {report.HeadObjectId}/{report.HeadTensorName}  [{report.VocabSize}×{report.HiddenSize}]" +
+                          (report.HeadReusesEmbedding ? " (reuses embedding)" : string.Empty));
+        Console.WriteLine($"pairs:      {report.Pairs} training pairs → {report.Steps} teacher-forced steps");
+        Console.WriteLine($"lr:         {report.LearningRate}  epochs: {report.Epochs}");
+        Console.WriteLine($"patch:      {report.PatchPath}  (1 tensor)");
+        foreach (var note in report.Notes)
+        {
+            Console.WriteLine($"note:       {note}");
+        }
+        Console.WriteLine();
+        Console.WriteLine("apply it:   amql-cli generate <container> --prompt \"...\" --tokenizer <checkpoint> --patch " + outPatch);
+        Console.WriteLine("bake it:    amql-cli export <container> --out <checkpoint> --patch " + outPatch);
+        return 0;
+    }
+
+    // ── plumbing ───────────────────────────────────────────────────────────
+
     /// <summary>Loads and (when a container is at hand) shape-validates the
     /// <c>--patch</c> file. Returns null when no patch was given.</summary>
     private static WeightPatch? LoadPatch(string[] args, Vindex3Container? container)
@@ -1395,6 +1450,10 @@ internal static class Program
               amql-cli prune <container-dir> --out <pruned-dir> --target-bytes <size>
                               [--approach provenance|corpus|random] [--seed 42]
                               [--text <corpus.txt>] [--sample 8192] [--min-layers 1]
+              amql-cli fine-tune <container-dir> --data <pairs.tsv>
+                              --out <patch.safetensors>
+                              [--tokenizer <checkpoint-dir>] [--component target]
+                              [--lr 1e-4] [--epochs 1]
               amql-cli help
 
             Example:
@@ -1484,6 +1543,19 @@ internal static class Program
             budget (never below --min-layers), verifies the exact rebuilt
             sizes before writing, and refuses when the target is below
             the floor.
+            fine-tune runs supervised fine-tuning via teacher-forced
+            output-head adaptation. The --data file is a TSV of
+            prompt<TAB>completion lines; the model runs forward on each
+            prompt, then teacher-forces the completion tokens and
+            accumulates per-token deltas Δhead[target] += lr · h (the
+            post-norm hidden state) — a single SGD step per position,
+            no autograd. The result is a standard AMQL weight patch
+            (one F32 tensor: the head delta) that works with --patch
+            on any command; export --patch bakes it into the checkpoint.
+            When the head reuses the embedding table the embedding is
+            also adjusted. The learning rate and epochs are optional;
+            papers typically use lr ∈ [1e-5, 1e-4] for LoRA-style
+            fine-tuning.
             generate-mtp boots an MTP drafter for a dense model that has
             none: the trunk is a copy of the model's last full-attention
             layer, the drafter/final norms copy the final norm, the fc

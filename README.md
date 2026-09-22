@@ -6,7 +6,7 @@
 
 This was a port of the VIndex3 implementation, along with support for generating it from a model (Qwen 3.5-3.8 primarily) and then allowing model independent inference, token relationship route following and exploration of the model internals in order to do some research into direct model manipulation and patching, with live LORA adapters in custom inferencing.
 
-This implementation supports model merging (using reinforcement blending to avoid training time but get the same resultant effect as if the training sets of the two models had been combined and run) and custom tensor editing features for another project.
+This implementation supports model merging (using reinforcement blending to avoid training time but get the same resultant effect as if the training sets of the two models had been combined and run), supervised fine-tuning via output-head adaptation, and custom tensor editing features for another project.
 
 Credit for the design of the VIndex3 goes to Chris Hay.
 
@@ -24,6 +24,7 @@ Credit for the design of the VIndex3 goes to Chris Hay.
   - [Model merging](#model-merging)
   - [Pruning and MoE](#pruning-and-moe)
   - [Inspection](#inspection)
+  - [Fine-tuning](#fine-tuning)
 - [Code Examples](#code-examples)
 - [Q&A](#qa)
 - [Research](#research)
@@ -127,6 +128,10 @@ amql-cli moe-ify <container-dir> --out <moe-dir> --text <corpus.txt>
 amql-cli prune <container-dir> --out <pruned-dir> --target-bytes <size>
                 [--approach provenance|corpus|random] [--seed 42]
                 [--text <corpus.txt>] [--sample 8192] [--min-layers 1]
+amql-cli fine-tune <container-dir> --data <pairs.tsv>
+                --out <patch.safetensors>
+                [--tokenizer <checkpoint-dir>] [--component target]
+                [--lr 1e-4] [--epochs 1]
 amql-cli generate-mtp <container-dir> --out <out>
                 --text <corpus.txt> [--sample 4096] [--eval 1024]
                 [--clusters K | --sweep K1,K2,K3] [--ridge 1e-4]
@@ -634,6 +639,58 @@ container and `export` emits the drafter companion automatically.
 fit:        K ∈ {1, 4, 8}: K=1 R² 1.000 acc 14.8%; K=4 R² 0.917 acc 16.4%; K=8 R² 0.941 acc 16.8%
 note:       shipped K=8 (the acceptance gate's winner; ties prefer fewer clusters); weights 3e30e9c8…
 note:       held-out draft acceptance over 256 positions: boot 0.0% → fitted 16.8%
+```
+
+### Supervised fine-tuning (`fine-tune`)
+
+`fine-tune` performs supervised adaptation via **teacher-forced output-head
+adjustment** — no autograd, no gradient infrastructure, fully deterministic (same
+inputs → byte-identical patch). The command reads prompt/completion pairs from a
+TSV file, runs the model forward on each prompt, teacher-forces the completion
+tokens, and accumulates per-token head deltas `Δhead[target, :] += lr · h`
+(the post-final-norm hidden state). The result is a standard AMQL weight patch
+that works with `--patch` on any command and `export --patch` bakes it into a
+checkpoint.
+
+```bash
+# data file: one prompt<TAB>completion per line
+echo -e "The capital of France is\t Paris" > pairs.tsv
+echo -e "The largest ocean is\t Pacific" >> pairs.tsv
+
+amql-cli fine-tune ./containers/Qwen3.5-0.8B --data pairs.tsv \
+  --out patches/ft-head.safetensors --tokenizer ./Qwen3.5-0.8B --lr 1e-4 --epochs 3
+
+# apply the patch at inference time
+amql-cli generate ./containers/Qwen3.5-0.8B --prompt "The largest ocean is" \
+  --tokenizer ./Qwen3.5-0.8B --patch patches/ft-head.safetensors
+
+# or bake it into an exported checkpoint
+amql-cli export ./containers/Qwen3.5-0.8B --out ./models/Qwen3.5-0.8B-ft \
+  --patch patches/ft-head.safetensors
+```
+
+The head delta is a single F32 tensor shaped `[vocab_size, hidden_size]` — one
+row of corrections per token. When the head reuses the embedding table
+(Qwen3.5's default) the embedding is adjusted too. The learning rate and epoch
+count are tunable; papers typically use `lr ∈ [1e-5, 1e-4]` for LoRA-style
+fine-tuning. The `--component` flag selects which component to tune (default
+`target`).
+
+Data lines starting with `#` are comments and blank lines are skipped. The file
+is re-read each epoch, so streaming large datasets from disk costs no extra
+memory.
+
+```
+fine-tune:  Qwen3.5-0.8B  data pairs.tsv
+component:  target
+head:       target.embedding/weight  [248044×2048] (reuses embedding)
+pairs:      2 training pairs → 2 teacher-forced steps
+lr:         0.0001  epochs: 3
+patch:      patches/ft-head.safetensors  (1 tensor)
+note:       the head reuses the embedding table — the embedding is also adjusted
+
+apply it:   amql-cli generate <container> --prompt "..." --tokenizer <checkpoint> --patch patches/ft-head.safetensors
+bake it:    amql-cli export <container> --out <checkpoint> --patch patches/ft-head.safetensors
 ```
 
 ## Documentation
