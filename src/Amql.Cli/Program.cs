@@ -1354,6 +1354,20 @@ internal static class Program
         Console.WriteLine($"container: {containerDir} (weights)   tokenizer: {modelDir} ({(inContainer ? "in container" : "checkpoint")})");
         Console.WriteLine($"data:      {dataPath}");
 
+        var workingSet = WeightWorkingSetExtensions.FromEnv();
+        if (workingSet == WeightWorkingSet.Mxfp4 && CudaShim.Enabled)
+        {
+            Console.WriteLine("cuda:      MXFP4 packs resident on device — GEMMs run on the GPU (FP16 tensor cores, FP32 accumulate)");
+        }
+        else if (workingSet == WeightWorkingSet.Mxfp4)
+        {
+            Console.WriteLine("weights:   MXFP4 working set (dequantised to f32 on CPU)");
+        }
+        else
+        {
+            Console.WriteLine($"weights:   {workingSet} (managed f32 path)");
+        }
+
         var report = ModelFinetuner.FineTune(
             container, component, dataPath, outPatch, tokenizer, lr, epochs);
 
