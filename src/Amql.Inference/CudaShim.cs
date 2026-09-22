@@ -300,6 +300,107 @@ public static class CudaShim
         return true;
     }
 
+    /// <summary>
+    /// Launches the FP16-weight GEMM asynchronously on the CUDA stream
+    /// and returns immediately — the host output buffer <paramref name="c"/>
+    /// is NOT valid until <see cref="Sync"/> is called.  The caller batches
+    /// several <c>LaunchGemmAsync</c> calls (all using the same activation
+    /// shape) and calls <c>Sync</c> once to wait for all results.
+    /// Returns true on launch success; false latches <see cref="DeviceFailed"/>.
+    /// </summary>
+    public static bool LaunchGemmAsync(float[] a, IntPtr wF16, float[] c, int m, int k, int n)
+    {
+        if (!Enabled || _deviceFailed)
+        {
+            return false;
+        }
+        int code = amql_cuda_gemm_transposed_b_async(a, wF16, c, m, k, n, 0);
+        LastNativeError = code;
+        if (code != 0)
+        {
+            _deviceFailed = true;
+            return false;
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// Uploads a host FP32 activation matrix to the device as FP16 and
+    /// returns the device pointer.  The caller then launches several
+    /// <see cref="LaunchGemmDeviceA"/> calls against the same activation,
+    /// calls <see cref="Sync"/>, and frees the activation with
+    /// <see cref="FreeActivation"/>.  Returns <see cref="IntPtr.Zero"/>
+    /// on failure (device latched).
+    /// </summary>
+    public static IntPtr UploadActivationF16(float[] a, int m, int k)
+    {
+        if (!Enabled || _deviceFailed)
+        {
+            return IntPtr.Zero;
+        }
+        int code = amql_cuda_upload_activation_f16(a, out var ptr, m, k, 0);
+        LastNativeError = code;
+        if (code != 0)
+        {
+            _deviceFailed = true;
+            return IntPtr.Zero;
+        }
+        return ptr;
+    }
+
+    /// <summary>
+    /// Launches a GEMM against a device-resident FP16 activation (no host→device
+    /// copy, no FP32→FP16 cast).  Async — caller must <see cref="Sync"/> before
+    /// reading <paramref name="c"/>.
+    /// </summary>
+    public static bool LaunchGemmDeviceA(IntPtr aF16, IntPtr wF16, float[] c, int m, int k, int n)
+    {
+        if (!Enabled || _deviceFailed)
+        {
+            return false;
+        }
+        int code = amql_cuda_gemm_device_a(aF16, wF16, c, m, k, n, 0);
+        LastNativeError = code;
+        if (code != 0)
+        {
+            _deviceFailed = true;
+            return false;
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// Synchronises the CUDA stream — blocks until all previously launched
+    /// async GEMMs complete.  After this returns, every host output buffer
+    /// passed to <see cref="LaunchGemmAsync"/> or
+    /// <see cref="LaunchGemmDeviceA"/> since the last sync contains its result.
+    /// </summary>
+    public static bool Sync()
+    {
+        if (!Enabled || _deviceFailed)
+        {
+            return false;
+        }
+        int code = amql_cuda_sync(0);
+        LastNativeError = code;
+        if (code != 0)
+        {
+            _deviceFailed = true;
+            return false;
+        }
+        return true;
+    }
+
+    /// <summary>Frees a device activation buffer allocated by
+    /// <see cref="UploadActivationF16"/>.</summary>
+    public static void FreeActivation(IntPtr ptr)
+    {
+        if (ptr != IntPtr.Zero)
+        {
+            amql_cuda_free(ptr);
+        }
+    }
+
     /// <summary>FP32 transposed-B GEMM streamed over A in row blocks —
     /// the merge path's map-apply (aligned = other @ Mᵀ). Returns true on
     /// success; the caller falls back to the managed ApplyMap otherwise.</summary>
@@ -404,6 +505,21 @@ public static class CudaShim
     [DllImport("amql_cuda")]
     private static extern int amql_cuda_gemm_transposed_b(
         float[] a, IntPtr wF16, float[] c, int m, int k, int n, int streamOrdinal);
+
+    [DllImport("amql_cuda")]
+    private static extern int amql_cuda_gemm_transposed_b_async(
+        float[] a, IntPtr wF16, float[] c, int m, int k, int n, int streamOrdinal);
+
+    [DllImport("amql_cuda")]
+    private static extern int amql_cuda_upload_activation_f16(
+        float[] a, out IntPtr outF16, int m, int k, int streamOrdinal);
+
+    [DllImport("amql_cuda")]
+    private static extern int amql_cuda_gemm_device_a(
+        IntPtr aF16, IntPtr wF16, float[] c, int m, int k, int n, int streamOrdinal);
+
+    [DllImport("amql_cuda")]
+    private static extern int amql_cuda_sync(int streamOrdinal);
 
     [DllImport("amql_cuda")]
     private static extern int amql_cuda_gemm_transposed_b_f32(

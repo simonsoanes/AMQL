@@ -20,8 +20,25 @@ public static class FfnKernel
         Tensor2D hidden;
         if (gated && gate is not null)
         {
-            var g = TensorOps.MatMulTransposedB(x, gate);
-            var u = TensorOps.MatMulTransposedB(x, up);
+            // GPU-batched path: gate and up share the same input — launch
+            // both GEMMs on the device in one batch, then sync once.
+            Tensor2D[] pair;
+            if (CudaShim.Enabled &&
+                gate.DeviceWeightF16 != IntPtr.Zero &&
+                up.DeviceWeightF16 != IntPtr.Zero)
+            {
+                pair = TensorOps.MatMulTransposedBMulti(x, new[] { gate, up });
+            }
+            else
+            {
+                pair = new[]
+                {
+                    TensorOps.MatMulTransposedB(x, gate),
+                    TensorOps.MatMulTransposedB(x, up),
+                };
+            }
+            var g = pair[0];
+            var u = pair[1];
             hidden = Tensor2D.Zeros(x.Rows, g.Cols);
             for (int r = 0; r < hidden.Rows; r++)
             {

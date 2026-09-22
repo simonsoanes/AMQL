@@ -149,15 +149,36 @@ public sealed class GenericRuntime
         // q projection — with the hard output gate, q_proj [hidden, 2×QDim]
         // interleaves per head [q_h | gate_h]; the reference's
         // view(…, -1, 2·head_dim).chunk(2) takes each block's half.
-        var qRaw = TensorOps.MatMulTransposedB(h, _weights.Matrix(attn.QProj, attn.QProjWidth, hidden));
+        var wQ = _weights.Matrix(attn.QProj, attn.QProjWidth, hidden);
+        var wK = _weights.Matrix(attn.KProj, attn.KvDim, hidden);
+        var wV = _weights.Matrix(attn.VProj, attn.KvDim, hidden);
+
+        // GPU-batched path: q, k, v all share the same input h — launch
+        // all three GEMMs on the device in one batch, then sync once.
+        Tensor2D qRaw, k, v;
+        if (CudaShim.Enabled &&
+            wQ.DeviceWeightF16 != IntPtr.Zero &&
+            wK.DeviceWeightF16 != IntPtr.Zero &&
+            wV.DeviceWeightF16 != IntPtr.Zero)
+        {
+            var batch = TensorOps.MatMulTransposedBMulti(h, new[] { wQ, wK, wV });
+            qRaw = batch[0];
+            k = batch[1];
+            v = batch[2];
+        }
+        else
+        {
+            qRaw = TensorOps.MatMulTransposedB(h, wQ);
+            k = TensorOps.MatMulTransposedB(h, wK);
+            v = TensorOps.MatMulTransposedB(h, wV);
+        }
+
         Tensor2D? gate = null;
         Tensor2D q = attn.OutputGate ? ChunkBlocks(qRaw, attn.HeadDim, 0) : qRaw;
         if (attn.OutputGate)
         {
             gate = ChunkBlocks(qRaw, attn.HeadDim, 1);
         }
-        var k = TensorOps.MatMulTransposedB(h, _weights.Matrix(attn.KProj, attn.KvDim, hidden));
-        var v = TensorOps.MatMulTransposedB(h, _weights.Matrix(attn.VProj, attn.KvDim, hidden));
 
         // QK norm — weighted (learned q_norm/k_norm when present) or
         // parameter-free; reducer per head dim (the reference's "norm only

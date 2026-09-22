@@ -451,6 +451,188 @@ AMQL_EXPORT int amql_cuda_gemm_transposed_b(
     return status == CUBLAS_STATUS_SUCCESS ? 0 : -7;
 }
 
+// ── Async GEMM: same as amql_cuda_gemm_transposed_b but does NOT sync ──────
+// the stream — the caller is responsible for eventually calling
+// amql_cuda_sync before reading the host output buffer.  Batched callers
+// launch several async GEMMs and sync once.
+
+AMQL_EXPORT int amql_cuda_gemm_transposed_b_async(
+    const float* a,       // [m,k] row-major host
+    const __half* w,      // [n,k] row-major device (pre-dequantised, resident)
+    float* c,             // [m,n] row-major host out (filled after sync)
+    int m, int k, int n, int streamOrdinal)
+{
+    if (ctx_ensure() != 0)
+    {
+        return -1;
+    }
+    if (m <= 0 || k <= 0 || n <= 0)
+    {
+        return 0;
+    }
+    cudaStream_t stream = streamOrdinal == 0 ? gCtx.stream : 0;
+
+    if (scratch_reserve(&gCtx.scratchA, &gCtx.scratchABytes, (size_t)m * k * 4) != 0)
+    {
+        return -2;
+    }
+    if (scratch_reserve(&gCtx.scratchC, &gCtx.scratchCBytes, (size_t)m * n * 4) != 0)
+    {
+        return -3;
+    }
+    void* aD = gCtx.scratchA;
+    void* cD = gCtx.scratchC;
+    if (cudaMemcpyAsync(aD, a, (size_t)m * k * 4, cudaMemcpyHostToDevice, stream) != cudaSuccess)
+    {
+        return -4;
+    }
+    if (scratch_reserve(&gCtx.scratchAF16, &gCtx.scratchAF16Bytes, (size_t)m * k * 2) != 0)
+    {
+        return -5;
+    }
+    void* aF16 = gCtx.scratchAF16;
+    long actCount = (long)m * k;
+    int actThreads = 256;
+    int actBlocks = (int)((actCount + actThreads - 1) / actThreads);
+    cast_f32_to_f16<<<actBlocks, actThreads, 0, stream>>>(
+        (const float*)aD, (__half*)aF16, actCount);
+    if (cudaGetLastError() != cudaSuccess)
+    {
+        return -6;
+    }
+
+    float alpha = 1.0f, beta = 0.0f;
+    cublasStatus_t status = cublasGemmEx(
+        gCtx.cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+        n, m, k,
+        &alpha,
+        (const void*)w, CUDA_R_16F, k,
+        (const void*)aF16, CUDA_R_16F, k,
+        &beta,
+        (void*)cD, CUDA_R_32F, n,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+
+    cudaMemcpyAsync(c, cD, (size_t)m * n * 4, cudaMemcpyDeviceToHost, stream);
+    // NO sync — caller batches and syncs once.
+
+    return status == CUBLAS_STATUS_SUCCESS ? 0 : -7;
+}
+
+// ── Upload host FP32 activation to device as FP16 ─────────────────────────
+// Allocates a device buffer, copies and casts on the stream.  The caller
+// frees the returned pointer with amql_cuda_free_activation when done.
+// This is the batched-GEMM fast path: upload once, launch N GEMMs against
+// the same activation, sync once, free.
+
+AMQL_EXPORT int amql_cuda_upload_activation_f16(
+    const float* a,       // [m,k] row-major host
+    __half** out,         // allocated device FP16 pointer
+    int m, int k, int streamOrdinal)
+{
+    if (ctx_ensure() != 0)
+    {
+        return -1;
+    }
+    if (m <= 0 || k <= 0)
+    {
+        return 0;
+    }
+    cudaStream_t stream = streamOrdinal == 0 ? gCtx.stream : 0;
+    size_t bytes = (size_t)m * k * 2;
+    if (cudaMalloc((void**)out, bytes) != cudaSuccess)
+    {
+        return -2;
+    }
+
+    // Staging: copy host→device FP32, then cast to FP16 on device.
+    if (scratch_reserve(&gCtx.scratchA, &gCtx.scratchABytes, (size_t)m * k * 4) != 0)
+    {
+        cudaFree(*out);
+        *out = nullptr;
+        return -3;
+    }
+    if (cudaMemcpyAsync(gCtx.scratchA, a, (size_t)m * k * 4, cudaMemcpyHostToDevice, stream) != cudaSuccess)
+    {
+        cudaFree(*out);
+        *out = nullptr;
+        return -4;
+    }
+    long count = (long)m * k;
+    int threads = 256;
+    int blocks = (int)((count + threads - 1) / threads);
+    cast_f32_to_f16<<<blocks, threads, 0, stream>>>(
+        (const float*)gCtx.scratchA, *out, count);
+    if (cudaGetLastError() != cudaSuccess)
+    {
+        cudaFree(*out);
+        *out = nullptr;
+        return -5;
+    }
+    return 0;
+}
+
+// ── GEMM with device-resident FP16 activation (no upload, no cast) ────────
+// C[m,n] = A_dev[m,k] @ W[n,k]ᵀ.  No host→device copy, no FP32→FP16 cast
+// — the activation is already on the device in FP16 from a prior upload.
+// Async (no sync); the caller batches and syncs once.
+
+AMQL_EXPORT int amql_cuda_gemm_device_a(
+    const __half* a_dev,  // [m,k] row-major device FP16
+    const __half* w,      // [n,k] row-major device FP16
+    float* c,             // [m,n] row-major host out (filled after sync)
+    int m, int k, int n, int streamOrdinal)
+{
+    if (ctx_ensure() != 0)
+    {
+        return -1;
+    }
+    if (m <= 0 || k <= 0 || n <= 0)
+    {
+        return 0;
+    }
+    cudaStream_t stream = streamOrdinal == 0 ? gCtx.stream : 0;
+
+    if (scratch_reserve(&gCtx.scratchC, &gCtx.scratchCBytes, (size_t)m * n * 4) != 0)
+    {
+        return -2;
+    }
+    void* cD = gCtx.scratchC;
+
+    float alpha = 1.0f, beta = 0.0f;
+    cublasStatus_t status = cublasGemmEx(
+        gCtx.cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+        n, m, k,
+        &alpha,
+        (const void*)w, CUDA_R_16F, k,
+        (const void*)a_dev, CUDA_R_16F, k,
+        &beta,
+        (void*)cD, CUDA_R_32F, n,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+
+    cudaMemcpyAsync(c, cD, (size_t)m * n * 4, cudaMemcpyDeviceToHost, stream);
+    // NO sync.
+
+    return status == CUBLAS_STATUS_SUCCESS ? 0 : -7;
+}
+
+// ── Stream synchronisation — the caller's batch fence ─────────────────────
+
+AMQL_EXPORT int amql_cuda_sync(int streamOrdinal)
+{
+    if (ctx_ensure() != 0)
+    {
+        return -1;
+    }
+    cudaStream_t stream = streamOrdinal == 0 ? gCtx.stream : 0;
+    cudaError_t err = cudaStreamSynchronize(stream);
+    if (err != cudaSuccess)
+    {
+        return -2;
+    }
+    // Scratch buffers are now free for the next batch.
+    return 0;
+}
+
 // ── FP32 GEMM: C[m,n] = A[m,k] @ W[n,k]ᵀ, all row-major, FP32 × FP32 ─────
 // Used by the merge path (embedding alignment, map-apply, moe-ify usage
 // matmuls) which works entirely in fp32 — no FP16 dequant involved.

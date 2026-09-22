@@ -226,6 +226,81 @@ public static class TensorOps
         return new Tensor2D(output, m, n);
     }
 
+    /// <summary>
+    /// GPU-batched transposed-B GEMM: a single activation <c>x</c> against
+    /// <c>weights</c> weight matrices, all on the CUDA stream, synced once.
+    /// Returns the results in the same order as the weight span.  Falls
+    /// back to the CPU path when the GPU is not available or any weight
+    /// lacks a device pointer.
+    /// </summary>
+    public static Tensor2D[] MatMulTransposedBMulti(
+        Tensor2D x, ReadOnlySpan<Tensor2D> weights)
+    {
+        int m = x.Rows, k = x.Cols;
+        if (weights.Length == 0)
+        {
+            return Array.Empty<Tensor2D>();
+        }
+
+        // All weights must carry a device pointer and be above the MACs
+        // floor for the GPU fast path.
+        bool canGpu = CudaShim.Enabled;
+        if (canGpu)
+        {
+            foreach (var w in weights)
+            {
+                if (w.DeviceWeightF16 == IntPtr.Zero)
+                {
+                    canGpu = false;
+                    break;
+                }
+            }
+        }
+
+        if (canGpu)
+        {
+            // GPU fast path: upload the activation once, launch all GEMMs
+            // async, sync once, download all results.
+            IntPtr aDev = CudaShim.UploadActivationF16(x.Data, m, k);
+            if (aDev != IntPtr.Zero)
+            {
+                var results = new Tensor2D[weights.Length];
+                var outputBuffers = new float[weights.Length][];
+                bool allLaunched = true;
+                for (int i = 0; i < weights.Length; i++)
+                {
+                    int n = weights[i].Rows;
+                    var c = new float[m * n];
+                    outputBuffers[i] = c;
+                    if (!CudaShim.LaunchGemmDeviceA(aDev, weights[i].DeviceWeightF16, c, m, k, n))
+                    {
+                        allLaunched = false;
+                        break;
+                    }
+                }
+                if (allLaunched && CudaShim.Sync())
+                {
+                    for (int i = 0; i < weights.Length; i++)
+                    {
+                        results[i] = new Tensor2D(outputBuffers[i], m, weights[i].Rows);
+                    }
+                    CudaShim.FreeActivation(aDev);
+                    return results;
+                }
+                CudaShim.FreeActivation(aDev);
+                // Fall through to CPU on any GPU failure.
+            }
+        }
+
+        // CPU fallback: run each GEMM independently.
+        var cpuResults = new Tensor2D[weights.Length];
+        for (int i = 0; i < weights.Length; i++)
+        {
+            cpuResults[i] = MatMulTransposedB(x, weights[i]);
+        }
+        return cpuResults;
+    }
+
     /// <summary>How many cores to split a matmul's output rows across —
     /// capped by the row count and the process-wide compute budget (the
     /// machine is usually running other work).</summary>
