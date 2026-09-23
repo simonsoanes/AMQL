@@ -1,0 +1,69 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Publish amql-cli (self-contained win-x64)
+        run: dotnet publish src/Amql.Cli -c Release -p:PublishProfile=win-x64 --nologo
+        shell: cmd
+
+      - name: Publish amql-gui (self-contained win-x64)
+        run: >
+          dotnet publish src/Amql.Gui
+          -c Release
+          -f net10.0-windows
+          -r win-x64
+          --self-contained true
+          -p:PublishSingleFile=true
+          -p:IncludeNativeLibrariesForSelfExtract=true
+          -p:DebugType=none
+          -p:DebugSymbols=false
+          --nologo
+        shell: cmd
+
+      - name: Collect release files
+        run: |
+          mkdir release\amql
+          copy src\Amql.Cli\bin\Release\net10.0\win-x64\publish\amql-cli.exe release\amql\
+          copy src\Amql.Gui\bin\Release\net10.0-windows\win-x64\publish\amql-gui.exe release\amql\
+          copy README.md release\amql\
+          copy CHANGELOG.md release\amql\
+          copy LICENSE release\amql\
+        shell: cmd
+
+      - name: Create release zip
+        run: |
+          powershell Compress-Archive -Path release\amql\* -DestinationPath release\amql-release.zip
+        shell: cmd
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: amql-release
+          path: release\amql-release.zip
+          if-no-files-found: error
+
+      - name: Create GitHub Release (tag push only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release\amql-release.zip
+          generate_release_notes: true
