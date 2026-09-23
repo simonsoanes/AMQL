@@ -121,16 +121,61 @@ public partial class ContainerExplorer : UserControl
     private void OnViewLayerTensors(object sender, RoutedEventArgs e)
     {
         if (_rightClickedNode?.Kind != NodeKind.Layer) return;
-        // The layer's parent is the component; we need to find the decoder/encoder
-        // stack object. For now: show the decoder stack's first tensor.
-        if (_model.Container?.Graph is { } graph)
+        // The layer node ID is "layer.N" — parse the layer index.
+        string layerId = _rightClickedNode.Id;
+        if (!layerId.StartsWith("layer.") || !int.TryParse(layerId.Replace("layer.", ""), out int layerIdx))
         {
-            var decoderObj = graph.Objects.FirstOrDefault(o =>
-                o.Kind == ObjectKind.DecoderStack || o.Kind == ObjectKind.EncoderStack);
-            if (decoderObj is not null)
+            return;
+        }
+
+        if (_model.Container?.Graph is not { } graph) return;
+        var stackObj = graph.Objects.FirstOrDefault(o =>
+            o.Kind == ObjectKind.DecoderStack || o.Kind == ObjectKind.EncoderStack);
+        if (stackObj is null) return;
+
+        // Find the segment for this object and enumerate tensors matching this layer.
+        try
+        {
+            using var store = ((Vindex3Container)_model.Container!).CreateOperandStore();
+            string? segmentPath = store.SegmentPathFor(stackObj.Id);
+            if (segmentPath is null) return;
+
+            using var segment = SegmentFile.Open(System.IO.Path.Combine(_model.ContainerPath, segmentPath));
+            string prefix = $"{layerIdx}.";
+            var layerTensorNames = segment.Header.Tensors
+                .Select(t => t.Name)
+                .Where(n => n.StartsWith(prefix, StringComparison.Ordinal))
+                .ToList();
+
+            if (layerTensorNames.Count == 0)
             {
-                TensorSelected?.Invoke(decoderObj.Id, "weight");
+                MessageBox.Show($"No tensors found for layer {layerIdx} in the segment.",
+                    "Layer Tensors", MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
             }
+
+            // Show the first tensor by default; the list is available in the tree.
+            TensorSelected?.Invoke(stackObj.Id, layerTensorNames[0]);
+
+            // Also populate the layer node's children with tensor entries
+            // so they appear on next expand.
+            foreach (var tn in layerTensorNames)
+            {
+                string displayName = tn[prefix.Length..]; // strip "{layer}."
+                var exists = _rightClickedNode.Children.Any(c =>
+                    c.Kind == NodeKind.Property && c.Label == displayName);
+                if (!exists)
+                {
+                    _rightClickedNode.Children.Add(new ExplorerNode(
+                        displayName, NodeKind.Property,
+                        $"{stackObj.Id}/{tn}"));
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"Could not list layer tensors: {ex.Message}",
+                "Layer Tensors", MessageBoxButton.OK, MessageBoxImage.Warning);
         }
     }
 
