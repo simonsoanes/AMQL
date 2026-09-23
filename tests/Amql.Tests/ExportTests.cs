@@ -348,6 +348,158 @@ public class ExportTests
         Assert.Equal(Payload(containerPath, "target.decoder_stack", "0.self_attn.q_proj.weight"), raw);
     }
 
+    // ── Flash-Next (qwen4-next) export ──────────────────────────────────
+
+    [Fact]
+    public void Export_With_Arch_Qwen4Next_Writes_Qwen4Exp_Config()
+    {
+        using var dir = new TempDir();
+        var containerPath = WriteSynthContainer(dir);
+        var outDir = Path.Combine(dir.Path, "exported");
+
+        using (var container = Vindex3Container.Open(containerPath))
+        {
+            ModelExporter.Export(container, outDir, patch: null, arch: Qwen4NextLayout.Arch);
+        }
+
+        // Top-level model_type and architectures
+        using var config = JsonDocument.Parse(File.ReadAllBytes(Path.Combine(outDir, "config.json")));
+        var root = config.RootElement;
+        Assert.Equal("qwen4_exp", root.GetProperty("model_type").GetString());
+        Assert.Equal("Qwen4ExpForCausalLM",
+            root.GetProperty("architectures")[0].GetString());
+
+        // text_config sub-config
+        var text = root.GetProperty("text_config");
+        Assert.Equal("qwen4_exp_text", text.GetProperty("model_type").GetString());
+        Assert.Equal(SyntheticCheckpoint.Hidden, text.GetProperty("hidden_size").GetInt32());
+        Assert.Equal(SyntheticCheckpoint.Layers, text.GetProperty("num_hidden_layers").GetInt32());
+        Assert.Equal(SyntheticCheckpoint.NumQueryHeads, text.GetProperty("num_attention_heads").GetInt32());
+        Assert.Equal(SyntheticCheckpoint.NumKvHeads, text.GetProperty("num_key_value_heads").GetInt32());
+        Assert.Equal(SyntheticCheckpoint.HeadDim, text.GetProperty("head_dim").GetInt32());
+        Assert.Equal(SyntheticCheckpoint.Intermediate, text.GetProperty("intermediate_size").GetInt32());
+        Assert.Equal("silu", text.GetProperty("hidden_act").GetString());
+        Assert.Equal(SyntheticCheckpoint.Vocab, text.GetProperty("vocab_size").GetInt32());
+        Assert.Equal(2048, text.GetProperty("max_position_embeddings").GetInt32());
+
+        // HC fields
+        Assert.Equal(4, text.GetProperty("hc_count").GetInt32());
+        Assert.Equal(320, text.GetProperty("hc_lowrank").GetInt32());
+        Assert.Equal("sigmoid", text.GetProperty("output_gate_type").GetString());
+
+        // PLE fields (disabled)
+        Assert.Equal(0, text.GetProperty("ple_layer_ids").GetArrayLength());
+        Assert.Equal(3, text.GetProperty("ngram_size").GetInt32());
+        Assert.Equal(8, text.GetProperty("heads_per_ngram").GetInt32());
+
+        // No MoE on the synthetic container
+        Assert.Equal(0, text.GetProperty("num_experts").GetInt32());
+        Assert.Equal(0, text.GetProperty("num_experts_per_tok").GetInt32());
+        Assert.Equal(0, text.GetProperty("shared_expert_intermediate_size").GetInt32());
+
+        // layer_types
+        var layerTypes = text.GetProperty("layer_types");
+        Assert.Equal(2, layerTypes.GetArrayLength());
+        Assert.Equal("full_attention", layerTypes[0].GetString());
+        Assert.Equal("full_attention", layerTypes[1].GetString());
+
+        // Rope parameters
+        Assert.True(text.TryGetProperty("rope_parameters", out var rope));
+        Assert.Equal("default", rope.GetProperty("rope_type").GetString());
+        Assert.True(rope.TryGetProperty("rope_theta", out _));
+
+        // vision_config is present even for text-only
+        Assert.True(root.TryGetProperty("vision_config", out var vision));
+        Assert.Equal("qwen4_exp", vision.GetProperty("model_type").GetString());
+
+        // Tied embeddings
+        Assert.True(root.GetProperty("tie_word_embeddings").GetBoolean());
+    }
+
+    [Fact]
+    public void Export_With_Arch_Qwen4Next_Emits_HyperConnection_Placeholders()
+    {
+        using var dir = new TempDir();
+        var containerPath = WriteSynthContainer(dir);
+        var outDir = Path.Combine(dir.Path, "exported");
+
+        using (var container = Vindex3Container.Open(containerPath))
+        {
+            ModelExporter.Export(container, outDir, patch: null, arch: Qwen4NextLayout.Arch);
+        }
+
+        using var file = SafetensorsFile.Open(Path.Combine(outDir, "model.safetensors"));
+
+        // Per-layer attn_hc + mlp_hc for each of 2 layers
+        string[] hcSuffixes =
+        {
+            "attn_hc.hc_norm.weight",
+            "attn_hc.input_mix_weight_down.weight",
+            "attn_hc.input_mix_weight_up.weight",
+            "attn_hc.block_inject_weight.weight",
+            "mlp_hc.hc_norm.weight",
+            "mlp_hc.input_mix_weight_down.weight",
+            "mlp_hc.input_mix_weight_up.weight",
+            "mlp_hc.block_inject_weight.weight",
+        };
+        foreach (string suffix in hcSuffixes)
+        {
+            Assert.True(file.Contains($"model.layers.0.{suffix}"),
+                $"missing HC tensor: model.layers.0.{suffix}");
+            Assert.True(file.Contains($"model.layers.1.{suffix}"),
+                $"missing HC tensor: model.layers.1.{suffix}");
+        }
+
+        // Final mixer
+        Assert.True(file.Contains("model.hyper_connection_mixer.hc_norm.weight"));
+        Assert.True(file.Contains("model.hyper_connection_mixer.input_mix_weight_down.weight"));
+        Assert.True(file.Contains("model.hyper_connection_mixer.input_mix_weight_up.weight"));
+
+        // Spot-check: HC tensors are zero-initialised
+        var hcNorm0 = file.DecodeF32("model.layers.0.attn_hc.hc_norm.weight");
+        Assert.All(hcNorm0, v => Assert.Equal(0f, v));
+
+        // Original tensors are still present
+        Assert.True(file.Contains("model.embed_tokens.weight"));
+        Assert.True(file.Contains("model.layers.0.self_attn.q_proj.weight"));
+    }
+
+    [Fact]
+    public void Export_With_Arch_Qwen4Next_Contains_Safetensors_Metadata()
+    {
+        using var dir = new TempDir();
+        var containerPath = WriteSynthContainer(dir);
+        var outDir = Path.Combine(dir.Path, "exported");
+
+        using (var container = Vindex3Container.Open(containerPath))
+        {
+            ModelExporter.Export(container, outDir, patch: null, arch: Qwen4NextLayout.Arch);
+        }
+
+        using var file = SafetensorsFile.Open(Path.Combine(outDir, "model.safetensors"));
+        Assert.NotNull(file.Metadata);
+        Assert.Equal(ModelExporter.ExportFormat, file.Metadata!["format"]);
+        Assert.Equal(Qwen4NextLayout.Arch, file.Metadata!["arch"]);
+    }
+
+    [Fact]
+    public void Export_With_Arch_Qwen4Next_Refuses_Unjudged_Layer_Operator()
+    {
+        var spec = SyntheticModel.BuildSpec(new Dims());
+        spec.SystemGraph.Components[0].Attention![0].SetOperator(LayerOperators.Kda);
+
+        using var dir = new TempDir();
+        var containerPath = Path.Combine(dir.Path, "c");
+        ContainerEncoder.Encode(containerPath, spec);
+
+        using var container = Vindex3Container.Open(containerPath);
+        var ex = Assert.ThrowsAny<Exception>(() =>
+            ModelExporter.Export(container, Path.Combine(dir.Path, "out"), patch: null, arch: Qwen4NextLayout.Arch));
+        Assert.Contains("kda", ex.Message);
+        Assert.Contains("layer_types", ex.Message);
+        Assert.False(Directory.Exists(Path.Combine(dir.Path, "out")));
+    }
+
     private static byte[] ToBf16Bytes(byte[] f32Bytes)
     {
         var values = SyntheticModel.FromBytes(f32Bytes);

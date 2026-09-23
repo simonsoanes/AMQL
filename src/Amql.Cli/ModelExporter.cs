@@ -38,18 +38,32 @@ public static class ModelExporter
         Vindex3Container container,
         string outDir,
         WeightPatch? patch,
-        bool quantizeMxfp4 = false)
+        bool quantizeMxfp4 = false,
+        string? arch = null)
     {
         if (Directory.Exists(outDir))
         {
             throw new CliException($"export output '{outDir}' already exists");
         }
 
-        // Build config.json first: an unjudged operator refuses here,
-        // before anything is written.
-        string configJson = ExportConfig.BuildJson(container, quantizeMxfp4);
+        bool isQwen4Next = arch == Qwen4NextLayout.Arch;
+
         var graph = container.Graph
             ?? throw new CliException("container records no system graph — cannot rebuild HF tensor names");
+
+        // Build config.json first: an unjudged operator refuses here,
+        // before anything is written.
+        string configJson;
+        IReadOnlyList<string>? layerTypes = null;
+        if (isQwen4Next)
+        {
+            layerTypes = Qwen4NextLayout.BuildLayerTypes(container);
+            configJson = Qwen4NextLayout.BuildConfigJson(container, quantizeMxfp4, layerTypes);
+        }
+        else
+        {
+            configJson = ExportConfig.BuildJson(container, quantizeMxfp4);
+        }
 
         using var store = container.CreateOperandStore();
         var payloads = new List<TensorPayload>();
@@ -95,6 +109,10 @@ public static class ModelExporter
                 foreach (var tensor in segment.Header.Tensors)
                 {
                     string hfName = prefix + "." + tensor.Name;
+                    if (isQwen4Next)
+                    {
+                        hfName = Qwen4NextLayout.RemapTensorName(obj.Id, hfName);
+                    }
                     if (names.TryGetValue(hfName, out var other))
                     {
                         throw new CliException(
@@ -121,6 +139,10 @@ public static class ModelExporter
         Parallel.ForEach(work, new ParallelOptions { MaxDegreeOfParallelism = workers }, item =>
         {
             string hfName = objectPrefixes[item.ObjectId] + "." + item.Tensor.Name;
+            if (isQwen4Next)
+            {
+                hfName = Qwen4NextLayout.RemapTensorName(item.ObjectId, hfName);
+            }
             bool quantizing = quantizeMxfp4 && ShouldQuantize(item.ObjectId, item.Tensor.Name, item.Tensor.Shape);
 
             using var segment = SegmentFile.Open(Path.Combine(container.Root, item.SegmentPath));
@@ -147,6 +169,40 @@ public static class ModelExporter
             }
         });
 
+        // ── Flash-Next placeholder tensors (HC, shared expert) ────────
+        // Emitted as zero-initialised so the checkpoint is structurally
+        // loadable.  HC streams are identity-initialised (mix averages
+        // streams, combine injects 1:1); the shared expert duplicates the
+        // first routed expert when one is present.
+        if (isQwen4Next)
+        {
+            int placeholders = 0;
+            foreach (var (name, shape, dtype) in Qwen4NextLayout.PlaceholderTensors(container))
+            {
+                if (names.ContainsKey(name))
+                {
+                    continue; // a real tensor already occupies this name
+                }
+                byte[] zeroBytes = Qwen4NextLayout.ZeroPayload(shape, dtype);
+                payloads.Add(new TensorPayload
+                {
+                    Name = name,
+                    Dtype = dtype,
+                    Shape = shape,
+                    Data = zeroBytes,
+                });
+                names[name] = "(placeholder)";
+                placeholders++;
+            }
+            if (placeholders > 0)
+            {
+                notes.Add($"{placeholders} Flash-Next placeholder tensors emitted as zeros " +
+                          "(HyperConnection streams, shared expert) — " +
+                          "the checkpoint is structurally loadable; HC identity init means " +
+                          "the model passes the residual through unchanged");
+            }
+        }
+
         if (quantized > 0)
         {
             notes.Add($"{quantized} stack projection tensors exported as MXFP4 (FP4 E2M1 grid elements, " +
@@ -158,11 +214,16 @@ public static class ModelExporter
         }
 
         Directory.CreateDirectory(outDir);
-        SafetensorsWriter.Write(Path.Combine(outDir, ShardName), payloads, new Dictionary<string, string>
+        var metadata = new Dictionary<string, string>
         {
             ["format"] = ExportFormat,
             ["model"] = container.Index.Model,
-        });
+        };
+        if (isQwen4Next)
+        {
+            metadata["arch"] = Qwen4NextLayout.Arch;
+        }
+        SafetensorsWriter.Write(Path.Combine(outDir, ShardName), payloads, metadata);
         File.WriteAllText(Path.Combine(outDir, "config.json"), configJson);
 
         var tokenizerPath = Path.Combine(container.Root, "tokenizer.json");

@@ -854,6 +854,13 @@ internal static class Program
 
     private static int Export(string[] args)
     {
+        if (HasOption(args, "--list-architectures"))
+        {
+            Console.WriteLine("qwen3.x  (default) — Qwen3.5 / Qwen3-Next hybrid checkpoint format");
+            Console.WriteLine($"{Qwen4NextLayout.Arch}  — Qwen3.8-Flash-Next (qwen4_exp) architecture");
+            return 0;
+        }
+
         var containerDir = Arg(args, 0) ?? throw new CliException(
             "export requires a container directory, e.g. 'amql-cli export <container-dir> --out <checkpoint-dir>'");
         string outDir = OptionValue(args, "--out") ?? throw new CliException("export requires '--out <checkpoint-dir>'");
@@ -862,10 +869,16 @@ internal static class Program
         {
             throw new CliException($"unknown quantization '{quant}' — this build exports 'none' (full precision) or 'mxfp4'");
         }
+        string arch = OptionValue(args, "--arch") ?? "qwen3.x";
+        if (arch != "qwen3.x" && arch != Qwen4NextLayout.Arch)
+        {
+            throw new CliException($"unknown architecture '{arch}' — this build exports 'qwen3.x' (default) or '{Qwen4NextLayout.Arch}'");
+        }
+        string? archParam = arch == Qwen4NextLayout.Arch ? arch : null;
 
         using var container = Vindex3Container.Open(containerDir);
         var patch = LoadPatch(args, container);
-        var report = ModelExporter.Export(container, outDir, patch, quantizeMxfp4: quant == "mxfp4");
+        var report = ModelExporter.Export(container, outDir, patch, quantizeMxfp4: quant == "mxfp4", arch: archParam);
 
         Console.WriteLine($"exported:  {report.OutDir}");
         Console.WriteLine($"model:      {report.Model}");
@@ -876,7 +889,8 @@ internal static class Program
         }
         string files = "model.safetensors, config.json" +
                        (File.Exists(Path.Combine(outDir, "tokenizer.json")) ? ", tokenizer.json" : string.Empty);
-        Console.WriteLine($"wrote:      {files}  (quantization: {quant})");
+        string archLabel = archParam is not null ? $", architecture: {archParam}" : string.Empty;
+        Console.WriteLine($"wrote:      {files}  (quantization: {quant}{archLabel})");
         if (quant == "mxfp4")
         {
             Console.WriteLine("the MXFP4 checkpoint is a terminal artifact — the encoder reads full-precision dtypes; the Mxfp4 codec is the reference for consumer runtimes");
@@ -1577,6 +1591,7 @@ internal static class Program
                               [--rank 8] [--alpha 16] [--container <container-dir>]
               amql-cli export <container-dir> --out <checkpoint-dir>
                               [--patch <patch.safetensors>] [--quant mxfp4]
+                              [--arch qwen4-next]
               amql-cli to-gguf <checkpoint-dir> --out <file.gguf> [--force]
               amql-cli export-mtp <container-dir> --out <drafter-dir>
               amql-cli generate-mtp <container-dir> --out <out>
@@ -1624,16 +1639,21 @@ internal static class Program
             model.safetensors + tokenizer.json) from the container — the
             inverse of encode — with patch deltas baked into the stored
             tensors (unpatched tensors are copied byte-identically), so the
-            result is a plain original model again. Pass --quant mxfp4 to
-            export the stack's projection matrices in the OCP MXFP4 form
-            (FP4 E2M1 elements, two per byte, per-32-element E8M0 scales);
-            embeddings, norms, biases and the output head keep their full
-            precision, and the quantized checkpoint is terminal for this
-            build (the encoder reads full-precision dtypes). A materialised
-            VISION tower rides the same shard under model.visual.* (it is
-            part of the model), and a materialised MTP drafter exports
-            automatically alongside as mtp.safetensors + mtp.config.json —
-            or standalone via export-mtp.
+            result is a plain original model again. Pass --arch qwen4-next
+            to target the Qwen3.8-Flash-Next (qwen4_exp) architecture:
+            tensor names and config.json follow the Flash-Next checkpoint
+            contract, with HyperConnection placeholder tensors emitted as
+            zeros so the checkpoint is structurally loadable by vLLM/SGLang.
+            Pass --quant mxfp4 to export the stack's projection matrices in
+            the OCP MXFP4 form (FP4 E2M1 elements, two per byte,
+            per-32-element E8M0 scales); embeddings, norms, biases and the
+            output head keep their full precision, and the quantized
+            checkpoint is terminal for this build (the encoder reads
+            full-precision dtypes). A materialised VISION tower rides the
+            same shard under model.visual.* (it is part of the model), and
+            a materialised MTP drafter exports automatically alongside as
+            mtp.safetensors + mtp.config.json — or standalone via
+            export-mtp.
             to-gguf converts an exported HF checkpoint directory
             (config.json + model.safetensors + tokenizer.json) into a
             GGUF v3 file for llama.cpp / LM Studio. Qwen3.5-family
