@@ -25,6 +25,9 @@ Credit for the design of the VIndex3 goes to Chris Hay.
   - [Pruning and MoE](#pruning-and-moe)
   - [Inspection](#inspection)
   - [Fine-tuning](#fine-tuning)
+  - [Flash-Next export](#flash-next-export)
+  - [Classifier models](#classifier-models)
+  - [Embedding models](#embedding-models)
 - [Code Examples](#code-examples)
 - [Q&A](#qa)
 - [Research](#research)
@@ -38,18 +41,19 @@ Credit for the design of the VIndex3 goes to Chris Hay.
 
 ## Architecture
 
-AMQL is structured as a five-project solution with a single CLI front-end:
+AMQL is structured as seven projects with a CLI front-end and a WPF desktop GUI:
 
 | Project | Purpose |
 |---------|---------|
 | `Amql.Cli` | CLI front-end (`amql-cli`) — entry point for encoding, inference, patching, merging, and inspection |
+| `Amql.Gui` | WPF desktop GUI — visual container browser, command launcher, and parameter editor |
 | `Amql.Vindex3` | Core VIndex3 container graph, schema, and token-index management |
 | `Amql.Safetensors` | Safetensors I/O and MXFP4 / NVFP4 quantisation codecs |
 | `Amql.Inference` | Tensor inference engine, tracing, and LoRA adapter execution |
 | `Amql.Hf` | Hugging Face checkpoint loading and conversion |
 | `Amql.Merge` | Multi-model consensus-gated merging with token alignment and provenance |
 
-**Dependency flow:** `Amql.Cli` depends on all others. `Amql.Merge` depends on Safetensors, Vindex3, Hf, and Inference. `Amql.Hf` and `Amql.Inference` both depend on Safetensors and Vindex3.
+**Dependency flow:** `Amql.Cli` and `Amql.Gui` depend on all others. `Amql.Merge` depends on Safetensors, Vindex3, Hf, and Inference. `Amql.Hf` and `Amql.Inference` both depend on Safetensors and Vindex3.
 
 ## Project Structure
 
@@ -57,11 +61,14 @@ AMQL is structured as a five-project solution with a single CLI front-end:
 AMQL/
 ├── src/
 │   ├── Amql.Cli/        # CLI front-end (amql-cli)
+│   ├── Amql.Gui/         # WPF desktop GUI
 │   ├── Amql.Safetensors/ # Safetensors I/O & MXFP4 codec
 │   ├── Amql.Vindex3/     # VIndex3 container graph & schema
 │   ├── Amql.Inference/   # Tensor inference engine & tracing
 │   ├── Amql.Hf/          # Hugging Face checkpoint integration
 │   └── Amql.Merge/       # Model merging (token alignment, provenance)
+├── native/
+│   └── amql_cuda/        # CUDA backend (GEMM, dequant, elementwise)
 ├── tests/
 │   └── Amql.Tests/       # Unit & integration tests
 ├── scripts/
@@ -120,6 +127,7 @@ amql-cli save-lora <patch.safetensors> --out <lora-dir>
                 [--rank 8] [--alpha 16] [--container <container-dir>]
 amql-cli export <container-dir> --out <checkpoint-dir>
                 [--patch <patch.safetensors>] [--quant mxfp4]
+                [--arch qwen4-next]
 amql-cli layers <container-dir> [--component target]
 amql-cli import <container-dir> <model> --out <merged-dir>
                 [--container]
@@ -325,7 +333,8 @@ apply to the base container: for each target, add scale · lora_B · lora_A to t
 
 `export` is the inverse of `encode`: it materialises a plain HF checkpoint directory (`config.json` + `model.safetensors` + `tokenizer.json`) from the container, so the model leaves the VINDEX3 world as an ordinary model again. HF tensor names are rebuilt from the graph's source bindings; `config.json` is regenerated from the judged graph facts (operator table, surface geometry, rope/position, vocabulary), and any `--patch` deltas are **baked into the stored tensors** — widened to f32, the delta added, then re-encoded to the tensor's own dtype (BF16/F32/…). Tensors a patch never touches are copied byte-identically, so an unpatched export is byte-exact; an operator without a judged `layer_types` spelling refuses the export by name rather than being approximated, and the tied output head is skipped with a note (it reuses the embedding table). Pass `--quant mxfp4` to export the
 model as a 4-bit quantized checkpoint instead — see the "Exporting a quantized checkpoint"
-section below.
+section below. Pass `--arch qwen4-next` to target the Qwen3.8-Flash-Next architecture
+(qwen4_exp config, HC placeholder tensors) — see "Flash-Next export" below.
 
 ```bash
 # bake every delta in patches/capital.safetensors into the weights
@@ -750,4 +759,7 @@ Deeper technical reference is available in the [docs/](docs/) directory:
 
 - [VIndex3 Overview — container format, schema, segment layout](docs/vindex3-overview.md)
 - [System Architecture — layered design, component responsibilities, runtime model](docs/architecture.md)
+- [Flash-Next Export — qwen4-next architecture mapping and config surface](docs/export-qwen3.8-flash-next.md)
+- [Classifier Models — Jev/NLI classification container design](docs/classifier-models-jev.md)
+- [Embedding Models — nomic-bert encoder import and export](docs/embedding-models-nomic-embed-text.md)
 
