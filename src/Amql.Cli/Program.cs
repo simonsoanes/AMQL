@@ -90,6 +90,7 @@ internal static class Program
                 "moe-ify" => MoeIfy(args[1..]),
                 "prune" => Prune(args[1..]),
                 "fine-tune" => FineTune(args[1..]),
+                "classify" => Classify(args[1..]),
                 _ => throw new CliException($"unknown command '{args[0]}'"),
             };
         }
@@ -1549,6 +1550,16 @@ internal static class Program
         }
         Console.WriteLine($"patch: {path} ({patch.Entries.Count} tensor{(patch.Entries.Count == 1 ? string.Empty : "s")})");
         return patch;
+    }
+
+    // ── classify: run a classifier (Jev/NLI-style) ──────────────────────
+
+    private static int Classify(string[] args)
+    {
+        Console.WriteLine("classify is not yet implemented (Phase B — serve).");
+        Console.WriteLine("Classifier containers can be created via 'encode' and exported back via 'export'.");
+        Console.WriteLine("Use 'inspect <container> --classifier' to view the classifier surface.");
+        return 0;
     }
 
     // ── plumbing ───────────────────────────────────────────────────────────

@@ -143,7 +143,7 @@ public static class CommandCatalog
         new("encode", CatIngest, "Map + materialise an HF checkpoint into a VINDEX3 container.", new[]
         {
             new ParamDef("modelDir", "model dir", ParamKind.Positional, EditorKind.Directory,
-                Help: "Raw HF checkpoint directory (Qwen3.5 and similar text stacks)."),
+                Help: "Raw HF checkpoint directory (Qwen3.5, nomic-bert, Jev classifier)."),
             new("out", "--out container dir", ParamKind.Option, EditorKind.Directory, Flag: "--out",
                 Help: "Container directory to write (index.json, system_graph.json, segments/)."),
         }),
@@ -282,11 +282,27 @@ public static class CommandCatalog
             PatchParam,
             new ParamDef("quant", "--quant", ParamKind.Option, EditorKind.Choice, Flag: "--quant", DefaultValue: "none",
                 Choices: new[] { "none", "mxfp4" }),
+            new ParamDef("arch", "--arch", ParamKind.Option, EditorKind.Choice, Flag: "--arch", DefaultValue: "qwen3.x",
+                Choices: new[] { "qwen3.x", "qwen4-next" },
+                Help: "Target architecture: qwen3.x (default Qwen3.5) or qwen4-next (Flash-Next)."),
         }),
         new("to-gguf", CatExport, "Convert an exported HF checkpoint to GGUF v3.", new[]
         {
             new ParamDef("checkpointDir", "checkpoint dir", ParamKind.Positional, EditorKind.Directory),
             new ParamDef("out", "--out file.gguf", ParamKind.Option, EditorKind.File, Flag: "--out"),
+        }),
+
+        // ── 8. Classify ─────────────────────────────────────────────────────
+        new("classify", CatPathways, "Run a classifier model (Jev/NLI-style) on premise-hypothesis pairs.", new[]
+        {
+            ContainerParam,
+            new ParamDef("text", "--text premise|hypothesis", ParamKind.Option, EditorKind.Text, Flag: "--text",
+                Help: "Single string split on first | (premise | hypothesis)."),
+            new ParamDef("premise", "--premise", ParamKind.Option, EditorKind.Text, Flag: "--premise"),
+            new ParamDef("hypothesis", "--hypothesis", ParamKind.Option, EditorKind.Text, Flag: "--hypothesis"),
+            new ParamDef("format", "--format", ParamKind.Option, EditorKind.Choice, Flag: "--format", DefaultValue: "labels",
+                Choices: new[] { "labels", "json", "jsonl", "csv" }),
+            PatchParam,
         }),
 
         // ── 6. MTP Drafter ──────────────────────────────────────────────────

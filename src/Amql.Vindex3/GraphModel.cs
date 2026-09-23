@@ -30,6 +30,8 @@ public enum ObjectKind
     PerceptionAdapter,
     FeatureProjector,
     ExpertBank,
+    EncoderStack,
+    ClassifierHead,
 }
 
 /// <summary>Fidelity of a materialisation: canonical or approximate
@@ -85,7 +87,7 @@ public static class LayerOperators
 /// refused, not upgraded.</summary>
 public sealed class SystemGraph
 {
-    public const int CurrentSchema = 6;
+    public const int CurrentSchema = 7;
 
     public required int Schema { get; init; }
     public required List<Component> Components { get; init; }

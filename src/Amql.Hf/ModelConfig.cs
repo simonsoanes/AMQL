@@ -35,6 +35,15 @@ public sealed record MoeFacts(
 /// tower's judged facts (read from the checkpoint, never invented).</summary>
 public sealed record VisionFacts(int HiddenSize, int NumLayers);
 
+/// <summary>Top-level classifier facts a <c>ForSequenceClassification</c>
+/// checkpoint carries above its text stack — lifted so the ingest can build
+/// a classifier container, not silently drop the head facts.</summary>
+public sealed record ClassificationFacts(
+    int NumLabels,
+    string ProblemType,
+    string? Template,
+    bool HasScoreTensor);
+
 /// <summary>
 /// G1 output: architecture facts lifted from <c>config.json</c> — the
 /// read-only inputs the graph/surface builder turns into a system graph.
@@ -104,8 +113,27 @@ public static class ModelConfig
             }
             if (layerTypes.Count == 0)
             {
-                throw new ModelConfigException(
-                    "'layer_types' is absent or empty — this build refuses to guess a per-layer operator table");
+                // Encoder models (nomic-bert) have no layer_types table; every
+                // layer is full bidirectional attention. Synthesise one entry
+                // per num_hidden_layers.
+                int numLayers = text.TryGetProperty("num_hidden_layers", out var nhl)
+                    ? nhl.GetInt32()
+                    : text.TryGetProperty("n_layer", out var nl)
+                        ? nl.GetInt32()
+                        : 0;
+                if (numLayers > 0)
+                {
+                    for (int i = 0; i < numLayers; i++)
+                    {
+                        layerTypes.Add("full_attention");
+                    }
+                }
+                else
+                {
+                    throw new ModelConfigException(
+                        "'layer_types' is absent and num_hidden_layers/n_layer could not be determined — " +
+                        "this build refuses to guess a per-layer operator table");
+                }
             }
 
             JsonElement rope = text.TryGetProperty("rope_parameters", out var rp) && rp.ValueKind == JsonValueKind.Object
@@ -180,6 +208,18 @@ public static class ModelConfig
                 partialRotaryFactor = flatPf.GetDouble();
             }
 
+            string hiddenAct = text.TryGetProperty("hidden_act", out var act) ? act.GetString() ?? "silu"
+                : text.TryGetProperty("activation_function", out var af)
+                    ? af.GetString() switch { "swiglu" => "silu", var a => a ?? "silu" }
+                    : "silu";
+            double rmsNormEps = text.TryGetProperty("rms_norm_eps", out var eps)
+                ? eps.GetDouble()
+                : text.TryGetProperty("layer_norm_eps", out var lne)
+                    ? lne.GetDouble()
+                    : text.TryGetProperty("layer_norm_epsilon", out var lne2)
+                        ? lne2.GetDouble()
+                        : 1e-6;
+
             return new TextArchitectureFacts(
                 ModelType: text.GetProperty("model_type").GetString() ?? "unknown",
                 HiddenSize: Int(text, "hidden_size"),
@@ -188,8 +228,8 @@ public static class ModelConfig
                 NumKvHeads: Int(text, "num_key_value_heads", required: false),
                 HeadDim: Int(text, "head_dim"),
                 IntermediateSize: Int(text, "intermediate_size"),
-                HiddenAct: text.TryGetProperty("hidden_act", out var act) ? act.GetString() ?? "silu" : "silu",
-                RmsNormEps: text.TryGetProperty("rms_norm_eps", out var eps) ? eps.GetDouble() : 1e-6,
+                HiddenAct: hiddenAct,
+                RmsNormEps: rmsNormEps,
                 VocabSize: Int(text, "vocab_size"),
                 TieWordEmbeddings: text.TryGetProperty("tie_word_embeddings", out var tie) && tie.GetBoolean(),
                 AttentionBias: text.TryGetProperty("attention_bias", out var ab) && ab.GetBoolean(),
@@ -224,5 +264,52 @@ public static class ModelConfig
             return value.GetInt64();
         }
         throw new ModelConfigException($"config is missing required field '{name}'");
+    }
+
+    /// <summary>Lifts the top-level classifier keys from config.json when a
+    /// <c>ForSequenceClassification</c> checkpoint is detected. Returns null
+    /// when the checkpoint carries no classifier head (ordinary decoder).
+    /// A config that claims a head but has no <c>score.weight</c> in the
+    /// inventory is a defect — refused by name.</summary>
+    public static ClassificationFacts? ReadClassificationFacts(string configPath, HfInventory inventory)
+    {
+        using var doc = JsonDocument.Parse(File.ReadAllBytes(configPath));
+        var root = doc.RootElement;
+
+        // Detect via architectures or the presence of a score head
+        bool isClassifier = false;
+        if (root.TryGetProperty("architectures", out var arch) && arch.ValueKind == JsonValueKind.Array)
+        {
+            isClassifier = arch.EnumerateArray().Any(a =>
+                a.GetString()?.Contains("SequenceClassification", StringComparison.OrdinalIgnoreCase) == true);
+        }
+
+        bool hasScore = inventory.CountUnder("model.score.") > 0 ||
+                        inventory.TensorNames.Any(n => n == "score.weight" || n.EndsWith(".score.weight"));
+
+        if (!isClassifier && !hasScore)
+        {
+            return null;
+        }
+        if (isClassifier && !hasScore)
+        {
+            throw new ModelConfigException(
+                "config declares a SequenceClassification architecture but no 'model.score.weight' or 'score.weight' tensor is in the inventory");
+        }
+
+        int numLabels = 0;
+        if (root.TryGetProperty("id2label", out var id2Lbl) && id2Lbl.ValueKind == JsonValueKind.Object)
+        {
+            numLabels = id2Lbl.EnumerateObject().Count();
+        }
+        if (numLabels == 0 && hasScore && inventory.TryGet("model.score.weight", out var info))
+        {
+            numLabels = (int)info.Shape[0];
+        }
+
+        string problemType = root.TryGetProperty("problem_type", out var pt) ? pt.GetString() ?? "single_label_classification" : "single_label_classification";
+        string? template = root.TryGetProperty("nli_template", out var tpl) ? tpl.GetString() : null;
+
+        return new ClassificationFacts(numLabels, problemType, template, hasScore);
     }
 }

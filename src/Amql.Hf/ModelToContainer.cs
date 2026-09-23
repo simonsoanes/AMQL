@@ -29,7 +29,9 @@ public static class ModelToContainer
         string modelName = modelId ?? Path.GetFileName(modelDir.TrimEnd('\\', '/'));
         var facts = ModelConfig.ReadTextFacts(Path.Combine(modelDir, "config.json"));
         using var inventory = HfInventory.Open(modelDir);
-        var spec = ArchMapper.MapToContainerSpec(modelName, facts, inventory, options ?? new ArchMapper.EncodeOptions());
+        var classification = ModelConfig.ReadClassificationFacts(Path.Combine(modelDir, "config.json"), inventory);
+        var spec = ArchMapper.MapToContainerSpec(modelName, facts, inventory, options ?? new ArchMapper.EncodeOptions(),
+            classification);
         var result = ContainerEncoder.Encode(containerOut, spec);
 
         // The tokenizer travels with the container: if the checkpoint ships

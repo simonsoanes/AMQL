@@ -216,6 +216,62 @@ public sealed class HeadSurface
     public bool HeadReusesEmbedding { get; init; }
 }
 
+// ── Pooling surface (shared by embedding and classifier families) ────────
+
+public enum PoolingKind
+{
+    Mean,
+    MeanSqrtLen,
+    Max,
+    Cls,
+    Last,
+    WeightedMean,
+}
+
+/// <summary>How hidden states are pooled into one vector. For <c>Last</c>,
+/// <see cref="LastNonPad"/> distinguishes the final row from the last
+/// non-padding token (attention-mask-aware).</summary>
+public sealed class PoolingSurface
+{
+    public required PoolingKind Kind { get; init; }
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool LastNonPad { get; init; }
+
+    public bool MaskPadding { get; init; } = true;
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool IncludeSpecialTokens { get; init; } = true;
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public NormSpec? PreTruncationNorm { get; init; }
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public IReadOnlyList<int>? MatryoshkaDims { get; init; }
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool L2Normalise { get; init; }
+}
+
+// ── Classifier surface ────────────────────────────────────────────────────
+
+/// <summary>The head of a sequence-classification model: a <c>score</c>
+/// linear that maps the pooled hidden state → label logits. The backbone
+/// is an ordinary decoder (or encoder); this surface records the
+/// classification-specific facts above it.</summary>
+public sealed class ClassifierSurface
+{
+    public required int NumLabels { get; init; }
+    public required string ProblemType { get; init; }
+    public required PoolingSurface Pooling { get; init; }
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Template { get; init; }
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool ScoreHeadReusesEmbeddingLayout { get; init; }
+}
+
 // ── The surface proper ─────────────────────────────────────────────────────
 
 /// <summary>
@@ -268,4 +324,7 @@ public sealed class ExecutionSurface
 
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public bool? ResidualInFp32 { get; init; }
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public ClassifierSurface? Classifier { get; init; }
 }

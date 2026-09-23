@@ -21,8 +21,10 @@ public static class ArchMapper
         public bool IncludeMtp { get; init; } = true;
     }
 
-    public static ContainerSpec MapToContainerSpec(string modelId, TextArchitectureFacts facts, HfInventory inventory, EncodeOptions options)
+    public static ContainerSpec MapToContainerSpec(string modelId, TextArchitectureFacts facts, HfInventory inventory, EncodeOptions options,
+        ClassificationFacts? classification = null)
     {
+        bool isNomicBert = facts.ModelType == "nomic_bert";
         string prefix = DetectTextPrefix(inventory);
         if (facts.LayerTypes.Count != facts.NumLayers)
         {
@@ -33,6 +35,11 @@ public static class ArchMapper
         {
             throw new ModelConfigException(
                 $"hidden_act '{facts.HiddenAct}' has no judged FFN mapping (only 'silu')");
+        }
+
+        if (isNomicBert)
+        {
+            return MapNomicBert(modelId, facts, inventory, options, classification, prefix);
         }
 
         // ── per-layer policy table ────────────────────────────────────────
@@ -130,6 +137,20 @@ public static class ArchMapper
                     state_dtype = "float32",
                 }, ViJson.Options)
                 : null,
+            Classifier = classification is { HasScoreTensor: true }
+                ? new ClassifierSurface
+                {
+                    NumLabels = classification.NumLabels,
+                    ProblemType = classification.ProblemType,
+                    Pooling = new PoolingSurface
+                    {
+                        Kind = PoolingKind.Last,
+                        LastNonPad = true,
+                        MaskPadding = true,
+                    },
+                    Template = classification.Template,
+                }
+                : null,
         };
 
         // ── canonical encoding: judged from the stored dtype, never
@@ -171,6 +192,33 @@ public static class ArchMapper
                     : new List<Representation>(), // tied: no dedicated segment
             },
         };
+
+        // Classifier head: a separate score linear (not a vocabulary head).
+        if (classification is { HasScoreTensor: true })
+        {
+            string scoreKey = inventory.TensorNames.FirstOrDefault(
+                n => n == "score.weight" || n.EndsWith(".score.weight") || n == "model.score.weight") ?? "model.score.weight";
+            objects.Add(new LogicalObject
+            {
+                Id = "target.classifier_head",
+                Component = "target",
+                Kind = ObjectKind.ClassifierHead,
+                SourceBindings = new List<SourceBinding>
+                {
+                    new()
+                    {
+                        Artifact = prefix,
+                        TensorPrefix = scoreKey.Contains("model.score.") ? "model.score" : "score",
+                        Tensors = 1,
+                        Bytes = 0,
+                    },
+                },
+                Representations = new List<Representation>
+                {
+                    new() { Encoding = encoding, Fidelity = Fidelity.Canonical },
+                },
+            });
+        }
 
         var components = new List<Component>
         {
@@ -291,6 +339,10 @@ public static class ArchMapper
         {
             reps.Add(Rep("target.output_head", encoding, BindOutputHead(inventory, prefix)));
         }
+        if (classification is { HasScoreTensor: true })
+        {
+            reps.Add(Rep("target.classifier_head", encoding, BindScoreHead(inventory, prefix)));
+        }
         if (options.IncludeMtp && inventory.CountUnder("mtp.") > 0)
         {
             reps.Add(Rep("mtp.stack", encoding, BindUnder(inventory, "mtp.")));
@@ -381,15 +433,20 @@ public static class ArchMapper
     /// bare text checkpoints). Never assumed.</summary>
     private static string DetectTextPrefix(HfInventory inventory)
     {
-        foreach (var candidate in new[] { "model.language_model", "model", "language_model" })
+        foreach (var candidate in new[] { "model.language_model", "model", "language_model", "encoder" })
         {
             if (inventory.CountUnder(candidate + ".layers.") > 0)
             {
                 return candidate;
             }
         }
+        // nomic-bert uses "encoder.layers." without a traditional prefix
+        if (inventory.CountUnder("encoder.layers.") > 0)
+        {
+            return "encoder";
+        }
         throw new ModelConfigException(
-            "no 'model.*.layers.N' decoder tensors found in the inventory — this build refuses to guess the text prefix");
+            "no '*.*.layers.N' decoder tensors found in the inventory — this build refuses to guess the text prefix");
     }
 
     private static string? EncodingFor(HfInventory inventory, string anyTensor)
@@ -472,6 +529,22 @@ public static class ArchMapper
             "tie_word_embeddings is false but neither 'lm_head.weight' nor '<prefix>.lm_head.weight' is in the inventory");
     }
 
+    /// <summary>Binds the classifier score head: <c>model.score.weight</c>
+    /// or <c>score.weight</c> as the single tensor of a ClassifierHead
+    /// object, mapped to the object-relative name <c>weight</c>.</summary>
+    private static List<NamedTensorData> BindScoreHead(HfInventory inventory, string prefix)
+    {
+        foreach (var fullName in new[] { "model.score.weight", "score.weight", $"{prefix}.score.weight" })
+        {
+            if (inventory.TryGet(fullName, out _))
+            {
+                return new List<NamedTensorData> { ToTensorData(inventory, fullName, "weight") };
+            }
+        }
+        throw new ModelConfigException(
+            "'model.score.weight' / 'score.weight' is required for a classifier but not found in the inventory");
+    }
+
     /// <summary>Binds a carried module (the MTP drafter's <c>mtp.</c> stem or
     /// the vision tower's <c>model.visual.</c> stem) verbatim: every tensor
     /// under the stem, as object-relative names — the stem IS the binding's
@@ -504,4 +577,218 @@ public static class ArchMapper
         Encoding = encoding,
         Tensors = tensors,
     };
+
+    // ── nomic-bert encoder path ─────────────────────────────────────────
+
+    private static ContainerSpec MapNomicBert(string modelId, TextArchitectureFacts facts, HfInventory inventory,
+        EncodeOptions options, ClassificationFacts? classification, string prefix)
+    {
+        string encoding = EncodingFor(inventory, "encoder.layers.0.attn.Wqkv.weight") ??
+                          EncodingFor(inventory, "embeddings.word_embeddings.weight") ??
+                          "F32";
+        Dtype encodingDtype = DtypeExtensions.FromLabel(encoding);
+
+        // Per-layer policies: all layers are full bidirectional attention.
+        var position = new PositionRope { Theta = 1000.0 };
+        var policies = new List<AttentionLayerPolicy>(facts.NumLayers);
+        for (int l = 0; l < facts.NumLayers; l++)
+        {
+            policies.Add(new AttentionLayerPolicy
+            {
+                Operator = LayerOperators.Softmax,
+                Span = AttentionSpan.Full,
+                Position = position,
+                Geometry = new HeadGeometry { HeadDim = facts.HeadDim, NumKvHeads = facts.NumKvHeads },
+            });
+        }
+
+        // Post-LayerNorm with bias (nomic-bert uses weight+bias LayerNorm
+        // after the residual, not before).
+        var normSpec = new NormSpec
+        {
+            Kind = NormType.LayerNorm,
+            Eps = facts.RmsNormEps,
+            WeightOffset = 0f,
+        };
+        var surface = new ExecutionSurface
+        {
+            ContextLength = facts.MaxPositionEmbeddings,
+            Attention = new AttentionSurface
+            {
+                NumQHeads = facts.NumQueryHeads,
+                NumKvHeads = facts.NumKvHeads,
+                HeadDim = facts.HeadDim,
+                ScoreScale = 1.0 / Math.Sqrt(facts.HeadDim),
+            },
+            Ffn = new FfnSurface
+            {
+                IntermediateSize = facts.IntermediateSize,
+                Activation = Activation.Silu,
+                FfnType = FfnType.Gated,
+            },
+            Norm = new NormSurface
+            {
+                Pre = normSpec,
+                Post = normSpec,
+                FinalNorm = normSpec,
+                Placement = NormPlacement.PrePost,
+            },
+            Head = new HeadSurface
+            {
+                VocabSize = facts.VocabSize,
+                HeadReusesEmbedding = true,
+            },
+            Classifier = classification is { HasScoreTensor: true }
+                ? new ClassifierSurface
+                {
+                    NumLabels = classification.NumLabels,
+                    ProblemType = classification.ProblemType,
+                    Pooling = new PoolingSurface { Kind = PoolingKind.Last, LastNonPad = true },
+                }
+                : null,
+        };
+
+        // Logical objects: EncoderStack for the bidirectional layers,
+        // with source bindings to the nomic-bert tensor names so export
+        // rebuilds the original checkpoint.
+        var objects = new List<LogicalObject>
+        {
+            new()
+            {
+                Id = "target.embedding",
+                Component = "target",
+                Kind = ObjectKind.Embedding,
+                SourceBindings = new List<SourceBinding>
+                {
+                    new() { Artifact = "embeddings", TensorPrefix = "embeddings", Tensors = 1, Bytes = 0 },
+                },
+                Representations = new List<Representation>
+                {
+                    new() { Encoding = encoding, Fidelity = Fidelity.Canonical },
+                },
+            },
+            new()
+            {
+                Id = "target.encoder_stack",
+                Component = "target",
+                Kind = ObjectKind.EncoderStack,
+                SourceBindings = new List<SourceBinding>
+                {
+                    new() { Artifact = "encoder.layers", TensorPrefix = "encoder.layers", Tensors = 0, Bytes = 0 },
+                },
+                Representations = new List<Representation>
+                {
+                    new() { Encoding = encoding, Fidelity = Fidelity.Canonical },
+                },
+            },
+            new()
+            {
+                Id = "target.final_norm",
+                Component = "target",
+                Kind = ObjectKind.FinalNorm,
+                SourceBindings = new List<SourceBinding>
+                {
+                    new() { Artifact = "emb_ln", TensorPrefix = "emb_ln", Tensors = 1, Bytes = 0 },
+                },
+                Representations = new List<Representation>
+                {
+                    new() { Encoding = encoding, Fidelity = Fidelity.Canonical },
+                },
+            },
+        };
+
+        var components = new List<Component>
+        {
+            new()
+            {
+                Id = "target",
+                Role = ComponentRole.PrimaryText,
+                SourceArtifact = "encoder.layers",
+                NumLayers = facts.NumLayers,
+                HiddenSize = facts.HiddenSize,
+                Attention = policies,
+                Execution = surface,
+            },
+        };
+
+        var graph = new SystemGraph
+        {
+            Schema = SystemGraph.CurrentSchema,
+            Components = components,
+            Objects = objects,
+            Edges = new List<HiddenStateEdge>(),
+        };
+
+        // Representation specs: bind the actual checkpoint tensors.
+        var reps = new List<RepresentationSpec>
+        {
+            Rep("target.embedding", encoding, BindNomicEmbedding(inventory)),
+            Rep("target.encoder_stack", encoding, BindNomicEncoder(inventory)),
+            Rep("target.final_norm", encoding, BindNomicFinalNorm(inventory)),
+        };
+
+        return new ContainerSpec
+        {
+            Model = modelId,
+            Family = facts.ModelType,
+            HiddenSize = facts.HiddenSize,
+            NumLayers = facts.NumLayers,
+            SystemGraph = graph,
+            Representations = reps,
+        };
+    }
+
+    private static List<NamedTensorData> BindNomicEmbedding(HfInventory inventory)
+    {
+        var bound = new List<NamedTensorData>();
+        foreach (var name in new[] { "word_embeddings.weight", "token_type_embeddings.weight" })
+        {
+            var fullName = $"embeddings.{name}";
+            if (inventory.TryGet(fullName, out _))
+            {
+                bound.Add(ToTensorData(inventory, fullName, name));
+            }
+        }
+        if (bound.Count == 0)
+        {
+            throw new ModelConfigException("no embedding tensors found under 'embeddings.'");
+        }
+        return bound;
+    }
+
+    private static List<NamedTensorData> BindNomicEncoder(HfInventory inventory)
+    {
+        var bound = new List<NamedTensorData>();
+        var prefix = "encoder.layers.";
+        foreach (var fullName in inventory.TensorNames)
+        {
+            if (fullName.StartsWith(prefix, StringComparison.Ordinal))
+            {
+                bound.Add(ToTensorData(inventory, fullName, fullName[prefix.Length..]));
+            }
+        }
+        if (bound.Count == 0)
+        {
+            throw new ModelConfigException("no encoder tensors found under 'encoder.layers.'");
+        }
+        return bound;
+    }
+
+    private static List<NamedTensorData> BindNomicFinalNorm(HfInventory inventory)
+    {
+        var bound = new List<NamedTensorData>();
+        foreach (var name in new[] { "weight", "bias" })
+        {
+            var fullName = $"emb_ln.{name}";
+            if (inventory.TryGet(fullName, out _))
+            {
+                bound.Add(ToTensorData(inventory, fullName, name));
+            }
+        }
+        if (bound.Count == 0)
+        {
+            throw new ModelConfigException("no final norm tensors found under 'emb_ln.'");
+        }
+        return bound;
+    }
 }

@@ -82,11 +82,11 @@ public sealed class Vindex3Container : IDisposable
                 throw new ContainerException($"container '{root}': malformed {graphPath}: {e.Message}", e);
             }
 
-            if (graph.Schema != SystemGraph.CurrentSchema)
+            if (graph.Schema < 6 || graph.Schema > SystemGraph.CurrentSchema)
             {
                 throw new ContainerException(
                     $"container '{root}': system graph schema {graph.Schema} is not supported " +
-                    $"(expected {SystemGraph.CurrentSchema})");
+                    $"(expected 6..{SystemGraph.CurrentSchema})");
             }
         }
 

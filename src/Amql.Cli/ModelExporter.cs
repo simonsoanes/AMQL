@@ -695,8 +695,17 @@ internal static class ExportConfig
                 $"FFN activation '{other}' has no judged hidden_act spelling — refusing to approximate"),
         };
 
+        // Detect a classifier container: a ClassifierHead object with a
+        // ClassifierSurface on the execution surface.
+        var classifier = surface.Classifier;
+        bool isClassifier = classifier is not null;
+        string architectures = isClassifier
+            ? "Qwen3_5ForSequenceClassification"
+            : "Qwen3_5ForConditionalGeneration";
+
         var config = new JsonObject
         {
+            ["architectures"] = new JsonArray(JsonValue.Create(architectures)!),
             ["model_type"] = container.Index.Family,
             ["hidden_size"] = component.HiddenSize,
             ["num_hidden_layers"] = component.NumLayers,
@@ -769,6 +778,30 @@ internal static class ExportConfig
                 ["block_elements"] = Mxfp4.BlockElements,
                 ["block_scale_dtype"] = "F8_E8M0",
             };
+        }
+
+        // Classifier head facts: carried from the ClassifierSurface.
+        if (isClassifier)
+        {
+            config["problem_type"] = classifier!.ProblemType;
+            if (classifier.Template is { } template)
+            {
+                config["nli_template"] = template;
+            }
+            // id2label: synthetic 0→"LABEL_0", 1→"LABEL_1", …
+            // The real checkpoint carries the actual labels; here we
+            // regenerate from NumLabels since the surface records count
+            // but not the label strings (carried in classifier.json).
+            var id2Label = new JsonObject();
+            var label2Id = new JsonObject();
+            for (int i = 0; i < classifier.NumLabels; i++)
+            {
+                string label = $"LABEL_{i}";
+                id2Label[i.ToString()] = label;
+                label2Id[label] = i;
+            }
+            config["id2label"] = id2Label;
+            config["label2id"] = label2Id;
         }
 
         // A materialised vision tower is part of the model: the export's

@@ -693,6 +693,57 @@ apply it:   amql-cli generate <container> --prompt "..." --tokenizer <checkpoint
 bake it:    amql-cli export <container> --out <checkpoint> --patch patches/ft-head.safetensors
 ```
 
+### Flash-Next export (`--arch qwen4-next`)
+
+Export a container as a Qwen3.8-Flash-Next (qwen4_exp) checkpoint — the same format
+vLLM, SGLang, and HF Transformers serve:
+
+```bash
+amql-cli export ./containers/Qwen3.8-27B-pruned --out ./exports/qwen4-next \
+  --arch qwen4-next --quant mxfp4
+```
+
+Pass `--arch qwen4-next` to target the Qwen 4 architecture family: tensor names follow
+the Flash-Next checkpoint contract (`mlp.gate.weight` router, `linear_attn.*` GDN
+blocks), `config.json` carries the `qwen4_exp`/`qwen4_exp_text` model types, and
+HyperConnection placeholder tensors are emitted as zeros so the checkpoint is
+structurally loadable. Composes with `--quant mxfp4` for ~13% of f32 working set.
+
+List supported architectures with `amql-cli export --list-architectures`.
+
+### Classifier models (Jev / sequence-classification)
+
+Classifier checkpoints (e.g. `AlexWortega/openjev` — `Qwen3_5ForSequenceClassification`)
+can be encoded, inspected, and exported:
+
+```bash
+amql-cli encode ./models/openjev --out ./containers/openjev
+amql-cli export ./containers/openjev --out ./exports/openjev
+```
+
+The classifier head (`model.score.weight`, `[num_labels, hidden_size]`) is its own
+`ClassifierHead` object with a `ClassifierSurface` carrying the label count, problem
+type, pooling rule (last-non-pad token), and NLI template. The backbone is an ordinary
+Qwen3.5 decoder — all existing transform commands (`moe-ify`, `prune`, `merge`) work on
+it unchanged. The `classify` serve command (Phase B) will apply the template, pool the
+last-token hidden state, and emit label probabilities.
+
+### Embedding models (nomic-bert)
+
+Encoder checkpoints like `nomic-ai/nomic-embed-text-v1.5` (`NomicBertModel`) can be
+imported and exported:
+
+```bash
+amql-cli encode ./models/nomic-embed-text-v1.5 --out ./containers/nomic-embed
+amql-cli export ./containers/nomic-embed --out ./exports/nomic-embed
+```
+
+The bidirectional encoder stack is represented as an `EncoderStack` object with
+source bindings to the original `encoder.layers.N.*` tensor names, so export
+rebuilds the checkpoint byte-identically. The pooling surface records the mean-pooling
+recipe; the `embed` serve command (future) will produce L2-normalised vectors
+with task-prefix support.
+
 ## Documentation
 
 Deeper technical reference is available in the [docs/](docs/) directory:
