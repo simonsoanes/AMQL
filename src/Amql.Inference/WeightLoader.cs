@@ -66,6 +66,11 @@ public sealed class WeightLoader
 
     public WeightWorkingSet WorkingSet => _workingSet;
 
+    /// <summary>When set, every tensor load reports its (objectId, tensorName),
+    /// shape, and whether it was already cached (hit). The generate command's
+    /// <c>--trace-tensors</c> flag wires it.</summary>
+    public Action<string, string, long[], bool>? LoadTrace { get; set; }
+
     /// <summary>How many elements a 2-D stack tensor must have before it is
     /// worth compacting (norms and tiny projections stay f32).</summary>
     private const long CompressMinimumElements = 1L << 20; // 1M
@@ -115,35 +120,39 @@ public sealed class WeightLoader
         if (_matrices.TryGetValue(key, out var cached))
         {
             TouchLru(key);
+            LoadTrace?.Invoke(operand.ObjectId, operand.TensorName, new long[] { rows, cols }, true);
             return cached;
         }
 
         var shape = new[] { (long)rows, cols };
+        Tensor2D matrix;
         if (_workingSet != WeightWorkingSet.ResidentF32 && Compactable(operand, shape))
         {
-            var compacted = _workingSet == WeightWorkingSet.OnDemandBf16
+            matrix = _workingSet == WeightWorkingSet.OnDemandBf16
                 ? MatrixOnDemandBf16(operand, rows, cols)
                 : MatrixMxfp4(operand, rows, cols);
-            CacheBounded(key, compacted);
-            return compacted;
+            CacheBounded(key, matrix);
         }
-
-        // Charge before the widened array exists so an over-budget load
-        // never allocates: the caller's shape IS the element count.
-        ChargeWidened(operand, (long)rows * cols);
-
-        var resolution = _store.ResolveWidened(operand);
-        if (resolution.Shape.Length == 0 || ElementCount(resolution.Shape) != (long)rows * cols)
+        else
         {
-            throw new ContainerException(
-                $"operand '{operand.ObjectId}/{operand.TensorName}' resolves to shape " +
-                $"[{string.Join(",", resolution.Shape)}] — expected [{rows} x {cols}]");
-        }
+            // Charge before the widened array exists so an over-budget load
+            // never allocates: the caller's shape IS the element count.
+            ChargeWidened(operand, (long)rows * cols);
 
-        var data = resolution.Values;
-        ApplyPatch(operand, data);
-        var matrix = new Tensor2D(data, rows, cols);
-        _matrices[key] = matrix;
+            var resolution = _store.ResolveWidened(operand);
+            if (resolution.Shape.Length == 0 || ElementCount(resolution.Shape) != (long)rows * cols)
+            {
+                throw new ContainerException(
+                    $"operand '{operand.ObjectId}/{operand.TensorName}' resolves to shape " +
+                    $"[{string.Join(",", resolution.Shape)}] — expected [{rows} x {cols}]");
+            }
+
+            var data = resolution.Values;
+            ApplyPatch(operand, data);
+            matrix = new Tensor2D(data, rows, cols);
+            _matrices[key] = matrix;
+        }
+        LoadTrace?.Invoke(operand.ObjectId, operand.TensorName, shape, false);
         return matrix;
     }
 

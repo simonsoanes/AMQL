@@ -559,7 +559,17 @@ public sealed class GenericRuntime
 
         for (int layer = 0; layer < _plan.Layers.Count; layer++)
         {
+            var beforeLast = hidden.Row(hidden.Rows - 1);
             hidden = RunLayerInternal(hidden, layer, queryPositions, kvPositions, appendKv: true);
+            var afterLast = hidden.Row(hidden.Rows - 1);
+            float residualNorm = (float)Math.Sqrt(TensorOps.Dot(afterLast, afterLast));
+            float deltaNorm = 0f;
+            for (int i = 0; i < afterLast.Length; i++)
+            {
+                float d = afterLast[i] - beforeLast[i];
+                deltaNorm += d * d;
+            }
+            LayerNormTrace?.Invoke(position, layer, residualNorm, (float)Math.Sqrt(deltaNorm));
         }
         SessionPosition++;
         return hidden;
@@ -583,6 +593,33 @@ public sealed class GenericRuntime
     /// layer as the layer runs — the MoE-ification sampler's activation
     /// seam (see <c>amql-cli moe-ify</c>).</summary>
     public Action<int, Tensor2D>? FfnInputCapture { get; set; }
+
+    /// <summary>When set, every layer's attention-output and FFN-output
+    /// L2 norms are reported per step for diagnostic tracing
+    /// (<c>--trace</c>).</summary>
+    public Action<int, int, float, float>? LayerNormTrace { get; set; }
+
+    /// <summary>When set, every tensor load reports its name, shape, and
+    /// whether it hit the cache (<c>--trace-tensors</c>).</summary>
+    public Action<string, long[], bool>? TensorLoadTrace { get; set; }
+
+    /// <summary>Collected per-layer trace from the most recent forward pass.
+    /// Cleared at the start of each StepForward; populated by
+    /// LayerNormTrace during the layer loop.</summary>
+    public readonly List<(int Layer, float R, float D)> Trace = new();
+
+    /// <summary>Enables trace collection for the next forward pass.</summary>
+    public void BeginTrace()
+    {
+        Trace.Clear();
+        LayerNormTrace = (_, layer, r, d) => { Trace.Add((layer, r, d)); };
+    }
+
+    /// <summary>Stops trace collection.</summary>
+    public void EndTrace()
+    {
+        LayerNormTrace = null;
+    }
 
     /// <summary>
     /// A residual-stream override: after <c>Layer</c> completes (mixer +

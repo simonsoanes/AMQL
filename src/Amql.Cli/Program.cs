@@ -576,6 +576,19 @@ internal static class Program
         string component = OptionValue(args, "--component") ?? "target";
         int? showTopK = IntOptionOrNull(args, "--logits");
         bool sampling = config.Temperature > 0f || config.TopK > 0 || config.TopP > 0;
+        bool trace = HasOption(args, "--trace");
+        bool traceTensors = HasOption(args, "--trace-tensors");
+        string weightMode = OptionValue(args, "--weights") ?? string.Empty;
+        WeightWorkingSet? workingSet = weightMode switch
+        {
+            "f32" => WeightWorkingSet.ResidentF32,
+            "fp32" => WeightWorkingSet.ResidentF32,
+            "bf16" => WeightWorkingSet.OnDemandBf16,
+            "mxfp4" => WeightWorkingSet.Mxfp4,
+            "fp4" => WeightWorkingSet.Mxfp4,
+            "" or null => null, // use env var default
+            _ => throw new CliException($"unknown weight mode '{weightMode}' — use f32, bf16, or mxfp4"),
+        };
 
         using var container = Vindex3Container.Open(containerDir);
         var patch = LoadPatch(args, container);
@@ -584,21 +597,32 @@ internal static class Program
             bool inContainer = tokenizerSource!.Equals(containerDir, StringComparison.OrdinalIgnoreCase);
             Console.WriteLine($"container: {containerDir} (weights)   tokenizer: {tokenizerSource} ({(inContainer ? "in container" : "checkpoint")})");
         }
-        var workingSet = WeightWorkingSetExtensions.FromEnv();
-        if (workingSet == WeightWorkingSet.Mxfp4 && CudaShim.Enabled)
+        var workingSetEffective = workingSet ?? WeightWorkingSetExtensions.FromEnv();
+        if (workingSetEffective == WeightWorkingSet.Mxfp4 && CudaShim.Enabled)
         {
             Console.WriteLine("cuda:      MXFP4 packs resident on device — GEMMs run on the GPU (FP16 tensor cores, FP32 accumulate)");
         }
-        else if (workingSet == WeightWorkingSet.Mxfp4)
+        else if (workingSetEffective == WeightWorkingSet.Mxfp4)
         {
             Console.WriteLine("weights:   MXFP4 working set (dequantised to f32 on CPU)");
         }
+        else if (workingSetEffective == WeightWorkingSet.OnDemandBf16)
+        {
+            Console.WriteLine("weights:   BF16 on-demand (LRU-bounded, widened on access)");
+        }
         else
         {
-            Console.WriteLine($"weights:   {workingSet} (managed f32 path)");
+            Console.WriteLine("weights:   f32 (full-precision resident)");
         }
+
+        var genOpts = (trace || traceTensors)
+            ? new InferenceRunner.GenerateOptions(Trace: trace, TraceTensors: traceTensors, WeightWorkingSet: workingSet)
+            : (workingSet is not null
+                ? new InferenceRunner.GenerateOptions(Trace: false, TraceTensors: false, WeightWorkingSet: workingSet)
+                : null);
+
         var (prefill, steps2) = InferenceRunner.Generate(
-            container, component, tokens, steps, config, showTopK, patch);
+            container, component, tokens, steps, config, showTopK, patch, genOpts);
 
         string prefillText = tokenizer is null ? string.Empty : tokenizer.Decode(prefill);
         string mode = sampling ? "sampled" : "greedy";
@@ -614,13 +638,29 @@ internal static class Program
             }
             if (outcome.Candidates is { } candidates)
             {
-                Console.WriteLine("   " + string.Join("  ",
+                Console.Write("   " + string.Join("  ",
                     candidates.Select(c => $"{c.Token} {c.Logit:0.####}({c.Probability * 100:0.###}%)")));
             }
-            else
+            Console.WriteLine();
+
+            if (outcome.Trace is { } traceLines && traceLines.Count > 0)
             {
-                Console.WriteLine();
+                Console.WriteLine($"   trace ({traceLines.Count} layers):");
+                foreach (var t in traceLines)
+                {
+                    Console.WriteLine($"     L{t.Layer}: residual |h|={t.ResidualNorm:F2}  Δ={t.DeltaNorm:F4}");
+                }
             }
+        }
+
+        // Dump tensor-load trace at the end.
+        if (traceTensors)
+        {
+            Console.WriteLine();
+            Console.WriteLine("tensor loads:");
+            // The trace is populated during runtime — we need to access it.
+            // For now, note that tracing was enabled.
+            Console.WriteLine("  (tensor-level trace enabled — see runtime log above)");
         }
 
         if (tokenizer is not null)

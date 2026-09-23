@@ -1,6 +1,7 @@
 <Window x:Class="Amql.Gui.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:explorer="clr-namespace:Amql.Gui.Explorer"
         Title="AMQL Studio" Height="760" Width="1240"
         WindowStartupLocation="CenterScreen">
     <DockPanel>
@@ -22,6 +23,10 @@
                 <MenuItem Header="_Cancel Run" Click="OnCancelRun"/>
                 <MenuItem Header="Clear _Output" Click="OnClearOutput"/>
             </MenuItem>
+            <MenuItem Header="_Explorer">
+                <MenuItem Header="_Open Container in Explorer…" Click="OnOpenExplorer"/>
+                <MenuItem Header="_Close Explorer Container" Click="OnCloseExplorer"/>
+            </MenuItem>
             <MenuItem Header="_Help">
                 <MenuItem Header="_About AMQL Studio" Click="OnAbout"/>
             </MenuItem>
@@ -40,76 +45,86 @@
             </StatusBarItem>
         </StatusBar>
 
-        <Grid>
-            <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="250" MinWidth="180"/>
-                <ColumnDefinition Width="4"/>
-                <ColumnDefinition Width="3*" MinWidth="380"/>
-                <ColumnDefinition Width="4"/>
-                <ColumnDefinition Width="2*" MinWidth="280"/>
-            </Grid.ColumnDefinitions>
+        <!-- Tab control for commands vs explorer -->
+        <TabControl>
+            <TabItem Header="Commands">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="250" MinWidth="180"/>
+                        <ColumnDefinition Width="4"/>
+                        <ColumnDefinition Width="3*" MinWidth="380"/>
+                        <ColumnDefinition Width="4"/>
+                        <ColumnDefinition Width="2*" MinWidth="280"/>
+                    </Grid.ColumnDefinitions>
 
-            <!-- Command list -->
-            <DockPanel Grid.Column="0">
-                <TextBlock DockPanel.Dock="Top" Text="Commands" FontWeight="Bold" Margin="6,6,6,2"/>
-                <TreeView x:Name="CommandTree" SelectedItemChanged="OnCommandSelected"/>
-            </DockPanel>
-            <GridSplitter Grid.Column="1" Width="4" HorizontalAlignment="Stretch" Background="#FFE0E0E0"/>
+                    <!-- Command list -->
+                    <DockPanel Grid.Column="0">
+                        <TextBlock DockPanel.Dock="Top" Text="Commands" FontWeight="Bold" Margin="6,6,6,2"/>
+                        <TreeView x:Name="CommandTree" SelectedItemChanged="OnCommandSelected"/>
+                    </DockPanel>
+                    <GridSplitter Grid.Column="1" Width="4" HorizontalAlignment="Stretch" Background="#FFE0E0E0"/>
 
-            <!-- Parameter form + output -->
-            <Grid Grid.Column="2">
-                <Grid.RowDefinitions>
-                    <RowDefinition Height="Auto"/>
-                    <RowDefinition Height="2*" MinHeight="140"/>
-                    <RowDefinition Height="4"/>
-                    <RowDefinition Height="3*"/>
-                </Grid.RowDefinitions>
+                    <!-- Parameter form + output -->
+                    <Grid Grid.Column="2">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="2*" MinHeight="140"/>
+                            <RowDefinition Height="4"/>
+                            <RowDefinition Height="3*"/>
+                        </Grid.RowDefinitions>
 
-                <!-- Command header + run bar -->
-                <Border Grid.Row="0" Padding="8" Background="#FFF4F6FA" BorderBrush="#FFD0D7E2" BorderThickness="0,0,0,1">
-                    <StackPanel>
-                        <TextBlock x:Name="CommandTitle" Text="Select a command" FontSize="16" FontWeight="Bold"/>
-                        <TextBlock x:Name="CommandSummary" Text="" TextWrapping="Wrap" Foreground="Gray" Margin="0,2,0,6"/>
-                        <TextBlock x:Name="CommandLinePreview" Text="" FontFamily="Cascadia Mono, Consolas" FontSize="11"
-                                   TextWrapping="Wrap" Foreground="#FF3A5A8A" Margin="0,0,0,6"/>
-                        <StackPanel Orientation="Horizontal">
-                            <Button x:Name="RunButton" Content="▶ Run (F5)" Click="OnRun" FontWeight="Bold" Padding="18,6"/>
-                            <Button x:Name="CancelButton" Content="■ Cancel" Click="OnCancelRun" IsEnabled="False" Padding="14,6"/>
-                            <Button Content="Apply Project Defaults" Click="OnApplyDefaults" Padding="14,6"
-                                    ToolTip="Stamp the project-wide container/tokenizer/patch/component into this form"/>
-                            <ProgressBar x:Name="RunProgress" Width="220" Height="18" Margin="12,0" Minimum="0" Maximum="100"/>
-                            <TextBlock x:Name="RunStateText" VerticalAlignment="Center" Text="idle"/>
-                        </StackPanel>
-                    </StackPanel>
-                </Border>
+                        <!-- Command header + run bar -->
+                        <Border Grid.Row="0" Padding="8" Background="#FFF4F6FA" BorderBrush="#FFD0D7E2" BorderThickness="0,0,0,1">
+                            <StackPanel>
+                                <TextBlock x:Name="CommandTitle" Text="Select a command" FontSize="16" FontWeight="Bold"/>
+                                <TextBlock x:Name="CommandSummary" Text="" TextWrapping="Wrap" Foreground="Gray" Margin="0,2,0,6"/>
+                                <TextBlock x:Name="CommandLinePreview" Text="" FontFamily="Cascadia Mono, Consolas" FontSize="11"
+                                           TextWrapping="Wrap" Foreground="#FF3A5A8A" Margin="0,0,0,6"/>
+                                <StackPanel Orientation="Horizontal">
+                                    <Button x:Name="RunButton" Content="▶ Run (F5)" Click="OnRun" FontWeight="Bold" Padding="18,6"/>
+                                    <Button x:Name="CancelButton" Content="■ Cancel" Click="OnCancelRun" IsEnabled="False" Padding="14,6"/>
+                                    <Button Content="Apply Project Defaults" Click="OnApplyDefaults" Padding="14,6"
+                                            ToolTip="Stamp the project-wide container/tokenizer/patch/component into this form"/>
+                                    <ProgressBar x:Name="RunProgress" Width="220" Height="18" Margin="12,0" Minimum="0" Maximum="100"/>
+                                    <TextBlock x:Name="RunStateText" VerticalAlignment="Center" Text="idle"/>
+                                </StackPanel>
+                            </StackPanel>
+                        </Border>
 
-                <!-- Dynamic parameter form -->
-                <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
-                    <StackPanel x:Name="ParamPanel" Margin="8"/>
-                </ScrollViewer>
+                        <!-- Dynamic parameter form -->
+                        <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+                            <StackPanel x:Name="ParamPanel" Margin="8"/>
+                        </ScrollViewer>
 
-                <GridSplitter Grid.Row="2" Height="4" HorizontalAlignment="Stretch" Background="#FFE0E0E0"/>
+                        <GridSplitter Grid.Row="2" Height="4" HorizontalAlignment="Stretch" Background="#FFE0E0E0"/>
 
-                <!-- Output -->
-                <DockPanel Grid.Row="3">
-                    <TextBlock DockPanel.Dock="Top" Text="Output" FontWeight="Bold" Margin="2,4"/>
-                    <TextBox x:Name="OutputBox" Style="{StaticResource OutputBox}"/>
-                </DockPanel>
-            </Grid>
+                        <!-- Output -->
+                        <DockPanel Grid.Row="3">
+                            <TextBlock DockPanel.Dock="Top" Text="Output" FontWeight="Bold" Margin="2,4"/>
+                            <TextBox x:Name="OutputBox" Style="{StaticResource OutputBox}"/>
+                        </DockPanel>
+                    </Grid>
 
-            <GridSplitter Grid.Column="3" Width="4" HorizontalAlignment="Stretch" Background="#FFE0E0E0"/>
+                    <GridSplitter Grid.Column="3" Width="4" HorizontalAlignment="Stretch" Background="#FFE0E0E0"/>
 
-            <!-- Run history -->
-            <DockPanel Grid.Column="4">
-                <Grid DockPanel.Dock="Top" Margin="6,6,6,2">
-                    <TextBlock Text="Run History (saved in the project)" FontWeight="Bold"/>
-                    <Button Content="Clear" HorizontalAlignment="Right" Padding="8,2" Click="OnClearHistory"/>
+                    <!-- Run history -->
+                    <DockPanel Grid.Column="4">
+                        <Grid DockPanel.Dock="Top" Margin="6,6,6,2">
+                            <TextBlock Text="Run History (saved in the project)" FontWeight="Bold"/>
+                            <Button Content="Clear" HorizontalAlignment="Right" Padding="8,2" Click="OnClearHistory"/>
+                        </Grid>
+                        <ListBox x:Name="HistoryList" SelectionChanged="OnHistorySelected"
+                                 HorizontalContentAlignment="Stretch"
+                                 ScrollViewer.HorizontalScrollBarVisibility="Auto"/>
+                    </DockPanel>
                 </Grid>
-                <ListBox x:Name="HistoryList" SelectionChanged="OnHistorySelected"
-                         HorizontalContentAlignment="Stretch"
-                         ScrollViewer.HorizontalScrollBarVisibility="Auto"/>
-            </DockPanel>
-        </Grid>
+            </TabItem>
+
+            <TabItem Header="Explorer">
+                <explorer:ContainerExplorer x:Name="ExplorerControl"
+                    TensorSelected="OnTensorSelected"/>
+            </TabItem>
+        </TabControl>
     </DockPanel>
     <Window.CommandBindings>
         <CommandBinding Command="ApplicationCommands.Save" Executed="OnSaveProject"/>

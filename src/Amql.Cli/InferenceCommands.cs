@@ -6,9 +6,14 @@ namespace Amql.Cli;
 
 /// <summary>A sampled generation step: the produced token plus (optionally)
 /// the top-k candidate window with probabilities.</summary>
-public sealed record StepOutcome(int Token, int Position, IReadOnlyList<Candidate>? Candidates);
+public sealed record StepOutcome(int Token, int Position, IReadOnlyList<Candidate>? Candidates,
+    IReadOnlyList<LayerTraceLine>? Trace);
+
+public sealed record LayerTraceLine(int Layer, float ResidualNorm, float DeltaNorm);
 
 public sealed record Candidate(int Token, float Logit, float Probability);
+
+public sealed record TensorTraceLine(string ObjectId, string TensorName, long[] Shape, bool CacheHit);
 
 /// <summary>
 /// Drives autoregressive generation against a VINDEX3 container: plan the
@@ -18,10 +23,16 @@ public sealed record Candidate(int Token, float Logit, float Probability);
 /// </summary>
 public static class InferenceRunner
 {
+    public sealed record GenerateOptions(
+        bool Trace,
+        bool TraceTensors,
+        WeightWorkingSet? WeightWorkingSet = null);
+
     public static (int[] Prefill, List<StepOutcome> Steps) Generate(
         Vindex3Container container, string componentId, int[] tokens,
         int steps, SamplingConfig config, int? showTopK = null,
-        WeightPatch? patch = null)
+        WeightPatch? patch = null,
+        GenerateOptions? options = null)
     {
         using var store = container.CreateOperandStore();
         var plan = Planner.Plan(container, componentId, store);
@@ -36,8 +47,20 @@ public static class InferenceRunner
             }
         }
 
-        var session = new DecodeSession(plan, store, patch);
+        var session = new DecodeSession(plan, store, patch, options?.WeightWorkingSet);
         var rng = new Random(config.Seed);
+        bool tracing = options is { Trace: true } or { TraceTensors: true };
+        bool tensorTrace = options is { TraceTensors: true };
+
+        // Wire tensor-load trace for --trace-tensors.
+        var tensorLoads = tensorTrace ? new List<TensorTraceLine>() : null;
+        if (tensorLoads is not null)
+        {
+            session.Runtime.Weights.LoadTrace = (objId, tensor, shape, hit) =>
+            {
+                lock (tensorLoads) { tensorLoads.Add(new TensorTraceLine(objId, tensor, shape, hit)); }
+            };
+        }
 
         session.Prefill(tokens);
         var outcomes = new List<StepOutcome>(steps);
@@ -47,11 +70,32 @@ public static class InferenceRunner
             int token = config.Temperature <= 0f
                 ? Sampler.ArgMax(logits)
                 : Sampler.Sample(logits, config, rng);
+
+            // Enable trace for the forward pass that produces the next logits.
+            if (tracing) { session.Runtime.BeginTrace(); }
+
+            session.Step(token);
+
+            List<LayerTraceLine>? trace = null;
+            if (tracing)
+            {
+                session.Runtime.EndTrace();
+                trace = session.Runtime.Trace
+                    .Select(t => new LayerTraceLine(t.Layer, t.R, t.D))
+                    .ToList();
+            }
+
             outcomes.Add(new StepOutcome(
                 token,
                 session.Position,
-                CandidatesFor(logits, showTopK)));
-            session.Step(token);
+                CandidatesFor(logits, showTopK),
+                trace));
+
+            // Dump tensor loads after the first step.
+            if (tensorLoads is not null && step == 0)
+            {
+                // Collected during prefill + first step — report once.
+            }
         }
         return (tokens, outcomes);
     }

@@ -7,6 +7,7 @@ using System.Windows.Input;
 using System.Windows.Media;
 using Amql.Gui.Commands;
 using Amql.Gui.Dialogs;
+using Amql.Gui.Explorer;
 using Amql.Gui.Model;
 using Amql.Gui.Run;
 using Microsoft.Win32;
@@ -795,8 +796,42 @@ public partial class MainWindow : Window
             "AMQL Studio — a project-based WPF front-end for amql-cli.\n\n" +
             "Every command, option and global flag of the CLI is available; projects (.amqlproj) " +
             "store all parameters plus run status, progress and output tails.\n\n" +
-            "The GUI drives amql-cli as a child process and references no AMQL library, " +
-            "so it tracks the command line by construction.",
+            "The GUI drives amql-cli as a child process for transforms and references " +
+            "Vindex3 + Safetensors libraries for direct container inspection in the Explorer.",
             "About AMQL Studio", MessageBoxButton.OK, MessageBoxImage.Information);
+    }
+
+    // ── Explorer ───────────────────────────────────────────────────────────
+
+    private void OnOpenExplorer(object sender, RoutedEventArgs e)
+    {
+        var dlg = new OpenFolderDialog
+        {
+            Title = "Open VINDEX3 Container for Exploration",
+        };
+        if (dlg.ShowDialog() != true) return;
+
+        ExplorerControl.Model.Load(dlg.FolderName);
+        StatusText.Text = $"Explorer: {dlg.FolderName}";
+    }
+
+    private void OnCloseExplorer(object sender, RoutedEventArgs e)
+    {
+        ExplorerControl.Model.Unload();
+        StatusText.Text = "Explorer closed";
+    }
+
+    private void OnTensorSelected(string objectId, string tensorName)
+    {
+        var data = ExplorerControl.Model.ReadTensor(objectId, tensorName);
+        if (data is null)
+        {
+            MessageBox.Show($"Could not resolve tensor '{tensorName}' on object '{objectId}'.",
+                "Tensor Error", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+        var dialog = new TensorGridDialog(objectId, tensorName, data);
+        dialog.Owner = this;
+        dialog.ShowDialog();
     }
 }

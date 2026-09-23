@@ -1,5 +1,10 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
+  <ItemGroup>
+    <ProjectReference Include="..\Amql.Vindex3\Amql.Vindex3.csproj" />
+    <ProjectReference Include="..\Amql.Safetensors\Amql.Safetensors.csproj" />
+  </ItemGroup>
+
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
     <TargetFramework>net10.0-windows</TargetFramework>
@@ -8,7 +13,7 @@
     <Nullable>enable</Nullable>
     <AssemblyName>amql-gui</AssemblyName>
     <RootNamespace>Amql.Gui</RootNamespace>
-    <Description>WPF project-based front-end for amql-cli. Deliberately references no AMQL library: it drives the CLI as a child process so it stays decoupled from in-flight core changes.</Description>
+    <Description>WPF desktop GUI for AMQL — container explorer, command launcher, and parameter editor. References Vindex3 and Safetensors libraries for direct container inspection; the CLI child process handles transforms.</Description>
   </PropertyGroup>
 
 </Project>

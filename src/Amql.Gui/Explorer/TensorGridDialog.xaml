@@ -1,0 +1,59 @@
+<Window x:Class="Amql.Gui.Explorer.TensorGridDialog"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Tensor Viewer" Height="600" Width="900"
+        WindowStartupLocation="CenterOwner"
+        WindowStyle="ToolWindow">
+    <DockPanel>
+        <!-- Header -->
+        <Border DockPanel.Dock="Top" Padding="8" Background="#FFF4F6FA" BorderBrush="#FFD0D7E2" BorderThickness="0,0,0,1">
+            <StackPanel Orientation="Horizontal">
+                <TextBlock x:Name="TensorNameText" FontSize="14" FontWeight="Bold" VerticalAlignment="Center"/>
+                <TextBlock x:Name="TensorShapeText" Margin="16,0,0,0" FontFamily="Cascadia Mono, Consolas" FontSize="12"
+                           VerticalAlignment="Center" Foreground="Gray"/>
+                <TextBlock x:Name="TensorDtypeText" Margin="16,0,0,0" FontSize="12"
+                           VerticalAlignment="Center" Foreground="#FF3A5A8A"/>
+            </StackPanel>
+        </Border>
+
+        <!-- Search / filter bar -->
+        <Border DockPanel.Dock="Top" Padding="4" Background="#FFF8F9FB">
+            <StackPanel Orientation="Horizontal">
+                <TextBlock Text="Filter:" VerticalAlignment="Center" Margin="4,0"/>
+                <TextBox x:Name="FilterBox" Width="140" VerticalContentAlignment="Center"
+                         TextChanged="OnFilterChanged"/>
+                <TextBlock x:Name="StatsText" VerticalAlignment="Center" Margin="12,0" FontSize="11" Foreground="Gray"/>
+            </StackPanel>
+        </Border>
+
+        <!-- DataGrid -->
+        <DataGrid x:Name="TensorGrid" AutoGenerateColumns="False"
+                  CanUserAddRows="False" CanUserDeleteRows="False"
+                  CanUserReorderColumns="False"
+                  CellEditEnding="OnCellEditEnding"
+                  SelectionUnit="Cell"
+                  EnableRowVirtualization="True"
+                  EnableColumnVirtualization="True"
+                  GridLinesVisibility="Horizontal"
+                  AlternatingRowBackground="#FFF8F9FB"
+                  RowHeaderWidth="40"
+                  FontFamily="Cascadia Mono, Consolas" FontSize="11">
+            <DataGrid.Resources>
+                <Style TargetType="DataGridCell">
+                    <Setter Property="BorderThickness" Value="0"/>
+                    <Setter Property="Padding" Value="4,2"/>
+                </Style>
+            </DataGrid.Resources>
+        </DataGrid>
+
+        <!-- Footer -->
+        <Border DockPanel.Dock="Bottom" Padding="6" Background="#FFF0F2F5">
+            <StackPanel Orientation="Horizontal">
+                <TextBlock x:Name="CellInfoText" FontSize="11" Foreground="Gray" VerticalAlignment="Center"/>
+                <Button Content="📋 Copy Cell" Click="OnCopyCell" Padding="8,2" Margin="16,0,4,0"/>
+                <Button Content="📋 Copy Row" Click="OnCopyRow" Padding="8,2" Margin="4,0"/>
+                <Button Content="Close" Click="OnClose" Padding="8,2" Margin="16,0,0,0" IsCancel="True"/>
+            </StackPanel>
+        </Border>
+    </DockPanel>
+</Window>
