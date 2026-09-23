@@ -308,6 +308,25 @@ public static class CommandCatalog
             ComponentParam,
             PatchParam,
         }),
+        new("create-model", CatIngest, "Create a new empty container with random weights.", new[]
+        {
+            new ParamDef("out", "--out container dir", ParamKind.Option, EditorKind.Directory, Flag: "--out",
+                Help: "Container directory to write."),
+            new ParamDef("name", "--name", ParamKind.Option, EditorKind.Text, Flag: "--name", DefaultValue: "untitled-model"),
+            new ParamDef("hidden", "--hidden", ParamKind.Option, EditorKind.Int, Flag: "--hidden", DefaultValue: "768"),
+            new ParamDef("layers", "--layers", ParamKind.Option, EditorKind.Int, Flag: "--layers", DefaultValue: "12"),
+            new ParamDef("heads", "--heads", ParamKind.Option, EditorKind.Int, Flag: "--heads", DefaultValue: "12"),
+            new ParamDef("kvHeads", "--kv-heads", ParamKind.Option, EditorKind.Int, Flag: "--kv-heads", DefaultValue: "2"),
+            new ParamDef("headDim", "--head-dim", ParamKind.Option, EditorKind.Int, Flag: "--head-dim", DefaultValue: "64"),
+            new ParamDef("intermediate", "--intermediate", ParamKind.Option, EditorKind.Int, Flag: "--intermediate", DefaultValue: "2048"),
+            new ParamDef("vocab", "--vocab", ParamKind.Option, EditorKind.Int, Flag: "--vocab", DefaultValue: "32000"),
+            new ParamDef("context", "--context", ParamKind.Option, EditorKind.Int, Flag: "--context", DefaultValue: "2048"),
+            new ParamDef("layerTypes", "--layer-types", ParamKind.Option, EditorKind.Text, Flag: "--layer-types",
+                Help: "Comma-separated list of 'full_attention'/'linear_attention' per layer (e.g. 'full,full,linear' or a repeated pattern 'full,linear')."),
+            new ParamDef("untied", "--untied", ParamKind.Option, EditorKind.Choice, Flag: "--untied",
+                DefaultValue: "", Choices: new[] { "", "1" },
+                Help: "Untied output head (separate from embedding)."),
+        }),
 
         // ── 8. Classify ─────────────────────────────────────────────────────
         new("classify", CatPathways, "Run a classifier model (Jev/NLI-style) on premise-hypothesis pairs.", new[]

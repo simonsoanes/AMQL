@@ -95,6 +95,7 @@ internal static class Program
                 "convert-to-classifier" => ConvertToClassifier(args[1..]),
                 "convert-to-embedding" => ConvertToEmbedding(args[1..]),
                 "export-onnx" => ExportOnnx(args[1..]),
+                "create-model" => CreateModel(args[1..]),
                 _ => throw new CliException($"unknown command '{args[0]}'"),
             };
         }
@@ -1669,6 +1670,58 @@ internal static class Program
         Console.WriteLine($"weights:   {result.InitializerCount}");
         Console.WriteLine("the ONNX graph uses standard ops only (no custom ops) — compatible with ONNX Runtime 1.21+");
         return 0;
+    }
+
+    // ── create-model: new empty container with random weights ────────────
+
+    private static int CreateModel(string[] args)
+    {
+        string outDir = OptionValue(args, "--out") ?? throw new CliException("create-model requires '--out <dir>'");
+        int numLayers = IntOption(args, "--layers", 12);
+        var spec = new ModelSpec(
+            ModelName: OptionValue(args, "--name") ?? "untitled-model",
+            Family: OptionValue(args, "--family") ?? "qwen3_5",
+            HiddenSize: IntOption(args, "--hidden", 768),
+            NumLayers: numLayers,
+            NumQHeads: IntOption(args, "--heads", 12),
+            NumKvHeads: IntOption(args, "--kv-heads", 2),
+            HeadDim: IntOption(args, "--head-dim", 64),
+            IntermediateSize: IntOption(args, "--intermediate", 2048),
+            VocabSize: IntOption(args, "--vocab", 32000),
+            ContextLength: IntOption(args, "--context", 2048),
+            NormEps: DoubleOption(args, "--norm-eps", 1e-5),
+            TieEmbeddings: !HasOption(args, "--untied"),
+            LayerTypes: ParseLayerTypes(args, numLayers)
+        );
+
+        ModelInitializer.Create(spec, outDir);
+        Console.WriteLine($"model:  {spec.ModelName}");
+        Console.WriteLine($"arch:   {spec.NumLayers}L × {spec.HiddenSize}H, {spec.NumQHeads}Q/{spec.NumKvHeads}KV heads × {spec.HeadDim}D");
+        Console.WriteLine($"vocab:  {spec.VocabSize}, context: {spec.ContextLength}, tied: {spec.TieEmbeddings}");
+        Console.WriteLine($"init:   Xavier-uniform weights, norm weights = 1.0");
+        Console.WriteLine($"out:    {outDir}");
+        Console.WriteLine("the container is ready for training — use 'amql-cli fine-tune' to apply training data");
+        return 0;
+    }
+
+    private static IReadOnlyList<string> ParseLayerTypes(string[] args, int numLayers)
+    {
+        string raw = OptionValue(args, "--layer-types") ?? string.Empty;
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return Enumerable.Repeat("full_attention", numLayers).ToList();
+        }
+        var parts = raw.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length == 0) return Enumerable.Repeat("full_attention", numLayers).ToList();
+        if (parts.Length == numLayers) return parts;
+        if (parts.Length < numLayers)
+        {
+            var repeated = new List<string>(numLayers);
+            while (repeated.Count < numLayers) repeated.AddRange(parts);
+            return repeated.Take(numLayers).ToList();
+        }
+        throw new CliException(
+            $"--layer-types has {parts.Length} entries but model has {numLayers} layers");
     }
 
     // ── plumbing ───────────────────────────────────────────────────────────
