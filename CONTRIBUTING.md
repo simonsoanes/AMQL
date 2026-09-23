@@ -88,4 +88,4 @@ AMQL is research code developed in the open. Some internals are intentionally op
 
 ---
 
-This project is maintained by [Simon Soanes](https://github.com/simonsoanes). Questions? Open an issue or reach out via the [Fizl](https://fizl.org) channels.
+This project is maintained by [Simon Soanes](https://github.com/simonsoanes). Questions? Open an issue or reach out via the [Fizl](https://www.fizl.co.uk) channels.
