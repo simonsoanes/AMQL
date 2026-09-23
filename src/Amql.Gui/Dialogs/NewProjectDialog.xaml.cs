@@ -18,6 +18,14 @@ public partial class NewProjectDialog : Window
     {
         InitializeComponent();
         RepoBox.Text = GuessRepoPath();
+
+        // Auto-detect the CLI exe if one exists nearby
+        var detectedExe = CliAutoDetect.FindExe();
+        if (detectedExe is not null)
+        {
+            ExeBox.Text = detectedExe;
+        }
+
         PathBox.Text = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
             "AMQL Projects",

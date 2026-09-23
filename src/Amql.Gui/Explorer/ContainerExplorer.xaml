@@ -24,6 +24,7 @@
         <!-- Tree -->
         <TreeView x:Name="ModelTree" ItemsSource="{Binding Roots}"
                   SelectedItemChanged="OnNodeSelected"
+                  MouseRightButtonUp="OnNodeRightClick"
                   VirtualizingStackPanel.IsVirtualizing="True">
             <TreeView.ItemContainerStyle>
                 <Style TargetType="TreeViewItem">

@@ -89,8 +89,39 @@ public partial class MainWindow : Window
         CommandTitle.Text = $"amql-cli {cmd.Name}";
         CommandSummary.Text = cmd.Summary;
         BuildParamForm(cmd);
+        AutoApplyDefaults(cmd);
         UpdateCommandLinePreview();
         MarkDirty();
+    }
+
+    /// <summary>Auto-fills empty form fields from project defaults when a
+    /// command is first selected (no user edits have been saved for it).</summary>
+    private void AutoApplyDefaults(CommandDef cmd)
+    {
+        var state = _project.Command(cmd.Name);
+        bool wasBlank = state.Values.Count == 0;
+        var d = _project.Defaults;
+        foreach (var p in cmd.Params)
+        {
+            if (p.DefaultFrom is null) continue;
+            string? value = p.DefaultFrom switch
+            {
+                "container" => d.ContainerDir,
+                "tokenizer" => d.TokenizerDir,
+                "patch" => d.PatchFile,
+                "component" => d.Component,
+                _ => null,
+            };
+            if (!string.IsNullOrWhiteSpace(value) && _editors.TryGetValue(p.Key, out var editor))
+            {
+                bool isBlank = !state.Values.ContainsKey(p.Key) || string.IsNullOrEmpty(state.Values[p.Key]);
+                if (wasBlank || isBlank)
+                {
+                    SetEditorValue(editor, value!);
+                    state.Values[p.Key] = value!;
+                }
+            }
+        }
     }
 
     // ── dynamic parameter form ──────────────────────────────────────────────
