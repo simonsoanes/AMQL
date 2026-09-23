@@ -39,6 +39,7 @@ public static class ModelExporter
         string outDir,
         WeightPatch? patch,
         bool quantizeMxfp4 = false,
+        bool quantizeTernary = false,
         string? arch = null)
     {
         if (Directory.Exists(outDir))
@@ -143,12 +144,23 @@ public static class ModelExporter
             {
                 hfName = Qwen4NextLayout.RemapTensorName(item.ObjectId, hfName);
             }
-            bool quantizing = quantizeMxfp4 && ShouldQuantize(item.ObjectId, item.Tensor.Name, item.Tensor.Shape);
+            bool quantizing = (quantizeMxfp4 || quantizeTernary) &&
+                ShouldQuantize(item.ObjectId, item.Tensor.Name, item.Tensor.Shape);
 
             using var segment = SegmentFile.Open(Path.Combine(container.Root, item.SegmentPath));
-            IReadOnlyList<TensorPayload> produced = quantizing
-                ? BuildQuantizedPayloads(item.ObjectId, segment, item.Tensor, patch, hfName)
-                : new[] { BuildExportPayload(item.ObjectId, segment, item.Tensor, patch, hfName) };
+            IReadOnlyList<TensorPayload> produced;
+            if (quantizeTernary)
+            {
+                produced = BuildTernaryPayloads(item.ObjectId, segment, item.Tensor, patch, hfName);
+            }
+            else if (quantizeMxfp4)
+            {
+                produced = BuildQuantizedPayloads(item.ObjectId, segment, item.Tensor, patch, hfName);
+            }
+            else
+            {
+                produced = new[] { BuildExportPayload(item.ObjectId, segment, item.Tensor, patch, hfName) };
+            }
 
             lock (lockObj)
             {
@@ -205,8 +217,11 @@ public static class ModelExporter
 
         if (quantized > 0)
         {
-            notes.Add($"{quantized} stack projection tensors exported as MXFP4 (FP4 E2M1 grid elements, " +
-                      $"per-{Mxfp4.BlockElements}-element {Dtype.F8_E8M0.Label()} scales) — " +
+            string quantLabel = quantizeTernary ? "ternary" : "MXFP4";
+            string gridDesc = quantizeTernary
+                ? $"{{-1,0,+1}} grid elements, per-{Ternary.BlockElements}-element {Ternary.ScaleDtype.Label()} scales"
+                : $"FP4 E2M1 grid elements, per-{Mxfp4.BlockElements}-element {Dtype.F8_E8M0.Label()} scales";
+            notes.Add($"{quantized} stack projection tensors exported as {quantLabel} ({gridDesc}) — " +
                       "embeddings, norms, biases and the output head keep their full precision");
             notes.Add($"export ran with {workers} parallel workers " +
                       $"({Environment.ProcessorCount} cores" +
@@ -588,6 +603,37 @@ public static class ModelExporter
                 Dtype = Dtype.F8_E8M0,
                 Shape = new[] { rows, Mxfp4.BlocksPerRow(columns) },
                 Data = quantized.BlockScales,
+            },
+        };
+    }
+
+    /// <summary>f32 weight → packed ternary ({-1,0,+1}) + FP16 block scales.
+    /// Emits two tensors: the weight payload with dtype <c>F32</c> (but
+    /// packed 2-bit data) and a companion scale tensor.</summary>
+    private static IReadOnlyList<TensorPayload> BuildTernaryPayloads(
+        string objectId, SegmentFile segment, SegmentTensor tensor, WeightPatch? patch, string hfName)
+    {
+        var values = WidenedValues(segment, objectId, tensor, patch);
+        var (packed, scales) = Ternary.Encode(values);
+        long rows = tensor.Shape[0];
+        long columns = tensor.Shape[1];
+        int scaleRows = Ternary.BlockScaleCount(values.Length);
+
+        return new[]
+        {
+            new TensorPayload
+            {
+                Name = hfName,
+                Dtype = Dtype.FP4, // re-use the 2-bit packed dtype label
+                Shape = tensor.Shape,
+                Data = packed,
+            },
+            new TensorPayload
+            {
+                Name = hfName + ".scales",
+                Dtype = Dtype.F16,
+                Shape = new long[] { scaleRows },
+                Data = scales,
             },
         };
     }

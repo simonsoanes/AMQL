@@ -212,6 +212,15 @@ public static class ModelConfig
                 : text.TryGetProperty("activation_function", out var af)
                     ? af.GetString() switch { "swiglu" => "silu", var a => a ?? "silu" }
                     : "silu";
+            // Map Gemma 4's gelu_pytorch_tanh → the closest judged activation.
+            hiddenAct = hiddenAct switch
+            {
+                "gelu_pytorch_tanh" => "gelu",
+                "gelu_new" => "gelu",
+                "gelu_fast" => "gelu",
+                "gelu_accurate" => "gelu",
+                _ => hiddenAct,
+            };
             double rmsNormEps = text.TryGetProperty("rms_norm_eps", out var eps)
                 ? eps.GetDouble()
                 : text.TryGetProperty("layer_norm_eps", out var lne)

@@ -31,11 +31,7 @@ public static class ArchMapper
             throw new ModelConfigException(
                 $"layer_types declares {facts.LayerTypes.Count} layers but num_hidden_layers is {facts.NumLayers}");
         }
-        if (facts.HiddenAct != "silu")
-        {
-            throw new ModelConfigException(
-                $"hidden_act '{facts.HiddenAct}' has no judged FFN mapping (only 'silu')");
-        }
+        // Activation is validated uniformally inside MapActivation.
 
         if (isNomicBert)
         {
@@ -102,7 +98,7 @@ public static class ArchMapper
             Ffn = new FfnSurface
             {
                 IntermediateSize = facts.IntermediateSize,
-                Activation = Activation.Silu,
+                Activation = MapActivation(facts.HiddenAct),
                 FfnType = FfnType.Gated,
                 Moe = facts.Moe is { } moe
                     ? new MoeSurface
@@ -428,6 +424,16 @@ public static class ArchMapper
         };
     }
 
+    /// <summary>Judges the persisted <c>hidden_act</c> string against the
+    /// known activation set. Unknown activations refuse by name.</summary>
+    private static Activation MapActivation(string hiddenAct) => hiddenAct switch
+    {
+        "silu" => Activation.Silu,
+        "gelu" => Activation.Gelu,
+        _ => throw new ModelConfigException(
+            $"hidden_act '{hiddenAct}' is not a judged FFN activation — this build maps 'silu' and 'gelu' only"),
+    };
+
     /// <summary>Finds the tensor prefix the text decoder actually lives
     /// under ("model.language_model" for multimodal wrappers, "model" for
     /// bare text checkpoints). Never assumed.</summary>
@@ -623,7 +629,7 @@ public static class ArchMapper
             Ffn = new FfnSurface
             {
                 IntermediateSize = facts.IntermediateSize,
-                Activation = Activation.Silu,
+                Activation = MapActivation(facts.HiddenAct),
                 FfnType = FfnType.Gated,
             },
             Norm = new NormSurface

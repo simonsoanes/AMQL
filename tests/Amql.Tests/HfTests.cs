@@ -1,4 +1,5 @@
 using System.Text.Json;
+using Amql.Cli;
 using Amql.Hf;
 using Amql.Inference;
 using Amql.Safetensors;
@@ -288,5 +289,70 @@ public class HfTests
             }
             """;
         File.WriteAllText(Path.Combine(modelDir, "config.json"), configJson);
+    }
+
+    // ── Gemma 4 synthetic import ────────────────────────────────────────
+
+    [Fact]
+    public void Gemma4_Config_Facts_And_Encode()
+    {
+        using var dir = new TempDir();
+        SyntheticGemma4Checkpoint.Write(dir.Path);
+
+        var facts = ModelConfig.ReadTextFacts(Path.Combine(dir.Path, "config.json"));
+        Assert.Equal(SyntheticGemma4Checkpoint.TextModelType, facts.ModelType);
+        Assert.Equal(SyntheticGemma4Checkpoint.Hidden, facts.HiddenSize);
+        Assert.Equal(SyntheticGemma4Checkpoint.NumQHeads, facts.NumQueryHeads);
+        Assert.Equal(SyntheticGemma4Checkpoint.NumKvHeads, facts.NumKvHeads);
+        Assert.Equal("gelu", facts.HiddenAct);
+        Assert.True(facts.TieWordEmbeddings);
+
+        using var inventory = HfInventory.Open(dir.Path);
+        var spec = ArchMapper.MapToContainerSpec("gemma4-test", facts, inventory,
+            new ArchMapper.EncodeOptions());
+        var containerDir = Path.Combine(dir.Path, "container");
+        ContainerEncoder.Encode(containerDir, spec);
+
+        using var container = Vindex3Container.Open(containerDir);
+        var (prefill, steps) = InferenceRunner.Generate(container, "target",
+            new[] { 0 }, 2, new SamplingConfig(42, 0f));
+        Assert.Equal(2, steps.Count);
+
+        var surface = container.Graph!.Components[0].Execution!;
+        Assert.Equal(Activation.Gelu, surface.Ffn!.Activation);
+    }
+
+    [Fact]
+    public void Gemma4_Config_Refuses_Relu()
+    {
+        using var dir = new TempDir();
+        var configPath = Path.Combine(dir.Path, "config.json");
+        File.WriteAllText(configPath, """
+        {
+          "architectures": ["Gemma4ForConditionalGeneration"],
+          "model_type": "gemma4",
+          "text_config": {
+            "model_type": "gemma4_text",
+            "hidden_size": 128, "num_hidden_layers": 2,
+            "num_attention_heads": 4, "num_key_value_heads": 1, "head_dim": 32,
+            "intermediate_size": 256, "hidden_act": "relu",
+            "rms_norm_eps": 1e-6, "vocab_size": 1000,
+            "max_position_embeddings": 512,
+            "layer_types": ["full_attention", "full_attention"]
+          }
+        }
+        """);
+
+        var facts = ModelConfig.ReadTextFacts(configPath);
+        Assert.Equal("relu", facts.HiddenAct);
+
+        SyntheticGemma4Checkpoint.WriteMinimalSafetensors(dir.Path);
+
+        using var inventory = HfInventory.Open(dir.Path);
+        // relu is not a judged activation — ArchMapper must refuse it.
+        var ex = Assert.Throws<ModelConfigException>(() =>
+            ArchMapper.MapToContainerSpec("test", facts, inventory, new ArchMapper.EncodeOptions()));
+        Assert.Contains("hidden_act", ex.Message);
+        Assert.Contains("relu", ex.Message);
     }
 }

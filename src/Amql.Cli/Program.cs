@@ -911,9 +911,9 @@ internal static class Program
             "export requires a container directory, e.g. 'amql-cli export <container-dir> --out <checkpoint-dir>'");
         string outDir = OptionValue(args, "--out") ?? throw new CliException("export requires '--out <checkpoint-dir>'");
         string quant = OptionValue(args, "--quant") ?? "none";
-        if (quant != "none" && quant != "mxfp4")
+        if (quant != "none" && quant != "mxfp4" && quant != "ternary")
         {
-            throw new CliException($"unknown quantization '{quant}' — this build exports 'none' (full precision) or 'mxfp4'");
+            throw new CliException($"unknown quantization '{quant}' — this build exports 'none' (full precision), 'mxfp4' or 'ternary'");
         }
         string arch = OptionValue(args, "--arch") ?? "qwen3.x";
         if (arch != "qwen3.x" && arch != Qwen4NextLayout.Arch)
@@ -924,7 +924,10 @@ internal static class Program
 
         using var container = Vindex3Container.Open(containerDir);
         var patch = LoadPatch(args, container);
-        var report = ModelExporter.Export(container, outDir, patch, quantizeMxfp4: quant == "mxfp4", arch: archParam);
+        var report = ModelExporter.Export(container, outDir, patch,
+            quantizeMxfp4: quant == "mxfp4",
+            quantizeTernary: quant == "ternary",
+            arch: archParam);
 
         Console.WriteLine($"exported:  {report.OutDir}");
         Console.WriteLine($"model:      {report.Model}");

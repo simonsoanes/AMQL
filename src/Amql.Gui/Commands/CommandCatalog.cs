@@ -290,7 +290,7 @@ public static class CommandCatalog
             OutDirParam with { Label = "--out checkpoint dir" },
             PatchParam,
             new ParamDef("quant", "--quant", ParamKind.Option, EditorKind.Choice, Flag: "--quant", DefaultValue: "none",
-                Choices: new[] { "none", "mxfp4" }),
+                Choices: new[] { "none", "mxfp4", "ternary" }),
             new ParamDef("arch", "--arch", ParamKind.Option, EditorKind.Choice, Flag: "--arch", DefaultValue: "qwen3.x",
                 Choices: new[] { "qwen3.x", "qwen4-next" },
                 Help: "Target architecture: qwen3.x (default Qwen3.5) or qwen4-next (Flash-Next)."),
