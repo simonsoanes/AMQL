@@ -246,7 +246,7 @@ public static class ModelInitializer
                 Pre = new NormSpec { Kind = NormType.RmsNorm, Eps = spec.NormEps },
                 Post = new NormSpec { Kind = NormType.RmsNorm, Eps = spec.NormEps },
                 FinalNorm = new NormSpec { Kind = NormType.RmsNorm, Eps = spec.NormEps },
-                Placement = NormPlacement.PrePost,
+                Placement = NormPlacement.PreOnly,
             },
             Head = new HeadSurface
             {
