@@ -39,7 +39,7 @@ public static class ModelExporter
         string outDir,
         WeightPatch? patch,
         bool quantizeMxfp4 = false,
-        bool quantizeTernary = false,
+        string? quantizeTernary = null,
         string? arch = null)
     {
         if (Directory.Exists(outDir))
@@ -144,12 +144,12 @@ public static class ModelExporter
             {
                 hfName = Qwen4NextLayout.RemapTensorName(item.ObjectId, hfName);
             }
-            bool quantizing = (quantizeMxfp4 || quantizeTernary) &&
+            bool quantizing = (quantizeMxfp4 || quantizeTernary is not null) &&
                 ShouldQuantize(item.ObjectId, item.Tensor.Name, item.Tensor.Shape);
 
             using var segment = SegmentFile.Open(Path.Combine(container.Root, item.SegmentPath));
             IReadOnlyList<TensorPayload> produced;
-            if (quantizeTernary)
+            if (quantizeTernary is not null)
             {
                 produced = BuildTernaryPayloads(item.ObjectId, segment, item.Tensor, patch, hfName);
             }
@@ -217,8 +217,9 @@ public static class ModelExporter
 
         if (quantized > 0)
         {
-            string quantLabel = quantizeTernary ? "ternary" : "MXFP4";
-            string gridDesc = quantizeTernary
+            bool isTernary = quantizeTernary is not null;
+            string quantLabel = isTernary ? "ternary" : "MXFP4";
+            string gridDesc = isTernary
                 ? $"{{-1,0,+1}} grid elements, per-{Ternary.BlockElements}-element {Ternary.ScaleDtype.Label()} scales"
                 : $"FP4 E2M1 grid elements, per-{Mxfp4.BlockElements}-element {Dtype.F8_E8M0.Label()} scales";
             notes.Add($"{quantized} stack projection tensors exported as {quantLabel} ({gridDesc}) — " +
@@ -614,9 +615,9 @@ public static class ModelExporter
         string objectId, SegmentFile segment, SegmentTensor tensor, WeightPatch? patch, string hfName)
     {
         var values = WidenedValues(segment, objectId, tensor, patch);
-        var (packed, scales) = Ternary.Encode(values);
-        long rows = tensor.Shape[0];
-        long columns = tensor.Shape[1];
+        var rows = tensor.Shape[0];
+        var cols = tensor.Shape[1];
+        var (packed, scales) = Ternary.EncodePq2(values, (int)rows, (int)cols);
         int scaleRows = Ternary.BlockScaleCount(values.Length);
 
         return new[]
@@ -624,7 +625,7 @@ public static class ModelExporter
             new TensorPayload
             {
                 Name = hfName,
-                Dtype = Dtype.FP4, // re-use the 2-bit packed dtype label
+                Dtype = Dtype.FP4,
                 Shape = tensor.Shape,
                 Data = packed,
             },

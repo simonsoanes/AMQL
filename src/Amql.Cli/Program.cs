@@ -911,9 +911,9 @@ internal static class Program
             "export requires a container directory, e.g. 'amql-cli export <container-dir> --out <checkpoint-dir>'");
         string outDir = OptionValue(args, "--out") ?? throw new CliException("export requires '--out <checkpoint-dir>'");
         string quant = OptionValue(args, "--quant") ?? "none";
-        if (quant != "none" && quant != "mxfp4" && quant != "ternary")
+        if (quant != "none" && quant != "mxfp4" && quant != "ptq1" && quant != "pq2")
         {
-            throw new CliException($"unknown quantization '{quant}' — this build exports 'none' (full precision), 'mxfp4' or 'ternary'");
+            throw new CliException($"unknown quantization '{quant}' — this build exports 'none' (full precision), 'mxfp4', 'ptq1' (ternary dense), or 'pq2' (ternary 2-bit)");
         }
         string arch = OptionValue(args, "--arch") ?? "qwen3.x";
         if (arch != "qwen3.x" && arch != Qwen4NextLayout.Arch)
@@ -926,7 +926,7 @@ internal static class Program
         var patch = LoadPatch(args, container);
         var report = ModelExporter.Export(container, outDir, patch,
             quantizeMxfp4: quant == "mxfp4",
-            quantizeTernary: quant == "ternary",
+            quantizeTernary: quant == "ptq1" ? "ptq1" : quant == "pq2" ? "pq2" : null,
             arch: archParam);
 
         Console.WriteLine($"exported:  {report.OutDir}");
