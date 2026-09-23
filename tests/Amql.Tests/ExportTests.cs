@@ -3,6 +3,7 @@ using System.Text.Json.Nodes;
 using Amql.Cli;
 using Amql.Hf;
 using Amql.Inference;
+using Amql.Merge;
 using Amql.Safetensors;
 using Amql.Vindex3;
 
@@ -498,6 +499,145 @@ public class ExportTests
         Assert.Contains("kda", ex.Message);
         Assert.Contains("layer_types", ex.Message);
         Assert.False(Directory.Exists(Path.Combine(dir.Path, "out")));
+    }
+
+    // ── Model type conversion ────────────────────────────────────────────
+
+    [Fact]
+    public void ConvertToClassifier_Creates_ScoreHead_And_ClassifierSurface()
+    {
+        using var dir = new TempDir();
+        var containerPath = WriteSynthContainer(dir);
+        var outDir = Path.Combine(dir.Path, "classifier");
+
+        var report = ModelConverter.ConvertToClassifier(containerPath, outDir, numLabels: 3);
+
+        Assert.Equal(outDir, report.OutDir);
+        Assert.Contains("classifier", report.Model);
+
+        // Container can be opened
+        using var container = Vindex3Container.Open(outDir);
+        var graph = container.Graph!;
+        var component = graph.Components.First(c => c.Role == ComponentRole.PrimaryText);
+
+        // ClassifierSurface
+        var surface = component.Execution!;
+        Assert.NotNull(surface.Classifier);
+        Assert.Equal(3, surface.Classifier!.NumLabels);
+        Assert.Equal("single_label_classification", surface.Classifier.ProblemType);
+        Assert.Equal(PoolingKind.Last, surface.Classifier.Pooling.Kind);
+        Assert.True(surface.Classifier.Pooling.LastNonPad);
+
+        // ClassifierHead object
+        var classifierObj = graph.Objects.First(o => o.Kind == ObjectKind.ClassifierHead);
+        Assert.Equal("target.classifier_head", classifierObj.Id);
+        Assert.Equal("model.score", classifierObj.SourceBindings![0].TensorPrefix);
+
+        // Score tensor exists and is shaped [numLabels, hidden]
+        using var store = container.CreateOperandStore();
+        var resolution = store.Resolve("target.classifier_head", "weight");
+        Assert.Equal(Dtype.F32, resolution.Dtype);
+        Assert.Equal(2, resolution.Shape.Length);
+        Assert.Equal(3, resolution.Shape[0]); // numLabels
+        Assert.Equal(SyntheticCheckpoint.Hidden, resolution.Shape[1]);
+
+        // Original decoder tensors are still present
+        store.Resolve("target.decoder_stack", "0.self_attn.q_proj.weight");
+    }
+
+    [Fact]
+    public void ConvertToClassifier_Refuses_Already_Classifier()
+    {
+        using var dir = new TempDir();
+        var containerPath = WriteSynthContainer(dir);
+        var outDir1 = Path.Combine(dir.Path, "classifier");
+
+        ModelConverter.ConvertToClassifier(containerPath, outDir1, numLabels: 3);
+
+        var ex = Assert.ThrowsAny<Exception>(() =>
+            ModelConverter.ConvertToClassifier(outDir1, Path.Combine(dir.Path, "classifier2"), numLabels: 3));
+        Assert.Contains("ClassifierSurface", ex.Message);
+    }
+
+    [Fact]
+    public void ConvertToEmbedding_Adds_PoolingSurface_No_New_Tensors()
+    {
+        using var dir = new TempDir();
+        var containerPath = WriteSynthContainer(dir);
+        var outDir = Path.Combine(dir.Path, "embedding");
+
+        var report = ModelConverter.ConvertToEmbedding(containerPath, outDir);
+
+        Assert.Equal(outDir, report.OutDir);
+        Assert.Contains("embedding", report.Model);
+
+        using var container = Vindex3Container.Open(outDir);
+        var graph = container.Graph!;
+        var component = graph.Components.First(c => c.Role == ComponentRole.PrimaryText);
+        var surface = component.Execution!;
+
+        // Embedding surface facts
+        Assert.True(surface.Embedding.HasValue);
+        var emb = surface.Embedding!.Value;
+        Assert.Equal("mean", emb.GetProperty("pooling").GetProperty("kind").GetString());
+        Assert.True(emb.GetProperty("pooling").GetProperty("l2_normalise").GetBoolean());
+
+        // No new objects added (decoder stack stays as-is)
+        Assert.DoesNotContain(graph.Objects, o => o.Kind == ObjectKind.EncoderStack);
+
+        // Original tensors present
+        using var store = container.CreateOperandStore();
+        store.Resolve("target.decoder_stack", "0.self_attn.q_proj.weight");
+    }
+
+    [Fact]
+    public void ConvertToEmbedding_Exports_And_Roundtrips()
+    {
+        using var dir = new TempDir();
+        var containerPath = WriteSynthContainer(dir);
+        var embeddingDir = Path.Combine(dir.Path, "embedding");
+
+        ModelConverter.ConvertToEmbedding(containerPath, embeddingDir);
+
+        // Export the embedding container
+        var exportDir = Path.Combine(dir.Path, "exported");
+        using (var container = Vindex3Container.Open(embeddingDir))
+        {
+            ModelExporter.Export(container, exportDir, patch: null);
+        }
+
+        // Config.json is present and is a standard checkpoint
+        var config = JsonDocument.Parse(File.ReadAllBytes(Path.Combine(exportDir, "config.json")));
+        Assert.Equal("qwen3_5_text", config.RootElement.GetProperty("model_type").GetString());
+
+        // Model weights are present
+        using var file = SafetensorsFile.Open(Path.Combine(exportDir, "model.safetensors"));
+        Assert.True(file.Contains("model.embed_tokens.weight"));
+    }
+
+    [Fact]
+    public void ConvertToClassifier_Exports_With_ScoreHead()
+    {
+        using var dir = new TempDir();
+        var containerPath = WriteSynthContainer(dir);
+        var classifierDir = Path.Combine(dir.Path, "classifier");
+
+        ModelConverter.ConvertToClassifier(containerPath, classifierDir, numLabels: 5);
+
+        var exportDir = Path.Combine(dir.Path, "exported");
+        using (var container = Vindex3Container.Open(classifierDir))
+        {
+            ModelExporter.Export(container, exportDir, patch: null);
+        }
+
+        // Config.json has classifier architectures
+        var config = JsonDocument.Parse(File.ReadAllBytes(Path.Combine(exportDir, "config.json")));
+        Assert.Equal("Qwen3_5ForSequenceClassification",
+            config.RootElement.GetProperty("architectures")[0].GetString());
+
+        // Score tensor is exported
+        using var file = SafetensorsFile.Open(Path.Combine(exportDir, "model.safetensors"));
+        Assert.True(file.Contains("model.score.weight"));
     }
 
     private static byte[] ToBf16Bytes(byte[] f32Bytes)

@@ -91,6 +91,8 @@ internal static class Program
                 "prune" => Prune(args[1..]),
                 "fine-tune" => FineTune(args[1..]),
                 "classify" => Classify(args[1..]),
+                "convert-to-classifier" => ConvertToClassifier(args[1..]),
+                "convert-to-embedding" => ConvertToEmbedding(args[1..]),
                 _ => throw new CliException($"unknown command '{args[0]}'"),
             };
         }
@@ -1559,6 +1561,50 @@ internal static class Program
         Console.WriteLine("classify is not yet implemented (Phase B — serve).");
         Console.WriteLine("Classifier containers can be created via 'encode' and exported back via 'export'.");
         Console.WriteLine("Use 'inspect <container> --classifier' to view the classifier surface.");
+        return 0;
+    }
+
+    // ── convert-to-classifier: generative → classifier container ────────
+
+    private static int ConvertToClassifier(string[] args)
+    {
+        var containerDir = Arg(args, 0) ?? throw new CliException(
+            "convert-to-classifier requires a container directory, e.g. 'amql-cli convert-to-classifier <container> --num-labels 3 --out <dir>'");
+        string outDir = OptionValue(args, "--out") ?? throw new CliException("convert-to-classifier requires '--out <dir>'");
+        int numLabels = int.Parse(OptionValue(args, "--num-labels") ?? "2");
+
+        using var container = Vindex3Container.Open(containerDir);
+        var report = ModelConverter.ConvertToClassifier(containerDir, outDir, numLabels);
+
+        Console.WriteLine($"converted: {report.OutDir}");
+        Console.WriteLine($"model:     {report.Model}");
+        Console.WriteLine($"labels:    {numLabels}");
+        foreach (var note in report.Notes)
+        {
+            Console.WriteLine($"note:      {note}");
+        }
+        Console.WriteLine("apply classification training data to the score head, then export:");
+        Console.WriteLine($"  amql-cli export {outDir} --out <checkpoint>");
+        return 0;
+    }
+
+    private static int ConvertToEmbedding(string[] args)
+    {
+        var containerDir = Arg(args, 0) ?? throw new CliException(
+            "convert-to-embedding requires a container directory, e.g. 'amql-cli convert-to-embedding <container> --out <dir>'");
+        string outDir = OptionValue(args, "--out") ?? throw new CliException("convert-to-embedding requires '--out <dir>'");
+
+        using var container = Vindex3Container.Open(containerDir);
+        var report = ModelConverter.ConvertToEmbedding(containerDir, outDir);
+
+        Console.WriteLine($"converted: {report.OutDir}");
+        Console.WriteLine($"model:     {report.Model}");
+        foreach (var note in report.Notes)
+        {
+            Console.WriteLine($"note:      {note}");
+        }
+        Console.WriteLine("the embedding model can be exported back:");
+        Console.WriteLine($"  amql-cli export {outDir} --out <checkpoint>");
         return 0;
     }
 

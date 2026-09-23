@@ -327,4 +327,7 @@ public sealed class ExecutionSurface
 
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public ClassifierSurface? Classifier { get; init; }
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public JsonElement? Embedding { get; init; }
 }
