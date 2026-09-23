@@ -300,6 +300,14 @@ public static class CommandCatalog
             new ParamDef("checkpointDir", "checkpoint dir", ParamKind.Positional, EditorKind.Directory),
             new ParamDef("out", "--out file.gguf", ParamKind.Option, EditorKind.File, Flag: "--out"),
         }),
+        new("export-onnx", CatExport, "Export a container as an ONNX model (.onnx).", new[]
+        {
+            ContainerParam,
+            new ParamDef("out", "--out model.onnx", ParamKind.Option, EditorKind.File, Flag: "--out",
+                Help: "Output .onnx file path."),
+            ComponentParam,
+            PatchParam,
+        }),
 
         // ── 8. Classify ─────────────────────────────────────────────────────
         new("classify", CatPathways, "Run a classifier model (Jev/NLI-style) on premise-hypothesis pairs.", new[]

@@ -3,6 +3,7 @@ using Amql.Gguf;
 using Amql.Hf;
 using Amql.Inference;
 using Amql.Merge;
+using Amql.Onnx;
 using Amql.Safetensors;
 using Amql.Vindex3;
 
@@ -93,6 +94,7 @@ internal static class Program
                 "classify" => Classify(args[1..]),
                 "convert-to-classifier" => ConvertToClassifier(args[1..]),
                 "convert-to-embedding" => ConvertToEmbedding(args[1..]),
+                "export-onnx" => ExportOnnx(args[1..]),
                 _ => throw new CliException($"unknown command '{args[0]}'"),
             };
         }
@@ -1645,6 +1647,27 @@ internal static class Program
         }
         Console.WriteLine("the embedding model can be exported back:");
         Console.WriteLine($"  amql-cli export {outDir} --out <checkpoint>");
+        return 0;
+    }
+
+    // ── export-onnx: container → ONNX model ─────────────────────────────
+
+    private static int ExportOnnx(string[] args)
+    {
+        var containerDir = Arg(args, 0) ?? throw new CliException(
+            "export-onnx requires a container directory, e.g. 'amql-cli export-onnx <container> --out <model.onnx>'");
+        string outPath = OptionValue(args, "--out") ?? throw new CliException("export-onnx requires '--out <model.onnx>'");
+        string component = OptionValue(args, "--component") ?? "target";
+
+        using var container = Vindex3Container.Open(containerDir);
+        var patch = LoadPatch(args, container);
+        var result = OnnxExporter.Export(container, component, outPath, patch);
+
+        Console.WriteLine($"onnx:      {result.Path}");
+        Console.WriteLine($"model:     {result.Model}");
+        Console.WriteLine($"nodes:     {result.NodeCount}");
+        Console.WriteLine($"weights:   {result.InitializerCount}");
+        Console.WriteLine("the ONNX graph uses standard ops only (no custom ops) — compatible with ONNX Runtime 1.21+");
         return 0;
     }
 

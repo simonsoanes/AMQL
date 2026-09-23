@@ -4,6 +4,7 @@ using Amql.Cli;
 using Amql.Hf;
 using Amql.Inference;
 using Amql.Merge;
+using Amql.Onnx;
 using Amql.Safetensors;
 using Amql.Vindex3;
 
@@ -638,6 +639,44 @@ public class ExportTests
         // Score tensor is exported
         using var file = SafetensorsFile.Open(Path.Combine(exportDir, "model.safetensors"));
         Assert.True(file.Contains("model.score.weight"));
+    }
+
+    // ── ONNX export ───────────────────────────────────────────────────────
+
+    [Fact]
+    public void ExportOnnx_GenerativeModel_Produces_Valid_File()
+    {
+        using var dir = new TempDir();
+        var containerPath = WriteSynthContainer(dir);
+        var outPath = Path.Combine(dir.Path, "model.onnx");
+
+        using (var container = Vindex3Container.Open(containerPath))
+        {
+            var result = OnnxExporter.Export(container, "target", outPath);
+            Assert.Equal(outPath, result.Path);
+            Assert.True(result.NodeCount > 0);
+            Assert.True(result.InitializerCount > 0);
+        }
+
+        Assert.True(File.Exists(outPath));
+        Assert.True(new FileInfo(outPath).Length > 100); // at least some bytes
+    }
+
+    [Fact]
+    public void ExportOnnx_ClassifierModel_Produces_Pooling_Graph()
+    {
+        using var dir = new TempDir();
+        var containerPath = WriteSynthContainer(dir);
+        var classifierDir = Path.Combine(dir.Path, "classifier");
+        ModelConverter.ConvertToClassifier(containerPath, classifierDir, numLabels: 3);
+
+        var outPath = Path.Combine(dir.Path, "classifier.onnx");
+        using (var container = Vindex3Container.Open(classifierDir))
+        {
+            var result = OnnxExporter.Export(container, "target", outPath);
+            Assert.True(result.NodeCount > 0);
+        }
+        Assert.True(File.Exists(outPath));
     }
 
     private static byte[] ToBf16Bytes(byte[] f32Bytes)
