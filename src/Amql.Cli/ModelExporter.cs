@@ -134,7 +134,7 @@ public static class ModelExporter
         // Widening and quantisation dominate; each worker reads through its
         // own segment mapping (memory-mapped views are not thread-shared) so
         // only the small payload/name bookkeeping locks.
-        int workers = WorkerCount(Environment.ProcessorCount);
+        int workers = quantizeMxfp4 ? 1 : WorkerCount(Environment.ProcessorCount);
         var lockObj = new object();
         int quantized = 0;
         Parallel.ForEach(work, new ParallelOptions { MaxDegreeOfParallelism = workers }, item =>
@@ -587,6 +587,12 @@ public static class ModelExporter
         var values = WidenedValues(segment, objectId, tensor, patch);
         long rows = tensor.Shape[0];
         long columns = tensor.Shape[1];
+        if (rows * columns != values.Length)
+        {
+            throw new CliException(
+                $"MXFP4 shape mismatch: tensor '{hfName}' shape [{rows},{columns}] = {rows * columns} elements, " +
+                $"but widened values has {values.Length} elements");
+        }
         var quantized = Mxfp4.Quantize(values, rows, columns);
 
         return new[]
@@ -727,6 +733,9 @@ internal static class ExportConfig
                 case LayerOperators.LinearAttention:
                     layerTypes.Add("linear_attention");
                     hasLinearAttention = true;
+                    break;
+                case LayerOperators.Conv:
+                    layerTypes.Add("conv");
                     break;
                 default:
                     throw new CliException(

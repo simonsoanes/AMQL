@@ -26,17 +26,7 @@ jobs:
         shell: cmd
 
       - name: Publish amql-gui (self-contained win-x64)
-        run: >
-          dotnet publish src/Amql.Gui
-          -c Release
-          -f net10.0-windows
-          -r win-x64
-          --self-contained true
-          -p:PublishSingleFile=true
-          -p:IncludeNativeLibrariesForSelfExtract=true
-          -p:DebugType=none
-          -p:DebugSymbols=false
-          --nologo
+        run: dotnet publish src/Amql.Gui -c Release -r win-x64 --self-contained -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:DebugType=none -p:DebugSymbols=false --nologo
         shell: cmd
 
       - name: Collect release files
