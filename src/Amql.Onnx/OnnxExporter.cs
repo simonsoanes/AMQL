@@ -160,9 +160,9 @@ public static class OnnxExporter
             string k = Gemm(N(), normed, kWeight, nodes);
             string v = Gemm(N(), normed, vWeight, nodes);
 
-            // RoPE (simplified: concat cos/sin tables + apply)
-            string ropeOutQ = RotaryEmbedding(N(), q, headDim, "q", nodes, initializers);
-            string ropeOutK = RotaryEmbedding(N(), k, headDim, "k", nodes, initializers);
+            // RoPE (position-dependent rotary embedding via Cos/Sin)
+            string ropeOutQ = RotaryEmbedding(N(), q, headDim, 1_000_000.0, "q", nodes, initializers);
+            string ropeOutK = RotaryEmbedding(N(), k, headDim, 1_000_000.0, "k", nodes, initializers);
 
             // Scaled dot-product attention (simplified single-head view).
             // Full multi-head attention requires reshape/transpose which is
@@ -320,17 +320,295 @@ public static class OnnxExporter
         return name;
     }
 
-    private static string RotaryEmbedding(string name, string x, int headDim, string prefix,
-        List<OnnxNode> nodes, List<OnnxInitializer> initializers)
+    private static string RotaryEmbedding(string name, string x, int headDim, double theta,
+        string prefix, List<OnnxNode> nodes, List<OnnxInitializer> initializers)
     {
-        // Simplified RoPE: assume cos/sin tables are precomputed for
-        // position 0..max_seq. For ONNX, we'd need dynamic position
-        // encoding. For v1, skip RoPE and just passthrough.
-        // Full RoPE requires position-dependent sin/cos tables and
-        // complex-number rotation of pairs of dimensions.
-        // For now: identity passthrough (the model still loads; numerics
-        // differ without RoPE).
-        return x;
+        // Build inv_freq: 1.0 / (theta^(2*i/headDim)) for i = 0..headDim/2-1
+        int halfDim = headDim / 2;
+        var invFreq = new float[halfDim];
+        for (int i = 0; i < halfDim; i++)
+        {
+            invFreq[i] = (float)(1.0 / Math.Pow(theta, 2.0 * i / headDim));
+        }
+        string invFreqName = $"{name}_inv_freq";
+        initializers.Add(new OnnxInitializer
+        {
+            Name = invFreqName, DataType = OnnxTypes.Float,
+            Dims = new long[] { halfDim }, RawData = F32ToRaw(invFreq),
+        });
+
+        // pos = Range(0, seq_len, 1, dtype=float32)
+        string shapeName = $"{name}_shape";
+        nodes.Add(new OnnxNode { OpType = "Shape", Inputs = new[] { x }, Outputs = new[] { shapeName } });
+        string seqLenName = $"{name}_seq";
+        nodes.Add(new OnnxNode
+        {
+            OpType = "Gather",
+            Inputs = new[] { shapeName, $"{name}_seq_idx" },
+            Outputs = new[] { seqLenName },
+            Attributes = { ["axis"] = 0L },
+        });
+        // Gather index = 1 (sequence dim)
+        string seqIdxInit = $"{name}_seq_idx";
+        initializers.Add(new OnnxInitializer
+        {
+            Name = seqIdxInit, DataType = OnnxTypes.Int64,
+            Dims = new long[] { 1 },
+            RawData = BitConverter.GetBytes(1L), // axis 1 = seq dim
+        });
+        if (!BitConverter.IsLittleEndian)
+        {
+            var bytes = (byte[])(Array)initializers[^1].RawData;
+            Array.Reverse(bytes);
+        }
+
+        // Cast seq_len to float (Range output is float if inputs are float, but Gather
+        // output is int64 — need Cast)
+        string seqFloat = $"{name}_seq_f";
+        nodes.Add(new OnnxNode
+        {
+            OpType = "Cast",
+            Inputs = new[] { seqLenName },
+            Outputs = new[] { seqFloat },
+            Attributes = { ["to"] = OnnxTypes.Float },
+        });
+        string zeroPosInit = $"{name}_zero";
+        string oneStepInit = $"{name}_one";
+        initializers.Add(new OnnxInitializer
+        {
+            Name = zeroPosInit, DataType = OnnxTypes.Float,
+            Dims = new long[] { 1 }, RawData = F32ToRaw(new[] { 0f }),
+        });
+        initializers.Add(new OnnxInitializer
+        {
+            Name = oneStepInit, DataType = OnnxTypes.Float,
+            Dims = new long[] { 1 }, RawData = F32ToRaw(new[] { 1f }),
+        });
+        string posFloat = $"{name}_pos_f";
+        nodes.Add(new OnnxNode
+        {
+            OpType = "Range",
+            Inputs = new[] { zeroPosInit, seqFloat, oneStepInit },
+            Outputs = new[] { posFloat },
+        });
+
+        // freqs = pos[:, None] * inv_freq[None, :] → [seq_len, halfDim]
+        string posUnsq = $"{name}_pu";
+        nodes.Add(new OnnxNode
+        {
+            OpType = "Unsqueeze",
+            Inputs = new[] { posFloat },
+            Outputs = new[] { posUnsq },
+            Attributes = { ["axes"] = new[] { 1L } }, // [seq_len, 1]
+        });
+        string freqUnsq = $"{name}_fu";
+        nodes.Add(new OnnxNode
+        {
+            OpType = "Unsqueeze",
+            Inputs = new[] { invFreqName },
+            Outputs = new[] { freqUnsq },
+            Attributes = { ["axes"] = new[] { 0L } }, // [1, halfDim]
+        });
+        string freqsName = $"{name}_fr";
+        nodes.Add(new OnnxNode
+        {
+            OpType = "Mul",
+            Inputs = new[] { posUnsq, freqUnsq },
+            Outputs = new[] { freqsName },
+        });
+
+        // cos = Cos(freqs), sin = Sin(freqs)
+        string cosName = $"{name}_cos";
+        string sinName = $"{name}_sin";
+        nodes.Add(new OnnxNode { OpType = "Cos", Inputs = new[] { freqsName }, Outputs = new[] { cosName } });
+        nodes.Add(new OnnxNode { OpType = "Sin", Inputs = new[] { freqsName }, Outputs = new[] { sinName } });
+
+        // cos2 = Concat([cos, cos], axis=-1) → [seq_len, headDim]
+        string cos2Name = $"{name}_cos2";
+        nodes.Add(new OnnxNode
+        {
+            OpType = "Concat",
+            Inputs = new[] { cosName, cosName },
+            Outputs = new[] { cos2Name },
+            Attributes = { ["axis"] = -1L },
+        });
+        string sin2Name = $"{name}_sin2";
+        nodes.Add(new OnnxNode
+        {
+            OpType = "Concat",
+            Inputs = new[] { sinName, sinName },
+            Outputs = new[] { sin2Name },
+            Attributes = { ["axis"] = -1L },
+        });
+
+        // Broadcast cos/sin for batch dim: unsqueeze at axis 0
+        string cosBName = $"{name}_cos_b";
+        string sinBName = $"{name}_sin_b";
+        nodes.Add(new OnnxNode
+        {
+            OpType = "Unsqueeze",
+            Inputs = new[] { cos2Name },
+            Outputs = new[] { cosBName },
+            Attributes = { ["axes"] = new[] { 0L } },
+        });
+        nodes.Add(new OnnxNode
+        {
+            OpType = "Unsqueeze",
+            Inputs = new[] { sin2Name },
+            Outputs = new[] { sinBName },
+            Attributes = { ["axes"] = new[] { 0L } },
+        });
+
+        // Split x's last dim into two halves (even/odd pairs)
+        // Reshape x from [B, S, D] to [B, S, D/2, 2]
+        string xShapeName = $"{name}_x_shape";
+        nodes.Add(new OnnxNode { OpType = "Shape", Inputs = new[] { x }, Outputs = new[] { xShapeName } });
+        string batchDimName = $"{name}_b";
+        string seqDimName2 = $"{name}_s2";
+        // Gather batch and seq dims
+        string bIdxInit = $"{name}_bi";
+        string sIdxInit = $"{name}_si";
+        initializers.Add(new OnnxInitializer
+        {
+            Name = bIdxInit, DataType = OnnxTypes.Int64, Dims = new long[] { 1 },
+            RawData = BitConverter.GetBytes(0L),
+        });
+        initializers.Add(new OnnxInitializer
+        {
+            Name = sIdxInit, DataType = OnnxTypes.Int64, Dims = new long[] { 1 },
+            RawData = BitConverter.GetBytes(1L),
+        });
+        nodes.Add(new OnnxNode
+        {
+            OpType = "Gather",
+            Inputs = new[] { xShapeName, bIdxInit },
+            Outputs = new[] { batchDimName },
+            Attributes = { ["axis"] = 0L },
+        });
+        nodes.Add(new OnnxNode
+        {
+            OpType = "Gather",
+            Inputs = new[] { xShapeName, sIdxInit },
+            Outputs = new[] { seqDimName2 },
+            Attributes = { ["axis"] = 0L },
+        });
+        // Build reshape target: [batch, seq, halfDim, 2]
+        string halfDimInit = $"{name}_hd";
+        string twoInit = $"{name}_two";
+        initializers.Add(new OnnxInitializer
+        {
+            Name = halfDimInit, DataType = OnnxTypes.Int64, Dims = new long[] { 1 },
+            RawData = BitConverter.GetBytes((long)halfDim),
+        });
+        initializers.Add(new OnnxInitializer
+        {
+            Name = twoInit, DataType = OnnxTypes.Int64, Dims = new long[] { 1 },
+            RawData = BitConverter.GetBytes(2L),
+        });
+        string xReshapeShapeName = $"{name}_rs";
+        nodes.Add(new OnnxNode
+        {
+            OpType = "Concat",
+            Inputs = new[] { batchDimName, seqDimName2, halfDimInit, twoInit },
+            Outputs = new[] { xReshapeShapeName },
+            Attributes = { ["axis"] = 0L },
+        });
+        string xReshapeName = $"{name}_x4";
+        nodes.Add(new OnnxNode
+        {
+            OpType = "Reshape",
+            Inputs = new[] { x, xReshapeShapeName },
+            Outputs = new[] { xReshapeName },
+        });
+
+        // Split into even/odd: Gather index 0 or 1 along the last axis
+
+        string xEvenName2 = $"{name}_e2";
+        string xOddName2 = $"{name}_o2";
+        string evenIdxInit = $"{name}_ei";
+        string oddIdxInit = $"{name}_oi";
+        initializers.Add(new OnnxInitializer
+        {
+            Name = evenIdxInit, DataType = OnnxTypes.Int64, Dims = new long[] { 1 },
+            RawData = BitConverter.GetBytes(0L),
+        });
+        initializers.Add(new OnnxInitializer
+        {
+            Name = oddIdxInit, DataType = OnnxTypes.Int64, Dims = new long[] { 1 },
+            RawData = BitConverter.GetBytes(1L),
+        });
+        nodes.Add(new OnnxNode
+        {
+            OpType = "Gather",
+            Inputs = new[] { xReshapeName, evenIdxInit },
+            Outputs = new[] { xEvenName2 },
+            Attributes = { ["axis"] = 3L },
+        });
+        nodes.Add(new OnnxNode
+        {
+            OpType = "Gather",
+            Inputs = new[] { xReshapeName, oddIdxInit },
+            Outputs = new[] { xOddName2 },
+            Attributes = { ["axis"] = 3L },
+        });
+
+        // Squeeze the last dim (which is size 1 after Gather)
+        string evenSqueezed = $"{name}_es";
+        string oddSqueezed = $"{name}_os";
+        nodes.Add(new OnnxNode
+        {
+            OpType = "Squeeze",
+            Inputs = new[] { xEvenName2 },
+            Outputs = new[] { evenSqueezed },
+            Attributes = { ["axes"] = new[] { 3L } },
+        });
+        nodes.Add(new OnnxNode
+        {
+            OpType = "Squeeze",
+            Inputs = new[] { xOddName2 },
+            Outputs = new[] { oddSqueezed },
+            Attributes = { ["axes"] = new[] { 3L } },
+        });
+
+        // Apply rotation: rot_even = even*cos - odd*sin, rot_odd = odd*cos + even*sin
+        string eCos = $"{name}_ec";
+        string oSin = $"{name}_os2";
+        string oCos = $"{name}_oc";
+        string eSin = $"{name}_es2";
+        nodes.Add(new OnnxNode { OpType = "Mul", Inputs = new[] { evenSqueezed, cosBName }, Outputs = new[] { eCos } });
+        nodes.Add(new OnnxNode { OpType = "Mul", Inputs = new[] { oddSqueezed, sinBName }, Outputs = new[] { oSin } });
+        nodes.Add(new OnnxNode { OpType = "Mul", Inputs = new[] { oddSqueezed, cosBName }, Outputs = new[] { oCos } });
+        nodes.Add(new OnnxNode { OpType = "Mul", Inputs = new[] { evenSqueezed, sinBName }, Outputs = new[] { eSin } });
+
+        string rotEven = $"{name}_re";
+        string rotOdd = $"{name}_ro";
+        nodes.Add(new OnnxNode { OpType = "Sub", Inputs = new[] { eCos, oSin }, Outputs = new[] { rotEven } });
+        nodes.Add(new OnnxNode { OpType = "Add", Inputs = new[] { oCos, eSin }, Outputs = new[] { rotOdd } });
+
+        // Unsqueeze back to [B, S, D/2, 1], then Concat
+        string reU = $"{name}_reu";
+        string roU = $"{name}_rou";
+        nodes.Add(new OnnxNode { OpType = "Unsqueeze", Inputs = new[] { rotEven }, Outputs = new[] { reU }, Attributes = { ["axes"] = new[] { 3L } } });
+        nodes.Add(new OnnxNode { OpType = "Unsqueeze", Inputs = new[] { rotOdd }, Outputs = new[] { roU }, Attributes = { ["axes"] = new[] { 3L } } });
+
+        string rotConcat = $"{name}_rc";
+        nodes.Add(new OnnxNode
+        {
+            OpType = "Concat",
+            Inputs = new[] { reU, roU },
+            Outputs = new[] { rotConcat },
+            Attributes = { ["axis"] = 3L },
+        });
+
+        // Reshape back to [B, S, D] using the original shape
+        nodes.Add(new OnnxNode
+        {
+            OpType = "Reshape",
+            Inputs = new[] { rotConcat, xShapeName },
+            Outputs = new[] { name },
+        });
+
+        return name;
     }
 
     private static string SimpleAttention(string name, string q, string k, string v,
