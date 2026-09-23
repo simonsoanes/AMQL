@@ -58,6 +58,7 @@ public static class ArchMapper
                 {
                     "full_attention" => LayerOperators.Softmax,
                     "linear_attention" => LayerOperators.LinearAttention,
+                    "conv" => LayerOperators.Conv,
                     var other => throw new ModelConfigException(
                         $"layer {l}: layer_type '{other}' has no judged operator mapping"),
                 },

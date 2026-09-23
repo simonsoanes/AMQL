@@ -75,7 +75,7 @@ public class LfmImportTests
         using var container = Vindex3Container.Open(containerDir);
         var surface = container.Graph!.Components[0].Execution!;
         var attnSurface = surface.Attention!;
-        Assert.True(attnSurface.QkNorm);
-        Assert.Equal(32, attnSurface.QkNormDim);
+        Assert.True(attnSurface.QkNormScope == QkNormScope.PerHead);
+        Assert.Equal(SyntheticLfmCheckpoint.HeadDim, attnSurface.HeadDim);
     }
 }

@@ -68,6 +68,7 @@ public static class LayerOperators
     public const string Recurrent = "recurrent";
     public const string Mla = "mla";
     public const string ConvQkvAttention = "conv_qkv_attention";
+    public const string Conv = "conv";
 
     /// <summary>Qwen3.5-style linear attention (conv + recurrent-key
     /// hybrid). Declared by the graph, refused by plan time — an operator
@@ -75,7 +76,7 @@ public static class LayerOperators
     public const string LinearAttention = "linear_attention";
 
     public static readonly IReadOnlyList<string> Known =
-        new[] { Softmax, GatedDelta, Kda, Mamba2, Recurrent, Mla, ConvQkvAttention, LinearAttention };
+        new[] { Softmax, GatedDelta, Kda, Mamba2, Recurrent, Mla, ConvQkvAttention, Conv, LinearAttention };
 
     public static bool IsKnown(string op) => Known.Contains(op);
 }

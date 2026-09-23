@@ -28,6 +28,12 @@ Credit for the design of the VIndex3 goes to Chris Hay.
   - [Flash-Next export](#flash-next-export)
   - [Classifier models](#classifier-models)
   - [Embedding models](#embedding-models)
+  - [Ternary weight export](#ternary-weight-export)
+  - [ONNX export](#onnx-export)
+  - [LFM 2.5 import/export](#lfm-25-importexport)
+  - [Gemma 4 import](#gemma-4-import)
+  - [Model type conversion](#model-type-conversion)
+  - [Creating a new model from scratch](#creating-a-new-model-from-scratch)
 - [Code Examples](#code-examples)
 - [Q&A](#qa)
 - [Research](#research)
@@ -48,10 +54,12 @@ AMQL is structured as seven projects with a CLI front-end and a WPF desktop GUI:
 | `Amql.Cli` | CLI front-end (`amql-cli`) — entry point for encoding, inference, patching, merging, and inspection |
 | `Amql.Gui` | WPF desktop GUI — visual container browser, command launcher, and parameter editor |
 | `Amql.Vindex3` | Core VIndex3 container graph, schema, and token-index management |
-| `Amql.Safetensors` | Safetensors I/O and MXFP4 / NVFP4 quantisation codecs |
+| `Amql.Safetensors` | Safetensors I/O and MXFP4 / NVFP4 / ternary quantisation codecs |
 | `Amql.Inference` | Tensor inference engine, tracing, and LoRA adapter execution |
-| `Amql.Hf` | Hugging Face checkpoint loading and conversion |
-| `Amql.Merge` | Multi-model consensus-gated merging with token alignment and provenance |
+| `Amql.Hf` | Hugging Face checkpoint loading, conversion, and configuration |
+| `Amql.Merge` | Multi-model consensus-gated merging, MoE-ification, fine-tuning, pruning, and model conversion |
+| `Amql.Onnx` | ONNX graph builder — zero-dependency protobuf writer for .onnx export |
+| `Amql.Gguf` | GGUF v3 converter for llama.cpp deployment |
 
 **Dependency flow:** `Amql.Cli` and `Amql.Gui` depend on all others. `Amql.Merge` depends on Safetensors, Vindex3, Hf, and Inference. `Amql.Hf` and `Amql.Inference` both depend on Safetensors and Vindex3.
 
@@ -752,6 +760,105 @@ source bindings to the original `encoder.layers.N.*` tensor names, so export
 rebuilds the checkpoint byte-identically. The pooling surface records the mean-pooling
 recipe; the `embed` serve command (future) will produce L2-normalised vectors
 with task-prefix support.
+
+### Ternary weight export (`--quant ptq1` / `--quant pq2`)
+
+Export projection matrices as ternary {-1, 0, +1} quantised weights (Bonsai-style, PrismML
+interop). Two packing formats are available, both with 128-element blocks and one FP16 scale
+per block, blockwise Hadamard rotation (block 1024) applied before quantisation:
+
+| Flag | Format | Bits/Weight | Packing | 27B size |
+|------|--------|------------|---------|----------|
+| `--quant ptq1` | PTQ1_0 (ggml type 143) | 1.75 | 5 trits/byte (base-3 dense) | ~5.9 GB |
+| `--quant pq2` | PQ2_0 (ggml type 142) | 2.13 | 2 bits/trit (4 per byte) | ~7.2 GB |
+
+```bash
+amql-cli export ./containers/merged --out ./exports/ternary --quant pq2
+```
+
+Each quantised projection becomes two safetensors tensors: the packed data (dtype `FP4`,
+reusing the 2-bit label) and `.scales` (dtype `F16`, one per 128-element block). Embeddings,
+norms, and the output head keep full precision. The checkpoint loads with the PrismML
+llama.cpp fork; stock llama.cpp rejects types 142/143 as unknown.
+
+### ONNX export (`export-onnx`)
+
+Export a container as a standard ONNX model (.onnx) using only built-in ONNX operators —
+no custom ops required. Supports generative (decoder), classifier, and embedding model types:
+
+```bash
+amql-cli export-onnx ./containers/model --out model.onnx
+```
+
+The graph includes full RoPE (position-dependent cos/sin tables built from `Range`/`Cos`/`Sin`),
+RMSNorm from primitive ops (`ReduceMean`/`Sqrt`/`Reciprocal`/`Mul`), SiLU via `Sigmoid`+`Mul`,
+and scaled dot-product attention with mask. Classifier models pool the last non-pad token;
+embedding models mean-pool + L2-normalise. Compatible with ONNX Runtime 1.21+.
+
+### LFM 2.5 import/export
+
+Liquid AI LFM 2.5 checkpoints (`Lfm2ForCausalLM`, model type `lfm2`) can be encoded and
+exported. The hybrid architecture (short-convolution layers interleaved with GQA attention,
+SwiGLU MLP, per-head QK norms) maps to AMQL canonical tensor names automatically:
+
+| LFM Name | Maps To |
+|----------|---------|
+| `operator_norm` | `input_layernorm` |
+| `ffn_norm` | `post_attention_layernorm` |
+| `feed_forward.w1/w2/w3` | `mlp.gate_proj/down_proj/up_proj` |
+| `conv.in_proj/conv/out_proj` | `self_attn.q_proj/conv1d/o_proj` |
+| `self_attn.q/k_layernorm` | per-head QK norms |
+
+```bash
+amql-cli encode ./models/LFM2.5-2.6B --out ./containers/lfm
+amql-cli export ./containers/lfm --out ./exports/lfm
+```
+
+Conv layers carry the `conv` operator in `layer_types`; the ArchMapper judges `conv` →
+`LayerOperators.Conv`. The short-convolution kernel dimension and bias flag are recorded in
+the `Conv1dSurface`. All existing transform commands work on the canonicalised container.
+
+### Gemma 4 import
+
+Google Gemma 4 checkpoints (`Gemma4ForConditionalGeneration`, model type `gemma4_text` in
+`text_config`) are supported. The `gelu_pytorch_tanh` activation is automatically mapped
+to the GELU runtime path:
+
+```bash
+amql-cli encode ./models/gemma-4-2b --out ./containers/gemma4
+amql-cli export ./containers/gemma4 --out ./exports/gemma4
+```
+
+### Model type conversion
+
+Convert a generative (decoder) container into a classifier or embedding container:
+
+```bash
+# Generative → classifier (adds random score head, Xavier-uniform init)
+amql-cli convert-to-classifier ./containers/model --num-labels 3 --out ./containers/classifier
+
+# Generative → embedding (mean-pooling + L2 norm, no new tensors)
+amql-cli convert-to-embedding ./containers/model --out ./containers/embedding
+```
+
+The classifier head weights are a warm start — apply classification training data with
+`fine-tune` afterwards. The embedding model uses the existing decoder stack; pooling is a
+runtime operation applied by the consumer.
+
+### Creating a new model from scratch (`create-model`)
+
+Create a new VINDEX3 container with randomly initialised weights (Xavier-uniform) and a
+user-defined architecture — no checkpoint needed:
+
+```bash
+amql-cli create-model --hidden 768 --layers 12 --heads 12 --kv-heads 2 \
+  --head-dim 64 --intermediate 2048 --vocab 32000 --context 2048 \
+  --layer-types full,linear --out ./containers/new-model
+```
+
+`--layer-types` accepts a comma-separated list or a repeating pattern (e.g. `full,linear`
+repeats every 2 layers). Norm weights initialise to 1.0; the container is immediately
+ready for training with `fine-tune`.
 
 ## Documentation
 
