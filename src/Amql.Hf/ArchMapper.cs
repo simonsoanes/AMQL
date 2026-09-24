@@ -330,7 +330,8 @@ public static class ArchMapper
             Rep("target.decoder_stack", encoding,
                 BindLayers(inventory, prefix)),
             Rep("target.final_norm", encoding,
-                BindOne(inventory, prefix, "norm.weight")),
+                TryBindOne(inventory, prefix, "embedding_norm.weight")
+                ?? BindOne(inventory, prefix, "norm.weight")),
         };
         if (untied)
         {
@@ -512,10 +513,17 @@ public static class ArchMapper
     /// <c>embed_tokens.weight → weight</c>, <c>norm.weight → weight</c>.</summary>
     private static List<NamedTensorData> BindOne(HfInventory inventory, string prefix, string stem)
     {
+        return TryBindOne(inventory, prefix, stem)
+            ?? throw new ModelConfigException($"binding requires '{prefix}.{stem}' but the inventory has no such tensor");
+    }
+
+    /// <summary>Tries one object-relative tensor, returns null if not found.</summary>
+    private static List<NamedTensorData>? TryBindOne(HfInventory inventory, string prefix, string stem)
+    {
         var fullName = $"{prefix}.{stem}";
         if (!inventory.TryGet(fullName, out _))
         {
-            throw new ModelConfigException($"binding requires '{fullName}' but the inventory has no such tensor");
+            return null;
         }
         return new List<NamedTensorData> { ToTensorData(inventory, fullName, "weight") };
     }

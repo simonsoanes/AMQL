@@ -235,7 +235,9 @@ public static class ModelConfig
                 NumLayers: Int(text, "num_hidden_layers"),
                 NumQueryHeads: Int(text, "num_attention_heads"),
                 NumKvHeads: Int(text, "num_key_value_heads", required: false),
-                HeadDim: Int(text, "head_dim"),
+                HeadDim: Int(text, "head_dim", required: false) != 0
+                    ? Int(text, "head_dim", required: false)
+                    : Int(text, "hidden_size") / Int(text, "num_attention_heads"),
                 IntermediateSize: Int(text, "intermediate_size"),
                 HiddenAct: hiddenAct,
                 RmsNormEps: rmsNormEps,
