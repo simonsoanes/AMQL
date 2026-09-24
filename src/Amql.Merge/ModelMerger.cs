@@ -205,7 +205,7 @@ public static class ModelMerger
             {
                 Name = "weight",
                 Dtype = mergedDtype,
-                Shape = new long[] { mapping.Count, width },
+                Shape = new long[] { mergedVocab, width },
                 Chunks = embeddingMerge.Chunks,
             } });
         representations[$"target.embedding@{embeddingEncoding}"] = new RepresentationEntry
@@ -235,7 +235,7 @@ public static class ModelMerger
                 {
                     Name = "weight",
                     Dtype = headDtype.Value,
-                    Shape = new long[] { mapping.Count, width },
+                    Shape = new long[] { mergedVocab, width },
                     Chunks = headChunks!,
                 } });
             representations[$"target.output_head@{headEncoding}"] = new RepresentationEntry
@@ -288,7 +288,7 @@ public static class ModelMerger
             }
         }
 
-        var manifest = BuildManifest(baseView, importedView, mapping, width, mergedDtype, headDtype,
+        var manifest = BuildManifest(baseView, importedView, mapping, mergedVocab, width, mergedDtype, headDtype,
             mergedTied, stack, embeddingAlignment, embeddingMerge, other.Model, preservedSegments);
         File.WriteAllText(Path.Combine(outDir, ManifestName), manifest.ToJsonString(ViJson.Options));
 
@@ -1120,6 +1120,7 @@ public static class ModelMerger
         ModelView baseView,
         ModelView importedView,
         TokenMapping mapping,
+        int mergedVocab,
         int width,
         Dtype mergedDtype,
         Dtype? headDtype,
@@ -1150,13 +1151,15 @@ public static class ModelMerger
             {
                 ["dtype"] = mergedDtype.Label(),
                 ["width"] = width,
-                ["rows"] = mapping.Count,
+                ["rows"] = mergedVocab,
+                ["mapped_tokens"] = mapping.Count,
             },
             ["head"] = new JsonObject
             {
                 ["tied"] = mergedTied,
                 ["dtype"] = headDtype?.Label() ?? mergedDtype.Label(),
-                ["rows"] = mapping.Count,
+                ["rows"] = mergedVocab,
+                ["mapped_tokens"] = mapping.Count,
             },
             ["scaffold"] = new JsonObject
             {

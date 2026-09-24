@@ -548,4 +548,127 @@ public class MergeTests
         var (actualHead, _) = Table(outDir, "target.output_head", 4);
         AssertClose(expectedHead, actualHead, tolerance: 1e-5f);
     }
+
+    // ── special tokens and vocabulary padding ────────────────────────────
+
+    /// <summary>Writes a tokenizer.json whose special tokens live in the
+    /// top-level <c>added_tokens</c> array above <c>model.vocab</c> — the HF
+    /// layout, and the one the merge used to drop.</summary>
+    private static void WriteTokenizerWithSpecials(string containerDir, string[] baseTokens, string[] specials)
+    {
+        var added = specials.Select((content, i) => new
+        {
+            id = baseTokens.Length + i,
+            content,
+            special = true,
+            single_word = false,
+            lstrip = false,
+            rstrip = false,
+            normalized = false,
+        }).ToArray();
+
+        var root = new JsonObject
+        {
+            ["model"] = new JsonObject
+            {
+                ["type"] = "bpe",
+                ["vocab"] = new JsonObject(
+                    baseTokens.Select((t, i) => new KeyValuePair<string, JsonNode?>(t, JsonValue.Create(i))).ToArray()),
+                ["merges"] = new JsonArray(),
+            },
+            ["added_tokens"] = JsonSerializer.SerializeToNode(added)!.AsArray(),
+        };
+        File.WriteAllText(Path.Combine(containerDir, "tokenizer.json"),
+            root.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+    }
+
+    [Fact]
+    public void TokenVocabulary_Includes_Added_Tokens_Above_The_Base_Vocab()
+    {
+        using var dir = new TempDir();
+        var path = Path.Combine(dir.Path, "tokenizer.json");
+        File.WriteAllText(path, """
+        {
+          "model": {
+            "type": "bpe",
+            "vocab": { "a": 0, "b": 1, "c": 2 },
+            "merges": []
+          },
+          "added_tokens": [
+            { "id": 3, "content": "<|fim_prefix|>", "special": true },
+            { "id": 4, "content": "<|fim_middle|>", "special": true },
+            { "id": 5, "content": "<|fim_suffix|>", "special": true }
+          ]
+        }
+        """);
+
+        var vocab = TokenVocabulary.ReadFromFile(path);
+
+        // The special tokens are part of the vocabulary, not a tail to drop.
+        Assert.Equal(6, vocab.Count);
+        Assert.Equal(3, vocab.ByToken["<|fim_prefix|>"]);
+        Assert.Equal(5, vocab.ByToken["<|fim_suffix|>"]);
+        Assert.Equal("<|fim_middle|>", vocab.Ordered[4]);
+    }
+
+    [Fact]
+    public void TokenVocabulary_Rejects_Conflicting_Ids_For_The_Same_Token()
+    {
+        using var dir = new TempDir();
+        var path = Path.Combine(dir.Path, "tokenizer.json");
+        File.WriteAllText(path, """
+        {
+          "model": { "type": "bpe", "vocab": { "a": 0, "dup": 1 }, "merges": [] },
+          "added_tokens": [ { "id": 7, "content": "dup", "special": true } ]
+        }
+        """);
+
+        var ex = Assert.Throws<MergeException>(() => TokenVocabulary.ReadFromFile(path));
+        Assert.Contains("dup", ex.Message);
+    }
+
+    [Fact]
+    public void Import_Preserves_Special_Token_And_Padding_Vocab_Rows()
+    {
+        using var dir = new TempDir();
+        // Embedding has 12 rows; the tokenizer defines 8 base tokens plus 3
+        // specials at ids 8-10, leaving row 11 as published vocab padding.
+        // The merge must not size the output from model.vocab alone.
+        var baseTokens = new[] { "Ġ", "a", "b", "c", "d", "e", "f", "g" };
+        var specials = new[] { "<|fim_prefix|>", "<|fim_middle|>", "<|fim_suffix|>" };
+        var dims = new Dims(Vocab: 12, Hidden: 4, Layers: 2);
+
+        var basePath = BuildContainer(dir, "synth-a", dims, baseTokens);
+        WriteTokenizerWithSpecials(basePath, baseTokens, specials);
+        var importedPath = BuildContainer(dir, "synth-b", dims, baseTokens);
+        WriteTokenizerWithSpecials(importedPath, baseTokens, specials);
+        var outDir = Path.Combine(dir.Path, "merged");
+
+        var report = ModelMerger.Import(basePath, importedPath, outDir, importedIsContainer: true);
+
+        // 11 real tokens (8 base + 3 special), and the table keeps all 12 rows.
+        Assert.Equal(11, report.MergedVocab);
+
+        var (mergedEmbedding, _) = Table(outDir, "target.embedding", 4);
+        Assert.Equal(12 * 4, mergedEmbedding.Length);
+
+        // The trailing padding row is carried across from the scaffold rather
+        // than dropped or zeroed.
+        var (scaffoldEmbedding, _) = Table(basePath, "target.embedding", 4);
+        for (int c = 0; c < 4; c++)
+        {
+            Assert.Equal(scaffoldEmbedding[11 * 4 + c], mergedEmbedding[11 * 4 + c]);
+        }
+
+        // The merged tokenizer still defines the specials at their original
+        // ids (8 base tokens occupy 0-7), and the graph's vocab_size agrees
+        // with the table that was actually written.
+        var mergedTokenizer = TokenVocabulary.ReadFromFile(Path.Combine(outDir, "tokenizer.json"));
+        Assert.Equal(8, mergedTokenizer.ByToken["<|fim_prefix|>"]);
+        Assert.Equal(10, mergedTokenizer.ByToken["<|fim_suffix|>"]);
+
+        using var container = Vindex3Container.Open(outDir);
+        var component = container.Graph!.Components.First(c => c.Role == ComponentRole.PrimaryText);
+        Assert.Equal(12, component.Execution!.Head!.VocabSize);
+    }
 }
