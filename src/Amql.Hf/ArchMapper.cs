@@ -281,6 +281,36 @@ public static class ArchMapper
             });
         }
 
+        // ── multi-modal projector (LFM2.5-VL, Qwen-VL, etc.) ────────────
+        if (options.IncludeVision)
+        {
+            const string projectorPrefix = "model.multi_modal_projector";
+            int projectorTensors = inventory.CountUnder(projectorPrefix + ".");
+            if (projectorTensors > 0)
+            {
+                objects.Add(new LogicalObject
+                {
+                    Id = "vision.projector",
+                    Component = "vision",
+                    Kind = ObjectKind.FeatureProjector,
+                    SourceBindings = new List<SourceBinding>
+                    {
+                        new()
+                        {
+                            Artifact = projectorPrefix,
+                            TensorPrefix = projectorPrefix,
+                            Tensors = projectorTensors,
+                            Bytes = inventory.BytesUnder(projectorPrefix + "."),
+                        },
+                    },
+                    Representations = new List<Representation>
+                    {
+                        new() { Encoding = encoding, Fidelity = Fidelity.Canonical },
+                    },
+                });
+            }
+        }
+
         if (options.IncludeMtp)
         {
             const string mtpPrefix = "mtp";
@@ -356,6 +386,10 @@ public static class ArchMapper
         if (options.IncludeVision && inventory.CountUnder(visionPrefix + ".") > 0)
         {
             reps.Add(Rep("vision.perception_tower", encoding, BindUnder(inventory, visionPrefix + ".")));
+        }
+        if (options.IncludeVision && inventory.CountUnder("model.multi_modal_projector.") > 0)
+        {
+            reps.Add(Rep("vision.projector", encoding, BindUnder(inventory, "model.multi_modal_projector.")));
         }
 
         // Stored-precision policy: the canonical encoding is the stack
