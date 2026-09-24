@@ -85,7 +85,8 @@ public static class Planner
     {
         bool linear = policy.Operator == LayerOperators.LinearAttention;
         bool softmax = policy.Operator == LayerOperators.Softmax;
-        if (!linear && !softmax)
+        bool conv = policy.Operator == LayerOperators.Conv;
+        if (!linear && !softmax && !conv)
         {
             throw new UnsupportedOperatorException(
                 $"layer {layer}: operator '{policy.Operator}' has no managed implementation (required primitive: {policy.Operator})");
@@ -105,8 +106,13 @@ public static class Planner
         }
 
         // ── norm sites + FFN (shared by both operator families) ──────────
-        string preAttnName = $"{layer}.input_layernorm.weight";
-        string postAttnName = $"{layer}.post_attention_layernorm.weight";
+        // Try canonical Qwen names first, then LFM2.5 variants
+        string preAttnName = TryResolve(store, stackId, layer,
+            "input_layernorm.weight", "operator_norm.weight")
+            ?? throw new UnsupportedOperatorException($"layer {layer}: no pre-attention norm found");
+        string postAttnName = TryResolve(store, stackId, layer,
+            "post_attention_layernorm.weight", "ffn_norm.weight")
+            ?? throw new UnsupportedOperatorException($"layer {layer}: no post-attention norm found");
         Require(store, stackId, preAttnName, layer, "pre-attention norm");
 
         NormOp? preAttention = BindNorm(store, stackId, preAttnName, normSurface.Pre, hiddenSize);
@@ -134,6 +140,7 @@ public static class Planner
         {
             Attention = softmax ? BuildSoftmaxAttention(store, stackId, layer, policy, surface, normSurface) : null,
             LinearAttention = linear ? BuildLinearAttention(store, stackId, layer, surface, normSurface, hiddenSize) : null,
+            Conv = conv ? BuildConv(store, stackId, layer, surface, hiddenSize) : null,
             PreAttentionNorm = preAttention,
             PostAttentionNorm = postAttention,
             PreFfnNorm = preFfn,
@@ -174,15 +181,19 @@ public static class Planner
             ParameterFreeQkNormEps = normSurface.Pre.Eps,
             QNorm = BindOptionalQkNorm(store, stackId, layer, "q_norm", attnSurface, normSurface),
             KNorm = BindOptionalQkNorm(store, stackId, layer, "k_norm", attnSurface, normSurface),
-            QProj = new OperandRef(stackId, $"{layer}.self_attn.q_proj.weight"),
-            KProj = new OperandRef(stackId, $"{layer}.self_attn.k_proj.weight"),
-            VProj = new OperandRef(stackId, $"{layer}.self_attn.v_proj.weight"),
-            OProj = new OperandRef(stackId, $"{layer}.self_attn.o_proj.weight"),
+            QProj = new OperandRef(stackId, TryResolve(store, stackId, layer, "self_attn.q_proj.weight") ?? $"{layer}.self_attn.q_proj.weight"),
+            KProj = new OperandRef(stackId, TryResolve(store, stackId, layer, "self_attn.k_proj.weight") ?? $"{layer}.self_attn.k_proj.weight"),
+            VProj = new OperandRef(stackId, TryResolve(store, stackId, layer, "self_attn.v_proj.weight") ?? $"{layer}.self_attn.v_proj.weight"),
+            OProj = new OperandRef(stackId, TryResolve(store, stackId, layer, "self_attn.o_proj.weight", "self_attn.out_proj.weight") ?? $"{layer}.self_attn.o_proj.weight"),
         };
-        Require(store, stackId, $"{layer}.self_attn.q_proj.weight", layer, "attention (q_proj)");
-        Require(store, stackId, $"{layer}.self_attn.k_proj.weight", layer, "attention (k_proj)");
-        Require(store, stackId, $"{layer}.self_attn.v_proj.weight", layer, "attention (v_proj)");
-        Require(store, stackId, $"{layer}.self_attn.o_proj.weight", layer, "attention (o_proj)");
+        string qName = TryResolve(store, stackId, layer, "self_attn.q_proj.weight") ?? $"{layer}.self_attn.q_proj.weight";
+        string kName = TryResolve(store, stackId, layer, "self_attn.k_proj.weight") ?? $"{layer}.self_attn.k_proj.weight";
+        string vName = TryResolve(store, stackId, layer, "self_attn.v_proj.weight") ?? $"{layer}.self_attn.v_proj.weight";
+        string oName = TryResolve(store, stackId, layer, "self_attn.o_proj.weight", "self_attn.out_proj.weight") ?? $"{layer}.self_attn.o_proj.weight";
+        Require(store, stackId, qName, layer, "attention (q_proj)");
+        Require(store, stackId, kName, layer, "attention (k_proj)");
+        Require(store, stackId, vName, layer, "attention (v_proj)");
+        Require(store, stackId, oName, layer, "attention (o_proj)");
         return op;
     }
 
@@ -280,6 +291,50 @@ public static class Planner
                 : null;
     }
 
+    private static ConvOp BuildConv(
+        OperandStore store, string stackId, int layer,
+        ExecutionSurface surface, int hiddenSize)
+    {
+        // LFM2.5 uses conv_kernel=4 (short causal convolution)
+        int convKernel = 4;
+
+        // LFM2.5 conv tensor names: conv.in_proj, conv.conv, conv.out_proj
+        string inProjName = $"{layer}.conv.in_proj.weight";
+        string convWeightName = $"{layer}.conv.conv.weight";
+        string convBiasName = $"{layer}.conv.conv.bias";
+        string outProjName = $"{layer}.conv.out_proj.weight";
+
+        Require(store, stackId, inProjName, layer, "conv in_proj");
+        Require(store, stackId, convWeightName, layer, "conv weight");
+        Require(store, stackId, outProjName, layer, "conv out_proj");
+
+        // Conv bias is optional — try to resolve, null if missing
+        OperandRef? convBias = null;
+        try
+        {
+            store.Resolve(stackId, convBiasName);
+            convBias = new OperandRef(stackId, convBiasName);
+        }
+        catch
+        {
+            // Bias not present — that's OK
+        }
+
+        // Conv dim = hidden size (depthwise conv preserves dimensionality)
+        int convDim = hiddenSize;
+
+        return new ConvOp
+        {
+            InProj = new OperandRef(stackId, inProjName),
+            ConvWeight = new OperandRef(stackId, convWeightName),
+            ConvBias = convBias,
+            OutProj = new OperandRef(stackId, outProjName),
+            ConvDim = convDim,
+            KernelSize = convKernel,
+            HiddenSize = hiddenSize,
+        };
+    }
+
     private static LayerFfn? BuildFfn(OperandStore store, string stackId, int layer, FfnSurface ffnSurface, int hiddenSize)
     {
         if (ffnSurface.Moe is { } moe)
@@ -308,19 +363,26 @@ public static class Planner
         }
 
         bool gated = ffnSurface.FfnType == FfnType.Gated;
-        if (gated)
-        {
-            Require(store, stackId, $"{layer}.mlp.gate_proj.weight", layer, "ffn gate");
-        }
-        Require(store, stackId, $"{layer}.mlp.up_proj.weight", layer, "ffn up");
-        Require(store, stackId, $"{layer}.mlp.down_proj.weight", layer, "ffn down");
+        // Try canonical Qwen names first, then LFM2.5 variants
+        string gateName = gated
+            ? TryResolve(store, stackId, layer, "mlp.gate_proj.weight", "feed_forward.w1.weight")
+                ?? throw new UnsupportedOperatorException($"layer {layer}: no FFN gate found")
+            : null!;
+        string upName = TryResolve(store, stackId, layer, "mlp.up_proj.weight", "feed_forward.w3.weight")
+            ?? throw new UnsupportedOperatorException($"layer {layer}: no FFN up found");
+        string downName = TryResolve(store, stackId, layer, "mlp.down_proj.weight", "feed_forward.w2.weight")
+            ?? throw new UnsupportedOperatorException($"layer {layer}: no FFN down found");
+
+        if (gated) Require(store, stackId, gateName, layer, "ffn gate");
+        Require(store, stackId, upName, layer, "ffn up");
+        Require(store, stackId, downName, layer, "ffn down");
         return new LayerFfn
         {
             Dense = new DenseFfnOp
             {
-                Gate = gated ? new OperandRef(stackId, $"{layer}.mlp.gate_proj.weight") : null,
-                Up = new OperandRef(stackId, $"{layer}.mlp.up_proj.weight"),
-                Down = new OperandRef(stackId, $"{layer}.mlp.down_proj.weight"),
+                Gate = gated ? new OperandRef(stackId, gateName) : null,
+                Up = new OperandRef(stackId, upName),
+                Down = new OperandRef(stackId, downName),
                 Activation = ffnSurface.Activation,
                 IntermediateSize = ffnSurface.IntermediateSize,
                 HiddenSize = hiddenSize,
@@ -395,5 +457,21 @@ public static class Planner
                 $"operand closure: {layerLabel}surface implies '{objectId}/{tensorName}' ({what}) " +
                 "but the segment carries no such tensor");
         }
+    }
+
+    /// <summary>Tries multiple tensor name spellings and returns the first
+    /// that resolves. Used for cross-family compatibility (e.g., Qwen's
+    /// input_layernorm vs LFM2.5's operator_norm).</summary>
+    private static string? TryResolve(OperandStore store, string objectId, int layer, params string[] candidates)
+    {
+        foreach (var suffix in candidates)
+        {
+            string fullName = $"{layer}.{suffix}";
+            if (store.ContainsTensor(objectId, fullName))
+            {
+                return fullName;
+            }
+        }
+        return null;
     }
 }

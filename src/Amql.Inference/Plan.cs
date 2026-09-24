@@ -159,6 +159,24 @@ public sealed class LinearAttentionOp
     public int ConvDim => 2 * KeyDim + ValueDim;
 }
 
+/// <summary>
+/// LFM2.5-style short-convolution block: a depthwise causal conv1d with
+/// SiLU gating, flanked by input/output projections. The conv state is a
+/// sliding window of the last (kernel-1) inputs — stateful like linear
+/// attention, but simpler (no recurrence, no gating network).
+/// </summary>
+public sealed class ConvOp
+{
+    public required OperandRef InProj { get; init; }
+    public required OperandRef ConvWeight { get; init; }
+    public required OperandRef? ConvBias { get; init; }
+    public required OperandRef OutProj { get; init; }
+
+    public required int ConvDim { get; init; }
+    public required int KernelSize { get; init; }
+    public required int HiddenSize { get; init; }
+}
+
 public sealed class LayerPlan
 {
     /// <summary>The softmax attention op (present on full-attention
@@ -167,6 +185,9 @@ public sealed class LayerPlan
 
     /// <summary>The linear-attention op (present on linear layers).</summary>
     public LinearAttentionOp? LinearAttention { get; init; }
+
+    /// <summary>The short-convolution op (present on LFM2.5 conv layers).</summary>
+    public ConvOp? Conv { get; init; }
 
     /// <summary>Norm sites; which of these are bound follows the
     /// placement evidence: PreOnly = pre-attn + pre-ffn (the reference's
@@ -181,7 +202,7 @@ public sealed class LayerPlan
 
     /// <summary>Whether this layer carries a stateful operator (its states
     /// must advance position by position — prefill cannot batch rows).</summary>
-    public bool IsStateful => LinearAttention is not null;
+    public bool IsStateful => LinearAttention is not null || Conv is not null;
 }
 
 public sealed class OutputOp
