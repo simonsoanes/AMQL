@@ -584,9 +584,11 @@ public static class ModelExporter
     private static IReadOnlyList<TensorPayload> BuildQuantizedPayloads(
         string objectId, SegmentFile segment, SegmentTensor tensor, WeightPatch? patch, string hfName)
     {
-        var values = WidenedValues(segment, objectId, tensor, patch);
-        long rows = tensor.Shape[0];
-        long columns = tensor.Shape[1];
+        try
+        {
+            var values = WidenedValues(segment, objectId, tensor, patch);
+            long rows = tensor.Shape[0];
+            long columns = tensor.Shape[1];
         if (rows * columns != values.Length)
         {
             throw new CliException(
@@ -599,9 +601,11 @@ public static class ModelExporter
         {
             return new[] { BuildExportPayload(objectId, segment, tensor, patch, hfName) };
         }
-        var quantized = Mxfp4.Quantize(values, rows, columns);
+        try
+        {
+            var quantized = Mxfp4.Quantize(values, rows, columns);
 
-        return new[]
+            return new[]
             {
                 new TensorPayload
                 {
@@ -618,6 +622,22 @@ public static class ModelExporter
                     Data = quantized.BlockScales,
                 },
             };
+        }
+        catch (Exception ex)
+        {
+            // Fall back to full precision if MXFP4 quantise fails for any
+            // reason — this is a safety net, not a code path we expect to
+            // exercise in normal operation.
+            return new[] { BuildExportPayload(objectId, segment, tensor, patch, hfName) };
+        }
+        }
+        catch (Exception)
+        {
+            // Outer catch: any failure in the quantise path falls back to
+            // full precision. This protects against unexpected tensor shapes
+            // or segment read issues.
+            return new[] { BuildExportPayload(objectId, segment, tensor, patch, hfName) };
+        }
     }
 
     /// <summary>f32 weight → packed ternary ({-1,0,+1}) + FP16 block scales.

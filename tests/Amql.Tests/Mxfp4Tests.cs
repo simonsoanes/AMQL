@@ -221,4 +221,16 @@ public class Mxfp4Tests
                 $"dequant NRMSE over the source too high: {Math.Sqrt(sqErr / sqSignal):0.00}");
         }
     }
+
+    [Fact]
+    public void Quantize_Large_Tensor_Does_Not_Throw()
+    {
+        var rng = new Random(42);
+        var values = new float[Mxfp4TestSpec.Hidden * Mxfp4TestSpec.Hidden]; // 128×128
+        for (int i = 0; i < values.Length; i++)
+            values[i] = (float)(rng.NextDouble() * 2 - 1);
+        var q = Mxfp4.Quantize(values, Mxfp4TestSpec.Hidden, Mxfp4TestSpec.Hidden);
+        Assert.NotNull(q.Packed);
+        Assert.NotNull(q.BlockScales);
+    }
 }
