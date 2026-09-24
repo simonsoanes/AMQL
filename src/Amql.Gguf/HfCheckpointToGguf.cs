@@ -321,7 +321,10 @@ public static class GgufConverter
                 ? $"linear-attention V heads reordered grouped → tiled ({linearValueHeads} value / {linearKeyHeads} key heads) per llama.cpp's Qwen3.5 convention" : "",
             qwen35 ? "Qwen3-Next value transforms applied: A_log = -exp(A_log), norms +1, conv1d squeezed" : "",
             "MTP drafter (mtp.safetensors + mtp.config.json) stays a separate companion shard — not embedded",
-            "weights written as F16 (BF16 sources; lossless in the normal range); F32 routers kept",
+            quantization == "q4_0"
+                ? "Q4_0 quantization applied to 2-D weight matrices; norms, embeddings, output head, " +
+                  "MoE routers and stacked 3-D expert tensors kept full precision"
+                : "weights written as F16 (BF16 sources; lossless in the normal range); F32 routers kept",
         };
 
         return new GgufConversion
@@ -489,15 +492,19 @@ public static class GgufConverter
     }
 
     /// <summary>Determines if a tensor should be quantized to Q4_0.
-    /// Norms, embeddings, output heads, and small tensors stay full precision.</summary>
+    /// Norms, embeddings, output heads, MoE routers, and small tensors stay
+    /// full precision — matching llama.cpp's own quantize skip list, since
+    /// 4-bit routers measurably degrade expert selection.</summary>
     private static bool ShouldQuantize(PlanEntry entry)
     {
         if (entry.Source is null) return false;
         var name = entry.Source.Info.Name;
         var shape = entry.Source.Info.Shape;
 
-        // Skip norms, embeddings, and output heads
-        if (name.Contains("norm") || name.Contains("embed") || name.Contains("lm_head"))
+        // Skip norms, embeddings, output heads and MoE routers. The router
+        // reaches GGUF as ffn_gate_inp but its source name carries "router".
+        if (name.Contains("norm") || name.Contains("embed") || name.Contains("lm_head")
+            || name.Contains("router"))
             return false;
 
         // Skip small tensors (< 256 elements)
@@ -505,7 +512,7 @@ public static class GgufConverter
         foreach (var dim in shape) totalElements *= dim;
         if (totalElements < 256) return false;
 
-        // Skip non-2D tensors (conv weights, etc.)
+        // Skip non-2D tensors (conv weights, stacked MoE experts, etc.)
         if (shape.Length != 2) return false;
 
         // Skip transforms that need F32
