@@ -231,9 +231,17 @@ public static class ArchMapper
             },
         };
 
+        // ── vision tower prefix detection ────────────────────────────────────
+        // Qwen uses "model.visual.", LFM2.5-VL (SigLIP2) uses
+        // "model.vision_tower.vision_model.". Detect which exists.
+        string visionPrefix = inventory.CountUnder("model.visual.") > 0
+            ? "model.visual"
+            : inventory.CountUnder("model.vision_tower.vision_model.") > 0
+                ? "model.vision_tower.vision_model"
+                : "model.visual"; // fallback
+
         if (options.IncludeVision)
         {
-            const string visionPrefix = "model.visual";
             int visionTensors = inventory.CountUnder(visionPrefix + ".");
             bool visionMaterialised = visionTensors > 0;
             objects.Add(new LogicalObject
@@ -345,9 +353,9 @@ public static class ArchMapper
         {
             reps.Add(Rep("mtp.stack", encoding, BindUnder(inventory, "mtp.")));
         }
-        if (options.IncludeVision && inventory.CountUnder("model.visual.") > 0)
+        if (options.IncludeVision && inventory.CountUnder(visionPrefix + ".") > 0)
         {
-            reps.Add(Rep("vision.perception_tower", encoding, BindUnder(inventory, "model.visual.")));
+            reps.Add(Rep("vision.perception_tower", encoding, BindUnder(inventory, visionPrefix + ".")));
         }
 
         // Stored-precision policy: the canonical encoding is the stack
