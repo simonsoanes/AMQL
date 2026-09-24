@@ -68,7 +68,9 @@ public static class Mxfp4
                 byte scaleByte = peak == 0 ? (byte)0 : BitPattern.EncodeF8E8M0((float)(peak / Fp4MaxValue));
                 scales[row * blocksPerRow + b] = scaleByte;
                 float scale = BitPattern.DecodeF8E8M0(scaleByte);
-                bool zero = scale <= 0;
+                // E8M0 can't represent true zero; 0x00 → 2⁻¹²⁷ ≈ 5.88e-39.
+                // Guard against both true-zero blocks and empty trailing blocks.
+                bool zero = scale < 1e-12f || elementsInBlock == 0;
 
                 for (long k = 0; k < elementsInBlock; k++)
                 {

@@ -593,25 +593,34 @@ public static class ModelExporter
                 $"MXFP4 shape mismatch: tensor '{hfName}' shape [{rows},{columns}] = {rows * columns} elements, " +
                 $"but widened values has {values.Length} elements");
         }
-        var quantized = Mxfp4.Quantize(values, rows, columns);
-
-        return new[]
+        try
         {
-            new TensorPayload
+            Console.WriteLine($"MXFP4: {hfName} [{rows}×{columns}]");
+            var quantized = Mxfp4.Quantize(values, rows, columns);
+
+            return new[]
             {
-                Name = hfName,
-                Dtype = Dtype.FP4,
-                Shape = tensor.Shape,
-                Data = quantized.Packed,
-            },
-            new TensorPayload
-            {
-                Name = hfName + Mxfp4.ScaleSuffix,
-                Dtype = Dtype.F8_E8M0,
-                Shape = new[] { rows, Mxfp4.BlocksPerRow(columns) },
-                Data = quantized.BlockScales,
-            },
-        };
+                new TensorPayload
+                {
+                    Name = hfName,
+                    Dtype = Dtype.FP4,
+                    Shape = tensor.Shape,
+                    Data = quantized.Packed,
+                },
+                new TensorPayload
+                {
+                    Name = hfName + Mxfp4.ScaleSuffix,
+                    Dtype = Dtype.F8_E8M0,
+                    Shape = new[] { rows, Mxfp4.BlocksPerRow(columns) },
+                    Data = quantized.BlockScales,
+                },
+            };
+        }
+        catch (Exception ex)
+        {
+            throw new CliException(
+                $"MXFP4 quantize failed for tensor '{hfName}' [{rows}×{columns}]: {ex.Message}");
+        }
     }
 
     /// <summary>f32 weight → packed ternary ({-1,0,+1}) + FP16 block scales.

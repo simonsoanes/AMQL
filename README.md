@@ -1,872 +1,223 @@
-# AMQL - C# implementation of VIndex3 (Larql)
+# AMQL — VIndex3 Model Container & Graph Database
 
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![.NET 10.0](https://img.shields.io/badge/.NET-10.0-purple.svg)](https://dotnet.microsoft.com/download/dotnet)
 [![Research — Pre 1.0](https://img.shields.io/badge/status-research%20%7C%20pre--1.0-orange.svg)
 
-This was a port of the VIndex3 implementation, along with support for generating it from a model (Qwen 3.5-3.8 primarily) and then allowing model independent inference, token relationship route following and exploration of the model internals in order to do some research into direct model manipulation and patching, with live LORA adapters in custom inferencing.
+AMQL turns LLMs into a queryable graph database — encode a checkpoint into a VINDEX3
+container, then probe token relationships, trace causal pathways, edit weights, generate
+LoRA adapters, merge models, prune layers, and export back to a standard checkpoint.
+Built in C# against .NET 10.0 with an optional CUDA backend and a WPF desktop GUI.
 
-This implementation supports model merging (using reinforcement blending to avoid training time but get the same resultant effect as if the training sets of the two models had been combined and run), supervised fine-tuning via output-head adaptation, and custom tensor editing features for another project.
+Credit for the VIndex3 design: [Chris Hay](https://github.com/chrishay).
 
-Credit for the design of the VIndex3 goes to Chris Hay.
+## What is this for?
 
+AMQL is the model-introspection engine behind a continuous-cognition platform. It exposes
+the internal structure of a language model as a **graph** so you can query how tokens
+relate, find the edges that carry one concept into another, and then **edit those edges**
+— by patching weights, generating a LoRA adapter, or rewriting the base model.
 
-## Table of Contents
+At the token level you can remove false associations or add new ones in a familiar form
+(e.g. "PlaceA is the capital of PlaceB"). At the next layer of abstraction you can adjust
+relationships that haven't been described linguistically but are inferred — hallucinations,
+incorrect tool selection, biases introduced during post-training.
 
-- [What is this for?](#what-is-this-for)
-- [Architecture](#architecture)
-- [Prerequisites](#prerequisites)
-- [Project Structure](#project-structure)
-- [Usage](#usage)
-  - [Quick start](#quick-start)
-  - [Encoding and verifying](#encoding-and-verifying)
-  - [LoRA patching and exporting](#lora-patching-and-exporting)
-  - [Model merging](#model-merging)
-  - [Pruning and MoE](#pruning-and-moe)
-  - [Inspection](#inspection)
-  - [Fine-tuning](#fine-tuning)
-  - [Flash-Next export](#flash-next-export)
-  - [Classifier models](#classifier-models)
-  - [Embedding models](#embedding-models)
-  - [Ternary weight export](#ternary-weight-export)
-  - [ONNX export](#onnx-export)
-  - [LFM 2.5 import/export](#lfm-25-importexport)
-  - [Gemma 4 import](#gemma-4-import)
-  - [Model type conversion](#model-type-conversion)
-  - [Creating a new model from scratch](#creating-a-new-model-from-scratch)
-- [Code Examples](#code-examples)
-- [Q&A](#qa)
-- [Research](#research)
-- [Contributing](#contributing)
-- [Documentation](#documentation)
+Blending models via consensus-gated token alignment adds solution-space vectors from one
+model into another. Combined with automated self-learning, this extends a model's
+understanding beyond what fine-tuning alone can achieve — because fine-tuning is inherently
+gated at human-level textual representations. Generating genuinely novel solution vectors
+is a separate challenge, but AMQL lets you apply them once they exist.
 
-## Prerequisites
+## Quick Start
 
-- [.NET 10.0 SDK](https://dotnet.microsoft.com/download/dotnet/10.0) (latest LTS)
-- Git
+```bash
+# Create a tiny demo model, encode it, and generate a few tokens
+amql-cli synth-model demo-model
+amql-cli encode demo-model --out demo-container
+amql-cli generate demo-container --prompt "The capital of France is" --tokenizer demo-model
+
+# Probe a token relationship
+amql-cli route demo-container France Paris --tokenizer demo-model --top 5
+```
+
+**Prerequisites:** [.NET 10.0 SDK](https://dotnet.microsoft.com/download/dotnet/10.0) and Git.
 
 ## Architecture
 
-AMQL is structured as seven projects with a CLI front-end and a WPF desktop GUI:
+AMQL is nine projects with a CLI front-end and a WPF desktop GUI:
 
 | Project | Purpose |
 |---------|---------|
-| `Amql.Cli` | CLI front-end (`amql-cli`) — entry point for encoding, inference, patching, merging, and inspection |
-| `Amql.Gui` | WPF desktop GUI — visual container browser, command launcher, and parameter editor |
-| `Amql.Vindex3` | Core VIndex3 container graph, schema, and token-index management |
-| `Amql.Safetensors` | Safetensors I/O and MXFP4 / NVFP4 / ternary quantisation codecs |
-| `Amql.Inference` | Tensor inference engine, tracing, and LoRA adapter execution |
-| `Amql.Hf` | Hugging Face checkpoint loading, conversion, and configuration |
-| `Amql.Merge` | Multi-model consensus-gated merging, MoE-ification, fine-tuning, pruning, and model conversion |
-| `Amql.Onnx` | ONNX graph builder — zero-dependency protobuf writer for .onnx export |
+| `Amql.Cli` | CLI (`amql-cli`) — encode, infer, patch, merge, inspect |
+| `Amql.Gui` | WPF GUI — container browser, command launcher, parameter editor, tensor explorer |
+| `Amql.Vindex3` | Container graph, schema, token-index management |
+| `Amql.Safetensors` | Safetensors I/O, MXFP4, ternary, and NVFP4 codecs |
+| `Amql.Inference` | Inference engine, tracing, LoRA adapter execution |
+| `Amql.Hf` | HuggingFace checkpoint loading, config parsing, architecture mapping |
+| `Amql.Merge` | Model merging, MoE-ification, fine-tuning, pruning, model conversion |
+| `Amql.Onnx` | ONNX graph builder — zero-dependency protobuf writer |
 | `Amql.Gguf` | GGUF v3 converter for llama.cpp deployment |
-
-**Dependency flow:** `Amql.Cli` and `Amql.Gui` depend on all others. `Amql.Merge` depends on Safetensors, Vindex3, Hf, and Inference. `Amql.Hf` and `Amql.Inference` both depend on Safetensors and Vindex3.
-
-## Project Structure
 
 ```
 AMQL/
 ├── src/
-│   ├── Amql.Cli/        # CLI front-end (amql-cli)
-│   ├── Amql.Gui/         # WPF desktop GUI
-│   ├── Amql.Safetensors/ # Safetensors I/O & MXFP4 codec
-│   ├── Amql.Vindex3/     # VIndex3 container graph & schema
-│   ├── Amql.Inference/   # Tensor inference engine & tracing
-│   ├── Amql.Hf/          # Hugging Face checkpoint integration
-│   └── Amql.Merge/       # Model merging (token alignment, provenance)
-├── native/
-│   └── amql_cuda/        # CUDA backend (GEMM, dequant, elementwise)
-├── tests/
-│   └── Amql.Tests/       # Unit & integration tests
-├── scripts/
-│   └── publish-exe.cmd   # Windows standalone publish script
-├── README.md
-├── CONTRIBUTING.md
-├── CHANGELOG.md
-└── LICENSE
-```
-## What is this for?
-
-While building a continuous cognition platform, I ran into the problem that all current LLMs have flaws and no way to self-improve. This project is intended to support AI self-improvement and the libraries are used by my orchestrator platform.
-
-It lets you turn a model into a graph database, then query the relationships between tokens (or their text representations). Once the edges in the graph have been identified, it becomes possible to generate a specific LoRA adapter that adjusts that behaviour in the model (or rewrites the base model), effectively editing its input and output knowledge.
-
-At the current level, it's possible to remove the concept of something being associated in a particular way, or to add a new association between two items in a familiar form (PlaceA is the capital of PlaceB) - useful for correcting flaws in the embedding layer. It's also possible to correct a relationship between two things where a relationship exists but is of the wrong type.
-
-At the next layer of abstraction, it's also possible to adjust relationships that humanity hasn't yet described linguistically but normally infers a connection between. This is especially useful when combined with positive and negative reinforcement derived from internal traces taken during a model's inference stage. The intent is to correct things ranging from hallucinations (where the relationship is a 'user satisfaction' signal added during post-training) to incorrect tool selection when operating agentically.
-
-By blending models we're able to increase the token-space and apply the other models problem space vector into an existing model - this allows adding concepts and solution space vectors.
-
-Combined with an automatic self-learning process, this should extend a model's understanding and intelligence beyond currently trainable human textual representations, in cases where a known construct would be better applied. That's an outcome fine-tuning alone can't achieve, since it can only generate more intelligent outcomes by relying on scenarios that are inherently gated at human-level intellect.
-
-Generating genuinely novel solution vectors for a problem space is a separate challenge requiring its own approach, but this project does allow alternate solution vectors to be applied once they've been identified and the merging of solution vectors and knowledge between models.
-
-## Usage
-
-`amql-cli` is the loader/inference front-end: it turns a raw HF checkpoint into a canonical VINDEX3 container, then lets you run and inspect inference against it.
-
-```
-amql-cli encode <model-dir> --out <container-dir>   map + materialise
-amql-cli verify <container-dir>                     integrity + readiness
-amql-cli synth-model <dir>                          write an executable demo checkpoint
-amql-cli tokens --tokenizer <checkpoint-dir> "text"
-amql-cli decode --tokenizer <checkpoint-dir> <id,id,…>
-amql-cli route <container-dir> <A> <B> --tokenizer <checkpoint-dir>
-                [--top 5] [--templates 8] [--trace-layer-start 8]
-                [--trace-layer-end 24] [--no-trace] [--corrupt the]
-                [--patch <patch.safetensors>]
-amql-cli path <container-dir> <A> <B>
-                [--topk 6] [--max-nodes 48] [--max-depth 6]
-                [--patch <patch.safetensors>]
-amql-cli generate <container-dir>
-                --prompt "text" --tokenizer <checkpoint-dir>
-                [--steps 8] [--temperature 0] [--top-k 0] [--top-p 0]
-                [--seed 42] [--logits K] [--component target]
-                [--patch <patch.safetensors>]
-amql-cli inspect-token <container-dir> <token>
-                [--tokens ctx,ids] [--neighbors 5] [--logits K]
-                [--tokenizer <checkpoint-dir>] [--component target]
-                [--patch <patch.safetensors>]
-amql-cli change-tensor <container-dir> <object> <tensor> <cell>
-                (--set V | --add V | --scale F | --zero)
-                --out <patch.safetensors>
-amql-cli save-lora <patch.safetensors> --out <lora-dir>
-                [--rank 8] [--alpha 16] [--container <container-dir>]
-amql-cli export <container-dir> --out <checkpoint-dir>
-                [--patch <patch.safetensors>] [--quant mxfp4]
-                [--arch qwen4-next]
-amql-cli layers <container-dir> [--component target]
-amql-cli import <container-dir> <model> --out <merged-dir>
-                [--container]
-amql-cli moe-ify <container-dir> --out <moe-dir> --text <corpus.txt>
-                [--experts 8] [--top-k 2] [--sample 4096] [--eval 1024]
-amql-cli prune <container-dir> --out <pruned-dir> --target-bytes <size>
-                [--approach provenance|corpus|random] [--seed 42]
-                [--text <corpus.txt>] [--sample 8192] [--min-layers 1]
-amql-cli fine-tune <container-dir> --data <pairs.tsv>
-                --out <patch.safetensors>
-                [--tokenizer <checkpoint-dir>] [--component target]
-                [--lr 1e-4] [--epochs 1]
-amql-cli generate-mtp <container-dir> --out <out>
-                --text <corpus.txt> [--sample 4096] [--eval 1024]
-                [--clusters K | --sweep K1,K2,K3] [--ridge 1e-4]
-amql-cli help
+│   ├── Amql.Cli/        Amql.Gui/       Amql.Safetensors/
+│   ├── Amql.Vindex3/    Amql.Inference/ Amql.Hf/
+│   ├── Amql.Merge/      Amql.Onnx/      Amql.Gguf/
+├── native/amql_cuda/    # CUDA backend (GEMM, dequant, elementwise)
+├── tests/Amql.Tests/    # ~200 unit & integration tests
+└── docs/                # Design docs and architecture reference
 ```
 
-Two kinds of directory are involved: the **container** (`<container-dir>`, encode output, weights only) and the **checkpoint** (`--tokenizer`, the original HF model directory whose `tokenizer.json` converts text to ids; `--model-dir` is an accepted alias). `--tokenizer` is optional once the container was encoded with a `tokenizer.json` beside it (encode copies it in).
-
-### Quick start
-
-```bash
-amql-cli synth-model demo-model
-amql-cli encode demo-model --out demo-container
-amql-cli generate demo-container --prompt "hi" --tokenizer demo-model
-amql-cli route demo-container France Paris --tokenizer demo-model --top 5
-```
-
-### Encoding and verifying a real checkpoint
-
-```bash
-amql-cli encode ./Qwen3.5-0.8B --out ./containers/Qwen3.5-0.8B
-amql-cli verify ./containers/Qwen3.5-0.8B
-```
-
-`verify` re-derives every hash from disk alone, resolves real operand tensors through the container, prints the operator census (which layer operators are present), and reports whether the primary text component plans and executes — refusing by name for anything the runtime doesn't yet serve.
-
-### Tokenizing text
-
-```bash
-amql-cli tokens --tokenizer ./Qwen3.5-0.8B "The capital of France is"
-amql-cli decode --tokenizer ./Qwen3.5-0.8B 9419,11
-```
-
-### Generating text
-
-```bash
-amql-cli generate ./containers/Qwen3.5-0.8B --prompt "The capital of France is" \
-  --tokenizer ./Qwen3.5-0.8B --steps 8 --logits 5
-```
-
-### Memory-efficient working sets and optional CUDA acceleration
-
-The runtime widens stored BF16 weights to f32, so a large model's working
-set doubles its payload (~94 GiB for the full 27B — enough to thrash a
-127 GiB machine). Three weight working-set modes are available, chosen by
-`AMQL_WEIGHTS` and inherited automatically by every runtime consumer
-(generate, route, path, moe-ify sampling, MTP collection, prune corpus
-scoring):
-
-| `AMQL_WEIGHTS` | What stays resident | Numerics vs f32 |
-|---|---|---|
-| `f32` (default) | every tensor widened to f32 | byte-exact reference |
-| `bf16` | stack projections as stored bytes, widened into a bounded LRU on access | bit-exact (~2× smaller) |
-| `mxfp4` | stack projections as MXFP4 packs (~13% of f32), dequantised into the LRU | deterministic, tolerance-gated (~4× smaller) |
-
-Embeddings, the output head, norms and `A_log` stay f32-resident in every
-mode (precision-sensitive, small by comparison). The LRU cap is
-`AMQL_F32_CACHE_GB` (default a quarter of the memory budget); the memory
-and core budgets themselves are `AMQL_MEMORY_GB` and `AMQL_CORES`.
-
-With an NVIDIA GPU and the native backend built
-(`native\amql_cuda\build-cuda.cmd` — nvcc + MSVC, targeting
-5090/Blackwell `sm_120`), set `AMQL_GPU=1` together with
-`AMQL_WEIGHTS=mxfp4`: the MXFP4 packs are
-dequantised once to FP16 on the device (lossless) and the GEMMs run on
-FP16 tensor cores with FP32 accumulate. Large-projection GEMMs route per
-call; small ops and any failure fall back to the managed path, so the GPU
-is never a correctness dependency. See `docs/CUDA_PLAN.md` for the fuller
-roadmap (elementwise/attention/gated-delta kernels on device, KV on
-device, streams/overlap).
-
-### Probing token relationships (`route`)
-
-`route` names the relationship between two tokens using template probing, reports the (layer, head, position) attention coordinates carrying one token into the other's prediction, and — via causal tracing — the per-layer weights naming exactly which residual tensors to patch or LoRA to change that propensity:
-
-```bash
-amql-cli route ./containers/Qwen3.5-0.8B France Paris --tokenizer ./Qwen3.5-0.8B --top 5
-```
-
-Illustrative output (actual scores/coordinates depend on the checkpoint):
+## CLI Reference
 
 ```
-container: ./containers/Qwen3.5-0.8B (weights)   tokenizer: ./Qwen3.5-0.8B (checkpoint)
-
-France -> capital-of (0.83 @ 14,3,5,2) -> Paris
-     causal weights (patch targets), P(Paris) clean=0.831 corrupt=0.041:
-       L14:  Δ 0.2140 (25.8% of effect)
-       L11:  Δ 0.1385 (16.7% of effect)
-
-scores = P(B) after template(A); coords = (layer, head, queryPos, keyPos) of the final-row attention onto A;
-causal Δ = P(B) restored by reinstating that layer's clean residual (corrupt → clean) — the tensors to patch/LoRA.
+amql-cli encode <model-dir> --out <container-dir>
+amql-cli verify <container-dir>
+amql-cli generate <container> --prompt "text" --tokenizer <dir> [--steps N] [--patch <file>]
+                     [--trace] [--trace-tensors] [--weights f32|bf16|mxfp4]
+amql-cli route <container> <A> <B> --tokenizer <dir> [--top N] [--patch <file>]
+amql-cli path <container> <A> <B> [--topk N] [--max-nodes N]
+amql-cli inspect-token <container> <token> [--neighbors N] [--tokenizer <dir>]
+amql-cli change-tensor <container> <object> <tensor> <cell> (--set V|--add V) --out <patch>
+amql-cli save-lora <patch> --out <dir> [--rank 8] [--alpha 16]
+amql-cli export <container> --out <dir> [--patch <file>] [--quant mxfp4|ptq1|pq2] [--arch qwen4-next]
+amql-cli import <container> <model> --out <dir> [--container]
+amql-cli merge <containerA> <containerB> --out <dir>
+amql-cli moe-ify <container> --out <dir> --text <corpus> [--experts 8] [--top-k 2]
+amql-cli prune <container> --out <dir> --target-bytes <size> [--approach provenance|corpus|random]
+amql-cli fine-tune <container> --data <pairs.tsv> --out <patch> [--lr 1e-4]
+amql-cli create-model --hidden 768 --layers 12 --vocab 32000 --out <dir>
+amql-cli convert-to-classifier <container> --num-labels N --out <dir>
+amql-cli convert-to-embedding <container> --out <dir>
+amql-cli export-onnx <container> --out <model.onnx>
+amql-cli classify <container> --premise "A" --hypothesis "B"
+amql-cli layers <container>
+amql-cli to-gguf <checkpoint-dir> --out <file.gguf>
+amql-cli export --list-architectures
 ```
 
-### Finding the token-continuation path between two tokens (`path`)
+Two directory types appear throughout: **containers** (`<container-dir>`, encode output,
+weights only) and **checkpoints** (`--tokenizer`, the original HF model directory whose
+`tokenizer.json` converts text to ids).
 
-Where `route` names the relationship, `path` shows the model's own route between two tokens without naming it — bidirectional best-first search over the next-token continuation graph:
-
-```bash
-amql-cli path ./containers/Qwen3.5-0.8B France Paris --tokenizer ./Qwen3.5-0.8B
-```
-
-Illustrative output (actual chain/costs depend on the checkpoint):
-
-```
-container: ./containers/Qwen3.5-0.8B (weights)   tokenizer: ./Qwen3.5-0.8B (checkpoint)
-searching from 'France' (id 9419) toward 'Paris' (id 12958) — edges = top-6 continuations (cost −log P) …
-
-    9419  France                   start
-    ...
-     603  is                       +1.42
-   12958  Paris                    +0.61
-
-meeting point: 'Paris' — fwd 3.11, bwd 0.61
-total cost 3.72 · 9 model forwards · 22 nodes
-path = token chain only (no relation names); costs are −log P of each continuation edge.
-```
-
-### Inspecting a token in vocabulary space
-
-```bash
-amql-cli inspect-token ./containers/Qwen3.5-0.8B 12958 --tokenizer ./Qwen3.5-0.8B \
-  --tokens 9419,318 --logits 5
-```
-
-Reports the token's embedding profile (row, min/max/mean, L2 norm) and nearest neighbours by cosine similarity; with `--tokens` and an executable component, it also reports the model's logit and rank for that token at the end of the given context.
-
-### Editing a weight by hand and creating a patch (`change-tensor`)
-
-A patch is a set of **weight deltas** (patched value − original, stored as f32 in a safetensors file). `change-tensor` reads a weight from the container, applies a single-cell edit, and records the delta into a patch file — the container itself is never rewritten, so `verify` integrity and the original model stay untouched. The cell is `row,col` for a 2-D tensor (a projection matrix) or a flat index for a 1-D vector (a norm scale). `--add` and `--scale` apply against base + existing delta, so repeated calls compose into the same patch; an edit that lands back on the base value removes its entry.
-
-```bash
-# a tiny container is the friendliest scratchpad
-amql-cli synth-model demo-model
-amql-cli encode demo-model --out demo-container
-
-# set the embedding cell (token 3, dim 1) to 2.5, then bump another cell
-amql-cli change-tensor demo-container target.embedding weight 3,1 --set 2.5 --out patches/demo.safetensors
-amql-cli change-tensor demo-container target.embedding weight 2,0 --add 0.5 --out patches/demo.safetensors
-```
-
-```
-'target.embedding/weight' [12x4] F32 [3,1] 0.1 → 2.5 (Δ 2.4)
-patch: patches/demo.safetensors (1 tensor)
-```
-
-On a real checkpoint, target the tensors `route` names as patch targets (the causal Δ layers), e.g. a projection in the decoder stack:
-
-```bash
-amql-cli change-tensor ./containers/Qwen3.5-0.8B target.decoder_stack 14.self_attn.q_proj.weight 100,50 \
-  --add 0.01 --out patches/capital.safetensors
-```
-
-### Running a pathway with a patch
-
-Every model pathway accepts `--patch <patch.safetensors>`. The deltas are merged into each weight as the runtime loads it, so `route`, `path`, `generate` and `inspect-token` all observe the patched model (the embedding table shows up in `inspect-token` too). `decode` and `tokens` accept and validate the file but cannot be affected — they never load weights.
-
-```bash
-amql-cli generate ./containers/Qwen3.5-0.8B --prompt "The capital of France is" \
-  --tokenizer ./Qwen3.5-0.8B --patch patches/capital.safetensors --logits 5
-
-amql-cli route ./containers/Qwen3.5-0.8B France Paris \
-  --tokenizer ./Qwen3.5-0.8B --patch patches/capital.safetensors --top 5
-
-amql-cli path ./containers/Qwen3.5-0.8B France Paris \
-  --tokenizer ./Qwen3.5-0.8B --patch patches/capital.safetensors
-
-amql-cli inspect-token ./containers/Qwen3.5-0.8B 9419 \
-  --tokenizer ./Qwen3.5-0.8B --patch patches/capital.safetensors --neighbors 5
-```
-
-A patched `route` run prints the same template-scored links and causal weights as the clean run, but measured on the patched weights — the scores shift where the patch touches the mechanism.
-
-### Saving a patch as a LoRA adapter (`save-lora`)
-
-`save-lora` factors a patch's 2-D deltas into a LoRA adapter **for the original model**: each delta becomes a pair of low-rank matrices (`lora_A` r×in, `lora_B` out×r) via a truncated SVD, with the standard `alpha / r` scaling. Applying `scale · lora_B · lora_A` to the base weights reproduces the patch — exactly, when the delta's rank does not exceed `r`. 1-D deltas (norm scales) are not linear-layer LoRA targets and are skipped with a note. The adapter directory is ready for a future live-adapter runtime: `adapter_model.safetensors` plus `adapter_config.json`, whose `targets` array maps tensor names to the `lora_A.N`/`lora_B.N` pairs and records each target's rank and reconstruction error.
-
-```bash
-amql-cli save-lora patches/capital.safetensors --out lora/capital \
-  --rank 8 --alpha 16 --container ./containers/Qwen3.5-0.8B
-```
-
-```
-LoRA: lora/capital   rank 8 (scale alpha/r = 16/8 = 2)   model Qwen3.5-0.8B
-  target.decoder_stack/14.self_attn.q_proj.weight [2048x2048] → r=8  lora_A.0 lora_B.0  (reconstruction error 1.2e-06)
-apply to the base container: for each target, add scale · lora_B · lora_A to the tensor.
-```
-
-`--container` is optional; when given, the patch is shape-validated against the container's tensors before factoring.
-
-### Exporting the container back to an original model (`export`)
-
-`export` is the inverse of `encode`: it materialises a plain HF checkpoint directory (`config.json` + `model.safetensors` + `tokenizer.json`) from the container, so the model leaves the VINDEX3 world as an ordinary model again. HF tensor names are rebuilt from the graph's source bindings; `config.json` is regenerated from the judged graph facts (operator table, surface geometry, rope/position, vocabulary), and any `--patch` deltas are **baked into the stored tensors** — widened to f32, the delta added, then re-encoded to the tensor's own dtype (BF16/F32/…). Tensors a patch never touches are copied byte-identically, so an unpatched export is byte-exact; an operator without a judged `layer_types` spelling refuses the export by name rather than being approximated, and the tied output head is skipped with a note (it reuses the embedding table). Pass `--quant mxfp4` to export the
-model as a 4-bit quantized checkpoint instead — see the "Exporting a quantized checkpoint"
-section below. Pass `--arch qwen4-next` to target the Qwen3.8-Flash-Next architecture
-(qwen4_exp config, HC placeholder tensors) — see "Flash-Next export" below.
-
-```bash
-# bake every delta in patches/capital.safetensors into the weights
-amql-cli export ./containers/Qwen3.5-0.8B --out ./models/Qwen3.5-0.8B \
-  --patch patches/capital.safetensors
-
-# the exported directory is a normal checkpoint — re-encode to round trip
-amql-cli encode ./models/Qwen3.5-0.8B --out ./containers/Qwen3.5-0.8B-rebuilt
-```
-
-```
-exported:  models/Qwen3.5-0.8B
-model:      Qwen3.5-0.8B
-tensors:    685  (1.39 GiB)
-note:       object 'target.output_head': carried only (no materialised tensors) — skipped
-wrote:      model.safetensors, config.json, tokenizer.json
-```
-
-### Describing the layers (`layers`)
-
-`layers` lists every component of the container, then — for the selected one (`--component`, default `target`) — the per-layer attention policy table (operator, span/window, position policy, head geometry) from the graph's authority table, the per-layer tensor inventory (name, stored dtype, shape) from the decoder-stack segment, and whether the planner serves the stack or refuses it by name:
-
-```bash
-amql-cli layers ./containers/Qwen3.5-0.8B
-```
-
-```
-container: containers/Qwen3.5-0.8B   model 'Qwen3.5-0.8B' (qwen3_5_text)
-
-component 'target' role=PrimaryText source=model layers=28 hidden=2048
-  attention:  linear_attention × 4, softmax × 24
-...
-  layers:
-    L 0: linear_attention  full      position none (NoPE)  heads 4×128
-    L 1: softmax           full      position partial rope θ=10000 f=0.25  heads 16×128
-    ...
-  tensors of 'target.decoder_stack':
-    L 0: linear_attn.in_proj_qkv.weight BF16 [1024x2048]; linear_attn.in_proj_z.weight BF16 [512x2048]; ...
-    L 1: self_attn.q_proj.weight BF16 [2048x2048]; self_attn.k_proj.weight BF16 [512x2048]; ...
-  runtime: [refused] layer 0: linear_attention has no judged runtime — the planner refuses it by name
-```
-
-### Exporting a quantized checkpoint (`--quant mxfp4`)
-
-`export --quant mxfp4` produces an MXFP4 checkpoint (the OCP microscaling standard):
-the stack's projection matrices (`q_proj`/`k_proj`/`v_proj`/`o_proj`/`gate_proj`/
-`up_proj`/`down_proj`/linear-attention projections) are quantised to FP4 E2M1 elements
-packed two per byte, with one FP8-E8M0 scale (a pure shared exponent) per 32-element
-block — FP4 codes at a quarter of the BF16 size plus negligible E8M0 scales, so each
-projection lands at roughly a quarter of its BF16 payload. Embeddings, norms, biases,
-the log-space `A_log` tensors and the output head keep their full precision, per the
-standard practice.
-
-```bash
-amql-cli export ./containers/merged --out ./models/merged-mxfp4 --quant mxfp4
-```
-
-```
-tensors:    505  (1.36 GiB)
-note:       186 stack projection tensors exported as MXFP4 (FP4 E2M1 grid elements, per-32-element F8_E8M0 scales) — embeddings, norms, biases and the output head keep their full precision
-wrote:      model.safetensors, config.json, tokenizer.json  (quantization: mxfp4)
-```
-
-Each quantised weight becomes two safetensors tensors: `...weight` (dtype `FP4`, logical
-shape, two elements per byte) and `...weight_scale` (dtype `F8_E8M0`, one per
-32-element block, laid out per row). Dequantisation is `x ≈ DecodeFp4(q) × DecodeE8M0(scale)`,
-and the element grid `{0, 0.5, 1, 1.5, 2, 3, 4, 6}` is serialised into `config.json`
-(`quantization_config.quant_method: "mxfp4"`) so the exact scheme is self-describing.
-The quantised checkpoint is a terminal artifact for this build (the encoder reads
-full-precision dtypes); the `Mxfp4` codec in `Amql.Safetensors` is the reference
-implementation for any consumer runtime.
-
-### Merging a second model into the container (`import`)
-
-`import` merges another model into an existing container: both models end up in one VIndex3, and `export` materialises the result as a single checkpoint. It does this through three pieces:
-
-- **The tokenization mapping layer.** The two tokenizers' vocabularies are related by token string (ids are opaque; identical strings are the only relationship this build judges). The merged vocabulary keeps the base model's ids stable and appends the imported-only tokens with fresh ids.
-- **Anchored alignment of the token interface.** The embedding (and the output head, when untied) grow to the union vocabulary, and every row is built **in the scaffold model's space** (the model whose stack actually runs — the larger shape). A ridge least-squares map is fitted from the *other* model's space into the scaffold's on the shared-token anchors. Shared tokens then pass a **consensus gate** — the per-token cosine between the scaffold's row and the other model's aligned row: where the two models **agree**, the rows are blended and the result **restored to the scaffold's full energy** (consensus is reinforced, not averaged away); where they **disagree**, the scaffold's own row is kept verbatim instead of fabricating a direction neither model holds. Other-model-only tokens are mapped through the fit; scaffold-only tokens stay verbatim. Every merged row is re-encoded to the merged storage dtype (F32/BF16/F16).
-- **Shape evolution of the stack.** The model with the larger shape (hidden size, then layers) scaffolds the result — its intermediate tensors are copied byte-identically, since differently-shaped stacks cannot be averaged. A tensor kind the scaffold lacks (e.g. `q_norm`) is grown in from the other model, zero-padded. **Per-layer provenance** records the source and operation of every tensor.
-
-`token-map.json` in the merged container is the relationship tracker: every token's kind (`blended` / `aligned_new` / `base_only`) and both source ids, the anchor count, alignment residual and per-token consensus statistics (mean agreement, share above the gate), the per-layer provenance table, and the scaffold. The replaced (non-scaffold) stack is preserved under `segments/source/` so both models' data live in the same container. The union tokenizer replaces the base's, so every command that reads the vocabulary keeps working unchanged.
-
-```bash
-# import a bigger/hybrid model into the existing 0.8B container
-amql-cli import ./containers/Qwen3.5-0.8B ./models/Qwen3.6-2B \
-  --out ./containers/Qwen3.5-0.8B-x-Qwen3.6-2B
-
-# ...or when the second model is already a container
-amql-cli import ./containers/Qwen3.5-0.8B ./containers/other \
-  --out ./containers/merged --container
-
-# layers shows the merged provenance; export gives the plain checkpoint
-amql-cli layers ./containers/merged
-amql-cli export ./containers/merged --out ./models/merged
-```
-
-```
-imported:   Qwen3.5-2B into Qwen3.5-0.8B
-result:     Qwen3.5-0.8B+Qwen3.5-2B
-scaffold:   Qwen3.5-2B  (hidden 2048, layers 24)
-vocab:      248044 + 248044 → 248044 (248044 blended, 0 aligned-new, 0 base-only)
-storage:    BF16 × 2048, head tied
-preserved:  3 segments of the replaced stack under segments/source/
-note:       base embedding 1024→2048: rows zero-extended to the merged width
-note:       alignment: 248044 shared-token anchors, residual L² 402.1
-wrote:      index.json, system_graph.json, token-map.json, tokenizer.json, segments/
-the merged container tracks every token relationship in token-map.json and exports as one model:
-  amql-cli export ./containers/merged --out <checkpoint-dir>
-```
-
-Both Qwen3.5 sizes ship the same 248,044-token vocabulary, so an 0.8B→2B merge is all-blended; merging a model family with a *different* tokenizer produces `aligned_new` rows for its extra tokens and `base_only` rows for the base's, with the new ids appended after the base vocabulary.
-
-### Restructuring a dense model into a routed MoE (`moe-ify`)
-
-`moe-ify` turns a dense transformer container into a mixture of experts in the MoEfication
-lineage — no training, quality gated by perplexity:
-
-```bash
-amql-cli moe-ify ./containers/Qwen3.8-27B --out ./containers/Qwen3.8-27B-moe \
-  --text ./corpus/wikipedia.txt --experts 8 --top-k 2 --sample 4096 --eval 1024
-```
-
-It samples FFN inputs through the model (a runtime activation seam), clusters each layer's
-intermediate units by co-activation into `--experts` **balanced** groups (k-means, cosine),
-slices the gate/up rows and down columns into per-expert tensors, and materialises a linear
-per-layer router (each expert's row is its cluster's mean gate direction — the affinity
-`x · routerᵀ` the routed kernel scores). The container is rebuilt with
-`mlp.router.weight` + `mlp.experts.{e}.{gate,up,down}_proj.weight` per layer, so the
-planner judges every FFN routed off-the-shelf and the existing top-k expert kernel runs it
-— no new runtime. Each expert's tensors are its own segment, so experts are separable for
-offload or distributed placement, and `export` (including `--quant mxfp4`) works unchanged.
-
-The held-out perplexity gate prints `dense → moe`. Measured on the 2-layer demo container
-(top-1, 2 experts): `dense 49.96 → moе 49.88 (−0.2%)`. The 27B is the real measurement —
-expect a larger PPL cost at sparsity, and the per-expert slices are a natural starting point
-for MoE-adaptation fine-tuning.
-
-```
-moе-ified:  demo-model-moe2x1
-routing:    2 experts × top-1 (expert intermediate 4) over 2 layers
-note:       sampled 6 tokens; 2 layers clustered into 2 balanced experts of 4 units
-note:       perplexity over 4 held-out tokens: dense 49.96 → moе 49.88 (-0.2%)
-wrote:      index.json, system_graph.json, segments/, tokenizer.json
-```
-
-### Pruning a container down to a byte budget (`prune`)
-
-`prune` shrinks a container to a target total on-disk size by dropping **whole decoder
-layers** — the only dimension a merge actually grows that can be removed without touching
-the vocabulary. The vocabulary (embedding/head), the tokenizer, the token-map, and every
-non-layer file are copied byte-identically; the stack segment is rebuilt without the
-dropped layers, the kept layers are renumbered 0..K−1, and the graph, index and token-map
-layer table are rewritten to match. The result is a **complete, mergeable container**: the
-planner runs it, `export` materialises it, and `import` accepts it as either side of a
-merge — which is what makes the prune→merge loop below work.
-
-```bash
-# drop as many layers as needed to get the whole container under 14.5 GiB
-amql-cli prune ./containers/merged --out ./containers/merged-pruned --target-bytes 14.5GiB
-
-# corpus-ranked: keep the layers whose removal changes the hidden state least
-amql-cli prune ./containers/merged --out ./containers/merged-pruned \
-  --target-bytes 14.5GiB --approach corpus --text ./corpus/wikipedia.txt
-
-# seeded random baseline for ablations
-amql-cli prune ./containers/merged --out ./containers/merged-pruned \
-  --target-bytes 14.5GiB --approach random --seed 7
-```
-
-`--target-bytes` accepts bare bytes or `B`/`KB`/`MB`/`GB`/`TB`, `KiB`/`MiB`/`GiB`/`TiB`
-suffixes (case-insensitive; `--target` is an accepted alias). The three approaches rank
-which layers drop first, and the prune takes the **smallest prefix of that order** that
-gets under the budget (never below `--min-layers`, default 1):
-
-- **`provenance`** (default, deterministic, no corpus) — reads `token-map.json`'s
-  per-layer provenance: layers whose tensors were *grown* (zero-padded from the other
-  model during the merge) drop first as the least authentic, then by position — the top of
-  the stack goes before the input-proximal layers. Without a token-map every layer ties
-  and the ranking is purely positional.
-- **`corpus`** — one forward pass over `--text` (needs a BPE tokenizer beside the
-  container, which `encode` copies in) scores each layer's residual delta
-  ‖h(l+1) − h(l)‖², mean over positions and tokens; the layers that change the hidden
-  state least drop first. One-shot: scores come from the full stack, they are not
-  re-measured after each drop.
-- **`random`** — a seeded uniform layer order (`--seed`, default 42) as the ablation
-  baseline.
-
-Selection and the commit are exact: each candidate's rebuilt stack segment and JSON files
-are sized before anything is written, the exact total is re-verified before the copies
-land, and a target below the `--min-layers` floor refuses with the floor size rather than
-shipping an over-budget container. The dropped layers are recorded in the index
-(`prune.dropped_layers`), and an MTP drafter carried by the container is not a blocker —
-its plain note records that its trunk (a copied layer) is now stale.
-
-```
-pruned:    ./containers/merged-pruned
-model:     Qwen3.5-0.8B+Qwen3.5-2B
-approach:  provenance     seed: 42
-layers:    24 → 14  (dropped 10: 14,15,16,17,18,19,20,21,22,23)
-bytes:     20.10 GiB → 13.20 GiB  (target 14.00 GiB, saved 6.90 GiB)
-note:      an MTP drafter is present and its trunk is now stale …
-the pruned container is a complete model — verify, export and import it as usual:
-  amql-cli verify ./containers/merged-pruned
-  amql-cli import ./containers/merged-pruned <smaller-model> --out <result>
-```
-
-The workflow this enables: merge two large models, prune the result to a target size, then
-merge a smaller model into the pruned container — the prune output participates in `import`
-as any complete container, so the chain closes on a fresh, verifiable merge.
-
-### The MTP drafter and vision tower on export
-
-The encoder **materialises the carried modules** whenever the source checkpoint holds
-them: the `mtp.` tensors (fc projector, pre-fc norms, the single trunk layer, the pre-head
-norm) land in a segment under `mtp.stack`, and the `model.visual.*` tower under
-`vision.perception_tower`. The container becomes self-contained for the whole model;
-without the source tensors the objects stay carried, per the "leave it" rule.
-
-`export` then produces the complete artifact set:
-
-- **`model.safetensors`** — the text model **and** the vision tower (it is part of the
-  model), under `model.visual.*`, with `vision_config` carrying the tower's judged facts.
-- **`mtp.safetensors` + `mtp.config.json`** — the MTP drafter, exported **automatically
-  alongside** when materialised: the module under its original `mtp.` names composed with
-  the shared embedding and head (`mtp_use_dedicated_embeddings: false`), a standalone
-  checkpoint for speculative decoding. `export-mtp` emits it alone into its own directory.
-
-```
-tensors:    1184  (50.96 GiB)       note:       17 mtp drafter tensors exported alongside as mtp.safetensors (5.9 GiB)
-wrote:      model.safetensors, config.json, mtp.safetensors, mtp.config.json, tokenizer.json
-```
-
-### Generating an MTP drafter for a model without one (`generate-mtp`)
-
-Models that ship no MTP (e.g. Qwen3.5-0.8B) can get one **generated entirely from their
-own weights** — the bootstrapping init the MTP line uses, no training:
-
-```bash
-amql-cli generate-mtp ./containers/Qwen3.5-0.8B --out ./containers/Qwen3.5-0.8B-mtp \
-  --text ./corpus/wikipedia.txt --sample 1024
-```
-
-- the **trunk layer** is a verbatim copy of the model's **last full-attention layer**
-  (the MTP trunk is always a softmax layer), self-attn + MLP + both norms;
-- the **two `pre_fc_norm_*` norms and the drafter's `norm.weight`** copy the model's
-  final norm;
-- the **`fc` projector [2h → h]** boots deterministically as the mean-combination
-  `0.5·(norm(h_t) + norm(e_{t+1}))`;
-- the head and the conditioning embedding are the model's **shared tables**
-  (`mtp_use_dedicated_embeddings: false`).
-
-The module materialises as `mtp.stack` in a new container, so `export` emits
-`mtp.safetensors` + `mtp.config.json` automatically. The **zero-shot draft-acceptance
-gate** runs the drafter's real pipeline — pre-fc norms, projector, one trunk attention+FFN
-pass, shared head — against the model's hidden states over `--sample` corpus tokens and
-reports the share of positions where the drafter's top-1 second-next-token draft matches
-the model, honestly labelled as a warm start: trained adapters (frozen model) are the
-next step.
-
-```
-generated:  Qwen3.5-0.8B + MTP drafter
-trunk:      a copy of full-attention layer 23 (15 module tensors)
-note:       zero-shot draft acceptance over 794 positions: 0.3% — the bootstrapped
-            drafter is a warm start; training (frozen model) is the next step
-```
-
-(Measured on the real Qwen3.5-0.8B. A 0.3% draft acceptance is above the random baseline
-but far below a useful speculative drafter — the untrained boot is a
-structure-and-warm-start deliverable, and the frozen-model adaptation pass is the
-follow-up that turns it into a real drafter.)
-
-### The calculated fit — "pre-trained" by calculation, no training
-
-The follow-up replaces "training (frozen model)" with **calculation**: one forward pass
-collects the model's own continuation map, and a **closed-form ridge least-squares solve**
-fits the drafter's free block — no autograd, no SGD, no random seeds in the learning path
-(same inputs → byte-identical weights; verified by a determinism test). Three commands
-run it, or `generate-mtp --fit` runs the whole pipeline in one shot:
-
-```bash
-amql-cli generate-mtp ./containers/Qwen3.5-0.8B --out ./containers/Qwen3.5-0.8B-mtp \
-  --text ./corpus/wikipedia.txt --sample 4096 --fit --eval 1024
-```
-
-1. **`collect-mtp` (phase 0)** — one dense forward over the corpus exports the pairs
-   `x_t = concat(pre_fc_norm_hidden(final_norm(h_t)), pre_fc_norm_embedding(e_{t+1}))`
-   (2h) and the regression target `y_t` = the model's **pre-final-norm residual at t+1**
-   (h), with the **fit/gate split fixed in the sink** — the acceptance gate is never
-   measured on fitted positions.
-2. **`fit-mtp` (phase 1)** — the single ridge projector `W* = (XᵀX+λI)⁻¹XᵀY`
-   (`λ` relative `1e-4`), written back into `mtp.stack` as `fc.weight`, re-encoded to the
-   segment dtype.
-3. **`fit-mtp --sweep 1,4,8` (phase 2)** — the **K-projector mixture**: the fit rows are
-   clustered into K balanced groups (deterministic farthest-first k-means), one ridge
-   projector is fit per cluster, and a linear router (L2-normalised cluster-mean rows, the
-   moe-ify convention) picks the expert per row. The free block materialises as
-   `fc.router.weight` + `fc.experts.{{e}}.weight` — the export and the acceptance gate
-   resolve the routed structure by name, so it survives export → re-encode. The held-out
-   acceptance gate decides the shipped K.
-
-**Measured on the real Qwen3.5-0.8B** (512 fit + 256 held-out positions, split fixed in
-the collector; the gate runs the drafter's real pipeline): boot 0.0% → fitted **14.8%**
-(K=1) → **16.4%** (K=4) → **16.8%** (K=8, shipped — the gate's winner). R² over the fit
-split is ≈1.0 (the system is under-determined at 512 rows < 2h dims — the held-out gate,
-not R², is the evidence of generalisation; K=1's in-memory 14.8% reproduces the
-materialised container's number exactly). The demo model tie-breaks to fewer clusters
-(1), so ties at equal acceptance prefer the smaller K. `verify` passes on the fitted
-container and `export` emits the drafter companion automatically.
-
-```
-fit:        K ∈ {1, 4, 8}: K=1 R² 1.000 acc 14.8%; K=4 R² 0.917 acc 16.4%; K=8 R² 0.941 acc 16.8%
-note:       shipped K=8 (the acceptance gate's winner; ties prefer fewer clusters); weights 3e30e9c8…
-note:       held-out draft acceptance over 256 positions: boot 0.0% → fitted 16.8%
-```
-
-### Supervised fine-tuning (`fine-tune`)
-
-`fine-tune` performs supervised adaptation via **teacher-forced output-head
-adjustment** — no autograd, no gradient infrastructure, fully deterministic (same
-inputs → byte-identical patch). The command reads prompt/completion pairs from a
-TSV file, runs the model forward on each prompt, teacher-forces the completion
-tokens, and accumulates per-token head deltas `Δhead[target, :] += lr · h`
-(the post-final-norm hidden state). The result is a standard AMQL weight patch
-that works with `--patch` on any command and `export --patch` bakes it into a
-checkpoint.
-
-```bash
-# data file: one prompt<TAB>completion per line
-echo -e "The capital of France is\t Paris" > pairs.tsv
-echo -e "The largest ocean is\t Pacific" >> pairs.tsv
-
-amql-cli fine-tune ./containers/Qwen3.5-0.8B --data pairs.tsv \
-  --out patches/ft-head.safetensors --tokenizer ./Qwen3.5-0.8B --lr 1e-4 --epochs 3
-
-# apply the patch at inference time
-amql-cli generate ./containers/Qwen3.5-0.8B --prompt "The largest ocean is" \
-  --tokenizer ./Qwen3.5-0.8B --patch patches/ft-head.safetensors
-
-# or bake it into an exported checkpoint
-amql-cli export ./containers/Qwen3.5-0.8B --out ./models/Qwen3.5-0.8B-ft \
-  --patch patches/ft-head.safetensors
-```
-
-The head delta is a single F32 tensor shaped `[vocab_size, hidden_size]` — one
-row of corrections per token. When the head reuses the embedding table
-(Qwen3.5's default) the embedding is adjusted too. The learning rate and epoch
-count are tunable; papers typically use `lr ∈ [1e-5, 1e-4]` for LoRA-style
-fine-tuning. The `--component` flag selects which component to tune (default
-`target`).
-
-Data lines starting with `#` are comments and blank lines are skipped. The file
-is re-read each epoch, so streaming large datasets from disk costs no extra
-memory.
-
-```
-fine-tune:  Qwen3.5-0.8B  data pairs.tsv
-component:  target
-head:       target.embedding/weight  [248044×2048] (reuses embedding)
-pairs:      2 training pairs → 2 teacher-forced steps
-lr:         0.0001  epochs: 3
-patch:      patches/ft-head.safetensors  (1 tensor)
-note:       the head reuses the embedding table — the embedding is also adjusted
-
-apply it:   amql-cli generate <container> --prompt "..." --tokenizer <checkpoint> --patch patches/ft-head.safetensors
-bake it:    amql-cli export <container> --out <checkpoint> --patch patches/ft-head.safetensors
-```
-
-### Flash-Next export (`--arch qwen4-next`)
-
-Export a container as a Qwen3.8-Flash-Next (qwen4_exp) checkpoint — the same format
-vLLM, SGLang, and HF Transformers serve:
-
-```bash
-amql-cli export ./containers/Qwen3.8-27B-pruned --out ./exports/qwen4-next \
-  --arch qwen4-next --quant mxfp4
-```
-
-Pass `--arch qwen4-next` to target the Qwen 4 architecture family: tensor names follow
-the Flash-Next checkpoint contract (`mlp.gate.weight` router, `linear_attn.*` GDN
-blocks), `config.json` carries the `qwen4_exp`/`qwen4_exp_text` model types, and
-HyperConnection placeholder tensors are emitted as zeros so the checkpoint is
-structurally loadable. Composes with `--quant mxfp4` for ~13% of f32 working set.
-
-List supported architectures with `amql-cli export --list-architectures`.
-
-### Classifier models (Jev / sequence-classification)
-
-Classifier checkpoints (e.g. `AlexWortega/openjev` — `Qwen3_5ForSequenceClassification`)
-can be encoded, inspected, and exported:
-
-```bash
-amql-cli encode ./models/openjev --out ./containers/openjev
-amql-cli export ./containers/openjev --out ./exports/openjev
-```
-
-The classifier head (`model.score.weight`, `[num_labels, hidden_size]`) is its own
-`ClassifierHead` object with a `ClassifierSurface` carrying the label count, problem
-type, pooling rule (last-non-pad token), and NLI template. The backbone is an ordinary
-Qwen3.5 decoder — all existing transform commands (`moe-ify`, `prune`, `merge`) work on
-it unchanged. The `classify` serve command (Phase B) will apply the template, pool the
-last-token hidden state, and emit label probabilities.
-
-### Embedding models (nomic-bert)
-
-Encoder checkpoints like `nomic-ai/nomic-embed-text-v1.5` (`NomicBertModel`) can be
-imported and exported:
-
-```bash
-amql-cli encode ./models/nomic-embed-text-v1.5 --out ./containers/nomic-embed
-amql-cli export ./containers/nomic-embed --out ./exports/nomic-embed
-```
-
-The bidirectional encoder stack is represented as an `EncoderStack` object with
-source bindings to the original `encoder.layers.N.*` tensor names, so export
-rebuilds the checkpoint byte-identically. The pooling surface records the mean-pooling
-recipe; the `embed` serve command (future) will produce L2-normalised vectors
-with task-prefix support.
-
-### Ternary weight export (`--quant ptq1` / `--quant pq2`)
-
-Export projection matrices as ternary {-1, 0, +1} quantised weights (Bonsai-style, PrismML
-interop). Two packing formats are available, both with 128-element blocks and one FP16 scale
-per block, blockwise Hadamard rotation (block 1024) applied before quantisation:
-
-| Flag | Format | Bits/Weight | Packing | 27B size |
-|------|--------|------------|---------|----------|
-| `--quant ptq1` | PTQ1_0 (ggml type 143) | 1.75 | 5 trits/byte (base-3 dense) | ~5.9 GB |
-| `--quant pq2` | PQ2_0 (ggml type 142) | 2.13 | 2 bits/trit (4 per byte) | ~7.2 GB |
-
-```bash
-amql-cli export ./containers/merged --out ./exports/ternary --quant pq2
-```
-
-Each quantised projection becomes two safetensors tensors: the packed data (dtype `FP4`,
-reusing the 2-bit label) and `.scales` (dtype `F16`, one per 128-element block). Embeddings,
-norms, and the output head keep full precision. The checkpoint loads with the PrismML
-llama.cpp fork; stock llama.cpp rejects types 142/143 as unknown.
-
-### ONNX export (`export-onnx`)
-
-Export a container as a standard ONNX model (.onnx) using only built-in ONNX operators —
-no custom ops required. Supports generative (decoder), classifier, and embedding model types:
-
-```bash
-amql-cli export-onnx ./containers/model --out model.onnx
-```
-
-The graph includes full RoPE (position-dependent cos/sin tables built from `Range`/`Cos`/`Sin`),
-RMSNorm from primitive ops (`ReduceMean`/`Sqrt`/`Reciprocal`/`Mul`), SiLU via `Sigmoid`+`Mul`,
-and scaled dot-product attention with mask. Classifier models pool the last non-pad token;
-embedding models mean-pool + L2-normalise. Compatible with ONNX Runtime 1.21+.
-
-### LFM 2.5 import/export
-
-Liquid AI LFM 2.5 checkpoints (`Lfm2ForCausalLM`, model type `lfm2`) can be encoded and
-exported. The hybrid architecture (short-convolution layers interleaved with GQA attention,
-SwiGLU MLP, per-head QK norms) maps to AMQL canonical tensor names automatically:
-
-| LFM Name | Maps To |
-|----------|---------|
-| `operator_norm` | `input_layernorm` |
-| `ffn_norm` | `post_attention_layernorm` |
-| `feed_forward.w1/w2/w3` | `mlp.gate_proj/down_proj/up_proj` |
-| `conv.in_proj/conv/out_proj` | `self_attn.q_proj/conv1d/o_proj` |
-| `self_attn.q/k_layernorm` | per-head QK norms |
-
-```bash
-amql-cli encode ./models/LFM2.5-2.6B --out ./containers/lfm
-amql-cli export ./containers/lfm --out ./exports/lfm
-```
-
-Conv layers carry the `conv` operator in `layer_types`; the ArchMapper judges `conv` →
-`LayerOperators.Conv`. The short-convolution kernel dimension and bias flag are recorded in
-the `Conv1dSurface`. All existing transform commands work on the canonicalised container.
-
-### Gemma 4 import
-
-Google Gemma 4 checkpoints (`Gemma4ForConditionalGeneration`, model type `gemma4_text` in
-`text_config`) are supported. The `gelu_pytorch_tanh` activation is automatically mapped
-to the GELU runtime path:
-
-```bash
-amql-cli encode ./models/gemma-4-2b --out ./containers/gemma4
-amql-cli export ./containers/gemma4 --out ./exports/gemma4
-```
-
-### Model type conversion
-
-Convert a generative (decoder) container into a classifier or embedding container:
-
-```bash
-# Generative → classifier (adds random score head, Xavier-uniform init)
-amql-cli convert-to-classifier ./containers/model --num-labels 3 --out ./containers/classifier
-
-# Generative → embedding (mean-pooling + L2 norm, no new tensors)
-amql-cli convert-to-embedding ./containers/model --out ./containers/embedding
-```
-
-The classifier head weights are a warm start — apply classification training data with
-`fine-tune` afterwards. The embedding model uses the existing decoder stack; pooling is a
-runtime operation applied by the consumer.
-
-### Creating a new model from scratch (`create-model`)
-
-Create a new VINDEX3 container with randomly initialised weights (Xavier-uniform) and a
-user-defined architecture — no checkpoint needed:
-
-```bash
-amql-cli create-model --hidden 768 --layers 12 --heads 12 --kv-heads 2 \
-  --head-dim 64 --intermediate 2048 --vocab 32000 --context 2048 \
-  --layer-types full,linear --out ./containers/new-model
-```
-
-`--layer-types` accepts a comma-separated list or a repeating pattern (e.g. `full,linear`
-repeats every 2 layers). Norm weights initialise to 1.0; the container is immediately
-ready for training with `fine-tune`.
+## Key Capabilities
+
+### Model Families
+
+Import and export these checkpoint formats:
+
+| Family | `model_type` | Notes |
+|--------|-------------|-------|
+| Qwen 3.5–3.8 | `qwen3_5_text` | Hybrid: GDN (linear attention) + softmax, MoE, vision |
+| Qwen Flash-Next | `qwen4_exp_text` | `--arch qwen4-next` export with HC placeholders |
+| Gemma 4 | `gemma4_text` | GeGLU activation, QK norms, nested `text_config` |
+| LFM 2.5 | `lfm2` | Short-convolution layers + GQA, SwiGLU MLP |
+| Nomic Embed | `nomic_bert` | Bidirectional encoder, mean pooling |
+| Jev Classifier | `*ForSequenceClassification` | Score head on decoder backbone |
+| Binary/Ternary | any decoder | Via `--quant mxfp4`, `--quant ptq1`, or `--quant pq2` |
+
+### Inference & Weight Management
+
+Three weight working-set modes, selected by `AMQL_WEIGHTS` (or `--weights` on `generate`):
+
+| Mode | Resident size | Description |
+|------|-------------|-------------|
+| `f32` | All weights widened to f32 | Byte-exact reference |
+| `bf16` | Stored BF16, widened on access into LRU cache | ~2× smaller |
+| `mxfp4` | MXFP4 packs dequantised into LRU cache | ~4× smaller |
+
+When `AMQL_GPU=1` and the CUDA backend is built (`native/amql_cuda/build-cuda.cmd`),
+MXFP4 packs are dequantised to FP16 on-device and GEMMs run on tensor cores with FP32
+accumulate. Embeddings, norms, and the output head stay f32 in every mode.
+
+Tune memory with `AMQL_MEMORY_GB`, `AMQL_F32_CACHE_GB`, and `AMQL_CORES`.
+
+### Token Relationship Probing
+
+`route` names the relationship between two tokens using template probing and identifies the
+exact (layer, head, position) attention coordinates carrying one token's meaning into the
+other. Causal tracing then reports per-layer residual weights — the targets to patch or LoRA.
+
+`path` shows the model's own continuation route between two tokens via bidirectional
+best-first search over the next-token graph.
+
+### Patching, LoRA & Fine-Tuning
+
+`change-tensor` edits a single weight cell and records the delta as a patch. Every
+command (`generate`, `route`, `path`, `inspect-token`, `export`) accepts `--patch` to
+apply deltas at load time. `save-lora` factors a patch's 2-D deltas into a LoRA adapter
+(`lora_A` / `lora_B`) via truncated SVD.
+
+`fine-tune` performs supervised output-head adaptation: for each (prompt, completion)
+pair, the model forward-passes the prompt, teacher-forces each completion token, and
+accumulates per-token head deltas — no autograd, no gradient infrastructure, fully
+deterministic.
+
+### Model Merging & Transformation
+
+- **`merge`** — Two models into one via consensus-gated token alignment. Shared tokens
+  that agree are blended and the result restored to full energy; disagreements keep the
+  scaffold's row. The larger model scaffolds the stack shape.
+- **`import`** — Merge a second model into an existing container.
+- **`moe-ify`** — Turn a dense model into a routed Mixture of Experts by clustering FFN
+  co-activations. No training, quality gated by perplexity.
+- **`prune`** — Drop whole decoder layers to hit a byte budget. Three ranking approaches:
+  provenance (merge history), corpus (residual delta), or random (ablation baseline).
+- **`create-model`** — New container with Xavier-uniform random weights and a
+  user-defined architecture. Ready for `fine-tune`.
+- **`convert-to-classifier`** — Add a random score head to a generative model.
+- **`convert-to-embedding`** — Add pooling facts; no new tensors.
+
+### Quantized Export
+
+| Flag | Format | Bits/Weight | Scheme |
+|------|--------|------------|--------|
+| `--quant mxfp4` | MXFP4 (OCP) | ~4.0 | FP4 E2M1, E8M0 block scales, 32-element blocks |
+| `--quant ptq1` | PTQ1_0 (type 143) | ~1.75 | 5 trits/byte (base-3 dense), FP16 scale, 128-block, Hadamard |
+| `--quant pq2` | PQ2_0 (type 142) | ~2.13 | 2 bits/trit, FP16 scale, 128-block, Hadamard |
+
+All three quantise stack projections only; embeddings, norms, and the output head stay
+full precision. `ptq1`/`pq2` produce PrismML Bonsai-compatible checkpoints for use with
+the PrismML llama.cpp fork.
+
+### ONNX Export
+
+`export-onnx` produces a standard `.onnx` model using only built-in operators (no custom
+ops). Includes full RoPE (dynamic cos/sin tables), RMSNorm from primitives, SiLU, and
+scaled dot-product attention with mask. Compatible with ONNX Runtime 1.21+.
+
+### GUI & Explorer
+
+`amql-gui` provides a WPF desktop interface: command catalog with parameter editing, run
+history, and a **Container Explorer** tab. The explorer drills into the VIndex3 structure
+(components → layers → objects → edges) with right-click context menus for viewing tensor
+values in a spreadsheet grid, browsing the tokenizer vocabulary, and inspecting
+hidden-state edge connections.
+
+## Configuration
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `AMQL_WEIGHTS` | `f32` | Weight working-set: `f32`, `bf16`, or `mxfp4` |
+| `AMQL_GPU` | `0` | Enable CUDA GPU acceleration |
+| `AMQL_MEMORY_GB` | auto | Total memory budget for LRU cache |
+| `AMQL_F32_CACHE_GB` | ¼ of budget | F32 LRU cache cap |
+| `AMQL_CORES` | auto | CPU core budget for parallel work |
+| `AMQL_MERGE_GPU` | `0` | Enable GPU-accelerated merge GEMM |
 
 ## Documentation
 
-Deeper technical reference is available in the [docs/](docs/) directory:
+- [VIndex3 Overview](docs/vindex3-overview.md) — container format, schema, segment layout
+- [System Architecture](docs/architecture.md) — layered design, component responsibilities
+- [Flash-Next Export](docs/export-qwen3.8-flash-next.md) — qwen4-next architecture mapping
+- [Classifier Models](docs/classifier-models-jev.md) — Jev/NLI classification design
+- [Embedding Models](docs/embedding-models-nomic-embed-text.md) — nomic-bert encoder
+- [CUDA Backend Plan](docs/CUDA_PLAN.md) — GPU kernel roadmap
+- [MTP Drafter](docs/MTP_DRAFTER.md) — speculative decoding drafter design
 
-- [VIndex3 Overview — container format, schema, segment layout](docs/vindex3-overview.md)
-- [System Architecture — layered design, component responsibilities, runtime model](docs/architecture.md)
-- [Flash-Next Export — qwen4-next architecture mapping and config surface](docs/export-qwen3.8-flash-next.md)
-- [Classifier Models — Jev/NLI classification container design](docs/classifier-models-jev.md)
-- [Embedding Models — nomic-bert encoder import and export](docs/embedding-models-nomic-embed-text.md)
+## Contributing
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines. The project is research-status
+(pre-1.0) — issues and PRs welcome, expect the surface to evolve.
