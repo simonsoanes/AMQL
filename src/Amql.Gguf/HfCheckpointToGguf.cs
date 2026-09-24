@@ -67,7 +67,7 @@ public static class GgufConverter
         Q35Norm,    // norms:       copy with +1 (Qwen3-Next convention)
     }
 
-    public static GgufConversion Convert(string checkpointDir, string outFile)
+    public static GgufConversion Convert(string checkpointDir, string outFile, string quantization = "none")
     {
         string configPath = Path.Combine(checkpointDir, "config.json");
         if (!File.Exists(configPath))
@@ -303,13 +303,13 @@ public static class GgufConverter
 
         foreach (var entry in plan)
         {
-            writer.Tensor(entry.Name, GgufTypeFor(entry), GgufDims(entry, reorderLinear));
+            writer.Tensor(entry.Name, GgufTypeFor(entry, quantization), GgufDims(entry, reorderLinear));
         }
         writer.WriteHeader();
 
         for (int i = 0; i < plan.Count; i++)
         {
-            WritePayload(writer, plan[i], i, reorderLinear, vPerK, linearValueHeads, linearKeyHeads, linearValueHeadDim);
+            WritePayload(writer, plan[i], i, reorderLinear, vPerK, linearValueHeads, linearKeyHeads, linearValueHeadDim, quantization);
         }
 
         long bytes = new FileInfo(outFile).Length;
@@ -352,10 +352,123 @@ public static class GgufConverter
             $"transform {Transform} for '{Name}' has no source tensor");
     }
 
+    // ── Q4_0 quantization ────────────────────────────────────────────────
+
+    /// <summary>Q4_0 block size: 32 elements per block.</summary>
+    private const int Q4_0BlockSize = 32;
+
+    /// <summary>Quantizes a float array to Q4_0 format.
+    /// Each 32-element block: [scale (F16, 2 bytes), 16 bytes of 4-bit weights].
+    /// Returns the quantized byte array.</summary>
+    private static byte[] QuantizeQ4_0(float[] values)
+    {
+        int numBlocks = (values.Length + Q4_0BlockSize - 1) / Q4_0BlockSize;
+        var result = new byte[numBlocks * 18]; // 2 bytes scale + 16 bytes data per block
+
+        for (int block = 0; block < numBlocks; block++)
+        {
+            int start = block * Q4_0BlockSize;
+            int count = Math.Min(Q4_0BlockSize, values.Length - start);
+
+            // Find max absolute value in block
+            float maxAbs = 0f;
+            for (int i = 0; i < count; i++)
+            {
+                float abs = MathF.Abs(values[start + i]);
+                if (abs > maxAbs) maxAbs = abs;
+            }
+
+            // Compute scale: maxAbs / 7 (Q4_0 uses signed 4-bit: -8 to 7)
+            float scale = maxAbs / 7.0f;
+            if (scale == 0f) scale = 1e-10f; // avoid division by zero
+
+            // Write scale as F16
+            ushort scaleBits = BitConverter.HalfToUInt16Bits((Half)scale);
+            result[block * 18] = (byte)(scaleBits & 0xFF);
+            result[block * 18 + 1] = (byte)(scaleBits >> 8);
+
+            // Quantize each value to 4-bit
+            for (int i = 0; i < Q4_0BlockSize; i++)
+            {
+                int byteIdx = block * 18 + 2 + (i / 2);
+                int nibbleShift = (i % 2) * 4;
+
+                byte nibble;
+                if (i < count)
+                {
+                    // Quantize: round(value / scale), clamp to [-8, 7]
+                    float quantized = values[start + i] / scale;
+                    int q = (int)MathF.Round(quantized);
+                    q = Math.Clamp(q, -8, 7);
+                    // Convert to unsigned 4-bit: -8 → 0, 7 → 15
+                    nibble = (byte)(q + 8);
+                }
+                else
+                {
+                    nibble = 8; // padding: represents 0
+                }
+
+                // Clear old nibble, set new one
+                result[byteIdx] = (byte)((result[byteIdx] & ~(0xF << nibbleShift)) | (nibble << nibbleShift));
+            }
+        }
+
+        return result;
+    }
+
+    /// <summary>Writes a Q4_0 quantized tensor payload. Loads the source
+    /// tensor as floats, applies transforms (transpose, addOne), quantizes
+    /// to Q4_0, and writes the quantized bytes.</summary>
+    private static void WriteQ4_0Payload(GgufWriter writer, PlanEntry entry)
+    {
+        var source = entry.RequiredSource;
+        var info = source.Info;
+        long rows = info.Shape[0], cols = info.Shape[1];
+
+        // Load as floats
+        float[] values = LoadFloats(source, rows * cols);
+
+        // Apply addOne transform if needed (for norms)
+        if (entry.AddOne)
+        {
+            for (long i = 0; i < values.Length; i++)
+            {
+                values[i] += 1.0f;
+            }
+        }
+
+        // Transpose if needed (GGUF uses [in, out] layout)
+        if (entry.Transform == Transform.Transpose)
+        {
+            var transposed = new float[values.Length];
+            for (long r = 0; r < rows; r++)
+            {
+                for (long c = 0; c < cols; c++)
+                {
+                    transposed[c * rows + r] = values[r * cols + c];
+                }
+            }
+            values = transposed;
+        }
+
+        // Quantize to Q4_0
+        byte[] quantized = QuantizeQ4_0(values);
+
+        // Write to GGUF
+        writer.Data.Write(quantized);
+    }
+
     // ── descriptors ────────────────────────────────────────────────────────
 
-    private static GgufType GgufTypeFor(PlanEntry entry)
-        => entry.Transform switch
+    private static GgufType GgufTypeFor(PlanEntry entry, string quantization)
+    {
+        // Q4_0 quantization for eligible weight tensors
+        if (quantization == "q4_0" && ShouldQuantize(entry))
+        {
+            return GgufType.Q4_0;
+        }
+
+        return entry.Transform switch
         {
             Transform.Zeros => GgufType.F16,
             // llama.cpp's Qwen3-Next reference keeps the per-value-head
@@ -372,6 +485,36 @@ public static class GgufConverter
                 _ => throw new GgufException($"source tensor '{entry.Source.Info.Name}' dtype {entry.Source.Info.Dtype.Label()} is not convertible"),
             },
         };
+    }
+
+    /// <summary>Determines if a tensor should be quantized to Q4_0.
+    /// Norms, embeddings, output heads, and small tensors stay full precision.</summary>
+    private static bool ShouldQuantize(PlanEntry entry)
+    {
+        if (entry.Source is null) return false;
+        var name = entry.Source.Info.Name;
+        var shape = entry.Source.Info.Shape;
+
+        // Skip norms, embeddings, and output heads
+        if (name.Contains("norm") || name.Contains("embed") || name.Contains("lm_head"))
+            return false;
+
+        // Skip small tensors (< 256 elements)
+        long totalElements = 1;
+        foreach (var dim in shape) totalElements *= dim;
+        if (totalElements < 256) return false;
+
+        // Skip non-2D tensors (conv weights, etc.)
+        if (shape.Length != 2) return false;
+
+        // Skip transforms that need F32
+        if (entry.Transform is Transform.Q35ALog or Transform.Q35Dt or Transform.Q35A
+            or Transform.Q35B or Transform.Q35Conv or Transform.Q35Out
+            or Transform.Q35Qkv or Transform.Q35Z)
+            return false;
+
+        return true;
+    }
 
     private static long[] GgufDims(PlanEntry entry, bool reorderLinear)
     {
@@ -405,9 +548,16 @@ public static class GgufConverter
     // ── payload streaming ──────────────────────────────────────────────────
 
     private static void WritePayload(GgufWriter writer, PlanEntry entry, int index, bool reorderLinear,
-        int vPerK, int numVHeads, int numKHeads, int headVDim)
+        int vPerK, int numVHeads, int numKHeads, int headVDim, string quantization)
     {
         writer.SeekTensor(index);
+
+        // Q4_0 quantization: load floats, quantize, write Q4_0 bytes
+        if (quantization == "q4_0" && ShouldQuantize(entry))
+        {
+            WriteQ4_0Payload(writer, entry);
+            return;
+        }
 
         switch (entry.Transform)
         {
@@ -513,7 +663,7 @@ public static class GgufConverter
         var info = source.Info;
         long rows = info.Shape[0], cols = info.Shape[1];
         long basePosition = (long)writer.TensorOffset(index);
-        bool asF32 = GgufTypeFor(entry) == GgufType.F32;
+        bool asF32 = GgufTypeFor(entry, "none") == GgufType.F32;
 
         long spanBytes = rows * cols * (info.Dtype == Dtype.F32 ? 4 : 2);
         if (spanBytes <= 512L << 20)

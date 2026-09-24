@@ -959,6 +959,11 @@ internal static class Program
         var checkpointDir = Arg(args, 0) ?? throw new CliException(
             "to-gguf requires a checkpoint directory, e.g. 'amql-cli to-gguf <checkpoint-dir> --out <model.gguf>'");
         string outFile = OptionValue(args, "--out") ?? throw new CliException("to-gguf requires '--out <file.gguf>'");
+        string quantization = OptionValue(args, "--quant") ?? "none";
+        if (quantization != "none" && quantization != "f16" && quantization != "q4_0")
+        {
+            throw new CliException($"unknown quantization '{quantization}' — this build supports 'none', 'f16', or 'q4_0'");
+        }
         if (File.Exists(outFile))
         {
             // --force makes re-runs idempotent (TODO.md item 7).
@@ -969,7 +974,7 @@ internal static class Program
             File.Delete(outFile);
         }
 
-        var report = GgufConverter.Convert(checkpointDir, outFile);
+        var report = GgufConverter.Convert(checkpointDir, outFile, quantization);
 
         Console.WriteLine($"converted: {report.OutputPath}");
         Console.WriteLine($"arch:       {report.Architecture}");

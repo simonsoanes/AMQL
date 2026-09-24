@@ -299,6 +299,9 @@ public static class CommandCatalog
         {
             new ParamDef("checkpointDir", "checkpoint dir", ParamKind.Positional, EditorKind.Directory),
             new ParamDef("out", "--out file.gguf", ParamKind.Option, EditorKind.File, Flag: "--out"),
+            new ParamDef("quant", "--quant", ParamKind.Option, EditorKind.Choice, Flag: "--quant", DefaultValue: "none",
+                Choices: new[] { "none", "f16", "q4_0" },
+                Help: "Quantization: none/f16 (full precision) or q4_0 (4-bit, ~50% size reduction)."),
         }),
         new("export-onnx", CatExport, "Export a container as an ONNX model (.onnx).", new[]
         {
