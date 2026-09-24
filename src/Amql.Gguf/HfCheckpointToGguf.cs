@@ -322,8 +322,9 @@ public static class GgufConverter
             qwen35 ? "Qwen3-Next value transforms applied: A_log = -exp(A_log), norms +1, conv1d squeezed" : "",
             "MTP drafter (mtp.safetensors + mtp.config.json) stays a separate companion shard — not embedded",
             quantization == "q4_0"
-                ? "Q4_0 quantization applied to 2-D weight matrices; norms, embeddings, output head, " +
-                  "MoE routers and stacked 3-D expert tensors kept full precision"
+                ? "Q4_0 quantization applied to weight matrices including the stacked 3-D MoE expert " +
+                  "tensors (every expert slice quantized); norms, embeddings, output head and MoE " +
+                  "routers kept full precision"
                 : "weights written as F16 (BF16 sources; lossless in the normal range); F32 routers kept",
         };
 
