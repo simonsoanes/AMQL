@@ -242,7 +242,14 @@ public static class GgufConverter
 
         writer.Kv("general.architecture", GgufValue.String(arch));
         writer.Kv("general.name", GgufValue.String(Path.GetFileName(checkpointDir)));
-        writer.Kv("general.file_type", GgufValue.Uint32(1));
+        // ggml ftype: 1 = mostly F16, 2 = mostly Q4_0. Declaring F16 over a
+        // file whose weights are Q4_0 misreports the model to every consumer.
+        bool quantizedQ4 = quantization == "q4_0";
+        writer.Kv("general.file_type", GgufValue.Uint32(quantizedQ4 ? 2u : 1u));
+        if (quantizedQ4)
+        {
+            writer.Kv("general.quantization_version", GgufValue.Uint32(2));
+        }
         writer.Kv("general.alignment", GgufValue.Uint32(32));
         writer.Kv($"{arch}.block_count", GgufValue.Uint32((uint)layers));
         writer.Kv($"{arch}.context_length", GgufValue.Uint32((uint)maxPos));
@@ -289,15 +296,31 @@ public static class GgufConverter
             writer.Kv($"{arch}.expert_shared_count", GgufValue.Uint32(1));
         }
 
-        var (tokens, scores, tokenTypes, merges) = LoadTokenizer(Path.Combine(checkpointDir, "tokenizer.json"), vocab);
+        var tok = LoadTokenizer(Path.Combine(checkpointDir, "tokenizer.json"), vocab);
         writer.Kv("tokenizer.ggml.model", GgufValue.String("gpt2"));
-        writer.Kv("tokenizer.ggml.pre", GgufValue.String("default"));
-        writer.Kv("tokenizer.ggml.tokens", GgufValue.StringArray(tokens));
-        writer.Kv("tokenizer.ggml.scores", GgufValue.FloatArray(scores));
-        writer.Kv("tokenizer.ggml.token_type", GgufValue.Int32Array(tokenTypes.Select(t => (int)t).ToArray()));
-        if (merges.Length > 0)
+        // The pretokenizer regex is arch-specific; "default" mis-splits Qwen
+        // text. Matches the lmstudio-community reference for this family.
+        writer.Kv("tokenizer.ggml.pre", GgufValue.String(qwen35 ? "qwen35" : "default"));
+        writer.Kv("tokenizer.ggml.tokens", GgufValue.StringArray(tok.Tokens));
+        if (tok.Scores is { } scores)
         {
-            writer.Kv("tokenizer.ggml.merges", GgufValue.StringArray(merges));
+            writer.Kv("tokenizer.ggml.scores", GgufValue.FloatArray(scores));
+        }
+        writer.Kv("tokenizer.ggml.token_type", GgufValue.Int32Array(tok.Types.Select(t => (int)t).ToArray()));
+        if (tok.Merges.Length > 0)
+        {
+            writer.Kv("tokenizer.ggml.merges", GgufValue.StringArray(tok.Merges));
+        }
+        if (tok.EosTokenId is { } eosId)
+        {
+            writer.Kv("tokenizer.ggml.eos_token_id", GgufValue.Uint32((uint)eosId));
+        }
+        if (tok.PaddingTokenId is { } padId)
+        {
+            // Qwen keeps bos == pad and never actually prepends a BOS.
+            writer.Kv("tokenizer.ggml.bos_token_id", GgufValue.Uint32((uint)padId));
+            writer.Kv("tokenizer.ggml.padding_token_id", GgufValue.Uint32((uint)padId));
+            writer.Kv("tokenizer.ggml.add_bos_token", GgufValue.Bool(false));
         }
         writer.Kv($"{arch}.vocab_size", GgufValue.Uint32((uint)vocab));
 
@@ -984,7 +1007,12 @@ public static class GgufConverter
 
     // ── tokenizer ──────────────────────────────────────────────────────────
 
-    private static (string[] Tokens, float[] Scores, uint[] Types, string[] Merges) LoadTokenizer(string tokenizerPath, int vocab)
+    /// <summary>Reads the GGUF tokenizer block out of an HF tokenizer.json.
+    /// <c>added_tokens</c> carries the special tokens at ids above
+    /// <c>model.vocab</c>; ignoring it truncates the vocabulary and leaves
+    /// the table shorter than the ids the tokenizer hands out, which reads
+    /// past the end of the embedding at load time.</summary>
+    private static TokenizerBlock LoadTokenizer(string tokenizerPath, int vocab)
     {
         if (!File.Exists(tokenizerPath))
         {
@@ -993,28 +1021,65 @@ public static class GgufConverter
         using var doc = JsonDocument.Parse(File.ReadAllText(tokenizerPath));
         var model = doc.RootElement.GetProperty("model");
 
-        var idToToken = new (int Id, string Token)[vocab];
+        var idToToken = new string?[vocab];
         var vocabObj = model.GetProperty("vocab");
         foreach (var kv in vocabObj.EnumerateObject())
         {
             int id = kv.Value.GetInt32();
             if (id >= 0 && id < vocab)
             {
-                idToToken[id] = (id, kv.Name);
+                idToToken[id] = kv.Name;
             }
         }
 
         var tokens = new string[vocab];
-        var scores = new float[vocab];
         var types = new uint[vocab];
         for (int i = 0; i < vocab; i++)
         {
-            tokens[i] = idToToken[i].Token ?? $"<unk_{i}>";
-            types[i] = 1;
+            types[i] = 1; // NORMAL
         }
 
+        // ggml token types: 1 NORMAL, 3 CONTROL, 4 USER_DEFINED.
+        var specials = new Dictionary<string, int>(StringComparer.Ordinal);
+        if (doc.RootElement.TryGetProperty("added_tokens", out var addedTokens) &&
+            addedTokens.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in addedTokens.EnumerateArray())
+            {
+                if (item.ValueKind != JsonValueKind.Object ||
+                    !item.TryGetProperty("id", out var idElement) ||
+                    !idElement.TryGetInt32(out int id) ||
+                    id < 0 || id >= vocab)
+                {
+                    continue;
+                }
+                string? content = item.TryGetProperty("content", out var contentElement)
+                    ? contentElement.GetString()
+                    : null;
+                if (content is null)
+                {
+                    continue;
+                }
+                bool isSpecial = item.TryGetProperty("special", out var sp) &&
+                                 sp.ValueKind == JsonValueKind.True;
+                idToToken[id] = content;
+                types[id] = isSpecial ? 3u : 4u;
+                specials[content] = id;
+            }
+        }
+
+        for (int i = 0; i < vocab; i++)
+        {
+            tokens[i] = idToToken[i] ?? $"<unk_{i}>";
+        }
+
+        // BPE tokenizers carry no scores; emitting an all-zero array is worse
+        // than omitting it, so only real scores are returned.
+        float[]? scores = null;
         if (model.TryGetProperty("scores", out var scoresJson) && scoresJson.ValueKind == JsonValueKind.Array)
         {
+            var parsed = new float[vocab];
+            bool any = false;
             foreach (var pair in scoresJson.EnumerateArray())
             {
                 if (pair.ValueKind != JsonValueKind.Array || pair.GetArrayLength() < 2)
@@ -1022,11 +1087,15 @@ public static class GgufConverter
                     continue;
                 }
                 int id = pair[0].GetInt32();
-                float score = pair[1].GetSingle();
                 if (id >= 0 && id < vocab)
                 {
-                    scores[id] = score;
+                    parsed[id] = pair[1].GetSingle();
+                    any = true;
                 }
+            }
+            if (any)
+            {
+                scores = parsed;
             }
         }
 
@@ -1039,8 +1108,24 @@ public static class GgufConverter
             }
         }
 
-        return (tokens, scores, types, merges.ToArray());
+        // Qwen convention (matches the lmstudio-community reference):
+        // <|endoftext|> is bos and pad, <|im_end|> is eos, and no BOS is
+        // actually prepended.
+        int? eos = specials.TryGetValue("<|im_end|>", out int imEnd) ? imEnd
+            : specials.TryGetValue("<|endoftext|>", out int eot0) ? eot0
+            : null;
+        int? pad = specials.TryGetValue("<|endoftext|>", out int eot) ? eot : null;
+
+        return new TokenizerBlock(tokens, scores, types, merges.ToArray(), eos, pad);
     }
+
+    private sealed record TokenizerBlock(
+        string[] Tokens,
+        float[]? Scores,
+        uint[] Types,
+        string[] Merges,
+        int? EosTokenId,
+        int? PaddingTokenId);
 
     private static int GetInt32(JsonElement obj, string name)
     {

@@ -589,20 +589,19 @@ public static class ModelExporter
             var values = WidenedValues(segment, objectId, tensor, patch);
             long rows = tensor.Shape[0];
             long columns = tensor.Shape[1];
-        if (rows * columns != values.Length)
-        {
-            throw new CliException(
-                $"MXFP4 shape mismatch: tensor '{hfName}' shape [{rows},{columns}] = {rows * columns} elements, " +
-                $"but widened values has {values.Length} elements");
-        }
-        // Tensors smaller than one block cannot be MXFP4-quantised: the block
-        // structure requires at least BlockElements for a single scale row.
-        if (values.Length <= Mxfp4.BlockElements)
-        {
-            return new[] { BuildExportPayload(objectId, segment, tensor, patch, hfName) };
-        }
-        try
-        {
+            if (rows * columns != values.Length)
+            {
+                throw new CliException(
+                    $"MXFP4 shape mismatch: tensor '{hfName}' shape [{rows},{columns}] = {rows * columns} elements, " +
+                    $"but widened values has {values.Length} elements");
+            }
+            // Tensors smaller than one block cannot be MXFP4-quantised: the
+            // block structure requires at least BlockElements for a scale row.
+            if (values.Length <= Mxfp4.BlockElements)
+            {
+                return new[] { BuildExportPayload(objectId, segment, tensor, patch, hfName) };
+            }
+
             var quantized = Mxfp4.Quantize(values, rows, columns);
 
             return new[]
@@ -623,19 +622,11 @@ public static class ModelExporter
                 },
             };
         }
-        catch (Exception ex)
-        {
-            // Fall back to full precision if MXFP4 quantise fails for any
-            // reason — this is a safety net, not a code path we expect to
-            // exercise in normal operation.
-            return new[] { BuildExportPayload(objectId, segment, tensor, patch, hfName) };
-        }
-        }
         catch (Exception)
         {
-            // Outer catch: any failure in the quantise path falls back to
-            // full precision. This protects against unexpected tensor shapes
-            // or segment read issues.
+            // Fall back to full precision if MXFP4 quantise fails for any
+            // reason — this yields a correct, larger checkpoint rather than a
+            // corrupt one, so it is a safe degradation rather than a hide.
             return new[] { BuildExportPayload(objectId, segment, tensor, patch, hfName) };
         }
     }
