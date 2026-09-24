@@ -42,7 +42,16 @@ public sealed class GgufWriter : IDisposable
         {
             elements = checked(elements * d);
         }
-        _tensors.Add((name, type, dims, checked(elements * ElementSize(type))));
+        long size = type switch
+        {
+            // Q4_0: 18 bytes per 32-element block (2 bytes scale + 16 bytes data)
+            GgufType.Q4_0 => ((elements + 31) / 32) * 18,
+            // Q4_K: 144 bytes per 256-element super-block
+            GgufType.Q4_K => ((elements + 255) / 256) * 144,
+            // Plain dtypes
+            _ => checked(elements * ElementSize(type)),
+        };
+        _tensors.Add((name, type, dims, size));
     }
 
     private static int ElementSize(GgufType type) => type switch

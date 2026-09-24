@@ -419,7 +419,7 @@ public static class GgufConverter
     /// <summary>Writes a Q4_0 quantized tensor payload. Loads the source
     /// tensor as floats, applies transforms (transpose, addOne), quantizes
     /// to Q4_0, and writes the quantized bytes.</summary>
-    private static void WriteQ4_0Payload(GgufWriter writer, PlanEntry entry)
+    private static void WriteQ4_0Payload(GgufWriter writer, PlanEntry entry, int index)
     {
         var source = entry.RequiredSource;
         var info = source.Info;
@@ -456,6 +456,7 @@ public static class GgufConverter
 
         // Write to GGUF
         writer.Data.Write(quantized);
+        writer.FinishTensor(index);
     }
 
     // ── descriptors ────────────────────────────────────────────────────────
@@ -555,7 +556,7 @@ public static class GgufConverter
         // Q4_0 quantization: load floats, quantize, write Q4_0 bytes
         if (quantization == "q4_0" && ShouldQuantize(entry))
         {
-            WriteQ4_0Payload(writer, entry);
+            WriteQ4_0Payload(writer, entry, index);
             return;
         }
 
