@@ -142,14 +142,28 @@ public static class ModelMerger
         var scaffoldEmbedRows = ReadWidenedRows(scaffold.Embedding, width);
         var otherEmbedRows = ReadWidenedRows(other.Embedding, width);
         Phase("widened embedding tables");
+
+        // The merged vocabulary is at least the union of real tokens, but the
+        // scaffold's table may carry trailing padding rows above the highest
+        // token id (Qwen pads vocab_size to a block multiple). Those rows are
+        // part of the published vocab_size and must survive the merge, so the
+        // output table is sized to whichever is larger.
+        int mergedVocab = Math.Max(mapping.Count, scaffoldEmbedRows.Length / width);
+
         var embeddingAlignment = AlignRows(
             scaffoldEmbedRows, otherEmbedRows, mapping, scaffoldIsImported, width, AgreementThreshold);
         Phase($"fitted embedding alignment ({embeddingAlignment.Anchors} anchors)");
         notes.Add($"alignment: {embeddingAlignment.Anchors} shared-token anchors into {scaffold.Model}'s space, " +
                   $"residual L² {embeddingAlignment.ResidualL2:g4} (ridge {embeddingAlignment.RidgeRel:g3}, " +
                   $"agreement threshold {AgreementThreshold:g2})");
+        if (mergedVocab > mapping.Count)
+        {
+            notes.Add($"vocabulary: {mapping.Count} mapped tokens + {mergedVocab - mapping.Count} trailing " +
+                      $"padding rows carried from {scaffold.Model} (vocab_size {mergedVocab})");
+        }
         var embeddingMerge = MergeTable(
-            scaffoldEmbedRows, otherEmbedRows, mapping, scaffoldIsImported, embeddingAlignment, width, mergedDtype);
+            scaffoldEmbedRows, otherEmbedRows, mapping, scaffoldIsImported, embeddingAlignment, width, mergedDtype,
+            mergedVocab);
         Phase($"merged embedding rows (mean agreement {embeddingMerge.MeanAgreement:0.000}, " +
               $"{embeddingMerge.ShareAboveThreshold * 100:0.0}% above threshold)");
         notes.Add(AgreementNote(embeddingMerge, scaffold.Model));
@@ -166,7 +180,8 @@ public static class ModelMerger
             var headAlignment = AlignRows(
                 scaffoldHeadRows, otherHeadRows, mapping, scaffoldIsImported, width, AgreementThreshold);
             var headMerge = MergeTable(
-                scaffoldHeadRows, otherHeadRows, mapping, scaffoldIsImported, headAlignment, width, headDtype.Value);
+                scaffoldHeadRows, otherHeadRows, mapping, scaffoldIsImported, headAlignment, width, headDtype.Value,
+                mergedVocab);
             headChunks = headMerge.Chunks;
             notes.Add(AgreementNote(headMerge, scaffold.Model, "head"));
             Phase("merged output head rows");
@@ -285,9 +300,9 @@ public static class ModelMerger
             TokenVocabulary.WithAppendedTokens(
                 Path.Combine(baseView.Container.Root, "tokenizer.json"), appended));
 
-        WriteGraph(outDir, baseView, scaffold, mapping.Count, width, layers, mergedTied, mergedDtype,
+        WriteGraph(outDir, baseView, scaffold, mergedVocab, width, layers, mergedTied, mergedDtype,
             headUntied, headDtype);
-        WriteIndex(outDir, baseView, importedView, scaffold, mapping.Count, width, layers,
+        WriteIndex(outDir, baseView, importedView, scaffold, mergedVocab, width, layers,
             scaffold.Index.PrecisionMap, representations, segments);
         Phase("wrote container metadata");
 
@@ -525,12 +540,28 @@ public static class ModelMerger
         bool scaffoldIsImported,
         Alignment alignment,
         int width,
-        Dtype mergedDtype)
+        Dtype mergedDtype,
+        int outputRows)
     {
         var m = alignment.Map;
-        var merged = new float[mapping.Count * width];
+        var merged = new float[outputRows * width];
         var entries = mapping.Entries;
         var agreement = new double[mapping.Count]; // NaN where not a shared token
+
+        // Rows the mapping does not cover are the scaffold's trailing
+        // vocabulary padding: the embedding table is typically padded to a
+        // multiple of the block size above the highest real token id. They
+        // carry no token but the model's vocab_size and every consumer's
+        // bounds assume they exist, so they are carried across verbatim
+        // rather than dropped.
+        int scaffoldRowCount = scaffoldRows.Length / width;
+        for (int i = mapping.Count; i < outputRows; i++)
+        {
+            if (i < scaffoldRowCount)
+            {
+                Array.Copy(scaffoldRows, i * width, merged, i * width, width);
+            }
+        }
 
         // CUDA path: the per-token ApplyMap (M·other, a d×d matvec per
         // shared token ≈ O(n·d²) — the other ~40-minute CPU phase at 27B

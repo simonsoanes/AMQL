@@ -61,6 +61,47 @@ public sealed class TokenVocabulary
                 }
             }
 
+            // Special tokens live in the top-level `added_tokens` array, not in
+            // model.vocab, and occupy the ids directly above it. Dropping them
+            // silently truncates the vocabulary: the merged embedding would be
+            // sized to model.vocab while the tokenizer still hands out the
+            // special ids, so every bos/eos lookup reads past the end of the
+            // table. They are part of the vocabulary and must be carried.
+            if (doc.RootElement.TryGetProperty("added_tokens", out var addedTokens) &&
+                addedTokens.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var item in addedTokens.EnumerateArray())
+                {
+                    if (item.ValueKind != JsonValueKind.Object ||
+                        !item.TryGetProperty("id", out var idElement) ||
+                        !idElement.TryGetInt32(out int addedId) || addedId < 0)
+                    {
+                        continue;
+                    }
+                    string? content = item.TryGetProperty("content", out var contentElement)
+                        ? contentElement.GetString()
+                        : null;
+                    if (content is null)
+                    {
+                        continue;
+                    }
+                    if (byToken.TryGetValue(content, out int existingId))
+                    {
+                        // The same string can legitimately appear in both places
+                        // with the same id; a conflicting id is a defect.
+                        if (existingId != addedId)
+                        {
+                            throw new MergeException(
+                                $"tokenizer '{tokenizerPath}': token '{content}' has id {existingId} in model.vocab " +
+                                $"but id {addedId} in added_tokens — refusing to guess");
+                        }
+                        continue;
+                    }
+                    ids.Add((addedId, content));
+                    byToken[content] = addedId;
+                }
+            }
+
             ids.Sort((a, b) => a.Id.CompareTo(b.Id));
             for (int i = 0; i < ids.Count; i++)
             {
@@ -106,7 +147,30 @@ public sealed class TokenVocabulary
 
         var vocab = root["model"]?["vocab"]?.AsObject()
             ?? throw new MergeException($"tokenizer '{tokenizerPath}' has no model.vocab object");
+
+        // Next free id must clear BOTH model.vocab and added_tokens — the
+        // special tokens sit above model.vocab, so sizing nextId from
+        // vocab.Count would hand new tokens ids that already belong to
+        // bos/eos/etc and silently overwrite them.
         int nextId = vocab.Count;
+        foreach (var entry in vocab)
+        {
+            if (entry.Value is JsonValue v && v.TryGetValue<int>(out int vid) && vid >= nextId)
+            {
+                nextId = vid + 1;
+            }
+        }
+        if (root["added_tokens"] is JsonArray addedArray)
+        {
+            foreach (var item in addedArray)
+            {
+                if (item?["id"] is JsonValue av && av.TryGetValue<int>(out int aid) && aid >= nextId)
+                {
+                    nextId = aid + 1;
+                }
+            }
+        }
+
         foreach (var token in append)
         {
             if (vocab.ContainsKey(token))
