@@ -43,6 +43,20 @@ public static class Mxfp4
                 $"MXFP4 quantize: shape [{rows}, {columns}] does not match the value count {values.Length}");
         }
 
+        try
+        {
+            return QuantizeCore(values, rows, columns);
+        }
+        catch (IndexOutOfRangeException ex)
+        {
+            throw new SafetensorsException(
+                $"MXFP4 Quantize failed for [{rows}×{columns}] (elements={values.Length}): {ex.Message}", ex);
+        }
+    }
+
+    private static Quantized QuantizeCore(float[] values, long rows, long columns)
+    {
+
         long blocksPerRow = BlocksPerRow(columns);
         long totalBlocks = rows * blocksPerRow;
         var packed = new byte[(values.Length + 1) / 2];
