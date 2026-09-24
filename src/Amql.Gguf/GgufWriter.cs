@@ -163,13 +163,28 @@ public sealed class GgufWriter : IDisposable
     /// <summary>Marks tensor <paramref name="index"/> complete: zero-fills
     /// from the current position up to the tensor's aligned region end, so
     /// the file has no unwritten holes and the next tensor starts cleanly
-    /// at a 32-byte boundary.</summary>
+    /// at a 32-byte boundary. The zero-fill is alignment padding only — a
+    /// payload that wrote fewer bytes than the header declared is a defect
+    /// and throws rather than being silently padded with zeros.</summary>
     public void FinishTensor(int index)
     {
         if (index != _nextTensor)
         {
             throw new InvalidOperationException($"tensor {_nextTensor} is pending, not {index}");
         }
+
+        // Guard against under-written payloads. Zero-padding here would
+        // produce a structurally valid file with silently missing weight
+        // data, which loads cleanly and then generates garbage.
+        long declaredEnd = (long)_offsets[index] + _tensors[index].DataBytes;
+        if (_out.Position < declaredEnd)
+        {
+            throw new InvalidOperationException(
+                $"tensor {index} ('{_tensors[index].Name}') wrote {_out.Position - (long)_offsets[index]} bytes " +
+                $"but the header declares {_tensors[index].DataBytes} — " +
+                $"{declaredEnd - _out.Position} bytes short; refusing to zero-pad");
+        }
+
         _nextTensor++;
         ulong end = _offsets[index] + AlignUp((ulong)_tensors[index].DataBytes, DefaultAlignment);
         while ((ulong)_out.Position < end)

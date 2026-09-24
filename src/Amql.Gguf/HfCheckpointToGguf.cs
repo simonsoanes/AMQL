@@ -424,6 +424,25 @@ public static class GgufConverter
     /// to Q4_0, and writes the quantized bytes.</summary>
     private static void WriteQ4_0Payload(GgufWriter writer, PlanEntry entry, int index)
     {
+        // Stacked MoE experts: the header declares all N slices, so every
+        // slice must be quantized and concatenated. Writing only slice 0
+        // would leave FinishTensor zero-padding the rest — a structurally
+        // valid file whose expert weights are mostly zeros.
+        if (entry.Transform == Transform.Stack)
+        {
+            foreach (var slice in entry.StackSlices!)
+            {
+                var sliceInfo = slice.Info;
+                long sliceRows = sliceInfo.Shape[0], sliceCols = sliceInfo.Shape[1];
+                float[] sliceValues = LoadFloats(slice, sliceRows * sliceCols);
+                // ne0 is sliceCols in GGUF order; slices are written in source
+                // row-major order, which already matches [ne0=sliceCols, ne1=sliceRows].
+                writer.Data.Write(QuantizeQ4_0(sliceValues));
+            }
+            writer.FinishTensor(index);
+            return;
+        }
+
         var source = entry.RequiredSource;
         var info = source.Info;
         long rows = info.Shape[0], cols = info.Shape[1];
