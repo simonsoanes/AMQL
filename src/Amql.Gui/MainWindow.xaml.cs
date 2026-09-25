@@ -870,6 +870,21 @@ public partial class MainWindow : Window
         StatusText.Text = $"Visualiser: {System.IO.Path.GetFileName(dlg.FileName)}";
     }
 
+    private void OnRunAndDisplayInference(object sender, RoutedEventArgs e)
+        => OnExplorerRunInference(ExplorerControl.Model.IsLoaded ? ExplorerControl.Model.ContainerPath : string.Empty);
+
+    /// <summary>Opens the run dialog with the explorer's container filled in and,
+    /// once accepted, a visualiser that fills in live as each token completes.
+    /// With no container open the dialog still appears, so the path can be
+    /// browsed to there.</summary>
+    private void OnExplorerRunInference(string containerPath)
+    {
+        if (Visualiser.InferenceVisualiserWindow.RunAndDisplay(this, containerPath, _project.Cli) is not null)
+        {
+            StatusText.Text = "Visualiser: live inference run started";
+        }
+    }
+
     private void OnTensorSelected(string objectId, string tensorName)
     {
         var data = ExplorerControl.Model.ReadTensor(objectId, tensorName);

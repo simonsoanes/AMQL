@@ -166,6 +166,39 @@ public sealed partial class InferenceVisualiserWindow : Window
         {
             return;
         }
+        await RunLiveAsync(dialog);
+    }
+
+    /// <summary>
+    /// The one-step entry point used by the container explorer: asks for the
+    /// run parameters with the container already filled in, then opens a
+    /// visualiser and starts the run in it. Nothing opens if the dialog is
+    /// cancelled, so a change of mind leaves no empty window behind.
+    /// </summary>
+    public static InferenceVisualiserWindow? RunAndDisplay(Window owner, string containerPath, CliSettings cli)
+    {
+        var dialog = new RunInferenceDialog(containerPath, "The capital of France is") { Owner = owner };
+        if (dialog.ShowDialog() != true)
+        {
+            return null;
+        }
+
+        // Non-modal, so the explorer stays usable while the map fills in.
+        var window = new InferenceVisualiserWindow { Owner = owner };
+        window.SetCliSettings(cli);
+        window.Show();
+        _ = window.RunLiveAsync(dialog);
+        return window;
+    }
+
+    /// <summary>Runs with parameters from an accepted dialog. The dialog has
+    /// closed by now, but its controls still hold the values it validated.</summary>
+    private async Task RunLiveAsync(RunInferenceDialog dialog)
+    {
+        if (_liveCts is not null)
+        {
+            return;     // one run per window; the button is showing Stop
+        }
 
         // Scratch owned by this window, so it goes in the temp directory rather
         // than beside the user's containers.

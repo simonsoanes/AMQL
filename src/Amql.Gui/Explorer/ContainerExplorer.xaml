@@ -16,6 +16,10 @@
                     <Button x:Name="CloseButton" Content="✕" Click="OnCloseContainer"
                             Padding="6,4" ToolTip="Close container"/>
                 </StackPanel>
+                <Button x:Name="RunInferenceButton" Content="▶ Run and display inference…"
+                        Click="OnRunInference" Padding="8,4" Margin="0,4,0,0"
+                        HorizontalAlignment="Left" IsEnabled="{Binding IsLoaded}"
+                        ToolTip="Run a prompt through this container and watch the inference visualiser fill in live as each token completes"/>
                 <TextBlock x:Name="PathText" Text="No container loaded" FontSize="10"
                            TextTrimming="CharacterEllipsis" Foreground="Gray" Margin="0,4,0,0"/>
             </StackPanel>
