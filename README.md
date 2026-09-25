@@ -217,6 +217,20 @@ history, and a **Container Explorer** tab. The explorer drills into the VIndex3 
 values in a spreadsheet grid, browsing the tokenizer vocabulary, and inspecting
 hidden-state edge connections.
 
+![AMQL Studio command runner](screenshots/AMQL%20Studio.png)
+
+*The Commands tab: every CLI command as a parameter form, grouped into eight categories,
+with a live argv preview above the Run button, streamed output below, and a run history
+saved into the project on the right.*
+
+![Container Explorer](screenshots/Model%20Explorer.png)
+
+*The Explorer tab on a Qwen3.5-0.8B container: index facts, then the primary-text
+component's per-layer attention policy — `linear_attention` and `softmax` alternating on a
+4-layer interval, each expandable to its span, position encoding and head geometry — above
+the object graph (embedding, decoder stack, final norm, output head, vision tower, MTP
+drafter).*
+
 ### Inference Visualiser
 
 `generate --trace-json trace.json` records every operator of every generated token — output
@@ -225,6 +239,18 @@ and top-1 margin. Opening that file in **Explorer → Inference Visualiser** (or
 `amql-gui --trace trace.json`) draws the forward pass as a zoomable map: one column per
 layer, operators in computation order, edges thickened and coloured by activation, and a
 violet tab on any operator that reads exactly one weight tensor.
+
+![Inference Visualiser](screenshots/Inference%20Visualiser.png)
+
+*An 8-step run of Qwen3.5-0.8B, aggregated over all steps. Layer columns carry their
+operators in computation order, coloured cool-to-hot by mean activation — the
+linear-attention `linear_qkv` projections dominate, and `linear_qkv` at layer 18 is
+selected at 100% intensity with its editable weight reference
+(`target.decoder_stack / 18.linear_attn.in_proj_qkv.weight`) shown at top right. The
+ranking lists weight-bearing operators by mean magnitude; the logit lens shows the eventual
+token `capital` only emerging from layer 19 onward; the attention panel gives one sparkline
+per head for the six softmax layers, the other eighteen being recurrent and having no
+attention matrix.*
 
 The map is meant to be acted on, not just read:
 
