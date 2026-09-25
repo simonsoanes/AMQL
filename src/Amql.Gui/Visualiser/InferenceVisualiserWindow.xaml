@@ -69,6 +69,7 @@
                     <RowDefinition Height="Auto"/>
                     <RowDefinition Height="*"/>
                     <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
                 </Grid.RowDefinitions>
 
                 <!-- Selected node -->
@@ -179,6 +180,34 @@
                                             <TextBlock Grid.Column="2" Text="{Binding Token}"
                                                        FontWeight="{Binding Weight}"
                                                        TextTrimming="CharacterEllipsis"/>
+                                        </Grid>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </ScrollViewer>
+                    </StackPanel>
+                </Border>
+                <!-- Attention -->
+                <Border Grid.Row="4" x:Name="AttentionPanel" Visibility="Collapsed" Padding="10,8"
+                        BorderBrush="#FFE1E6EE" BorderThickness="0,1,0,0">
+                    <StackPanel>
+                        <TextBlock Text="ATTENTION" FontSize="10" FontWeight="Bold" Foreground="#FF7A8798"/>
+                        <TextBlock x:Name="AttentionHintText" FontSize="10" Foreground="Gray"
+                                   TextWrapping="Wrap" Margin="0,0,0,4"/>
+                        <TextBlock x:Name="AttentionStepText" FontSize="10.5" Foreground="#FF3A5A8A" Margin="0,0,0,6"/>
+                        <ScrollViewer MaxHeight="200" VerticalScrollBarVisibility="Auto">
+                            <ItemsControl x:Name="AttentionList" FontFamily="Cascadia Mono, Consolas" FontSize="11">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <Grid Margin="0,1">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="58"/>
+                                                <ColumnDefinition Width="*"/>
+                                                <ColumnDefinition Width="Auto"/>
+                                            </Grid.ColumnDefinitions>
+                                            <TextBlock Grid.Column="0" Text="{Binding Label}" Foreground="Gray"/>
+                                            <TextBlock Grid.Column="1" Text="{Binding Spark}" Margin="0,0,6,0"/>
+                                            <TextBlock Grid.Column="2" Text="{Binding Peak}"/>
                                         </Grid>
                                     </DataTemplate>
                                 </ItemsControl.ItemTemplate>

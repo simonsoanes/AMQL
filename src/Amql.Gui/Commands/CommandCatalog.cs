@@ -241,6 +241,10 @@ public static class CommandCatalog
                       + "recording what that layer would have emitted. Shows the depth at which the "
                       + "prediction forms. Costs a full head GEMM per layer per step, so it is slow "
                       + "on a large model. Requires --trace-json."),
+            new ParamDef("traceAttention", "--trace-attention", ParamKind.Switch, EditorKind.Choice,
+                Flag: "--trace-attention", DefaultValue: "", Choices: new[] { "", "1" },
+                Help: "Record each softmax-attention head's post-softmax weights for the last query "
+                      + "row, per step. Recurrent layers produce none. Requires --trace-json."),
             new ParamDef("attribute", "--attribute", ParamKind.Switch, EditorKind.Choice, Flag: "--attribute",
                 DefaultValue: "", Choices: new[] { "", "1" },
                 Help: "Run ROME-style causal attribution after generating: corrupt one prompt token, "

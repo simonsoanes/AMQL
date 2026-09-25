@@ -40,6 +40,12 @@ public sealed record TokenCandidate(int Id, float Logit, float Probability, stri
 /// lands.</summary>
 public sealed record LensRow(int Layer, int TokenId, float Probability, IReadOnlyList<TokenCandidate> TopK);
 
+/// <summary>One head's post-softmax attention row at one step: the weight this
+/// head's last query position put on each key position. Only softmax-attention
+/// layers produce one — in a Qwen3.5 model three layers in four are recurrent and
+/// have no attention matrix at all, so a viewer must not imply otherwise.</summary>
+public sealed record AttentionRow(int Layer, int Head, IReadOnlyList<float> Weights);
+
 /// <summary>Everything observed during one generated token.</summary>
 public sealed record StepTrace(
     int Index,
@@ -51,7 +57,8 @@ public sealed record StepTrace(
     IReadOnlyList<TokenCandidate> TopK,
     IReadOnlyList<int> RoutedExperts,
     IReadOnlyList<OpSample> Ops,
-    IReadOnlyList<LensRow>? Lens = null);
+    IReadOnlyList<LensRow>? Lens = null,
+    IReadOnlyList<AttentionRow>? Attention = null);
 
 /// <summary>
 /// Layer-level causal attribution captured alongside a run, when asked for.
@@ -171,6 +178,7 @@ public sealed class TraceRecorder
     private List<OpSample> _samples = new();
     private readonly List<int> _experts = new();
     private readonly List<LensRow> _lens = new();
+    private readonly List<AttentionRow> _attention = new();
     private int _stepIndex;
     private int _position;
 
@@ -205,7 +213,12 @@ public sealed class TraceRecorder
         _samples = new List<OpSample>();
         _experts.Clear();
         _lens.Clear();
+        _attention.Clear();
     }
+
+    /// <summary>Records one head's attention row for this step.</summary>
+    public void ObserveAttention(int layer, int head, IReadOnlyList<float> weights)
+        => _attention.Add(new AttentionRow(layer, head, weights));
 
     /// <summary>Records one operator observation from the runtime hook. Taken
     /// by value so it binds directly to <c>Action&lt;OpObservation&gt;</c> —
@@ -240,7 +253,8 @@ public sealed class TraceRecorder
     {
         _steps.Add(new StepTrace(_stepIndex++, _position, tokenId, tokenText, entropy, top1Margin,
             topK, _experts.ToArray(), _samples.ToArray(),
-            _lens.Count == 0 ? null : _lens.ToArray()));
+            _lens.Count == 0 ? null : _lens.ToArray(),
+            _attention.Count == 0 ? null : _attention.ToArray()));
     }
 
     public RunTrace ToRunTrace(string model, string componentId, int hiddenSize, int layers,

@@ -35,7 +35,8 @@ public static class InferenceRunner
         int AttributeSourceRow = -1,
         int AttributeCorruptTokenId = -1,
         int AttributeLayerEnd = -1,
-        bool LogitLens = false);
+        bool LogitLens = false,
+        bool TraceAttention = false);
 
     /// <summary>How many top candidates a traced step records.</summary>
     private const int TraceTopK = 10;
@@ -93,6 +94,12 @@ public static class InferenceRunner
                     }
                 };
             }
+            if (options is { TraceAttention: true })
+            {
+                // One list, drained after every step: the runtime appends the
+                // final query row's post-softmax weights per head as it goes.
+                session.Runtime.AttentionTrace = new List<GenericRuntime.LayerHeadAttention>();
+            }
         }
 
         var outcomes = new List<StepOutcome>(steps);
@@ -126,6 +133,14 @@ public static class InferenceRunner
                 // "fed this token, these operators ran, this came out".
                 var produced = session.LastLogits;
                 var topK = CandidatesForTrace(produced, options?.TokenText);
+                if (session.Runtime.AttentionTrace is { } attention)
+                {
+                    foreach (var row in attention)
+                    {
+                        recorder.ObserveAttention(row.Layer, row.Head, row.Weights);
+                    }
+                    attention.Clear();
+                }
                 recorder.EndStep(token, options?.TokenText?.Invoke(token), topK,
                     SoftmaxEntropy(produced),
                     topK.Count >= 2 ? topK[0].Probability - topK[1].Probability : topK[0].Probability);
@@ -147,6 +162,10 @@ public static class InferenceRunner
             session.Runtime.OpTrace = null;
             session.Runtime.ExpertRoutingTrace = null;
             session.Runtime.LogitLensTrace = null;
+            // CausalTracer assigns AttentionTrace itself; leaving ours attached
+            // would collect rows from the replay forwards into the generation's
+            // steps.
+            session.Runtime.AttentionTrace = null;
         }
 
         CausalInfo? causal = null;

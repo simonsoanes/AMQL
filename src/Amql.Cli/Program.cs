@@ -666,7 +666,8 @@ internal static class Program
                 AttributeSourceRow: attributeSource,
                 AttributeCorruptTokenId: corruptId,
                 AttributeLayerEnd: attributeLayerEnd,
-                LogitLens: logitLens)
+                LogitLens: logitLens,
+                TraceAttention: HasOption(args, "--trace-attention"))
             : null;
 
         var (prefill, steps2) = InferenceRunner.Generate(
@@ -795,6 +796,29 @@ internal static class Program
                     bool matches = produced is not null && shown == produced.Replace("\n", "\\n");
                     Console.WriteLine($"  L{row.Layer,2}  {row.Probability,7:P2}  \"{shown}\""
                         + (matches ? "   ← what this step produced" : string.Empty));
+                }
+            }
+            var attended = written.Steps.LastOrDefault(s => s.Attention is { Count: > 0 });
+            if (attended?.Attention is { } attentionRows)
+            {
+                // Only softmax-attention layers appear here; in a Qwen3.5 model
+                // three layers in four are recurrent and have no attention
+                // matrix, so the absence of a layer is expected, not a gap.
+                Console.WriteLine($"attention (step {attended.Index + 1}, last query row, "
+                    + $"{attentionRows.Select(a => a.Layer).Distinct().Count()} softmax layers of "
+                    + $"{written.Layers}):");
+                foreach (var row in attentionRows.OrderBy(a => a.Layer).ThenBy(a => a.Head))
+                {
+                    int peak = 0;
+                    for (int i = 1; i < row.Weights.Count; i++)
+                    {
+                        if (row.Weights[i] > row.Weights[peak])
+                        {
+                            peak = i;
+                        }
+                    }
+                    Console.WriteLine($"  L{row.Layer,2} h{row.Head}  attends position {peak} "
+                        + $"at {row.Weights[peak]:P1} of {row.Weights.Count}");
                 }
             }
         }
@@ -1985,7 +2009,7 @@ internal static class Program
                               [--trace-json <trace.json>]
                               [--attribute --attribute-corrupt <text>]
                               [--attribute-source <row>] [--attribute-layers <end>]
-                              [--logit-lens]
+                              [--logit-lens] [--trace-attention]
               amql-cli inspect-token <container-dir> <token>
                               [--tokens ctx,ids] [--neighbors 5] [--logits K]
                               [--tokenizer <checkpoint-dir>] [--component target]

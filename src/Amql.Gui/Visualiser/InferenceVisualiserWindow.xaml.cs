@@ -100,6 +100,7 @@ public sealed partial class InferenceVisualiserWindow : Window
             RefreshRanking();
             ShowStepInfo(-1);
             ShowLens(-1);
+            ShowAttention(-1);
             ShowMetricHint();
             Title = $"Inference Visualiser — {System.IO.Path.GetFileName(path)}";
         }
@@ -180,6 +181,7 @@ public sealed partial class InferenceVisualiserWindow : Window
         StepText.Text = aggregate ? "aggregate" : $"step {step + 1} / {_trace.Steps.Count}";
         ShowStepInfo(step);
         ShowLens(step);
+        ShowAttention(step);
     }
 
     private void OnFit(object sender, RoutedEventArgs e) => Map.FitToView();
@@ -409,6 +411,79 @@ public sealed partial class InferenceVisualiserWindow : Window
 
     private static string Escape(string text)
         => text.Replace("\n", "\\n").Replace("\r", "\\r").Replace("\t", "\\t");
+
+    // ── attention ──────────────────────────────────────────────────────────
+
+    private sealed record AttentionRowVm(string Label, string Spark, string Peak);
+
+    private const string SparkGlyphs = "▁▂▃▄▅▆▇█";
+
+    /// <summary>Renders each head's attention row as a sparkline of block
+    /// characters, one glyph per key position. Text glyphs rather than a drawn
+    /// heatmap: it needs no custom rendering, stays legible at any panel width,
+    /// and a stack of heads reads as small multiples of the same thing.</summary>
+    private void ShowAttention(int step)
+    {
+        if (_trace is null || AttentionPanel is null)
+        {
+            return;
+        }
+        int index = step < 0 ? _trace.Steps.Count - 1 : Math.Min(step, _trace.Steps.Count - 1);
+        var current = index >= 0 && index < _trace.Steps.Count ? _trace.Steps[index] : null;
+        if (current?.Attention is not { Count: > 0 } rows)
+        {
+            AttentionPanel.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        AttentionPanel.Visibility = Visibility.Visible;
+        int softmaxLayers = rows.Select(r => r.Layer).Distinct().Count();
+        AttentionHintText.Text =
+            $"last query row · {softmaxLayers} softmax-attention layer(s) of {_trace.Layers} — "
+            + "recurrent layers have no attention matrix, so their absence is expected. "
+            + "Each glyph is one key position.";
+        AttentionStepText.Text = step < 0
+            ? $"last step ({index + 1} of {_trace.Steps.Count})"
+            : $"step {index + 1} of {_trace.Steps.Count}";
+
+        AttentionList.ItemsSource = rows
+            .OrderBy(r => r.Layer)
+            .ThenBy(r => r.Head)
+            .Select(r =>
+            {
+                int peak = 0;
+                for (int i = 1; i < r.Weights.Count; i++)
+                {
+                    if (r.Weights[i] > r.Weights[peak])
+                    {
+                        peak = i;
+                    }
+                }
+                float max = r.Weights.Count == 0 ? 0f : r.Weights[peak];
+                return new AttentionRowVm(
+                    $"L{r.Layer} h{r.Head}",
+                    Sparkline(r.Weights, max),
+                    r.Weights.Count == 0 ? string.Empty : $"p{peak} {r.Weights[peak]:P0}");
+            })
+            .ToList();
+    }
+
+    private static string Sparkline(IReadOnlyList<float> weights, float max)
+    {
+        if (weights.Count == 0)
+        {
+            return string.Empty;
+        }
+        var sb = new StringBuilder(weights.Count);
+        foreach (float w in weights)
+        {
+            int level = max <= 0f
+                ? 0
+                : (int)Math.Clamp(w / max * (SparkGlyphs.Length - 1), 0, SparkGlyphs.Length - 1);
+            sb.Append(SparkGlyphs[level]);
+        }
+        return sb.ToString();
+    }
 
     // ── editing a tensor the map has identified ────────────────────────────
 
