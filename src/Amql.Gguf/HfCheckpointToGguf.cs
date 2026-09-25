@@ -140,6 +140,22 @@ public static class GgufConverter
         bool reorderLinear = anyLinear && linearKeyHeads > 0 && linearValueHeads > 0 && linearKeyHeads != linearValueHeads;
         int vPerK = linearKeyHeads > 0 ? linearValueHeads / linearKeyHeads : 0;
 
+        // The reorder paths split in_proj_qkv's q|k window and the conv1d
+        // channels using one head width, so they are only correct while the key
+        // and value head dims agree — true of every Qwen3.5 config published so
+        // far, where both are 128. llama.cpp's converter reads head_k_dim for
+        // those splits; rather than silently scramble a model that breaks the
+        // assumption, fail loudly. Threading a separate key head width through
+        // WritePayload is the fix if one ever appears.
+        if (anyLinear && linearKeyHeadDim > 0 && linearValueHeadDim > 0
+            && linearKeyHeadDim != linearValueHeadDim)
+        {
+            throw new GgufException(
+                $"linear_key_head_dim ({linearKeyHeadDim}) differs from linear_value_head_dim "
+                + $"({linearValueHeadDim}) — the qwen35 V-head reorder assumes they match, "
+                + "refusing to write a scrambled file");
+        }
+
         using var directory = ModelDirectory.Open(checkpointDir);
         var names = directory.TensorNames.ToHashSet(StringComparer.Ordinal);
         if (names.Count == 0)

@@ -2,11 +2,17 @@ namespace Amql.Safetensors;
 
 /// <summary>
 /// Ternary weight quantization matching the PrismML Bonsai reference layout.
-/// Two packings: <b>PTQ1_0</b> (ggml type 143, dense 5-trit-per-byte, ~1.75 bpw)
-/// and <b>PQ2_0</b> (ggml type 142, 2-bit-per-trit, ~2.13 bpw). Both use 128-
-/// element blocks with one FP16 scale per block. Weights are stored after a
-/// blockwise Hadamard rotation (block 1024) so the exported checkpoint is
-/// byte-identical to a PrismML llama.cpp fork encode.
+/// Two packings: <b>PTQ1_0</b> (Bonsai type 143, dense 5-trit-per-byte,
+/// ~1.75 bpw) and <b>PQ2_0</b> (Bonsai type 142, 2-bit-per-trit, ~2.13 bpw).
+/// Both use 128-element blocks with one FP16 scale per block. Weights are
+/// stored after a blockwise Hadamard rotation (block 1024) so the exported
+/// checkpoint is byte-identical to a PrismML llama.cpp fork encode.
+/// <para>
+/// Those 142/143 ids are the Bonsai fork's own numbering, NOT upstream ggml's.
+/// Stock ggml ternary is TQ1_0 = 34 and TQ2_0 = 35 with a different trit
+/// packing, so these two codecs are only loadable by the Bonsai fork and must
+/// not be written into a GGUF destined for stock llama.cpp.
+/// </para>
 /// </summary>
 public static class Ternary
 {
