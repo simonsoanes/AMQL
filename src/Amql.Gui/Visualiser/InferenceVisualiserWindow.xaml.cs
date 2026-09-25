@@ -87,9 +87,19 @@ public sealed partial class InferenceVisualiserWindow : Window
             AggregateCheck.IsChecked = true;
 
             Map.SetTrace(trace);
-            Map.SetMetric(MapMetric.MeanL2);
+            CausalMetricItem.IsEnabled = trace.Causal is not null;
+            // SetCausal also selects the metric when attribution is present, so
+            // a trace captured with --attribute opens showing the thing that
+            // actually answers "which layers mattered".
+            Map.SetCausal(trace.Causal);
+            MetricBox.SelectedIndex = trace.Causal is not null ? 3 : 0;
+            if (trace.Causal is null)
+            {
+                Map.SetMetric(MapMetric.MeanL2);
+            }
             RefreshRanking();
             ShowStepInfo(-1);
+            ShowMetricHint();
             Title = $"Inference Visualiser — {System.IO.Path.GetFileName(path)}";
         }
         catch (Exception ex)
@@ -115,10 +125,26 @@ public sealed partial class InferenceVisualiserWindow : Window
             {
                 1 => MapMetric.MaxL2,
                 2 => MapMetric.MeanMs,
+                3 => MapMetric.Causal,
                 _ => MapMetric.MeanL2,
             });
         }
+        ShowMetricHint();
         RefreshRanking();
+    }
+
+    /// <summary>Causal attribution is per layer, so the map says so rather than
+    /// letting a per-operator colour imply a resolution the measurement does
+    /// not have.</summary>
+    private void ShowMetricHint()
+    {
+        if (_trace?.Causal is { } c && MetricBox.SelectedIndex == 3)
+        {
+            HoverText.Text =
+                $"causal share per LAYER (not per operator) · P(target) {c.CleanProbability:P2} clean → "
+                + $"{c.CorruptProbability:P2} corrupted · total effect {c.TotalEffect:P2} · "
+                + $"red = restoring that layer's residual recovered the target, blue = it made it worse";
+        }
     }
 
     private void OnAggregateChanged(object sender, RoutedEventArgs e)

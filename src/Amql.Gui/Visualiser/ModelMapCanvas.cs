@@ -15,6 +15,10 @@ public enum MapMetric
     Step,
     /// <summary>Difference against a baseline run, on a diverging ramp.</summary>
     Compare,
+    /// <summary>Layer share from ROME-style causal attribution, when the trace
+    /// carries it. Per layer, not per operator — tracing restores a whole
+    /// layer's residual, so it cannot resolve finer than that.</summary>
+    Causal,
 }
 
 /// <summary>
@@ -50,6 +54,8 @@ public sealed class ModelMapCanvas : FrameworkElement
     private IReadOnlyDictionary<int, NodeStats> _statsById = new Dictionary<int, NodeStats>();
     private IReadOnlyDictionary<int, float>? _stepValues;
     private IReadOnlyDictionary<int, NodeDelta>? _deltas;
+    private CausalInfo? _causal;
+    private float _causalPeak;
     private readonly Dictionary<int, Rect> _nodeRects = new();
     private readonly List<(int From, int To)> _edges = new();
     private readonly List<(int Layer, Rect Header)> _headers = new();
@@ -132,6 +138,27 @@ public sealed class ModelMapCanvas : FrameworkElement
     }
 
     public bool IsComparing => _deltas is not null;
+
+    /// <summary>Loads ROME-style causal attribution, if the trace carries it,
+    /// and switches the map to colour by layer share. Passing null clears it.</summary>
+    public void SetCausal(CausalInfo? causal)
+    {
+        _causal = causal;
+        _causalPeak = causal is null
+            ? 0f
+            : Math.Max(1e-6f, causal.LayerShare.Max(s => Math.Abs(s)));
+        if (causal is not null)
+        {
+            Metric = MapMetric.Causal;
+        }
+        else if (Metric == MapMetric.Causal)
+        {
+            Metric = MapMetric.MeanL2;
+        }
+        InvalidateVisual();
+    }
+
+    public bool HasCausal => _causal is not null;
 
     /// <summary>Frames the whole map in the viewport.</summary>
     public void FitToView()
@@ -270,6 +297,10 @@ public sealed class ModelMapCanvas : FrameworkElement
     /// comparing, otherwise the run aggregate for the chosen metric.</summary>
     private float IntensityOf(NodeStats s)
     {
+        if (Metric == MapMetric.Causal && _causal is { } c)
+        {
+            return CausalShare(c, s.Layer) is { } share ? Math.Abs(share) / _causalPeak : 0f;
+        }
         if (_deltas is { } deltas)
         {
             return deltas.TryGetValue(s.NodeId, out var delta) ? delta.Intensity : 0f;
@@ -286,9 +317,19 @@ public sealed class ModelMapCanvas : FrameworkElement
         };
     }
 
+    private float? CausalShare(CausalInfo causal, int layer)
+        => layer >= 0 && layer < causal.LayerShare.Count ? causal.LayerShare[layer] : null;
+
     private Color ColorFor(NodeStats s)
     {
         float intensity = IntensityOf(s);
+        if (Metric == MapMetric.Causal && _causal is { } causal)
+        {
+            // Signed: a layer whose restored residual made the target LESS
+            // likely is real information, not noise to be folded into |share|.
+            float share = CausalShare(causal, s.Layer) ?? 0f;
+            return DeltaColor(intensity, share >= 0f);
+        }
         if (_deltas is { } deltas)
         {
             return DeltaColor(intensity,
@@ -443,6 +484,9 @@ public sealed class ModelMapCanvas : FrameworkElement
                     MapMetric.Step => $"{intensity * 100:F0}%",
                     MapMetric.Compare => _deltas is { } d && d.TryGetValue(id, out var delta)
                         ? $"{(delta.Increased ? "+" : "−")}{delta.RelativeChange * 100:F0}%"
+                        : "—",
+                    MapMetric.Causal => _causal is { } c && CausalShare(c, stats.Layer) is { } share
+                        ? $"{(share >= 0 ? "+" : "−")}{Math.Abs(share) * 100:F1}%"
                         : "—",
                     _ => $"‖·‖ {stats.MeanL2:F1}",
                 };

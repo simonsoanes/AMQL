@@ -625,15 +625,41 @@ internal static class Program
         }
 
         string? traceJson = OptionValue(args, "--trace-json");
+        bool attribute = HasOption(args, "--attribute");
+        int corruptId = -1;
+        if (attribute)
+        {
+            string corruptText = OptionValue(args, "--attribute-corrupt") ?? throw new CliException(
+                "--attribute needs --attribute-corrupt <text>: the token that replaces the source "
+                + "position in the corrupted runs, e.g. --attribute-corrupt the");
+            if (tokenizer is null)
+            {
+                throw new CliException(
+                    "--attribute resolves --attribute-corrupt through the tokenizer, so it also needs "
+                    + "--tokenizer <checkpoint-dir>");
+            }
+            corruptId = FirstContinuationId(tokenizer, corruptText);
+            if (corruptId < 0)
+            {
+                throw new CliException($"--attribute-corrupt '{corruptText}' is not in the vocabulary");
+            }
+        }
+        int attributeSource = IntOption(args, "--attribute-source", -1);
+        int attributeLayerEnd = IntOption(args, "--attribute-layers", -1);
+
         var tensorLoads = traceTensors ? new List<TensorTraceLine>() : null;
-        var genOpts = (trace || traceTensors || traceJson is not null || workingSet is not null)
+        var genOpts = (trace || traceTensors || traceJson is not null || workingSet is not null || attribute)
             ? new InferenceRunner.GenerateOptions(Trace: trace, TraceTensors: traceTensors,
                 WeightWorkingSet: workingSet, TraceJsonPath: traceJson,
                 // Resolve token text at capture time so a saved trace reads as
                 // words when reopened, rather than depending on the tokenizer
                 // still being to hand.
                 TokenText: tokenizer is not null ? id => tokenizer.Decode(new[] { id }) : null,
-                OnTensorLoad: tensorLoads is not null ? line => tensorLoads.Add(line) : null)
+                OnTensorLoad: tensorLoads is not null ? line => tensorLoads.Add(line) : null,
+                Attribute: attribute,
+                AttributeSourceRow: attributeSource,
+                AttributeCorruptTokenId: corruptId,
+                AttributeLayerEnd: attributeLayerEnd)
             : null;
 
         var (prefill, steps2) = InferenceRunner.Generate(
@@ -720,6 +746,24 @@ internal static class Program
                     return $"{node.Op}@L{node.Layer} (mean ‖·‖ {kv.Value.MeanL2:F3})";
                 });
             Console.WriteLine($"           busiest operators: {string.Join(", ", top)}");
+
+            if (written.Causal is { } causal)
+            {
+                string Label(int id) => tokenizer is not null ? tokenizer.Decode(new[] { id }) : id.ToString();
+                Console.WriteLine($"attribution: P({Label(causal.TargetTokenId)}) "
+                    + $"{causal.CleanProbability:P2} clean → {causal.CorruptProbability:P2} with "
+                    + $"{Label(causal.SourceTokenId)} at row {causal.SourceRow} replaced by "
+                    + $"{Label(causal.CorruptTokenId)}");
+                Console.WriteLine($"           total effect {causal.TotalEffect:P2}; "
+                    + $"{causal.LayerDelta.Count} layers traced");
+                var peaks = causal.LayerShare
+                    .Select((share, layer) => (share, layer))
+                    .OrderByDescending(x => x.share)
+                    .Take(5)
+                    .Where(x => x.share > 0.001f)
+                    .Select(x => $"L{x.layer} {x.share * 100:F1}%");
+                Console.WriteLine($"           largest shares: {string.Join(", ", peaks)}");
+            }
         }
         return 0;
     }
@@ -1906,6 +1950,8 @@ internal static class Program
                               [--patch <patch.safetensors>]
                               [--trace] [--trace-tensors] [--weights f32|bf16|mxfp4]
                               [--trace-json <trace.json>]
+                              [--attribute --attribute-corrupt <text>]
+                              [--attribute-source <row>] [--attribute-layers <end>]
               amql-cli inspect-token <container-dir> <token>
                               [--tokens ctx,ids] [--neighbors 5] [--logits K]
                               [--tokenizer <checkpoint-dir>] [--component target]

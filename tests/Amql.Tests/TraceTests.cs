@@ -79,7 +79,10 @@ public class TraceTests
             entropy: 1.75f, top1Margin: 0.42f);
 
         var original = recorder.ToRunTrace("Qwen3.5-0.8B", "target.decoder_stack", 1024, 24,
-            new[] { 760, 6511 }, "temperature=0", "ResidentF32");
+            new[] { 760, 6511 }, "temperature=0", "ResidentF32",
+            containerPath: Path.Combine("containers", "Qwen3.5-0.8B"),
+            causal: new CausalInfo(3, 760, 9564, 279, 0.1245f, 0.0806f,
+                new float[] { 0.02f, -0.01f, 0.05f }, new float[] { 0.34f, -0.17f, 0.83f }));
         TraceRecorder.WriteJson(original, path);
 
         Assert.True(File.Exists(path));
@@ -91,6 +94,21 @@ public class TraceTests
         Assert.Equal(original.PromptTokens, read.PromptTokens);
         Assert.Equal(original.Sampling, read.Sampling);
         Assert.Equal(original.WeightWorkingSet, read.WeightWorkingSet);
+        Assert.Equal(original.ContainerPath, read.ContainerPath);
+
+        // the attribution block has to survive too, or the causal overlay is
+        // only ever available in the session that produced it
+        var causal = read.Causal;
+        Assert.NotNull(causal);
+        Assert.Equal(3, causal!.SourceRow);
+        Assert.Equal(760, causal.SourceTokenId);
+        Assert.Equal(9564, causal.CorruptTokenId);
+        Assert.Equal(279, causal.TargetTokenId);
+        Assert.Equal(0.1245f, causal.CleanProbability, precision: 5);
+        Assert.Equal(0.0806f, causal.CorruptProbability, precision: 5);
+        Assert.Equal(0.0439f, causal.TotalEffect, precision: 4);
+        Assert.Equal(new float[] { 0.34f, -0.17f, 0.83f }, causal.LayerShare);
+        Assert.Equal(2, causal.PeakLayer);
 
         var node = Assert.Single(read.Nodes);
         Assert.Equal(2, node.Layer);

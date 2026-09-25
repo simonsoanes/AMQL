@@ -30,7 +30,11 @@ public static class InferenceRunner
         WeightWorkingSet? WeightWorkingSet = null,
         string? TraceJsonPath = null,
         Func<int, string>? TokenText = null,
-        Action<TensorTraceLine>? OnTensorLoad = null);
+        Action<TensorTraceLine>? OnTensorLoad = null,
+        bool Attribute = false,
+        int AttributeSourceRow = -1,
+        int AttributeCorruptTokenId = -1,
+        int AttributeLayerEnd = -1);
 
     /// <summary>How many top candidates a traced step records.</summary>
     private const int TraceTopK = 10;
@@ -122,19 +126,64 @@ public static class InferenceRunner
                 trace));
         }
 
-        if (recorder is not null && options?.TraceJsonPath is { } tracePath)
+        // Detach before attribution. CausalTracer replays the whole context
+        // once per traced layer, and leaving the operator hook attached would
+        // fill the trace with samples from forwards that are not the generation
+        // the user asked about.
+        if (recorder is not null)
         {
             session.Runtime.OpTrace = null;
             session.Runtime.ExpertRoutingTrace = null;
+        }
+
+        CausalInfo? causal = null;
+        if (options is { Attribute: true })
+        {
+            if (recorder is null || options.TraceJsonPath is null)
+            {
+                throw new CliException(
+                    "--attribute records into the operator trace, so it also needs --trace-json <path>");
+            }
+            if (options.AttributeCorruptTokenId < 0)
+            {
+                throw new CliException(
+                    "--attribute needs --attribute-corrupt <text>. Attribution measures how much each "
+                    + "layer recovers the target token's probability after one prompt token is "
+                    + "replaced, so the replacement has to be chosen deliberately.");
+            }
+            if (outcomes.Count == 0)
+            {
+                throw new CliException(
+                    "--attribute needs at least one generated step, to have a target token to attribute");
+            }
+
+            int sourceRow = options.AttributeSourceRow >= 0
+                ? Math.Min(options.AttributeSourceRow, tokens.Length - 1)
+                : tokens.Length - 1;
+            int targetId = outcomes[0].Token;
+            int layerEnd = options.AttributeLayerEnd < 0
+                ? plan.Layers.Count
+                : Math.Clamp(options.AttributeLayerEnd, 1, plan.Layers.Count);
+
+            var attribution = CausalTracer.Trace(
+                session.Runtime, plan, tokens, sourceRow, new[] { targetId },
+                options.AttributeCorruptTokenId, 0, layerEnd);
+
+            causal = new CausalInfo(
+                sourceRow, tokens[sourceRow], options.AttributeCorruptTokenId, targetId,
+                attribution.CleanProbability, attribution.CorruptProbability,
+                attribution.LayerDelta, attribution.LayerShare);
+        }
+
+        if (recorder is not null && options?.TraceJsonPath is { } tracePath)
+        {
             TraceRecorder.WriteJson(
                 recorder.ToRunTrace(
                     container.Index.Model, componentId, plan.HiddenSize, plan.Layers.Count, tokens,
                     $"temperature={config.Temperature} top_k={config.TopK} top_p={config.TopP} seed={config.Seed}",
                     (options?.WeightWorkingSet ?? WeightWorkingSetExtensions.FromEnv()).ToString()!,
-                    // Recorded so the visualiser can offer an edit-tensor command
-                    // for whatever the user clicks, without asking them which
-                    // container the run came from.
-                    container.Root),
+                    container.Root,
+                    causal),
                 tracePath);
         }
 

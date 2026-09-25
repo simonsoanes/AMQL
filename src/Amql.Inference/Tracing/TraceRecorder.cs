@@ -45,6 +45,52 @@ public sealed record StepTrace(
     IReadOnlyList<int> RoutedExperts,
     IReadOnlyList<OpSample> Ops);
 
+/// <summary>
+/// Layer-level causal attribution captured alongside a run, when asked for.
+/// ROME-style: corrupt one prompt token, then restore each layer's clean
+/// residual in turn and re-measure the target token's probability. The share a
+/// layer recovers is how much of that propensity actually lives there — a much
+/// stronger statement than activation magnitude, which only says a tensor was
+/// loud. It costs one forward per traced layer plus two, so it is opt-in.
+/// <para>
+/// Attribution is per layer, not per operator: causal tracing restores a whole
+/// layer's residual, so it cannot resolve finer than that. A map coloured by it
+/// should say so rather than imply operator-level resolution.
+/// </para>
+/// </summary>
+public sealed record CausalInfo(
+    int SourceRow,
+    int SourceTokenId,
+    int CorruptTokenId,
+    int TargetTokenId,
+    float CleanProbability,
+    float CorruptProbability,
+    IReadOnlyList<float> LayerDelta,
+    IReadOnlyList<float> LayerShare)
+{
+    /// <summary>Propensity lost by corrupting the source token.</summary>
+    public float TotalEffect => CleanProbability - CorruptProbability;
+
+    /// <summary>The layer holding the largest share, or -1 if none moved.</summary>
+    public int PeakLayer
+    {
+        get
+        {
+            int best = -1;
+            float bestShare = 0f;
+            for (int i = 0; i < LayerShare.Count; i++)
+            {
+                if (LayerShare[i] > bestShare)
+                {
+                    bestShare = LayerShare[i];
+                    best = i;
+                }
+            }
+            return best;
+        }
+    }
+}
+
 /// <summary>A complete traced run: the graph it walked, then every step.
 /// Serialisable so a run can be saved, reopened, and diffed against another —
 /// comparing two runs on the same map is how an edit to a weight tensor gets
@@ -60,7 +106,8 @@ public sealed record RunTrace(
     string WeightWorkingSet,
     string CapturedUtc,
     IReadOnlyList<OpNode> Nodes,
-    IReadOnlyList<StepTrace> Steps)
+    IReadOnlyList<StepTrace> Steps,
+    CausalInfo? Causal = null)
 {
     /// <summary>Per-node reduction over the whole run, which is what a map
     /// colours itself by: a single token says little, the aggregate says which
@@ -179,9 +226,9 @@ public sealed class TraceRecorder
 
     public RunTrace ToRunTrace(string model, string componentId, int hiddenSize, int layers,
         IReadOnlyList<int> promptTokens, string sampling, string weightWorkingSet,
-        string containerPath = "")
+        string containerPath = "", CausalInfo? causal = null)
         => new(model, componentId, containerPath, hiddenSize, layers, promptTokens, sampling,
-            weightWorkingSet, DateTime.UtcNow.ToString("O"), _nodes.ToArray(), _steps.ToArray());
+            weightWorkingSet, DateTime.UtcNow.ToString("O"), _nodes.ToArray(), _steps.ToArray(), causal);
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {

@@ -25,6 +25,8 @@
                     <ComboBoxItem Content="Mean ‖output‖" IsSelected="True"/>
                     <ComboBoxItem Content="Max ‖output‖"/>
                     <ComboBoxItem Content="Mean time"/>
+                    <ComboBoxItem x:Name="CausalMetricItem" Content="Causal share" IsEnabled="False"
+                                  ToolTip="Layer share from ROME-style causal attribution. Needs a trace captured with generate --attribute. Per layer, not per operator."/>
                 </ComboBox>
 
                 <Separator Margin="14,2" Width="1" Background="#FFD0D7E2"/>
