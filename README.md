@@ -231,7 +231,10 @@ The map is meant to be acted on, not just read:
 - **Run** a prompt from the window (`▶ Run…`) and watch the map fill in as each
   token completes. Inference runs in a CLI child process and the window tails its
   stream, so the model is never loaded into the GUI and stopping a run kills the
-  process rather than unwinding a thread.
+  process rather than unwinding a thread. From the Explorer tab,
+  **▶ Run and display inference…** (header button, right-click menu, or
+  *Explorer → Run and Display Inference…*) does this in one step: it opens the run
+  dialog with the loaded container filled in and a visualiser that fills in live.
 - **Rank** operators by mean/peak activation or time, filtered to weight-bearing ones.
 - **Scrub** a single step, or view the aggregate over the whole run.
 - **Right-click** a weight node to copy the `edit-tensor` command that scales or zeroes that

@@ -24,12 +24,18 @@ public partial class ContainerExplorer : UserControl
 
     public event Action<string, string>? TensorSelected;
 
+    /// <summary>Raised with the loaded container's path when the user asks to
+    /// run and display inference. The explorer only asks: the main window owns
+    /// the CLI settings the run needs.</summary>
+    public event Action<string>? RunInferenceRequested;
+
     // ── context menu ────────────────────────────────────────────────────
 
     private ContextMenu _contextMenu = null!;
     private MenuItem _viewTensorsItem = null!;
     private MenuItem _viewTokenizerItem = null!;
     private MenuItem _viewConnectionsItem = null!;
+    private MenuItem _runInferenceItem = null!;
     private MenuItem _viewLayerTensorsItem = null!;
     private Separator _sepItem = null!;
     private MenuItem _toLinearItem = null!;
@@ -38,6 +44,10 @@ public partial class ContainerExplorer : UserControl
     private void BuildContextMenu()
     {
         _contextMenu = new ContextMenu();
+        _runInferenceItem = new MenuItem { Header = "▶ Run and Display Inference…", FontWeight = FontWeights.Bold };
+        _runInferenceItem.Click += OnRunInference;
+        _contextMenu.Items.Add(_runInferenceItem);
+
         _viewTensorsItem = new MenuItem { Header = "View Tensor Values" };
         _viewTensorsItem.Click += OnViewTensors;
         _contextMenu.Items.Add(_viewTensorsItem);
@@ -83,6 +93,7 @@ public partial class ContainerExplorer : UserControl
 
         _viewTensorsItem.Visibility = (isObject || isTensor) ? Visibility.Visible : Visibility.Collapsed;
         _viewLayerTensorsItem.Visibility = isLayer ? Visibility.Visible : Visibility.Collapsed;
+        _runInferenceItem.Visibility = _model.IsLoaded ? Visibility.Visible : Visibility.Collapsed;
         _viewTokenizerItem.Visibility = _model.IsLoaded ? Visibility.Visible : Visibility.Collapsed;
         _viewConnectionsItem.Visibility = _model.IsLoaded ? Visibility.Visible : Visibility.Collapsed;
         _sepItem.Visibility = isLayer ? Visibility.Visible : Visibility.Collapsed;
@@ -274,6 +285,12 @@ public partial class ContainerExplorer : UserControl
             "automatically from the source checkpoint's layer_types table.",
             "Layer Type Conversion",
             MessageBoxButton.OK, MessageBoxImage.Information);
+    }
+
+    private void OnRunInference(object sender, RoutedEventArgs e)
+    {
+        if (!_model.IsLoaded) return;
+        RunInferenceRequested?.Invoke(_model.ContainerPath);
     }
 
     // ── open / close ────────────────────────────────────────────────────

@@ -27,6 +27,8 @@
                 <MenuItem Header="_Open Container in Explorer…" Click="OnOpenExplorer"/>
                 <MenuItem Header="_Close Explorer Container" Click="OnCloseExplorer"/>
                 <Separator/>
+                <MenuItem Header="_Run and Display Inference…" Click="OnRunAndDisplayInference"
+                          ToolTip="Run a prompt through the container open in the Explorer and watch the visualiser fill in live"/>
                 <MenuItem Header="_Inference Visualiser…" Click="OnOpenVisualiser"
                           ToolTip="Open a captured operator trace (--trace-json) and see which tensors carried a given prompt"/>
             </MenuItem>
@@ -125,7 +127,8 @@
 
             <TabItem Header="Explorer">
                 <explorer:ContainerExplorer x:Name="ExplorerControl"
-                    TensorSelected="OnTensorSelected"/>
+                    TensorSelected="OnTensorSelected"
+                    RunInferenceRequested="OnExplorerRunInference"/>
             </TabItem>
         </TabControl>
     </DockPanel>

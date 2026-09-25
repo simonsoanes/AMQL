@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- **feat(gui):** "▶ Run and display inference…" in the container explorer (header button, right-click menu, and *Explorer* menu) — opens the run dialog with the loaded container pre-filled and starts a live run in a new inference visualiser
 - **feat:** `amql-cli --progress` (or `AMQL_PROGRESS=1`) — a machine-readable progress/result protocol on stdout: newline-delimited `##amql-progress` and `##amql-result` JSON lines, so front-ends bind progress exactly instead of scraping percentages out of prose
 - **feat:** `amql-cli --verbose` — full stack traces for unexpected errors are now opt-in
 - **feat:** `to-gguf --force` overwrites an existing output file (idempotent re-runs)
