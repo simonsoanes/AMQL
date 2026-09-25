@@ -202,7 +202,9 @@ public class TraceTests
 
         // out-of-range steps give an empty map rather than throwing
         Assert.Empty(TraceMetrics.StepValues(run, 99));
-        Assert.Equal((2, 14), TraceMetrics.LayoutSize(run));
+        // 2 layer columns; the row count is the canonical operator table, since
+        // the sample run introduces no operators outside it
+        Assert.Equal((2, TraceMetrics.OpOrder.Count), TraceMetrics.LayoutSize(run));
     }
 
     [Fact]

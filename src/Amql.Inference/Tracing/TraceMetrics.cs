@@ -50,7 +50,10 @@ public static class TraceMetrics
     {
         "pre_attn_norm",
         "attn_q", "attn_k", "attn_v", "attn_context", "attn_output",
-        "softmax_attn", "linear_attn", "conv",
+        "softmax_attn",
+        "linear_qkv", "linear_z", "linear_a", "linear_b",
+        "linear_decay", "linear_gate", "linear_core", "linear_norm", "linear_out",
+        "linear_attn", "conv",
         "pre_ffn_norm",
         "ffn_dense", "ffn_routed",
         "post_ffn_norm",

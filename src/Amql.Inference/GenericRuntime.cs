@@ -446,6 +446,15 @@ public sealed class GenericRuntime
         var b = TensorOps.MatMulTransposedB(h, _weights.Matrix(op.InProjB, op.NumVHeads, op.HiddenSize));
         var a = TensorOps.MatMulTransposedB(h, _weights.Matrix(op.InProjA, op.NumVHeads, op.HiddenSize));
 
+        // Three of every four layers in a Qwen3.5 model are linear-attention,
+        // so reporting the mixer as one node left most of the map without an
+        // editable tensor to point at. These are the projections a user would
+        // actually want to turn down.
+        Report(layer, "linear_qkv", op.InProjQkv, mixed, 0);
+        Report(layer, "linear_z", op.InProjZ, z, 0);
+        Report(layer, "linear_a", op.InProjA, a, 0);
+        Report(layer, "linear_b", op.InProjB, b, 0);
+
         // Depthwise causal conv over the qkv stream (columns → channels),
         // SiLU activated. A single position advances the conv state.
         var stream = ToColumnMajor(mixed, t, op.ConvDim);
@@ -484,11 +493,17 @@ public sealed class GenericRuntime
             beta[i] = 1f / (1f + MathF.Exp(-b.Data[i]));
         }
 
+        var decay = new Tensor2D(g, t, op.NumVHeads);
+        var gate = new Tensor2D(beta, t, op.NumVHeads);
+        Report(layer, "linear_decay", op.ALog, decay, 0);
+        Report(layer, "linear_gate", op.DtBias, gate, 0);
+
         var core = GatedDeltaKernel.Recurrent(
             q, k, v,
-            new Tensor2D(g, t, op.NumVHeads),
-            new Tensor2D(beta, t, op.NumVHeads),
+            decay,
+            gate,
             op.NumVHeads, op.HeadKDim, op.HeadVDim, state);
+        Report(layer, "linear_core", null, core, 0);
 
         // z-gated RMSNorm over the value head dim, then output projection.
         var normWeight = _weights.Vector(op.NormWeight, op.HeadVDim);
@@ -497,9 +512,11 @@ public sealed class GenericRuntime
             new Tensor2D(core.Data, rows, op.HeadVDim),
             new Tensor2D(z.Data, rows, op.HeadVDim),
             normWeight, op.NormEps);
+        Report(layer, "linear_norm", op.NormWeight, gated, 0);
         var out2 = TensorOps.MatMulTransposedB(
             new Tensor2D(gated.Data, t, op.ValueDim),
             _weights.Matrix(op.OutProj, op.HiddenSize, op.ValueDim));
+        Report(layer, "linear_out", op.OutProj, out2, 0);
         return out2;
     }
 
