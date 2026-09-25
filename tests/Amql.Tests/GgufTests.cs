@@ -256,6 +256,44 @@ public class GgufTests
         Assert.Equal(GgufType.F32, reader.GetTensor("blk.0.ssm_a").Type);
     }
 
+    /// <summary>llama.cpp reads the chat template out of the GGUF itself, not
+    /// from a sidecar file, so chat_template.jinja has to be embedded as
+    /// tokenizer.chat_template — otherwise the model loads but a runtime can
+    /// only do raw completions.</summary>
+    [Fact]
+    public void Chat_Template_Is_Embedded_As_A_Gguf_Key()
+    {
+        using var temp = new TempDir();
+        BuildCheckpoint(temp.Path);
+        const string template = "{% for m in messages %}{{ m.content }}{% endfor %}";
+        File.WriteAllText(Path.Combine(temp.Path, "chat_template.jinja"), template);
+
+        string outFile = Path.Combine(temp.Path, "with-template.gguf");
+        var report = GgufConverter.Convert(temp.Path, outFile);
+        Assert.Contains(report.Notes, n => n.Contains("chat template embedded"));
+
+        using var reader = GgufReader.Open(outFile);
+        Assert.Equal(template, reader.Get("tokenizer.chat_template").AsString());
+    }
+
+    /// <summary>A missing template is not an error — a base model legitimately
+    /// ships none — but it must be reported, since the result is a GGUF that
+    /// cannot format a conversation and that is easy to mistake for a
+    /// runtime bug.</summary>
+    [Fact]
+    public void Missing_Chat_Template_Leaves_The_Gguf_Completion_Only()
+    {
+        using var temp = new TempDir();
+        BuildCheckpoint(temp.Path);
+
+        string outFile = Path.Combine(temp.Path, "no-template.gguf");
+        var report = GgufConverter.Convert(temp.Path, outFile);
+        Assert.Contains(report.Notes, n => n.Contains("completion-only"));
+
+        using var reader = GgufReader.Open(outFile);
+        Assert.False(reader.TryGet("tokenizer.chat_template", out _));
+    }
+
     // 2 key heads × 3 value heads per key × head_dim 4, so a grouped row
     // (k, vp, h) becomes the tiled row (vp, k, h). num_v_per_k differing from
     // num_k_heads is what makes the permutation non-self-inverse, matching the

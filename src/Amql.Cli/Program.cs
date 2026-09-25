@@ -165,6 +165,11 @@ internal static class Program
         Console.WriteLine($"encoding:     {report.Encoding}");
         Console.WriteLine($"tensors:      {report.Tensors}");
         Console.WriteLine($"payload:      {FormatBytes(report.PayloadBytes)}");
+        Console.WriteLine($"tokenizer:    {(report.TokenizerCopied ? "tokenizer.json copied" : "not found")}");
+        if (report.AncillaryCopied.Count > 0)
+        {
+            Console.WriteLine($"ancillary:    {string.Join(", ", report.AncillaryCopied)}");
+        }
         foreach (var (repId, write) in report.Segments.OrderBy(s => s.Key))
         {
             Console.WriteLine($"  {repId}: {write.PayloadBytes} bytes  payload_sha={Short(write.PayloadSha256Hex)}  segment_sha={Short(write.SegmentSha256Hex)}");
@@ -1817,7 +1822,9 @@ internal static class Program
             save-lora factors a patch's 2-D deltas into lora_A/lora_B with
             alpha/r scaling for the ORIGINAL (unpatched) model weights.
             export materialises an HF checkpoint directory (config.json +
-            model.safetensors + tokenizer.json) from the container — the
+            model.safetensors + tokenizer.json, plus whatever ancillary
+            config the container carries — chat template, processor and
+            generation configs) from the container — the
             inverse of encode — with patch deltas baked into the stored
             tensors (unpatched tensors are copied byte-identically), so the
             result is a plain original model again. Pass --arch qwen4-next
@@ -1837,7 +1844,11 @@ internal static class Program
             export-mtp.
             to-gguf converts an exported HF checkpoint directory
             (config.json + model.safetensors + tokenizer.json) into a
-            GGUF v3 file for llama.cpp / LM Studio. Qwen3.5-family
+            GGUF v3 file for llama.cpp / LM Studio. A chat template is
+            embedded as tokenizer.chat_template when the directory carries
+            chat_template.jinja (or one inside tokenizer_config.json);
+            without it the GGUF is completion-only and the run says so.
+            Qwen3.5-family
             checkpoints (hybrid linear/full attention, optional MoE) are
             emitted as the qwen35 / qwen35moe architectures following
             llama.cpp's converter: linear-attention tensors map to

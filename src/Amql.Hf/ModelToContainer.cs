@@ -10,6 +10,7 @@ public sealed record EncodeReport(
     long PayloadBytes,
     int Tensors,
     bool TokenizerCopied,
+    IReadOnlyList<string> AncillaryCopied,
     IReadOnlyDictionary<string, SegmentWriteResult> Segments);
 
 /// <summary>
@@ -45,9 +46,17 @@ public static class ModelToContainer
             tokenizerCopied = true;
         }
 
+        // The chat template and the processor configs travel with it too.
+        // Without them a container re-exports as a checkpoint that can
+        // tokenize but cannot format a conversation, and a multi-modal model
+        // loses its image/video processor settings — neither is recoverable
+        // from the tensors, so the container is the only place to keep them.
+        var ancillaryCopied = HfAncillaryFiles.CopyInto(modelDir, containerOut);
+
         long payload = spec.Representations.Sum(r => r.Tensors.Sum(t => (long)t.Data.Length));
         int tensors = spec.Representations.Sum(r => r.Tensors.Count);
         var encoding = result.Index.Representations.Values.FirstOrDefault()?.Encoding ?? "?";
-        return new EncodeReport(modelName, containerOut, encoding, payload, tensors, tokenizerCopied, result.Segments);
+        return new EncodeReport(modelName, containerOut, encoding, payload, tensors, tokenizerCopied,
+            ancillaryCopied, result.Segments);
     }
 }

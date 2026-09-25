@@ -1,4 +1,5 @@
 using System.Text.Json;
+using Amql.Hf;
 using Amql.Inference;
 using Amql.Safetensors;
 using Amql.Vindex3;
@@ -425,6 +426,7 @@ public static class GenerateMtp
         {
             File.Copy(tokenizer, Path.Combine(outDir, "tokenizer.json"));
         }
+        HfAncillaryFiles.CopyInto(source.Root, outDir);
     }
 
     private static byte[] ToF32Bytes(float[] values)

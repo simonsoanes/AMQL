@@ -299,6 +299,10 @@ public static class ModelMerger
         File.WriteAllText(Path.Combine(outDir, "tokenizer.json"),
             TokenVocabulary.WithAppendedTokens(
                 Path.Combine(baseView.Container.Root, "tokenizer.json"), appended));
+        // The chat template and processor configs come from the base model
+        // unchanged: appending vocabulary rows does not alter how a
+        // conversation is formatted.
+        HfAncillaryFiles.CopyInto(baseView.Container.Root, outDir);
 
         WriteGraph(outDir, baseView, scaffold, mergedVocab, width, layers, mergedTied, mergedDtype,
             headUntied, headDtype);

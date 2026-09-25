@@ -187,6 +187,50 @@ public class ExportTests
         }
     }
 
+    // ── ancillary config survives the round trip ──────────────────────────
+
+    /// <summary>
+    /// The chat template and the processor configs are not recoverable from
+    /// the tensors, so the container is the only place that can keep them.
+    /// Without this a model re-exported from a container can tokenize but
+    /// cannot format a conversation, and a multi-modal model silently loses
+    /// its image/video processor settings. Repo metadata is not model config
+    /// and must not be dragged along with it.
+    /// </summary>
+    [Fact]
+    public void Encode_And_Export_Carry_The_Chat_Template_And_Processor_Configs()
+    {
+        using var dir = new TempDir();
+        var modelDir = Path.Combine(dir.Path, "model");
+        SyntheticCheckpoint.Write(modelDir);
+
+        const string template = "{{ '<|im_start|>' + role }}";
+        File.WriteAllText(Path.Combine(modelDir, "chat_template.jinja"), template);
+        File.WriteAllText(Path.Combine(modelDir, "preprocessor_config.json"), "{\"image_mean\":[0.5]}");
+        File.WriteAllText(Path.Combine(modelDir, "generation_config.json"), "{\"eos_token_id\":1}");
+        File.WriteAllText(Path.Combine(modelDir, "README.md"), "repo metadata, not model config");
+
+        var containerPath = Path.Combine(dir.Path, "container");
+        var report = ModelToContainer.Encode(modelDir, containerPath, "synth-ancillary");
+
+        Assert.Equal(
+            new[] { "chat_template.jinja", "generation_config.json", "preprocessor_config.json" },
+            report.AncillaryCopied.OrderBy(name => name, StringComparer.Ordinal).ToArray());
+        Assert.Equal(template, File.ReadAllText(Path.Combine(containerPath, "chat_template.jinja")));
+        Assert.False(File.Exists(Path.Combine(containerPath, "README.md")));
+
+        var outDir = Path.Combine(dir.Path, "exported");
+        using (var container = Vindex3Container.Open(containerPath))
+        {
+            ModelExporter.Export(container, outDir, patch: null);
+        }
+
+        Assert.Equal(template, File.ReadAllText(Path.Combine(outDir, "chat_template.jinja")));
+        Assert.Equal("{\"image_mean\":[0.5]}", File.ReadAllText(Path.Combine(outDir, "preprocessor_config.json")));
+        Assert.Equal("{\"eos_token_id\":1}", File.ReadAllText(Path.Combine(outDir, "generation_config.json")));
+        Assert.False(File.Exists(Path.Combine(outDir, "README.md")));
+    }
+
     // ── patched export bakes deltas in ────────────────────────────────────
 
     [Fact]

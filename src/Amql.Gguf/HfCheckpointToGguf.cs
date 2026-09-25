@@ -340,6 +340,15 @@ public static class GgufConverter
             writer.Kv("tokenizer.ggml.padding_token_id", GgufValue.Uint32((uint)padId));
             writer.Kv("tokenizer.ggml.add_bos_token", GgufValue.Bool(false));
         }
+        // llama.cpp reads the chat template out of the GGUF itself, not from a
+        // sidecar file. Without this key the runtime can only do raw
+        // completions, so the checkpoint directory has to have carried
+        // chat_template.jinja through the container for it to land here.
+        string? chatTemplate = LoadChatTemplate(checkpointDir);
+        if (chatTemplate is not null)
+        {
+            writer.Kv("tokenizer.chat_template", GgufValue.String(chatTemplate));
+        }
         writer.Kv($"{arch}.vocab_size", GgufValue.Uint32((uint)vocab));
 
         foreach (var entry in plan)
@@ -361,6 +370,9 @@ public static class GgufConverter
             anyLinear && reorderLinear
                 ? $"linear-attention V heads reordered grouped → tiled ({linearValueHeads} value / {linearKeyHeads} key heads) per llama.cpp's Qwen3.5 convention" : "",
             qwen35 ? "Qwen3-Next value transforms applied: A_log = -exp(A_log), norms +1, conv1d squeezed" : "",
+            chatTemplate is null
+                ? "no chat template found (chat_template.jinja or tokenizer_config.json) — the GGUF is completion-only"
+                : $"chat template embedded ({chatTemplate.Length} chars)",
             "MTP drafter (mtp.safetensors + mtp.config.json) stays a separate companion shard — not embedded",
             quantization == "q4_0"
                 ? "Q4_0 quantization applied to weight matrices"
@@ -1083,6 +1095,51 @@ public static class GgufConverter
     }
 
     // ── tokenizer ──────────────────────────────────────────────────────────
+
+    /// <summary>Finds the chat template for a checkpoint. HF moved it out of
+    /// tokenizer_config.json into a standalone chat_template.jinja, and older
+    /// repos keep it inside either JSON file, so all three are tried in that
+    /// order. Returns null when the checkpoint ships none, which makes the
+    /// GGUF completion-only rather than failing the conversion — a base model
+    /// legitimately has no template.</summary>
+    private static string? LoadChatTemplate(string checkpointDir)
+    {
+        var jinja = Path.Combine(checkpointDir, "chat_template.jinja");
+        if (File.Exists(jinja))
+        {
+            string text = File.ReadAllText(jinja).Trim();
+            if (text.Length > 0)
+            {
+                return text;
+            }
+        }
+
+        foreach (string name in new[] { "tokenizer_config.json", "tokenizer.json" })
+        {
+            var path = Path.Combine(checkpointDir, name);
+            if (!File.Exists(path))
+            {
+                continue;
+            }
+            try
+            {
+                using var doc = JsonDocument.Parse(File.ReadAllText(path));
+                if (doc.RootElement.ValueKind == JsonValueKind.Object
+                    && doc.RootElement.TryGetProperty("chat_template", out var template)
+                    && template.ValueKind == JsonValueKind.String
+                    && template.GetString() is { Length: > 0 } value)
+                {
+                    return value;
+                }
+            }
+            catch (JsonException)
+            {
+                // a malformed sidecar should not fail the whole conversion
+            }
+        }
+
+        return null;
+    }
 
     /// <summary>Reads the GGUF tokenizer block out of an HF tokenizer.json.
     /// <c>added_tokens</c> carries the special tokens at ids above

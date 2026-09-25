@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using Amql.Hf;
 using Amql.Safetensors;
 using Amql.Vindex3;
 
@@ -75,6 +76,7 @@ public static class ModelConverter
         {
             File.Copy(tokenizer, Path.Combine(outDir, "tokenizer.json"));
         }
+        HfAncillaryFiles.CopyInto(container.Root, outDir);
 
         // Write the score-head segment
         string scoreSegmentPath = "segments/target.classifier_head.bin";
@@ -213,6 +215,7 @@ public static class ModelConverter
         {
             File.Copy(tokenizer, Path.Combine(outDir, "tokenizer.json"));
         }
+        HfAncillaryFiles.CopyInto(container.Root, outDir);
 
         // ── 2. Build the updated system graph ────────────────────────────
         // An embedding surface records the pooling recipe; the stack stays

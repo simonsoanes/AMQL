@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using Amql.Hf;
 using Amql.Inference;
 using Amql.Safetensors;
 using Amql.Vindex3;
@@ -248,6 +249,15 @@ public static class ModelExporter
             File.Copy(tokenizerPath, Path.Combine(outDir, "tokenizer.json"));
         }
 
+        // Whatever ancillary config the container carries — chat template,
+        // processor configs, generation config — has to come back out, or the
+        // exported checkpoint can tokenize but not format a conversation.
+        var ancillary = HfAncillaryFiles.CopyInto(container.Root, outDir);
+        if (ancillary.Count > 0)
+        {
+            notes.Add($"carried from the container: {string.Join(", ", ancillary)}");
+        }
+
         // A materialised MTP drafter rides the same export as a companion:
         // mtp.safetensors + mtp.config.json beside the model's shard.
         var mtp = graph.Objects.FirstOrDefault(o => o.Component == "mtp" && o.Kind == ObjectKind.DecoderStack);
@@ -370,6 +380,7 @@ public static class ModelExporter
             {
                 File.Copy(tokenizerPath, Path.Combine(outDir, "tokenizer.json"));
             }
+            HfAncillaryFiles.CopyInto(container.Root, outDir);
         }
 
         return new MtpExportReport(
