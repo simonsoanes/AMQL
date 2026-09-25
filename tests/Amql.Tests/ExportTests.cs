@@ -231,6 +231,134 @@ public class ExportTests
         Assert.False(File.Exists(Path.Combine(outDir, "README.md")));
     }
 
+    // ── ternary export ─────────────────────────────────────────────────────
+
+    /// <summary>
+    /// PTQ1_0 packs 26 bytes per 128-weight block and PQ2_0 packs 32, so the
+    /// two exports must differ in size — that is the discriminator which catches
+    /// a dispatcher defaulting to one packing whatever the flag says, which is
+    /// exactly what it did. The packed payload is stored as an opaque U8 byte
+    /// matrix because safetensors has no dtype whose element size matches a
+    /// ternary packing (FP4, the only sub-byte tag, declares half a byte per
+    /// element and the writer rejected the payload outright), and the logical
+    /// shape travels in __metadata__ so a decoder can invert the rotation.
+    /// </summary>
+    [Fact]
+    public void Ternary_Export_Honours_The_Chosen_Packing()
+    {
+        using var dir = new TempDir();
+        var containerPath = WriteSynthContainer(dir);
+        var ptq1Dir = Path.Combine(dir.Path, "ptq1");
+        var pq2Dir = Path.Combine(dir.Path, "pq2");
+        using (var container = Vindex3Container.Open(containerPath))
+        {
+            ModelExporter.Export(container, ptq1Dir, patch: null, quantizeTernary: "ptq1");
+            ModelExporter.Export(container, pq2Dir, patch: null, quantizeTernary: "pq2");
+        }
+
+        using var ptq1 = SafetensorsFile.Open(Path.Combine(ptq1Dir, "model.safetensors"));
+        using var pq2 = SafetensorsFile.Open(Path.Combine(pq2Dir, "model.safetensors"));
+
+        Assert.Equal("PTQ1_0", ptq1.Metadata!["amql.ternary.packing"]);
+        Assert.Equal("PQ2_0", pq2.Metadata!["amql.ternary.packing"]);
+        Assert.Equal(Ternary.BlockElements.ToString(), ptq1.Metadata!["amql.ternary.block_elements"]);
+
+        // any quantized tensor: the one with a ".scales" companion
+        string name = ptq1.Tensors.Keys
+            .First(k => !k.EndsWith(".scales") && ptq1.Tensors.ContainsKey(k + ".scales"));
+
+        var a = ptq1.Tensors[name];
+        var b = pq2.Tensors[name];
+        Assert.Equal(Dtype.U8, a.Dtype);
+        Assert.Equal(Dtype.U8, b.Dtype);
+        Assert.Equal(2, a.Shape.Length);
+        Assert.Equal(a.Shape[0], b.Shape[0]);                       // same block count
+        Assert.Equal(Ternary.Ptq1BytesPerBlock, a.Shape[1]);        // 26
+        Assert.Equal(Ternary.Pq2BytesPerBlock, b.Shape[1]);         // 32
+
+        var packedA = ptq1.ReadBytes(name);
+        var packedB = pq2.ReadBytes(name);
+        Assert.Equal(a.Shape[0] * Ternary.Ptq1BytesPerBlock, packedA.Length);
+        Assert.Equal(b.Shape[0] * Ternary.Pq2BytesPerBlock, packedB.Length);
+        Assert.True(packedB.Length > packedA.Length,
+            "PQ2_0 is the denser packing; if both came from one encoder the sizes would match");
+
+        // the logical shape a decoder needs is recoverable from the header
+        var shapes = ptq1.Metadata!["amql.ternary.shapes"]
+            .Split(';', StringSplitOptions.RemoveEmptyEntries)
+            .Select(pair => pair.Split('='))
+            .ToDictionary(p => p[0], p => p[1]);
+        Assert.True(shapes.TryGetValue(name, out var dims), $"no logical shape recorded for '{name}'");
+        var rc = dims.Split('x');
+        Assert.Equal(a.Shape[0], Ternary.BlockScaleCount(int.Parse(rc[0]) * int.Parse(rc[1])));
+    }
+
+    /// <summary>
+    /// Both ternary codecs must be self-consistent, and must disagree in size:
+    /// PTQ1_0 packs 26 bytes per 128-weight block, PQ2_0 packs 32. That is the
+    /// discriminator for the exporter's dispatcher, which used to call
+    /// EncodePq2 whatever the flag said. DecodePtq1 and DecodePq2 previously
+    /// had no callers anywhere in the repo, so neither direction had ever been
+    /// executed by anything.
+    /// <para>
+    /// Numeric fidelity is deliberately not asserted. <c>ComputeScale</c> uses
+    /// the block's mean absolute value, and the Bonsai whitepaper specifies
+    /// only that there is one FP16 scale per 128 weights — not how it is
+    /// derived. The consequence is measurable: a uniform block of value c comes
+    /// back as c/128, because its rotated form is a single spike of √n·c whose
+    /// mean-abs is √n·c/n, and the reconstruction is then limited to that
+    /// scale. Whether mean-abs is the PrismML reference's intent or a defect is
+    /// an open question, and changing it would alter the on-disk numbers, so it
+    /// is left alone rather than guessed at.
+    /// </para>
+    /// </summary>
+    [Theory]
+    [InlineData("ptq1")]
+    [InlineData("pq2")]
+    public void Ternary_Codec_Is_Self_Consistent_For_Both_Packings(string packing)
+    {
+        const int rows = 8, cols = 128;                 // 1024 = one Hadamard block
+        var values = new float[rows * cols];
+        for (int i = 0; i < values.Length; i++)
+        {
+            values[i] = MathF.Sin(i * 0.37f) * (1f + (i % 7) * 0.1f);
+        }
+
+        int bytesPerBlock = packing == "ptq1" ? Ternary.Ptq1BytesPerBlock : Ternary.Pq2BytesPerBlock;
+        Assert.Equal(128, Ternary.BlockElements);
+        Assert.True(bytesPerBlock > 0);
+
+        // EncodePtq1/EncodePq2 rotate the input IN PLACE, so each call needs
+        // its own copy — encoding twice from one array would rotate twice.
+        var (packed, scales) = packing == "ptq1"
+            ? Ternary.EncodePtq1((float[])values.Clone(), rows, cols)
+            : Ternary.EncodePq2((float[])values.Clone(), rows, cols);
+
+        int blocks = Ternary.BlockScaleCount(values.Length);
+        Assert.Equal(blocks * bytesPerBlock, packed.Length);
+        Assert.Equal(blocks * 2, scales.Length);        // one FP16 scale per block
+
+        // deterministic: same input, same bytes
+        var (packed2, scales2) = packing == "ptq1"
+            ? Ternary.EncodePtq1((float[])values.Clone(), rows, cols)
+            : Ternary.EncodePq2((float[])values.Clone(), rows, cols);
+        Assert.Equal(packed, packed2);
+        Assert.Equal(scales, scales2);
+
+        var decoded = packing == "ptq1"
+            ? Ternary.DecodePtq1(packed, scales, values.Length, rows, cols)
+            : Ternary.DecodePq2(packed, scales, values.Length, rows, cols);
+        Assert.Equal(values.Length, decoded.Length);
+        Assert.All(decoded, v => Assert.True(float.IsFinite(v), "decoded a non-finite weight"));
+        Assert.NotEqual(0f, decoded.Max(v => MathF.Abs(v)));   // not an all-zero decode
+
+        // and the two packings really do differ on the same input
+        var (other, _) = packing == "ptq1"
+            ? Ternary.EncodePq2((float[])values.Clone(), rows, cols)
+            : Ternary.EncodePtq1((float[])values.Clone(), rows, cols);
+        Assert.NotEqual(packed.Length, other.Length);
+    }
+
     // ── patched export bakes deltas in ────────────────────────────────────
 
     [Fact]

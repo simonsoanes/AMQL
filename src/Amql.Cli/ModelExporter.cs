@@ -138,6 +138,11 @@ public static class ModelExporter
         int workers = quantizeMxfp4 ? 1 : WorkerCount(Environment.ProcessorCount);
         var lockObj = new object();
         int quantized = 0;
+        // Logical shapes of the ternary tensors. The packed payload is stored as
+        // an opaque byte matrix (see BuildTernaryPayloads), so the rows/cols the
+        // decoder needs to invert the blockwise Hadamard rotation have to be
+        // recorded somewhere — the file header is the only place that survives.
+        var ternaryShapes = new List<(string Name, long Rows, long Cols)>();
         Parallel.ForEach(work, new ParallelOptions { MaxDegreeOfParallelism = workers }, item =>
         {
             string hfName = objectPrefixes[item.ObjectId] + "." + item.Tensor.Name;
@@ -150,11 +155,18 @@ public static class ModelExporter
 
             using var segment = SegmentFile.Open(Path.Combine(container.Root, item.SegmentPath));
             IReadOnlyList<TensorPayload> produced;
-            if (quantizeTernary is not null)
+            // Gate on `quantizing`, not merely on which mode was asked for.
+            // ShouldQuantize is what excludes 1-D norms and biases, and
+            // dispatching without it sent those into the 2-D-only ternary
+            // encoder, which read Shape[1] and threw. MXFP4 survived the same
+            // mistake only because BuildQuantizedPayloads catches and falls
+            // back — exception-driven control flow for every tensor that was
+            // never a candidate.
+            if (quantizing && quantizeTernary is not null)
             {
-                produced = BuildTernaryPayloads(item.ObjectId, segment, item.Tensor, patch, hfName);
+                produced = BuildTernaryPayloads(item.ObjectId, segment, item.Tensor, patch, hfName, quantizeTernary);
             }
-            else if (quantizeMxfp4)
+            else if (quantizing && quantizeMxfp4)
             {
                 produced = BuildQuantizedPayloads(item.ObjectId, segment, item.Tensor, patch, hfName);
             }
@@ -178,6 +190,10 @@ public static class ModelExporter
                 if (quantizing)
                 {
                     quantized++;
+                    if (quantizeTernary is not null)
+                    {
+                        ternaryShapes.Add((hfName, item.Tensor.Shape[0], item.Tensor.Shape[1]));
+                    }
                 }
             }
         });
@@ -219,7 +235,13 @@ public static class ModelExporter
         if (quantized > 0)
         {
             bool isTernary = quantizeTernary is not null;
-            string quantLabel = isTernary ? "ternary" : "MXFP4";
+            // Name the packing, not just "ternary": the two layouts are not
+            // interchangeable and a reader has to know which one it got.
+            string quantLabel = isTernary
+                ? quantizeTernary == "ptq1"
+                    ? $"ternary PTQ1_0 ({Ternary.Ptq1BytesPerBlock} B per {Ternary.BlockElements})"
+                    : $"ternary PQ2_0 ({Ternary.Pq2BytesPerBlock} B per {Ternary.BlockElements})"
+                : "MXFP4";
             string gridDesc = isTernary
                 ? $"{{-1,0,+1}} grid elements, per-{Ternary.BlockElements}-element {Ternary.ScaleDtype.Label()} scales"
                 : $"FP4 E2M1 grid elements, per-{Mxfp4.BlockElements}-element {Dtype.F8_E8M0.Label()} scales";
@@ -239,6 +261,22 @@ public static class ModelExporter
         if (isQwen4Next)
         {
             metadata["arch"] = Qwen4NextLayout.Arch;
+        }
+        if (quantizeTernary is not null && ternaryShapes.Count > 0)
+        {
+            metadata["amql.ternary.packing"] = quantizeTernary == "ptq1" ? "PTQ1_0" : "PQ2_0";
+            metadata["amql.ternary.block_elements"] = Ternary.BlockElements.ToString();
+            metadata["amql.ternary.bytes_per_block"] = (quantizeTernary == "ptq1"
+                ? Ternary.Ptq1BytesPerBlock
+                : Ternary.Pq2BytesPerBlock).ToString();
+            metadata["amql.ternary.scale_dtype"] = Ternary.ScaleDtype.Label();
+            // "name=rowsxcols;name=rowsxcols;…" — the packed payload's own shape
+            // is [blocks, bytes_per_block], which does not encode the logical
+            // matrix, and DecodePtq1/DecodePq2 need rows and cols to undo the
+            // blockwise Hadamard rotation.
+            metadata["amql.ternary.shapes"] = string.Join(";",
+                ternaryShapes.OrderBy(s => s.Name, StringComparer.Ordinal)
+                    .Select(s => $"{s.Name}={s.Rows}x{s.Cols}"));
         }
         SafetensorsWriter.Write(Path.Combine(outDir, ShardName), payloads, metadata);
         File.WriteAllText(Path.Combine(outDir, "config.json"), configJson);
@@ -643,31 +681,54 @@ public static class ModelExporter
     }
 
     /// <summary>f32 weight → packed ternary ({-1,0,+1}) + FP16 block scales.
-    /// Emits two tensors: the weight payload with dtype <c>F32</c> (but
-    /// packed 2-bit data) and a companion scale tensor.</summary>
+    /// Emits two tensors: the packed weight payload and a companion scale
+    /// tensor. <paramref name="packing"/> selects the bit layout — it is not
+    /// cosmetic, and defaulting it silently produced PQ2 bytes for a PTQ1_0
+    /// request.</summary>
     private static IReadOnlyList<TensorPayload> BuildTernaryPayloads(
-        string objectId, SegmentFile segment, SegmentTensor tensor, WeightPatch? patch, string hfName)
+        string objectId, SegmentFile segment, SegmentTensor tensor, WeightPatch? patch, string hfName,
+        string packing)
     {
         var values = WidenedValues(segment, objectId, tensor, patch);
         var rows = tensor.Shape[0];
         var cols = tensor.Shape[1];
-        var (packed, scales) = Ternary.EncodePq2(values, (int)rows, (int)cols);
-        int scaleRows = Ternary.BlockScaleCount(values.Length);
+        // Both packings use 128-element blocks with FP16 scales and the same
+        // blockwise Hadamard rotation; only the bit layout differs. PTQ1_0
+        // stores 5 trits per byte (26 B/block), PQ2_0 stores 4 values per byte
+        // (32 B/block). Reading one as the other yields noise rather than an
+        // error, so the packing has to come from the flag.
+        var (packed, scales) = packing switch
+        {
+            "ptq1" => Ternary.EncodePtq1(values, (int)rows, (int)cols),
+            "pq2" => Ternary.EncodePq2(values, (int)rows, (int)cols),
+            _ => throw new CliException(
+                $"unknown ternary packing '{packing}' — this build exports 'ptq1' or 'pq2'"),
+        };
+        int blocks = Ternary.BlockScaleCount(values.Length);
+        int bytesPerBlock = packing == "ptq1" ? Ternary.Ptq1BytesPerBlock : Ternary.Pq2BytesPerBlock;
 
         return new[]
         {
             new TensorPayload
             {
                 Name = hfName,
-                Dtype = Dtype.FP4,
-                Shape = tensor.Shape,
+                // An opaque byte matrix, one row per 128-weight block.
+                // Safetensors has no dtype whose element size matches a ternary
+                // packing — PTQ1_0 is 26 bytes per block and PQ2_0 is 32, for
+                // 128 weights — and FP4, the only sub-byte tag, declares half a
+                // byte per element, so the writer rejected the payload with a
+                // length mismatch. U8 sized by block is both valid and honest
+                // about what the bytes are; the logical [rows, cols] travels in
+                // the file's __metadata__ instead.
+                Dtype = Dtype.U8,
+                Shape = new long[] { blocks, bytesPerBlock },
                 Data = packed,
             },
             new TensorPayload
             {
                 Name = hfName + ".scales",
-                Dtype = Dtype.F16,
-                Shape = new long[] { scaleRows },
+                Dtype = Ternary.ScaleDtype,
+                Shape = new long[] { blocks },
                 Data = scales,
             },
         };

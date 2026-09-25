@@ -224,12 +224,13 @@ public static class CommandCatalog
             new ParamDef("weights", "--weights", ParamKind.Option, EditorKind.Choice, Flag: "--weights",
                 DefaultValue: "", Choices: new[] { "", "f32", "bf16", "mxfp4" },
                 Help: "Weight working set (empty = env var default)."),
-            new ParamDef("trace", "--trace", ParamKind.Option, EditorKind.Choice, Flag: "--trace",
+            new ParamDef("trace", "--trace", ParamKind.Switch, EditorKind.Choice, Flag: "--trace",
                 DefaultValue: "", Choices: new[] { "", "1" },
                 Help: "Per-layer residual norm trace for each generated token."),
-            new ParamDef("traceTensors", "--trace-tensors", ParamKind.Option, EditorKind.Choice, Flag: "--trace-tensors",
+            new ParamDef("traceTensors", "--trace-tensors", ParamKind.Switch, EditorKind.Choice, Flag: "--trace-tensors",
                 DefaultValue: "", Choices: new[] { "", "1" },
-                Help: "Tensor-load trace (name, shape, cache hit) for each weight load."),
+                Help: "Weight-load trace: distinct tensors pulled, load counts and how many were "
+                      + "cold, including 1-D norm weights."),
             new ParamDef("traceJson", "--trace-json file.json", ParamKind.Option, EditorKind.File, Flag: "--trace-json",
                 Help: "Writes a per-operator trace of every generated token: which operators ran, "
                       + "their output magnitude, which experts a MoE layer routed to, and the "
@@ -310,7 +311,15 @@ public static class CommandCatalog
             OutDirParam with { Label = "--out checkpoint dir" },
             PatchParam,
             new ParamDef("quant", "--quant", ParamKind.Option, EditorKind.Choice, Flag: "--quant", DefaultValue: "none",
-                Choices: new[] { "none", "mxfp4", "ternary" }),
+                Choices: new[] { "none", "mxfp4", "ptq1", "pq2" },
+                Help: "Weight format for the exported checkpoint. 'none' keeps F16; 'mxfp4' is OCP "
+                      + "MXFP4 (FP4 E2M1 with E8M0 block scales, 32-element blocks). 'ptq1' is ternary "
+                      + "PTQ1_0 (5 trits/byte, ~1.75 bpw) and 'pq2' is ternary PQ2_0 (2 bits/trit, "
+                      + "~2.13 bpw); both use 128-element blocks with FP16 scales and a blockwise "
+                      + "Hadamard rotation, and produce PrismML Bonsai-compatible checkpoints for the "
+                      + "Bonsai llama.cpp fork. Their 142/143 type ids are that fork's own numbering, "
+                      + "not stock ggml's, so these two are not GGUF-writable. The CLI takes the "
+                      + "packing explicitly — there is no bare 'ternary' option."),
             new ParamDef("arch", "--arch", ParamKind.Option, EditorKind.Choice, Flag: "--arch", DefaultValue: "qwen3.x",
                 Choices: new[] { "qwen3.x", "qwen4-next" },
                 Help: "Target architecture: qwen3.x (default Qwen3.5) or qwen4-next (Flash-Next)."),
@@ -350,13 +359,15 @@ public static class CommandCatalog
             new ParamDef("context", "--context", ParamKind.Option, EditorKind.Int, Flag: "--context", DefaultValue: "2048"),
             new ParamDef("layerTypes", "--layer-types", ParamKind.Option, EditorKind.Text, Flag: "--layer-types",
                 Help: "Comma-separated list of 'full_attention'/'linear_attention' per layer (e.g. 'full,full,linear' or a repeated pattern 'full,linear')."),
-            new ParamDef("untied", "--untied", ParamKind.Option, EditorKind.Choice, Flag: "--untied",
+            new ParamDef("untied", "--untied", ParamKind.Switch, EditorKind.Choice, Flag: "--untied",
                 DefaultValue: "", Choices: new[] { "", "1" },
                 Help: "Untied output head (separate from embedding)."),
         }),
 
         // ── 8. Classify ─────────────────────────────────────────────────────
-        new("classify", CatPathways, "Run a classifier model (Jev/NLI-style) on premise-hypothesis pairs.", new[]
+        new("classify", CatPathways,
+            "NOT IMPLEMENTED — the CLI prints a placeholder and exits 0. Classifier containers "
+            + "can be made with convert-to-classifier and inspected with 'inspect --classifier'.", new[]
         {
             ContainerParam,
             new ParamDef("text", "--text premise|hypothesis", ParamKind.Option, EditorKind.Text, Flag: "--text",
@@ -364,7 +375,9 @@ public static class CommandCatalog
             new ParamDef("premise", "--premise", ParamKind.Option, EditorKind.Text, Flag: "--premise"),
             new ParamDef("hypothesis", "--hypothesis", ParamKind.Option, EditorKind.Text, Flag: "--hypothesis"),
             new ParamDef("format", "--format", ParamKind.Option, EditorKind.Choice, Flag: "--format", DefaultValue: "labels",
-                Choices: new[] { "labels", "json", "jsonl", "csv" }),
+                Choices: new[] { "labels", "json", "jsonl", "csv" },
+                Help: "Intended output format. Currently ignored — the command is a stub, so this "
+                      + "selects nothing until classify is implemented."),
             PatchParam,
         }),
 
