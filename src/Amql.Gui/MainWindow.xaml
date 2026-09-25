@@ -26,6 +26,9 @@
             <MenuItem Header="_Explorer">
                 <MenuItem Header="_Open Container in Explorer…" Click="OnOpenExplorer"/>
                 <MenuItem Header="_Close Explorer Container" Click="OnCloseExplorer"/>
+                <Separator/>
+                <MenuItem Header="_Inference Visualiser…" Click="OnOpenVisualiser"
+                          ToolTip="Open a captured operator trace (--trace-json) and see which tensors carried a given prompt"/>
             </MenuItem>
             <MenuItem Header="_Help">
                 <MenuItem Header="_About AMQL Studio" Click="OnAbout"/>

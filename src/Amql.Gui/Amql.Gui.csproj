@@ -3,6 +3,7 @@
   <ItemGroup>
     <ProjectReference Include="..\Amql.Vindex3\Amql.Vindex3.csproj" />
     <ProjectReference Include="..\Amql.Safetensors\Amql.Safetensors.csproj" />
+    <ProjectReference Include="..\Amql.Inference\Amql.Inference.csproj" />
   </ItemGroup>
 
   <PropertyGroup>
@@ -13,7 +14,7 @@
     <Nullable>enable</Nullable>
     <AssemblyName>amql-gui</AssemblyName>
     <RootNamespace>Amql.Gui</RootNamespace>
-    <Description>WPF desktop GUI for AMQL — container explorer, command launcher, and parameter editor. References Vindex3 and Safetensors libraries for direct container inspection; the CLI child process handles transforms.</Description>
+    <Description>WPF desktop GUI for AMQL — container explorer, command launcher, parameter editor, and inference visualiser. References Vindex3 and Safetensors for direct container inspection and Inference for its operator-trace model; the CLI child process handles transforms.</Description>
   </PropertyGroup>
 
 </Project>

@@ -626,7 +626,11 @@ internal static class Program
         string? traceJson = OptionValue(args, "--trace-json");
         var genOpts = (trace || traceTensors || traceJson is not null || workingSet is not null)
             ? new InferenceRunner.GenerateOptions(Trace: trace, TraceTensors: traceTensors,
-                WeightWorkingSet: workingSet, TraceJsonPath: traceJson)
+                WeightWorkingSet: workingSet, TraceJsonPath: traceJson,
+                // Resolve token text at capture time so a saved trace reads as
+                // words when reopened, rather than depending on the tokenizer
+                // still being to hand.
+                TokenText: tokenizer is not null ? id => tokenizer.Decode(new[] { id }) : null)
             : null;
 
         var (prefill, steps2) = InferenceRunner.Generate(

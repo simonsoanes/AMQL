@@ -852,6 +852,22 @@ public partial class MainWindow : Window
         StatusText.Text = "Explorer closed";
     }
 
+    private void OnOpenVisualiser(object sender, RoutedEventArgs e)
+    {
+        var dlg = new OpenFileDialog
+        {
+            Title = "Open an Inference Trace",
+            Filter = "Inference trace (*.json)|*.json|All files (*.*)|*.*",
+        };
+        if (dlg.ShowDialog() != true) return;
+
+        // Non-modal, so the map can stay open beside the container explorer
+        // while a tensor is being edited and the run repeated.
+        var window = new Visualiser.InferenceVisualiserWindow(dlg.FileName) { Owner = this };
+        window.Show();
+        StatusText.Text = $"Visualiser: {System.IO.Path.GetFileName(dlg.FileName)}";
+    }
+
     private void OnTensorSelected(string objectId, string tensorName)
     {
         var data = ExplorerControl.Model.ReadTensor(objectId, tensorName);

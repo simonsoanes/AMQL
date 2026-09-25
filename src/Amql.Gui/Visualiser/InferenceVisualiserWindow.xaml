@@ -1,0 +1,157 @@
+<Window x:Class="Amql.Gui.Visualiser.InferenceVisualiserWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:viz="clr-namespace:Amql.Gui.Visualiser"
+        Title="Inference Visualiser" Height="820" Width="1400"
+        WindowStartupLocation="CenterOwner"
+        Background="#FFFBFCFD">
+    <DockPanel>
+
+        <!-- Toolbar -->
+        <Border DockPanel.Dock="Top" Padding="8,6" Background="#FFF4F6FA"
+                BorderBrush="#FFD0D7E2" BorderThickness="0,0,0,1">
+            <StackPanel Orientation="Horizontal">
+                <Button x:Name="OpenButton" Content="📂 Open trace…" Click="OnOpenTrace" Padding="10,3"/>
+                <TextBlock x:Name="ModelText" Margin="14,0,0,0" VerticalAlignment="Center"
+                           FontSize="13" FontWeight="SemiBold" Foreground="#FF2B3A4A"/>
+                <TextBlock x:Name="SummaryText" Margin="12,0,0,0" VerticalAlignment="Center"
+                           FontSize="11" Foreground="Gray"/>
+
+                <Separator Margin="14,2" Width="1" Background="#FFD0D7E2"/>
+
+                <TextBlock Text="Colour by:" VerticalAlignment="Center" Margin="0,0,4,0" FontSize="11"/>
+                <ComboBox x:Name="MetricBox" Width="128" VerticalAlignment="Center"
+                          SelectionChanged="OnMetricChanged">
+                    <ComboBoxItem Content="Mean ‖output‖" IsSelected="True"/>
+                    <ComboBoxItem Content="Max ‖output‖"/>
+                    <ComboBoxItem Content="Mean time"/>
+                </ComboBox>
+
+                <Separator Margin="14,2" Width="1" Background="#FFD0D7E2"/>
+
+                <CheckBox x:Name="AggregateCheck" Content="Whole run" VerticalAlignment="Center"
+                          Margin="0,0,8,0" FontSize="11" IsChecked="True"
+                          Checked="OnAggregateChanged" Unchecked="OnAggregateChanged"/>
+                <Slider x:Name="StepSlider" Width="200" VerticalAlignment="Center"
+                        Minimum="0" Maximum="0" IsSnapToTickEnabled="True" TickFrequency="1"
+                        IsEnabled="False" ValueChanged="OnStepChanged"/>
+                <TextBlock x:Name="StepText" Margin="8,0,0,0" VerticalAlignment="Center"
+                           FontFamily="Cascadia Mono, Consolas" FontSize="11" Foreground="#FF3A5A8A"
+                           Text="aggregate"/>
+
+                <Separator Margin="14,2" Width="1" Background="#FFD0D7E2"/>
+                <Button Content="⤢ Fit" Click="OnFit" Padding="8,3" Margin="0,0,4,0"/>
+                <Button Content="Clear selection" Click="OnClearSelection" Padding="8,3"/>
+            </StackPanel>
+        </Border>
+
+        <!-- Status bar -->
+        <Border DockPanel.Dock="Bottom" Padding="8,4" Background="#FFF0F2F5"
+                BorderBrush="#FFD0D7E2" BorderThickness="0,1,0,0">
+            <StackPanel Orientation="Horizontal">
+                <TextBlock x:Name="HoverText" FontSize="11" Foreground="Gray" VerticalAlignment="Center"
+                           Text="wheel = zoom at cursor · drag = pan · click = select · double-click = zoom to node / fit"/>
+                <TextBlock x:Name="StepInfoText" Margin="20,0,0,0" FontSize="11" VerticalAlignment="Center"
+                           FontFamily="Cascadia Mono, Consolas" Foreground="#FF3A5A8A"/>
+            </StackPanel>
+        </Border>
+
+        <!-- Right-hand analysis panel -->
+        <Border DockPanel.Dock="Right" Width="372" Background="#FFF8F9FB"
+                BorderBrush="#FFD0D7E2" BorderThickness="1,0,0,0">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
+                </Grid.RowDefinitions>
+
+                <!-- Selected node -->
+                <Border Grid.Row="0" Padding="10,8" BorderBrush="#FFE1E6EE" BorderThickness="0,0,0,1">
+                    <StackPanel>
+                        <TextBlock Text="SELECTED OPERATOR" FontSize="10" FontWeight="Bold"
+                                   Foreground="#FF7A8798" Margin="0,0,0,6"/>
+                        <TextBlock x:Name="SelectedOpText" FontSize="14" FontWeight="Bold"
+                                   Foreground="#FF2B3A4A" Text="(none)"/>
+                        <TextBlock x:Name="SelectedWeightText" Margin="0,3,0,0" FontSize="11"
+                                   FontFamily="Cascadia Mono, Consolas" Foreground="#FF8E44AD"
+                                   TextWrapping="Wrap"/>
+                        <Grid x:Name="SelectedStatsGrid" Margin="0,8,0,0" Visibility="Collapsed">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto"/>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+                            <Grid.RowDefinitions>
+                                <RowDefinition/><RowDefinition/><RowDefinition/><RowDefinition/>
+                            </Grid.RowDefinitions>
+                            <TextBlock Grid.Row="0" Grid.Column="0" Text="mean ‖·‖" FontSize="11" Foreground="Gray" Margin="0,0,8,2"/>
+                            <TextBlock Grid.Row="0" Grid.Column="1" x:Name="StatMeanL2" FontSize="11" FontFamily="Cascadia Mono, Consolas" Margin="0,0,14,2"/>
+                            <TextBlock Grid.Row="0" Grid.Column="2" Text="max ‖·‖" FontSize="11" Foreground="Gray" Margin="0,0,8,2"/>
+                            <TextBlock Grid.Row="0" Grid.Column="3" x:Name="StatMaxL2" FontSize="11" FontFamily="Cascadia Mono, Consolas" Margin="0,0,0,2"/>
+                            <TextBlock Grid.Row="1" Grid.Column="0" Text="mean |x|" FontSize="11" Foreground="Gray" Margin="0,0,8,2"/>
+                            <TextBlock Grid.Row="1" Grid.Column="1" x:Name="StatMeanAbs" FontSize="11" FontFamily="Cascadia Mono, Consolas" Margin="0,0,14,2"/>
+                            <TextBlock Grid.Row="1" Grid.Column="2" Text="mean time" FontSize="11" Foreground="Gray" Margin="0,0,8,2"/>
+                            <TextBlock Grid.Row="1" Grid.Column="3" x:Name="StatMeanMs" FontSize="11" FontFamily="Cascadia Mono, Consolas" Margin="0,0,0,2"/>
+                            <TextBlock Grid.Row="2" Grid.Column="0" Text="steps seen" FontSize="11" Foreground="Gray" Margin="0,0,8,2"/>
+                            <TextBlock Grid.Row="2" Grid.Column="1" x:Name="StatSteps" FontSize="11" FontFamily="Cascadia Mono, Consolas" Margin="0,0,14,2"/>
+                            <TextBlock Grid.Row="2" Grid.Column="2" Text="intensity" FontSize="11" Foreground="Gray" Margin="0,0,8,2"/>
+                            <TextBlock Grid.Row="2" Grid.Column="3" x:Name="StatIntensity" FontSize="11" FontFamily="Cascadia Mono, Consolas" Margin="0,0,0,2"/>
+                        </Grid>
+                        <!-- Intensity bar -->
+                        <Grid Margin="0,4,0,0" Height="8" Visibility="{Binding Visibility, ElementName=SelectedStatsGrid}">
+                            <Rectangle Fill="#FFE1E6EE" RadiusX="4" RadiusY="4"/>
+                            <Rectangle x:Name="IntensityBar" HorizontalAlignment="Left" RadiusX="4" RadiusY="4"
+                                       Fill="#FFC0392B" Width="0"/>
+                        </Grid>
+                        <TextBlock x:Name="SelectedHintText" Margin="0,8,0,0" FontSize="10.5" Foreground="Gray"
+                                   TextWrapping="Wrap" Visibility="Collapsed"
+                                   Text="Violet tab = this operator reads exactly one weight tensor, so it is a candidate for change-tensor / save-lora."/>
+                    </StackPanel>
+                </Border>
+
+                <!-- Ranking header -->
+                <Border Grid.Row="1" Padding="10,8,10,4">
+                    <StackPanel Orientation="Horizontal">
+                        <TextBlock Text="RANKED BY" FontSize="10" FontWeight="Bold"
+                                   Foreground="#FF7A8798" VerticalAlignment="Center"/>
+                        <ComboBox x:Name="RankBox" Width="150" Margin="8,0,0,0" FontSize="11"
+                                  SelectionChanged="OnRankChanged">
+                            <ComboBoxItem Content="Mean activation" IsSelected="True"/>
+                            <ComboBoxItem Content="Peak activation"/>
+                            <ComboBoxItem Content="Mean time"/>
+                        </ComboBox>
+                        <CheckBox x:Name="WeightsOnlyCheck" Content="weights only" Margin="12,0,0,0"
+                                  FontSize="11" VerticalAlignment="Center" IsChecked="True"
+                                  Checked="OnRankChanged" Unchecked="OnRankChanged"/>
+                    </StackPanel>
+                </Border>
+
+                <!-- Ranked tensor list -->
+                <DataGrid Grid.Row="2" x:Name="RankGrid" AutoGenerateColumns="False"
+                          CanUserAddRows="False" CanUserDeleteRows="False" CanUserReorderColumns="False"
+                          IsReadOnly="True" SelectionMode="Single" HeadersVisibility="Column"
+                          GridLinesVisibility="Horizontal" AlternatingRowBackground="#FFF2F5F9"
+                          RowHeaderWidth="0" FontFamily="Cascadia Mono, Consolas" FontSize="11"
+                          Background="Transparent" BorderThickness="0"
+                          SelectionChanged="OnRankSelectionChanged">
+                    <DataGrid.Resources>
+                        <Style TargetType="DataGridCell">
+                            <Setter Property="BorderThickness" Value="0"/>
+                            <Setter Property="Padding" Value="4,2"/>
+                        </Style>
+                    </DataGrid.Resources>
+                    <DataGrid.Columns>
+                        <DataGridTextColumn Header="L" Binding="{Binding Layer}" Width="34"/>
+                        <DataGridTextColumn Header="operator" Binding="{Binding Op}" Width="112"/>
+                        <DataGridTextColumn Header="value" Binding="{Binding Display}" Width="*"/>
+                    </DataGrid.Columns>
+                </DataGrid>
+            </Grid>
+        </Border>
+
+        <!-- The map -->
+        <viz:ModelMapCanvas x:Name="Map"/>
+    </DockPanel>
+</Window>

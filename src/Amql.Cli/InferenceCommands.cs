@@ -28,7 +28,8 @@ public static class InferenceRunner
         bool Trace,
         bool TraceTensors,
         WeightWorkingSet? WeightWorkingSet = null,
-        string? TraceJsonPath = null);
+        string? TraceJsonPath = null,
+        Func<int, string>? TokenText = null);
 
     /// <summary>How many top candidates a traced step records.</summary>
     private const int TraceTopK = 10;
@@ -109,8 +110,9 @@ public static class InferenceRunner
                 // not the one the input token was drawn from: a step reads
                 // "fed this token, these operators ran, this came out".
                 var produced = session.LastLogits;
-                var topK = CandidatesForTrace(produced);
-                recorder.EndStep(token, topK, SoftmaxEntropy(produced),
+                var topK = CandidatesForTrace(produced, options?.TokenText);
+                recorder.EndStep(token, options?.TokenText?.Invoke(token), topK,
+                    SoftmaxEntropy(produced),
                     topK.Count >= 2 ? topK[0].Probability - topK[1].Probability : topK[0].Probability);
             }
 
@@ -142,9 +144,9 @@ public static class InferenceRunner
         return (tokens, outcomes);
     }
 
-    private static IReadOnlyList<TokenCandidate> CandidatesForTrace(Tensor2D logits)
+    private static IReadOnlyList<TokenCandidate> CandidatesForTrace(Tensor2D logits, Func<int, string>? tokenText)
         => (CandidatesFor(logits, TraceTopK) ?? Array.Empty<Candidate>())
-            .Select(c => new TokenCandidate(c.Token, c.Logit, c.Probability))
+            .Select(c => new TokenCandidate(c.Token, c.Logit, c.Probability, tokenText?.Invoke(c.Token)))
             .ToArray();
 
     /// <summary>Shannon entropy (nats) of the next-token distribution. A low

@@ -48,7 +48,7 @@ public class TraceTests
             recorder.BeginStep(step);
             recorder.Observe(Op(0, "attn_q", QProj, l2: 2f + step, ms: 1.0));
             recorder.ObserveExperts(new[] { 3, 7 });
-            recorder.EndStep(tokenId: 100 + step, Array.Empty<TokenCandidate>(), 0.5f, 0.25f);
+            recorder.EndStep(tokenId: 100 + step, tokenText: null, Array.Empty<TokenCandidate>(), 0.5f, 0.25f);
         }
 
         var trace = recorder.ToRunTrace("m", "c", 8, 1, new[] { 1, 2, 3 }, "greedy", "F32");
@@ -74,11 +74,9 @@ public class TraceTests
         recorder.BeginStep(5);
         recorder.Observe(Op(2, "ffn_dense", KProj, l2: 1.5f, ms: 0.25));
         recorder.ObserveExperts(new[] { 1, 4, 9 });
-        recorder.EndStep(
-            tokenId: 4242,
-            new[] { new TokenCandidate(4242, 9.5f, 0.6f), new TokenCandidate(7, 8.25f, 0.18f) },
-            entropy: 1.75f,
-            top1Margin: 0.42f);
+        recorder.EndStep(tokenId: 4242, tokenText: " Paris",
+            new[] { new TokenCandidate(4242, 9.5f, 0.6f, " Paris"), new TokenCandidate(7, 8.25f, 0.18f, " Lyon") },
+            entropy: 1.75f, top1Margin: 0.42f);
 
         var original = recorder.ToRunTrace("Qwen3.5-0.8B", "target.decoder_stack", 1024, 24,
             new[] { 760, 6511 }, "temperature=0", "ResidentF32");
@@ -103,16 +101,107 @@ public class TraceTests
         var step = Assert.Single(read.Steps);
         Assert.Equal(5, step.Position);
         Assert.Equal(4242, step.TokenId);
+        Assert.Equal(" Paris", step.TokenText);
         Assert.Equal(1.75f, step.Entropy);
         Assert.Equal(0.42f, step.Top1Margin);
         Assert.Equal(new[] { 1, 4, 9 }, step.RoutedExperts);
         Assert.Equal(2, step.TopK.Count);
         Assert.Equal(9.5f, step.TopK[0].Logit);
         Assert.Equal(0.6f, step.TopK[0].Probability);
+        Assert.Equal(" Paris", step.TopK[0].Text);
 
         var sample = Assert.Single(step.Ops);
         Assert.Equal(node.Id, sample.NodeId);
         Assert.Equal(1.5f, sample.L2);
         Assert.Equal(0.25, sample.Ms, precision: 9);
+    }
+
+    // ── reductions and layout the visualiser draws from ───────────────────
+
+    /// <summary>Builds a small two-layer run: layer 0 has a weighted projection
+    /// and a norm, layer 1 only a norm, over three steps with rising L2.</summary>
+    private static RunTrace SampleRun()
+    {
+        var recorder = new TraceRecorder();
+        for (int step = 0; step < 3; step++)
+        {
+            recorder.BeginStep(step);
+            recorder.Observe(Op(0, "attn_q", QProj, l2: 2f * (step + 1), ms: 1.0));
+            recorder.Observe(Op(0, "pre_ffn_norm", null, l2: 1f * (step + 1), ms: 0.5));
+            recorder.Observe(Op(1, "pre_ffn_norm", null, l2: 8f, ms: 0.25));
+            recorder.EndStep(100 + step, null, Array.Empty<TokenCandidate>(), 0.5f, 0.25f);
+        }
+        return recorder.ToRunTrace("m", "c", 8, 2, new[] { 1 }, "greedy", "F32");
+    }
+
+    [Fact]
+    public void Reduce_Computes_Mean_Max_And_Relative_Intensity()
+    {
+        var stats = TraceMetrics.Reduce(SampleRun()).ToDictionary(s => (s.Layer, s.Op));
+
+        var q = stats[(0, "attn_q")];
+        Assert.Equal(4f, q.MeanL2, precision: 5);   // (2 + 4 + 6) / 3
+        Assert.Equal(6f, q.MaxL2, precision: 5);
+        Assert.Equal(3, q.Steps);
+        Assert.Equal(1.0, q.MeanMs, precision: 5);
+        Assert.True(q.HasWeight);
+        Assert.Equal(QProj.ObjectId, q.WeightObject);
+
+        var norm0 = stats[(0, "pre_ffn_norm")];
+        Assert.Equal(2f, norm0.MeanL2, precision: 5);
+        Assert.False(norm0.HasWeight);
+
+        // Intensity is relative to the busiest operator in the run, which is
+        // layer 1's norm at a constant 8.
+        var norm1 = stats[(1, "pre_ffn_norm")];
+        Assert.Equal(1f, norm1.Intensity, precision: 5);
+        Assert.Equal(0.5f, q.Intensity, precision: 5);
+        Assert.Equal(0.25f, norm0.Intensity, precision: 5);
+    }
+
+    [Fact]
+    public void Ranking_Puts_The_Busiest_And_The_Slowest_First()
+    {
+        var run = SampleRun();
+        var byL2 = TraceMetrics.RankByMeanL2(run);
+        Assert.Equal("pre_ffn_norm", byL2[0].Op);
+        Assert.Equal(1, byL2[0].Layer);
+        Assert.Equal("attn_q", TraceMetrics.RankByMeanMs(run)[0].Op);
+    }
+
+    [Fact]
+    public void OpSlots_Keep_Canonical_Order_And_Append_Unknown_Ops()
+    {
+        var slots = TraceMetrics.OpSlots(SampleRun().Nodes);
+
+        // the canonical order is what makes a layer column read as a computation
+        Assert.True(slots["pre_attn_norm"] < slots["attn_q"]);
+        Assert.True(slots["attn_q"] < slots["attn_k"]);
+        Assert.True(slots["attn_output"] < slots["pre_ffn_norm"]);
+        Assert.True(slots["pre_ffn_norm"] < slots["ffn_routed"]);
+        Assert.True(slots["post_ffn_norm"] < slots["residual_out"]);
+
+        // an operator that is not in the table still gets a stable slot rather
+        // than disappearing from the map
+        var extended = TraceMetrics.OpSlots(
+            SampleRun().Nodes.Append(new OpNode(99, 0, "brand_new_op", null)).ToArray());
+        Assert.True(extended["brand_new_op"] >= TraceMetrics.OpOrder.Count);
+    }
+
+    [Fact]
+    public void StepValues_Normalise_Within_The_Selected_Step()
+    {
+        var run = SampleRun();
+        var last = TraceMetrics.StepValues(run, run.Steps.Count - 1);
+        int qId = run.Nodes.First(n => n.Op == "attn_q").Id;
+        int norm1Id = run.Nodes.First(n => n.Layer == 1).Id;
+
+        // layer 1's norm (8) outranks layer 0's projection (6) in this step
+        Assert.Equal(1f, last[norm1Id], precision: 5);
+        Assert.Equal(6f / 8f, last[qId], precision: 5);
+
+        // out-of-range steps give an empty map rather than throwing
+        Assert.Empty(TraceMetrics.StepValues(run, 99));
+        Assert.Equal((2, 14), TraceMetrics.LayoutSize(run));
     }
 }

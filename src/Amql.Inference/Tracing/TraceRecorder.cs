@@ -27,16 +27,18 @@ public sealed record OpNode(int Id, int Layer, string Op, OperandRef? Weight);
 /// </summary>
 public readonly record struct OpSample(int NodeId, float L2, float MaxAbs, float MeanAbs, double Ms);
 
-/// <summary>One entry of the output distribution at a step. Carries ids rather
-/// than text: the runtime has no tokenizer, and the consumer that renders a
-/// trace always does.</summary>
-public sealed record TokenCandidate(int Id, float Logit, float Probability);
+/// <summary>One entry of the output distribution at a step. The text is
+/// optional because the runtime has no tokenizer — whoever captures the trace
+/// supplies a resolver, so the saved file is self-describing and a run opened
+/// days later still reads as words rather than ids.</summary>
+public sealed record TokenCandidate(int Id, float Logit, float Probability, string? Text = null);
 
 /// <summary>Everything observed during one generated token.</summary>
 public sealed record StepTrace(
     int Index,
     int Position,
     int TokenId,
+    string? TokenText,
     float Entropy,
     float Top1Margin,
     IReadOnlyList<TokenCandidate> TopK,
@@ -167,9 +169,10 @@ public sealed class TraceRecorder
         }
     }
 
-    public void EndStep(int tokenId, IReadOnlyList<TokenCandidate> topK, float entropy, float top1Margin)
+    public void EndStep(int tokenId, string? tokenText, IReadOnlyList<TokenCandidate> topK,
+        float entropy, float top1Margin)
     {
-        _steps.Add(new StepTrace(_stepIndex++, _position, tokenId, entropy, top1Margin,
+        _steps.Add(new StepTrace(_stepIndex++, _position, tokenId, tokenText, entropy, top1Margin,
             topK, _experts.ToArray(), _samples.ToArray()));
     }
 
