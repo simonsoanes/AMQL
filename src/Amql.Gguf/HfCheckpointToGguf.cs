@@ -47,7 +47,6 @@ public sealed class GgufConversion
 /// </summary>
 public static class GgufConverter
 {
-    private const long TransposeBlockRows = 8192;
     private const long CopyChunkBytes = 1 << 20;
 
     private enum Transform
@@ -351,7 +350,7 @@ public static class GgufConverter
 
         for (int i = 0; i < plan.Count; i++)
         {
-            WritePayload(writer, plan[i], i, reorderLinear, vPerK, linearValueHeads, linearKeyHeads, linearValueHeadDim, quantization);
+            WritePayload(writer, plan[i], i, reorderLinear, vPerK, linearKeyHeads, linearValueHeadDim, quantization);
         }
 
         long bytes = new FileInfo(outFile).Length;
@@ -542,13 +541,17 @@ public static class GgufConverter
         return entry.Transform switch
         {
             Transform.Zeros => GgufType.F16,
-            // llama.cpp's Qwen3-Next reference keeps the per-value-head
-            // ssm scalar params (A_log/dt/in_proj_a/in_proj_b) in float32
-            // — they are float in the HF checkpoints and the graph mixes
-            // them with f32 states; f16 writes trip ggml's mixed-type
-            // binary ops in build.
-            Transform.Q35ALog or Transform.Q35Dt or Transform.Q35A or Transform.Q35B or Transform.Q35Conv
-                or Transform.Q35Out or Transform.Q35Qkv or Transform.Q35Z => GgufType.F32,
+            // The per-value-head scalar params (A_log/dt/in_proj_a/in_proj_b)
+            // and the depthwise conv stay float32 — they are float in the HF
+            // checkpoints and ggml mixes them with f32 recurrent state, where
+            // an f16 operand trips the mixed-type binary ops in build.
+            // in_proj_qkv / in_proj_z / out_proj are ordinary projection
+            // matrices that merely need their V heads permuted first, so they
+            // follow the normal dtype/quantization policy like every other
+            // weight; forcing them to F32 was costing 4 bytes per element on
+            // three quarters of a hybrid model's layers.
+            Transform.Q35ALog or Transform.Q35Dt or Transform.Q35A or Transform.Q35B
+                or Transform.Q35Conv => GgufType.F32,
             _ => entry.Source!.Info.Dtype switch
             {
                 Dtype.F32 => GgufType.F32,
@@ -587,10 +590,11 @@ public static class GgufConverter
         // must stay full precision rather than be padded.
         if (totalElements % Q4_0BlockSize != 0) return false;
 
-        // Skip transforms that need F32
+        // Skip the transforms that must stay F32 (see GgufTypeFor). The
+        // reordering projections are not in this list: their head permutation
+        // happens inside their own write path before the values are blocked.
         if (entry.Transform is Transform.Q35ALog or Transform.Q35Dt or Transform.Q35A
-            or Transform.Q35B or Transform.Q35Conv or Transform.Q35Out
-            or Transform.Q35Qkv or Transform.Q35Z)
+            or Transform.Q35B or Transform.Q35Conv or Transform.Q35Norm)
             return false;
 
         return true;
@@ -639,12 +643,15 @@ public static class GgufConverter
     // ── payload streaming ──────────────────────────────────────────────────
 
     private static void WritePayload(GgufWriter writer, PlanEntry entry, int index, bool reorderLinear,
-        int vPerK, int numVHeads, int numKHeads, int headVDim, string quantization)
+        int vPerK, int numKHeads, int headVDim, string quantization)
     {
         writer.SeekTensor(index);
 
-        // Q4_0 quantization: load floats, quantize, write Q4_0 bytes
-        if (quantization == "q4_0" && ShouldQuantize(entry))
+        // Q4_0 quantization: load floats, quantize, write Q4_0 bytes. The
+        // reordering projections are excluded here because their V-head
+        // permutation has to happen before the values are cut into blocks;
+        // they quantize inside their own write path instead.
+        if (quantization == "q4_0" && ShouldQuantize(entry) && !ReordersHeads(entry.Transform))
         {
             WriteQ4_0Payload(writer, entry, index);
             return;
@@ -711,17 +718,17 @@ public static class GgufConverter
                 }
                 break;
             case Transform.Q35Qkv:
-                // split rows into q | k | v, reorder v tiled, concatenate, transpose
-                var info = entry.RequiredSource.Info;
+                // rows are q | k | v; only the V window is permuted
                 long qDim = (long)numKHeads * headVDim;
-                WriteF32RowOrderAndTranspose(writer, entry, index, 2 * qDim, numKHeads, headVDim, vPerK);
+                WriteRowReordered(writer, entry, index, 2 * qDim, numKHeads, headVDim, vPerK, quantization);
                 break;
             case Transform.Q35Z:
-                WriteF32RowOrderAndTranspose(writer, entry, index, 0, numKHeads, headVDim, vPerK);
+                WriteRowReordered(writer, entry, index, 0, numKHeads, headVDim, vPerK, quantization);
                 break;
             case Transform.Q35A:
             case Transform.Q35B:
-                WriteF32RowOrderAndTranspose(writer, entry, index, 0, numKHeads, 1, vPerK);
+                // one row per value head, so the "head dim" of the permutation is 1
+                WriteRowReordered(writer, entry, index, 0, numKHeads, 1, vPerK, quantization);
                 break;
             case Transform.Q35ALog:
                 // 1-D per-value-head decay: reorder, value = -exp
@@ -735,8 +742,8 @@ public static class GgufConverter
                 ReorderConvRows(writer, entry, index, numKHeads, headVDim, vPerK);
                 break;
             case Transform.Q35Out:
-                // transpose + reorder columns (input dim) tiled
-                WriteTransposed(writer, entry, index, addOne: false, columnReorder: (numVHeads, numKHeads, headVDim, vPerK));
+                // the input dim carries the tiled V-head states
+                WriteColReordered(writer, entry, index, numKHeads, headVDim, vPerK, quantization);
                 break;
             default:
                 throw new GgufException($"unhandled transform {entry.Transform}");
@@ -819,197 +826,141 @@ public static class GgufConverter
     private static readonly bool NormPlusOne =
         Environment.GetEnvironmentVariable("AMQL_GGUF_NORM_PLUS_ONE") != "0";
 
-    private static void WriteTransposed(GgufWriter writer, PlanEntry entry, int index, bool addOne,
-        (int NumVHeads, int NumKHeads, int HeadVDim, int VPerK)? columnReorder = null)
-    {
-        var source = entry.RequiredSource;
-        var info = source.Info;
-        long rows = info.Shape[0], cols = info.Shape[1];
-        long basePosition = (long)writer.TensorOffset(index);
-        bool asF32 = GgufTypeFor(entry, "none") == GgufType.F32;
+    /// <summary>True for the transforms that permute V heads, which must run
+    /// their reorder before any quantization blocking.</summary>
+    private static bool ReordersHeads(Transform transform)
+        => transform is Transform.Q35Qkv or Transform.Q35Z or Transform.Q35Out;
 
-        long spanBytes = rows * cols * (info.Dtype == Dtype.F32 ? 4 : 2);
-        if (spanBytes <= 512L << 20)
-        {
-            float[] f = LoadFloats(source, rows * cols);
-            if (addOne)
-            {
-                for (long i = 0; i < f.Length; i++)
-                {
-                    f[i] += 1.0f;
-                }
-            }
-            if (columnReorder is { } cr)
-            {
-                f = ReorderColumnsFloats(f, rows, cols, cr.VPerK, cr.NumKHeads, cr.HeadVDim);
-            }
-            WriteTransposedFloats(writer, basePosition, f, rows, cols, asF32);
-        }
-        else
-        {
-            WriteTransposedBlocked(writer, entry, basePosition, rows, cols, addOne);
-        }
-    }
-
-    private static float[] LoadFloats(Source source, long count)
-    {
-        byte[] bytes = source.File.ReadBytes(source.Info);
-        var floats = new float[count];
-        if (source.Info.Dtype == Dtype.F32)
-        {
-            for (long i = 0; i < count; i++)
-            {
-                floats[i] = BitConverter.Int32BitsToSingle(BinaryPrimitives.ReadInt32LittleEndian(bytes.AsSpan((int)(i * 4))));
-            }
-        }
-        else
-        {
-            for (long i = 0; i < count; i++)
-            {
-                floats[i] = BitConverter.UInt32BitsToSingle(
-                    (uint)((ushort)(bytes[(int)(i * 2)] | (bytes[(int)(i * 2) + 1] << 8)) << 16));
-            }
-        }
-        return floats;
-    }
-
-    private static void WriteTransposedFloats(GgufWriter writer, long basePosition, float[] values, long rows, long cols, bool asF32)
-    {
-        int elem = asF32 ? 4 : 2;
-        var colRun = new byte[rows * elem];
-        for (long c = 0; c < cols; c++)
-        {
-            for (long r = 0; r < rows; r++)
-            {
-                if (asF32)
-                {
-                    BinaryPrimitives.WriteSingleLittleEndian(colRun.AsSpan((int)(r * 4)), values[r * cols + c]);
-                }
-                else
-                {
-                    BinaryPrimitives.WriteUInt16LittleEndian(colRun.AsSpan((int)(r * 2)), BitConverter.HalfToUInt16Bits((Half)values[r * cols + c]));
-                }
-            }
-            writer.SeekAbsolute(basePosition + c * rows * elem);
-            writer.Data.Write(colRun, 0, (int)(rows * elem));
-        }
-    }
-
-    private static float[] ReorderColumnsFloats(float[] values, long rows, long cols, int vPerK, int numKHeads, int headVDim)
-    {
-        var reordered = new float[values.Length];
-        long vPerKCols = (long)vPerK * headVDim;
-        for (long c = 0; c < cols; c++)
-        {
-            long k = c / vPerKCols;
-            long inner = c % vPerKCols;
-            long vp = inner / headVDim;
-            long headCol = inner % headVDim;
-            long tiled = vp * numKHeads + k;
-            long srcCol = tiled * headVDim + headCol;
-            for (long r = 0; r < rows; r++)
-            {
-                reordered[r * cols + c] = values[r * cols + srcCol];
-            }
-        }
-        return reordered;
-    }
-
-    private static void WriteTransposedBlocked(GgufWriter writer, PlanEntry entry, long basePosition, long rows, long cols, bool addOne)
-    {
-        var source = entry.RequiredSource;
-        var info = source.Info;
-        if (info.Dtype != Dtype.BF16)
-        {
-            throw new GgufException($"blocked transpose of non-BF16 tensor '{info.Name}' is unsupported");
-        }
-        int blockRows = (int)Math.Min(TransposeBlockRows, rows);
-        long rowBytes = cols * 2;
-        var block = new byte[blockRows * cols * 2];
-        var colRun = new byte[blockRows * 2];
-
-        for (long r0 = 0; r0 < rows; r0 += blockRows)
-        {
-            int b = (int)Math.Min(blockRows, rows - r0);
-            for (long r = 0; r < b; r++)
-            {
-                byte[] row = source.File.ReadBytes(info, (r0 + r) * rowBytes, (int)rowBytes);
-                row.CopyTo(block, (int)(r * cols * 2));
-            }
-            ConvertBf16ToF16(block.AsSpan(0, b * (int)cols * 2), block.AsSpan(0, b * (int)cols * 2));
-            if (addOne)
-            {
-                AddOneToF16(block.AsSpan(0, b * (int)cols * 2));
-            }
-            for (long c = 0; c < cols; c++)
-            {
-                for (long r = 0; r < b; r++)
-                {
-                    colRun[(int)(r * 2)] = block[(int)((r * cols + c) * 2)];
-                    colRun[(int)(r * 2) + 1] = block[(int)((r * cols + c) * 2) + 1];
-                }
-                writer.SeekAbsolute(basePosition + (c * rows + r0) * 2);
-                writer.Data.Write(colRun, 0, b * 2);
-            }
-        }
-    }
-
-    // ── Qwen3.5 linear-attention transforms ────────────────────────────────
-
-    private static void WriteF32RowOrderAndTranspose(GgufWriter writer, PlanEntry entry, int index,
-        long qkRows, int numKHeads, int headVDim, int vPerK)
+    /// <summary>Permutes the V-head rows of a linear-attention projection from
+    /// HF's grouped-by-K-head order into ggml's tiled order and writes the
+    /// result verbatim. Only rows move — the array keeps its [rows, cols]
+    /// shape — so the payload is the permuted buffer unchanged while the
+    /// header declares the reversed dims. Transposing it as well would
+    /// double-transpose the weight, the same failure mode Transform.Transpose
+    /// had. Mirrors _reorder_v_heads in llama.cpp's converter: reshape the V
+    /// window to [num_k_heads, num_v_per_k, head_dim], swap the first two
+    /// axes, flatten back. Rows before <paramref name="vWindowStart"/> are the
+    /// q and k window of in_proj_qkv and keep their place.</summary>
+    private static void WriteRowReordered(GgufWriter writer, PlanEntry entry, int index,
+        long vWindowStart, int numKHeads, int headVDim, int vPerK, string quantization)
     {
         var source = entry.RequiredSource;
         var info = source.Info;
         long rows = info.Shape[0], cols = info.Shape[1];
         byte[] bytes = source.File.ReadBytes(info);
-        var f32 = new float[rows * cols];
-        for (long i = 0; i < rows * cols; i++)
-        {
-            f32[i] = info.Dtype == Dtype.F32
-                ? BitConverter.Int32BitsToSingle(BinaryPrimitives.ReadInt32LittleEndian(bytes.AsSpan((int)(i * 4))))
-                : BitConverter.UInt32BitsToSingle((uint)((ushort)(bytes[(int)(i * 2)] | (bytes[(int)(i * 2) + 1] << 8)) << 16));
-        }
 
-        // rows before qkRows keep their place; the V window (rows qkRows..)
-        // is reordered grouped → tiled (rows = num_v_heads * head_dim)
-        var reordered = new float[rows * cols];
-        for (long r = 0; r < qkRows; r++)
-        {
-            for (long c = 0; c < cols; c++)
-            {
-                reordered[r * cols + c] = f32[r * cols + c];
-            }
-        }
         long vPerKRows = (long)vPerK * headVDim;
-        for (long r = qkRows; r < rows; r++)
+        var reordered = new float[rows * cols];
+        for (long r = 0; r < rows; r++)
         {
-            long rr = r - qkRows;
-            long k = rr / vPerKRows;
-            long inner = rr % vPerKRows;
-            long vp = inner / headVDim;
-            long headRow = inner % headVDim;
-            long tiled = vp * numKHeads + k;
-            long dstRow = qkRows + tiled * headVDim + headRow;
+            long dst = r;
+            if (r >= vWindowStart)
+            {
+                long rr = r - vWindowStart;
+                long k = rr / vPerKRows;
+                long inner = rr % vPerKRows;
+                long vp = inner / headVDim;
+                long headRow = inner % headVDim;
+                dst = vWindowStart + (vp * numKHeads + k) * headVDim + headRow;
+            }
+
+            long srcBase = r * cols, dstBase = dst * cols;
             for (long c = 0; c < cols; c++)
             {
-                reordered[dstRow * cols + c] = f32[r * cols + c];
+                reordered[dstBase + c] = ReadFloatAt(bytes, info.Dtype, srcBase + c);
             }
         }
 
-        // transpose into the file, 4-byte strided writes per output row
-        var colRun = new byte[rows * 4];
-        long basePosition = (long)writer.TensorOffset(index);
+        WriteTypedFloats(writer, entry, quantization, reordered);
+    }
+
+    /// <summary>Permutes the columns of out_proj, whose input dimension carries
+    /// the tiled V-head states. Same rule as the row case: a permutation of the
+    /// existing shape, written verbatim, with a grouped source column landing
+    /// at its tiled destination. The direction matters — the permutation is
+    /// only self-inverse when num_v_per_k equals num_k_heads, so a reversed
+    /// mapping passes on a small fixture and on Qwen3.5-0.8B (v_per_k 1) and
+    /// scrambles out_proj on the 27B (16 key heads, v_per_k 3).</summary>
+    private static void WriteColReordered(GgufWriter writer, PlanEntry entry, int index,
+        int numKHeads, int headVDim, int vPerK, string quantization)
+    {
+        var source = entry.RequiredSource;
+        var info = source.Info;
+        long rows = info.Shape[0], cols = info.Shape[1];
+        byte[] bytes = source.File.ReadBytes(info);
+
+        long vPerKCols = (long)vPerK * headVDim;
+        var reordered = new float[rows * cols];
         for (long c = 0; c < cols; c++)
         {
+            // c is the grouped source column (k, vp, d); it lands at the tiled
+            // column (vp, k, d).
+            long k = c / vPerKCols;
+            long inner = c % vPerKCols;
+            long vp = inner / headVDim;
+            long headCol = inner % headVDim;
+            long dstCol = (vp * numKHeads + k) * headVDim + headCol;
             for (long r = 0; r < rows; r++)
             {
-                BinaryPrimitives.WriteSingleLittleEndian(colRun.AsSpan((int)(r * 4)), reordered[r * cols + c]);
+                reordered[r * cols + dstCol] = ReadFloatAt(bytes, info.Dtype, r * cols + c);
             }
-            writer.SeekAbsolute(basePosition + c * rows * 4);
-            writer.Data.Write(colRun, 0, (int)(rows * 4));
+        }
+
+        WriteTypedFloats(writer, entry, quantization, reordered);
+    }
+
+    /// <summary>Emits floats in whatever type the header already declared for
+    /// this tensor, so a permuted projection can be Q4_0, F16 or F32 without
+    /// the reorder needing to know which. Does not call FinishTensor; the
+    /// caller's switch does.</summary>
+    private static void WriteTypedFloats(GgufWriter writer, PlanEntry entry, string quantization, float[] values)
+    {
+        switch (GgufTypeFor(entry, quantization))
+        {
+            case GgufType.Q4_0:
+                writer.Data.Write(QuantizeQ4_0(values));
+                break;
+            case GgufType.F32:
+                writer.Data.Write(MakeF32Bytes(values));
+                break;
+            default:
+                var f16 = new byte[values.Length * 2];
+                for (int i = 0; i < values.Length; i++)
+                {
+                    BinaryPrimitives.WriteUInt16LittleEndian(f16.AsSpan(i * 2),
+                        BitConverter.HalfToUInt16Bits((Half)values[i]));
+                }
+                writer.Data.Write(f16);
+                break;
         }
     }
+
+    /// <summary>Reads one value, widening BF16/F16 to float. Guessing which
+    /// half-width flavour a tensor uses silently halves the exponent field —
+    /// that is how A_log came out as -exp(0) = -1 in every even head slot.</summary>
+    private static float ReadFloatAt(byte[] bytes, Dtype dtype, long index) => dtype switch
+    {
+        Dtype.F32 => BitConverter.Int32BitsToSingle(
+            BinaryPrimitives.ReadInt32LittleEndian(bytes.AsSpan((int)index * 4))),
+        Dtype.BF16 => BitConverter.UInt32BitsToSingle((uint)(ushort)(
+            bytes[(int)index * 2] | (bytes[(int)index * 2 + 1] << 8)) << 16),
+        Dtype.F16 => (float)BitConverter.UInt16BitsToHalf((ushort)(
+            bytes[(int)index * 2] | (bytes[(int)index * 2 + 1] << 8))),
+        _ => throw new GgufException($"cannot read dtype {dtype.Label()} as float"),
+    };
+
+    private static float[] LoadFloats(Source source, long count)
+    {
+        byte[] bytes = source.File.ReadBytes(source.Info);
+        var floats = new float[count];
+        for (long i = 0; i < count; i++)
+        {
+            floats[i] = ReadFloatAt(bytes, source.Info.Dtype, i);
+        }
+        return floats;
+    }
+
+    // ── Qwen3.5 linear-attention transforms ────────────────────────────────
 
     private static void ReorderScalar1D(GgufWriter writer, PlanEntry entry, int index, bool negateExp, int vPerK, int numKHeads)
     {

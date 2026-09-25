@@ -174,6 +174,114 @@ public class GgufTests
         Assert.Equal(GgufType.F16, reader.GetTensor("token_embd.weight").Type);
     }
 
+    /// <summary>
+    /// The V-head reorder must permute rows (and, for out_proj, columns) and
+    /// then write the buffer verbatim, matching _reorder_v_heads in
+    /// llama.cpp's converter: reshape the V window to
+    /// [num_k_heads, num_v_per_k, head_dim], swap the first two axes, flatten
+    /// back to the original shape. Nothing transposes, so the declared dims
+    /// are the HF shape reversed and the payload stays row-major.
+    /// The synthetic config has 2 key heads and 4 value heads, making this the
+    /// only test that exercises the path — Qwen3.5-0.8B has equal head counts
+    /// and skips the reorder entirely, which is how a double transpose here
+    /// survived a fully verified 0.8B export.
+    /// </summary>
+    [Fact]
+    public void Linear_Attention_V_Heads_Are_Reordered_Not_Transposed()
+    {
+        using var temp = new TempDir();
+        BuildCheckpoint(temp.Path);
+
+        string outFile = Path.Combine(temp.Path, "model.gguf");
+        GgufConverter.Convert(temp.Path, outFile);
+
+        using var reader = GgufReader.Open(outFile);
+
+        // in_proj_qkv is [40, hidden]; rows 0..15 are the q|k window and keep
+        // their place, rows 16..39 are the V window and get permuted.
+        var qkv = reader.GetTensor("blk.0.attn_qkv.weight");
+        Assert.Equal(new long[] { Hidden, 40 }, qkv.Dims);
+        Assert.Equal(GgufType.F16, qkv.Type);
+        var qkvBytes = reader.ReadBytes("blk.0.attn_qkv.weight");
+        for (int dst = 0; dst < 40; dst++)
+        {
+            int src = VReorderSourceRow(dst);
+            for (int c = 0; c < Hidden; c++)
+            {
+                ushort actual = BinaryPrimitives.ReadUInt16LittleEndian(qkvBytes.AsSpan((dst * Hidden + c) * 2));
+                ushort expected = BitConverter.HalfToUInt16Bits((Half)SourceValue(src * Hidden + c));
+                Assert.Equal(expected, actual);
+            }
+        }
+
+        // out_proj is [hidden, 24] and permutes its input columns instead.
+        // The non-square shape makes the declared dims discriminate a
+        // transpose on their own, and num_v_per_k 3 against 2 key heads makes
+        // the permutation non-self-inverse, so this also pins its direction.
+        var outProj = reader.GetTensor("blk.0.ssm_out.weight");
+        Assert.Equal(new long[] { 24, Hidden }, outProj.Dims);
+        Assert.Equal(GgufType.F16, outProj.Type);
+        var outBytes = reader.ReadBytes("blk.0.ssm_out.weight");
+        for (int r = 0; r < Hidden; r++)
+        {
+            for (int c = 0; c < 24; c++)
+            {
+                ushort actual = BinaryPrimitives.ReadUInt16LittleEndian(outBytes.AsSpan((r * 24 + c) * 2));
+                ushort expected = BitConverter.HalfToUInt16Bits((Half)SourceValue(r * 24 + VReorderSourceCol(c)));
+                Assert.Equal(expected, actual);
+            }
+        }
+    }
+
+    /// <summary>The V-head projections are ordinary matrices, so they quantize
+    /// like every other weight; only the scalar params and the depthwise conv
+    /// must stay F32. Forcing all of them to F32 cost 4 bytes per element on
+    /// three quarters of a hybrid model's layers.</summary>
+    [Fact]
+    public void Q4_0_Quantizes_The_Reordering_Projections()
+    {
+        using var temp = new TempDir();
+        BuildCheckpoint(temp.Path);
+
+        string outFile = Path.Combine(temp.Path, "model-q4.gguf");
+        GgufConverter.Convert(temp.Path, outFile, quantization: "q4_0");
+
+        using var reader = GgufReader.Open(outFile);
+        Assert.Equal(GgufType.Q4_0, reader.GetTensor("blk.0.attn_qkv.weight").Type);
+        Assert.Equal(GgufType.Q4_0, reader.GetTensor("blk.0.attn_gate.weight").Type);
+        Assert.Equal(GgufType.Q4_0, reader.GetTensor("blk.0.ssm_out.weight").Type);
+        Assert.Equal(GgufType.F32, reader.GetTensor("blk.0.ssm_alpha.weight").Type);
+        Assert.Equal(GgufType.F32, reader.GetTensor("blk.0.ssm_beta.weight").Type);
+        Assert.Equal(GgufType.F32, reader.GetTensor("blk.0.ssm_conv1d.weight").Type);
+        Assert.Equal(GgufType.F32, reader.GetTensor("blk.0.ssm_a").Type);
+    }
+
+    // 2 key heads × 3 value heads per key × head_dim 4, so a grouped row
+    // (k, vp, h) becomes the tiled row (vp, k, h). num_v_per_k differing from
+    // num_k_heads is what makes the permutation non-self-inverse, matching the
+    // 27B's 16 key / 48 value heads.
+    private const int VWindowStart = 16, NumKHeads = 2, VPerK = 3, LinearHeadDim = 4;
+
+    private static int VReorderSourceRow(int dst)
+    {
+        if (dst < VWindowStart) return dst;
+        int tiled = dst - VWindowStart;
+        int vp = tiled / (NumKHeads * LinearHeadDim);
+        int rem = tiled % (NumKHeads * LinearHeadDim);
+        int k = rem / LinearHeadDim;
+        int h = rem % LinearHeadDim;
+        return VWindowStart + (k * VPerK + vp) * LinearHeadDim + h;
+    }
+
+    private static int VReorderSourceCol(int dst)
+    {
+        int vp = dst / (NumKHeads * LinearHeadDim);
+        int rem = dst % (NumKHeads * LinearHeadDim);
+        int k = rem / LinearHeadDim;
+        int h = rem % LinearHeadDim;
+        return (k * VPerK + vp) * LinearHeadDim + h;
+    }
+
     // ── synthetic checkpoint ───────────────────────────────────────────────
 
     private sealed class TempDir : IDisposable
@@ -241,7 +349,7 @@ public class GgufTests
               "linear_conv_kernel_dim": 4,
               "linear_num_key_heads": 2,
               "linear_key_head_dim": 4,
-              "linear_num_value_heads": 4,
+              "linear_num_value_heads": 6,
               "linear_value_head_dim": 4,
               "rope_parameters": { "rope_type": "default", "rope_theta": 10000, "partial_rotary_factor": 0.25 }
             }
@@ -299,21 +407,25 @@ public class GgufTests
 
             if (linear)
             {
-                // consistent with the head config: q(2×4) + k(2×4) + v(4×4) = 32 rows
-                Add(p + "linear_attn.in_proj_qkv.weight", 32, Hidden);
-                Add(p + "linear_attn.in_proj_a.weight", 4, Hidden);
-                Add(p + "linear_attn.in_proj_b.weight", 4, Hidden);
-                Add(p + "linear_attn.in_proj_z.weight", 16, Hidden);
-                Add(p + "linear_attn.out_proj.weight", Hidden, 16);
+                // consistent with the head config: q(2×4) + k(2×4) + v(6×4) = 40 rows.
+                // 6 value heads over 2 key heads gives num_v_per_k = 3, which
+                // matters: the grouped→tiled permutation is its own inverse only
+                // when num_v_per_k equals num_k_heads, so a fixture with 4 value
+                // heads would pass a column reorder written in either direction.
+                Add(p + "linear_attn.in_proj_qkv.weight", 40, Hidden);
+                Add(p + "linear_attn.in_proj_a.weight", 6, Hidden);
+                Add(p + "linear_attn.in_proj_b.weight", 6, Hidden);
+                Add(p + "linear_attn.in_proj_z.weight", 24, Hidden);
+                Add(p + "linear_attn.out_proj.weight", Hidden, 24);
                 tensors.Add(new TensorPayload
                 {
                     Name = p + "linear_attn.conv1d.weight",
                     Dtype = Dtype.BF16,
-                    Shape = new long[] { 32, 1, 4 },
-                    Data = Bf16(Enumerable.Range(0, 128).Select(i => SourceValue(i)).ToArray()),
+                    Shape = new long[] { 40, 1, 4 },
+                    Data = Bf16(Enumerable.Range(0, 160).Select(i => SourceValue(i)).ToArray()),
                 });
-                Add1D(p + "linear_attn.A_log", 4);
-                Add1D(p + "linear_attn.dt_bias", 4);
+                Add1D(p + "linear_attn.A_log", 6);
+                Add1D(p + "linear_attn.dt_bias", 6);
                 Add1D(p + "linear_attn.norm.weight", 8);
             }
             else
