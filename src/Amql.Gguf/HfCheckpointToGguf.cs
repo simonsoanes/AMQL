@@ -463,6 +463,9 @@ public static class GgufConverter
     /// <summary>Q4_0 block size: 32 elements per block.</summary>
     private const int Q4_0BlockSize = 32;
 
+    /// <summary>Tensors below this element count are never block-quantized.</summary>
+    private const long MinQuantElements = 256;
+
     /// <summary>Quantizes a float array to ggml's Q4_0 format: one 18-byte
     /// block per 32 values, a float16 scale followed by 16 bytes of nibbles.
     /// Byte j carries element j in its low nibble and element j+16 in its high
@@ -609,7 +612,7 @@ public static class GgufConverter
 
         return entry.Transform switch
         {
-            Transform.Zeros => GgufType.F16,
+            Transform.Zeros => ZeroPlaceholderType(entry, quantization),
             // The per-value-head scalar params (A_log/dt/in_proj_a/in_proj_b)
             // and the depthwise conv stay float32 — they are float in the HF
             // checkpoints and ggml mixes them with f32 recurrent state, where
@@ -627,6 +630,35 @@ public static class GgufConverter
                 Dtype.BF16 or Dtype.F16 => GgufType.F16,
                 _ => throw new GgufException($"source tensor '{entry.Source.Info.Name}' dtype {entry.Source.Info.Dtype.Label()} is not convertible"),
             },
+        };
+    }
+
+    /// <summary>Picks the type for a placeholder tensor — the shared-expert
+    /// slots llama.cpp's qwen35moe graph requires but a model without shared
+    /// experts does not have. They are entirely zero, and zero survives every
+    /// block encoding exactly, so there is no reason to store them at F16: on a
+    /// real 24-layer MoE export the 96 placeholders were 0.75 GiB of zeros and
+    /// blocking them took that to 0.39 GiB. They follow the same block type the
+    /// mode uses for real 2-D weights; a placeholder too small or misaligned
+    /// for blocking stays F16.</summary>
+    private static GgufType ZeroPlaceholderType(PlanEntry entry, string quantization)
+    {
+        long elements = 1;
+        foreach (long d in entry.ExplicitDims!)
+        {
+            elements *= d;
+        }
+        if (elements < MinQuantElements || elements % GgmlQuant.BlockElements != 0)
+        {
+            return GgufType.F16;
+        }
+        return quantization switch
+        {
+            "q4_0" => GgufType.Q4_0,
+            "mxfp4" => GgufType.Mxfp4,
+            // matches the recipe: a 2-D tensor under MXFP4_MOE becomes Q8_0
+            "mxfp4_moe" => GgufType.Q8_0,
+            _ => GgufType.F16,
         };
     }
 
@@ -648,10 +680,11 @@ public static class GgufConverter
             || name.Contains("router"))
             return false;
 
-        // Skip small tensors (< 256 elements)
+        // Skip small tensors: blocking a handful of values saves nothing and
+        // loses precision on exactly the tensors least able to absorb it.
         long totalElements = 1;
         foreach (var dim in shape) totalElements *= dim;
-        if (totalElements < 256) return false;
+        if (totalElements < MinQuantElements) return false;
 
         // Skip non-2D tensors (conv weights, stacked MoE experts, etc.)
         if (shape.Length != 2) return false;
@@ -718,12 +751,15 @@ public static class GgufConverter
     {
         writer.SeekTensor(index);
 
-        // Block quantization: load floats, encode, write. The reordering
-        // projections are excluded here because their V-head permutation has
-        // to happen before the values are cut into blocks; they encode inside
-        // their own write path instead.
+        // Block quantization: load floats, encode, write. Two exclusions. The
+        // reordering projections must permute their V heads before the values
+        // are cut into blocks, so they encode inside their own write path; and
+        // a placeholder has no source tensor at all — its own case writes the
+        // declared number of zero bytes, which is already the exact encoding.
         var declared = GgufTypeFor(entry, quantization);
-        if (GgufTypeSizing.IsBlockQuantized(declared) && !ReordersHeads(entry.Transform))
+        if (GgufTypeSizing.IsBlockQuantized(declared)
+            && entry.Transform != Transform.Zeros
+            && !ReordersHeads(entry.Transform))
         {
             WriteQuantizedPayload(writer, entry, index, declared);
             return;
@@ -732,13 +768,13 @@ public static class GgufConverter
         switch (entry.Transform)
         {
             case Transform.Zeros:
-                long elements = 1;
-                foreach (long d in entry.ExplicitDims!)
-                {
-                    elements *= d;
-                }
-                byte[] zeroBuf = new byte[Math.Min(elements * 2, 1 << 20)];
-                long zeroLeft = elements * 2;
+                // All-zero bytes are the exact encoder output for a zero block
+                // in Q8_0 (d = 0, every qs 0) and MXFP4 (e = 0, every code 0),
+                // and in Q4_0 they decode to (0 - 8) * 0 = 0 as well, so the
+                // placeholder payload is just the declared size in zeros.
+                long zeroLeft = GgufTypeSizing.DataBytes(
+                    GgufTypeFor(entry, quantization), entry.ExplicitDims!);
+                byte[] zeroBuf = new byte[Math.Min(Math.Max(zeroLeft, 1), 1 << 20)];
                 while (zeroLeft > 0)
                 {
                     int take = (int)Math.Min(zeroLeft, zeroBuf.Length);

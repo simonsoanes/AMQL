@@ -382,6 +382,18 @@ public class GgufTests
         Assert.Equal(GgufType.F32, reader.GetTensor("blk.0.ssm_conv1d.weight").Type);
         Assert.Equal(GgufType.F16, reader.GetTensor("token_embd.weight").Type);
 
+        // The shared-expert placeholders this model does not have are entirely
+        // zero, and zero survives blocking exactly, so they take the same type
+        // as real weights instead of sitting at F16 — on a real 24-layer MoE
+        // export that turned 0.75 GiB of zeros into 0.39 GiB.
+        var placeholder = reader.GetTensor("blk.0.ffn_gate_shexp.weight");
+        Assert.Equal(GgufType.Q8_0, placeholder.Type);
+        var placeholderBytes = reader.ReadBytes("blk.0.ffn_gate_shexp.weight");
+        Assert.Equal(Hidden * ExpertMid / 32 * 34, placeholderBytes.Length);
+        Assert.All(placeholderBytes, b => Assert.Equal(0, b));
+        // ...but one too small to be worth blocking stays F16
+        Assert.Equal(GgufType.F16, reader.GetTensor("blk.0.ffn_gate_inp_shexp.weight").Type);
+
         // all-MXFP4 mode quantizes the non-expert weights too
         string allFile = Path.Combine(temp.Path, "model-all.gguf");
         GgufConverter.Convert(temp.Path, allFile, quantization: "mxfp4");
