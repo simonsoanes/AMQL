@@ -73,7 +73,8 @@ public static class FfnKernel
         IReadOnlyList<Tensor2D> expertDown,
         int topK,
         ExpertRoutingPolicy routingPolicy,
-        Activation activation)
+        Activation activation,
+        Action<int, IReadOnlyList<int>>? onExpertsRouted = null)
     {
         int numExperts = expertGate.Count;
         if (topK > numExperts)
@@ -115,6 +116,7 @@ public static class FfnKernel
                 .OrderByDescending(e => row[e])
                 .Take(topK)
                 .ToArray();
+            onExpertsRouted?.Invoke(r, selected);
 
             if (routingPolicy == ExpertRoutingPolicy.NormalisedOverSelected)
             {

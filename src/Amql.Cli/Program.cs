@@ -623,11 +623,11 @@ internal static class Program
             Console.WriteLine("weights:   f32 (full-precision resident)");
         }
 
-        var genOpts = (trace || traceTensors)
-            ? new InferenceRunner.GenerateOptions(Trace: trace, TraceTensors: traceTensors, WeightWorkingSet: workingSet)
-            : (workingSet is not null
-                ? new InferenceRunner.GenerateOptions(Trace: false, TraceTensors: false, WeightWorkingSet: workingSet)
-                : null);
+        string? traceJson = OptionValue(args, "--trace-json");
+        var genOpts = (trace || traceTensors || traceJson is not null || workingSet is not null)
+            ? new InferenceRunner.GenerateOptions(Trace: trace, TraceTensors: traceTensors,
+                WeightWorkingSet: workingSet, TraceJsonPath: traceJson)
+            : null;
 
         var (prefill, steps2) = InferenceRunner.Generate(
             container, component, tokens, steps, config, showTopK, patch, genOpts);
@@ -677,6 +677,24 @@ internal static class Program
             Console.WriteLine($"text:      {tokenizer.Decode(generatedIds)}");
         }
         Console.WriteLine($"position: {prefill.Length + steps}");
+
+        // Read the trace back rather than trusting the write: it proves the
+        // JSON round-trips before anything downstream depends on the format.
+        if (traceJson is not null)
+        {
+            var written = Amql.Inference.Tracing.TraceRecorder.ReadJson(traceJson);
+            Console.WriteLine($"trace:     {written.Steps.Count} steps over {written.Nodes.Count} operator nodes, "
+                + $"{written.Steps.Sum(s => s.Ops.Count)} observations → {traceJson}");
+            var top = written.Aggregate()
+                .OrderByDescending(kv => kv.Value.MeanL2)
+                .Take(5)
+                .Select(kv =>
+                {
+                    var node = written.Nodes[kv.Key];
+                    return $"{node.Op}@L{node.Layer} (mean ‖·‖ {kv.Value.MeanL2:F3})";
+                });
+            Console.WriteLine($"           busiest operators: {string.Join(", ", top)}");
+        }
         return 0;
     }
 
@@ -1774,6 +1792,7 @@ internal static class Program
                               [--steps 8] [--temperature 0] [--top-k 0] [--top-p 0]
                               [--seed 42] [--logits K] [--component target]
                               [--patch <patch.safetensors>]
+                              [--trace-json <trace.json>]
               amql-cli inspect-token <container-dir> <token>
                               [--tokens ctx,ids] [--neighbors 5] [--logits K]
                               [--tokenizer <checkpoint-dir>] [--component target]

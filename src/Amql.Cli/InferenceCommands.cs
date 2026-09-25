@@ -1,4 +1,5 @@
 using Amql.Inference;
+using Amql.Inference.Tracing;
 using Amql.Safetensors;
 using Amql.Vindex3;
 
@@ -26,7 +27,11 @@ public static class InferenceRunner
     public sealed record GenerateOptions(
         bool Trace,
         bool TraceTensors,
-        WeightWorkingSet? WeightWorkingSet = null);
+        WeightWorkingSet? WeightWorkingSet = null,
+        string? TraceJsonPath = null);
+
+    /// <summary>How many top candidates a traced step records.</summary>
+    private const int TraceTopK = 10;
 
     public static (int[] Prefill, List<StepOutcome> Steps) Generate(
         Vindex3Container container, string componentId, int[] tokens,
@@ -63,6 +68,17 @@ public static class InferenceRunner
         }
 
         session.Prefill(tokens);
+
+        // The operator trace is attached only after prefill: the recorder's
+        // step buffer is what gives an observation its context, and prefill
+        // runs before any step exists.
+        var recorder = options?.TraceJsonPath is not null ? new TraceRecorder() : null;
+        if (recorder is not null)
+        {
+            session.Runtime.OpTrace = recorder.Observe;
+            session.Runtime.ExpertRoutingTrace = (_, experts) => recorder.ObserveExperts(experts);
+        }
+
         var outcomes = new List<StepOutcome>(steps);
         for (int step = 0; step < steps; step++)
         {
@@ -70,6 +86,8 @@ public static class InferenceRunner
             int token = config.Temperature <= 0f
                 ? Sampler.ArgMax(logits)
                 : Sampler.Sample(logits, config, rng);
+
+            recorder?.BeginStep(session.Position);
 
             // Enable trace for the forward pass that produces the next logits.
             if (tracing) { session.Runtime.BeginTrace(); }
@@ -85,6 +103,17 @@ public static class InferenceRunner
                     .ToList();
             }
 
+            if (recorder is not null)
+            {
+                // The distribution recorded is the one this forward produced,
+                // not the one the input token was drawn from: a step reads
+                // "fed this token, these operators ran, this came out".
+                var produced = session.LastLogits;
+                var topK = CandidatesForTrace(produced);
+                recorder.EndStep(token, topK, SoftmaxEntropy(produced),
+                    topK.Count >= 2 ? topK[0].Probability - topK[1].Probability : topK[0].Probability);
+            }
+
             outcomes.Add(new StepOutcome(
                 token,
                 session.Position,
@@ -97,7 +126,55 @@ public static class InferenceRunner
                 // Collected during prefill + first step — report once.
             }
         }
+
+        if (recorder is not null && options?.TraceJsonPath is { } tracePath)
+        {
+            session.Runtime.OpTrace = null;
+            session.Runtime.ExpertRoutingTrace = null;
+            TraceRecorder.WriteJson(
+                recorder.ToRunTrace(
+                    container.Index.Model, componentId, plan.HiddenSize, plan.Layers.Count, tokens,
+                    $"temperature={config.Temperature} top_k={config.TopK} top_p={config.TopP} seed={config.Seed}",
+                    (options?.WeightWorkingSet ?? WeightWorkingSetExtensions.FromEnv()).ToString()!),
+                tracePath);
+        }
+
         return (tokens, outcomes);
+    }
+
+    private static IReadOnlyList<TokenCandidate> CandidatesForTrace(Tensor2D logits)
+        => (CandidatesFor(logits, TraceTopK) ?? Array.Empty<Candidate>())
+            .Select(c => new TokenCandidate(c.Token, c.Logit, c.Probability))
+            .ToArray();
+
+    /// <summary>Shannon entropy (nats) of the next-token distribution. A low
+    /// entropy step is one the model was certain about, which is where an
+    /// edit to a weight is least likely to show up; a high one is where the
+    /// map is worth reading.</summary>
+    private static float SoftmaxEntropy(Tensor2D logits)
+    {
+        var row = logits.FirstRow();
+        float max = float.NegativeInfinity;
+        for (int i = 0; i < row.Length; i++)
+        {
+            if (row[i] > max)
+            {
+                max = row[i];
+            }
+        }
+        double sum = 0.0, entropy = 0.0;
+        for (int i = 0; i < row.Length; i++)
+        {
+            double e = Math.Exp(row[i] - max);
+            sum += e;
+            entropy += e * (row[i] - max);
+        }
+        if (sum <= 0.0)
+        {
+            return 0f;
+        }
+        // H = log(sum) - (1/sum) * Σ e_i * (x_i - max)
+        return (float)(Math.Log(sum) - entropy / sum);
     }
 
     private static IReadOnlyList<Candidate>? CandidatesFor(Tensor2D logits, int? showTopK)

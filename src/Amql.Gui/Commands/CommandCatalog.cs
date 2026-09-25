@@ -230,6 +230,10 @@ public static class CommandCatalog
             new ParamDef("traceTensors", "--trace-tensors", ParamKind.Option, EditorKind.Choice, Flag: "--trace-tensors",
                 DefaultValue: "", Choices: new[] { "", "1" },
                 Help: "Tensor-load trace (name, shape, cache hit) for each weight load."),
+            new ParamDef("traceJson", "--trace-json file.json", ParamKind.Option, EditorKind.File, Flag: "--trace-json",
+                Help: "Writes a per-operator trace of every generated token: which operators ran, "
+                      + "their output magnitude, which experts a MoE layer routed to, and the "
+                      + "resulting top-k distribution. This is the file the inference visualiser opens."),
             ComponentParam,
             PatchParam,
         }),

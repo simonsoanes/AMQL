@@ -1,3 +1,5 @@
+using System.Diagnostics;
+using Amql.Inference.Tracing;
 using Amql.Vindex3;
 
 namespace Amql.Inference;
@@ -81,23 +83,31 @@ public sealed class GenericRuntime
         {
             h = x.Clone();
             var preAttnW = _weights.Vector(preAttnNorm.Weight, hidden);
+            long t = TraceStart;
             Norms.ApplyInPlace(h, preAttnNorm.Kind, preAttnNorm.Eps, preAttnW, preAttnNorm.WeightOffset);
+            Report(layer, "pre_attn_norm", preAttnNorm.Weight, h, t);
         }
 
         // Token mixer dispatch.
         if (layerPlan.LinearAttention is { } linear)
         {
+            long t = TraceStart;
             var mixerOut = RunLinearAttention(h, layer, linear);
+            Report(layer, "linear_attn", null, mixerOut, t);
             AddInPlace(x, mixerOut);
         }
         else if (layerPlan.Conv is { } conv)
         {
+            long t = TraceStart;
             var mixerOut = RunConv(h, layer, conv);
+            Report(layer, "conv", null, mixerOut, t);
             AddInPlace(x, mixerOut);
         }
         else
         {
+            long t = TraceStart;
             var mixerOut = RunSoftmaxAttention(h, layer, layerPlan, queryPositions, kvPositions, appendKv);
+            Report(layer, "softmax_attn", null, mixerOut, t);
             AddInPlace(x, mixerOut);
         }
 
@@ -107,7 +117,9 @@ public sealed class GenericRuntime
         {
             hf = x.Clone();
             var preFfnW = _weights.Vector(preFfnNorm.Weight, hidden);
+            long t = TraceStart;
             Norms.ApplyInPlace(hf, preFfnNorm.Kind, preFfnNorm.Eps, preFfnW, preFfnNorm.WeightOffset);
+            Report(layer, "pre_ffn_norm", preFfnNorm.Weight, hf, t);
         }
 
         // FFN.
@@ -115,6 +127,7 @@ public sealed class GenericRuntime
         {
             FfnInputCapture?.Invoke(layer, hf);
             Tensor2D ffnOut;
+            long t = TraceStart;
             if (ffn.Dense is { } dense)
             {
                 var gate = dense.Gate is null
@@ -123,22 +136,29 @@ public sealed class GenericRuntime
                 var up = _weights.Matrix(dense.Up, dense.IntermediateSize, hidden);
                 var down = _weights.Matrix(dense.Down, hidden, dense.IntermediateSize);
                 ffnOut = FfnKernel.Dense(hf, gate, up, down, dense.Activation, dense.IsGated);
+                Report(layer, "ffn_dense", dense.Down, ffnOut, t);
             }
             else
             {
                 var routed = ffn.Routed!;
-                ffnOut = RunRoutedFfn(hf, routed);
+                ffnOut = RunRoutedFfn(hf, layer, routed);
+                Report(layer, "ffn_routed", routed.Router, ffnOut, t);
             }
 
             if (layerPlan.PostFfnNorm is { } postFfnNorm)
             {
                 var postFfnW = _weights.Vector(postFfnNorm.Weight, hidden);
+                long tn = TraceStart;
                 Norms.ApplyInPlace(ffnOut, postFfnNorm.Kind, postFfnNorm.Eps, postFfnW, postFfnNorm.WeightOffset);
+                Report(layer, "post_ffn_norm", postFfnNorm.Weight, ffnOut, tn);
             }
             AddInPlace(x, ffnOut);
         }
 
         ApplyPatches(x, layer, queryPositions);
+        // started 0 means "no timing" — the residual is the layer's result, not
+        // an operation with a duration of its own.
+        Report(layer, "residual_out", null, x, 0);
         return x;
     }
 
@@ -177,6 +197,13 @@ public sealed class GenericRuntime
             k = TensorOps.MatMulTransposedB(h, wK);
             v = TensorOps.MatMulTransposedB(h, wV);
         }
+
+        // Sub-operator observations carry no duration: on the GPU path q, k and
+        // v are a single batched launch, so a per-projection time would be
+        // fiction. Timing lives on the layer-level operators instead.
+        Report(layer, "attn_q", attn.QProj, qRaw, 0);
+        Report(layer, "attn_k", attn.KProj, k, 0);
+        Report(layer, "attn_v", attn.VProj, v, 0);
 
         Tensor2D? gate = null;
         Tensor2D q = attn.OutputGate ? ChunkBlocks(qRaw, attn.HeadDim, 0) : qRaw;
@@ -251,7 +278,10 @@ public sealed class GenericRuntime
             }
         }
 
+        Report(layer, "attn_context", null, output, 0);
+
         var o = TensorOps.MatMulTransposedB(output, _weights.Matrix(attn.OProj, hidden, attn.QDim));
+        Report(layer, "attn_output", attn.OProj, o, 0);
 
         // Post-attention norm (four-norm placement) applies to the mixer
         // output before the residual add.
@@ -518,7 +548,7 @@ public sealed class GenericRuntime
         return new Tensor2D(result, heads.Rows, srcHeads * ratio * headDim);
     }
 
-    private Tensor2D RunRoutedFfn(Tensor2D h, RoutedFfnOp routed)
+    private Tensor2D RunRoutedFfn(Tensor2D h, int layer, RoutedFfnOp routed)
     {
         int hidden = routed.HiddenSize;
         var router = _weights.Matrix(routed.Router, routed.NumExperts, hidden);
@@ -537,8 +567,21 @@ public sealed class GenericRuntime
             downs[e] = _weights.Matrix(new OperandRef(stackId, stem + "down_proj.weight"), hidden, routed.ExpertIntermediateSize);
         }
 
+        // Only the last row's routing is reported, matching Report's convention
+        // — it is the row that decides the next token, and capturing every
+        // prefill row would dwarf the rest of the trace.
+        int lastRow = h.Rows - 1;
         return FfnKernel.Routed(h, router, gates, ups, downs,
-            routed.TopK, routed.RoutingPolicy, routed.Activation);
+            routed.TopK, routed.RoutingPolicy, routed.Activation,
+            onExpertsRouted: ExpertRoutingTrace is null
+                ? null
+                : (row, selected) =>
+                {
+                    if (row == lastRow)
+                    {
+                        ExpertRoutingTrace(layer, selected);
+                    }
+                });
     }
 
     // ── conv layer (LFM2.5 short-convolution) ───────────────────────────
@@ -710,6 +753,51 @@ public sealed class GenericRuntime
     /// <summary>When set, every tensor load reports its name, shape, and
     /// whether it hit the cache (<c>--trace-tensors</c>).</summary>
     public Action<string, long[], bool>? TensorLoadTrace { get; set; }
+
+    /// <summary>When set, each operator reports its output statistics as it
+    /// runs — the per-operator seam the inference visualiser draws from, where
+    /// <see cref="LayerNormTrace"/> only sees two scalars per layer. Left null
+    /// the observation sites cost one null check and nothing else.</summary>
+    public Action<OpObservation>? OpTrace { get; set; }
+
+    /// <summary>When set, a routed FFN reports which experts it selected for
+    /// the row that decides the next token, as (layer, expert ids). Genuinely
+    /// sparse, and the most interpretable thing a MoE layer tells you.</summary>
+    public Action<int, IReadOnlyList<int>>? ExpertRoutingTrace { get; set; }
+
+    /// <summary>A timestamp for an observation about to be made, or 0 when
+    /// nothing is listening so the untraced path never queries the clock.</summary>
+    private long TraceStart => OpTrace is null ? 0 : Stopwatch.GetTimestamp();
+
+    /// <summary>Measures an operator's output row and reports it. Only the last
+    /// row is summarised: under decode that is the whole activation, and under
+    /// prefill it is the row that feeds the next token, which is the one the
+    /// map is being asked about.</summary>
+    private void Report(int layer, string op, OperandRef? weight, Tensor2D output, long started)
+    {
+        if (OpTrace is not { } sink)
+        {
+            return;
+        }
+        var row = output.Row(output.Rows - 1);
+        float sumSq = 0f, maxAbs = 0f, sumAbs = 0f;
+        for (int i = 0; i < row.Length; i++)
+        {
+            float v = row[i];
+            float a = MathF.Abs(v);
+            sumSq += v * v;
+            sumAbs += a;
+            if (a > maxAbs)
+            {
+                maxAbs = a;
+            }
+        }
+        double ms = started == 0
+            ? 0.0
+            : (Stopwatch.GetTimestamp() - started) * 1000.0 / Stopwatch.Frequency;
+        sink(new OpObservation(layer, op, weight, MathF.Sqrt(sumSq), maxAbs,
+            row.Length == 0 ? 0f : sumAbs / row.Length, ms));
+    }
 
     /// <summary>Collected per-layer trace from the most recent forward pass.
     /// Cleared at the start of each StepForward; populated by
