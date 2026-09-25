@@ -48,6 +48,16 @@ public enum GgufType : uint
     Nvfp4 = 40,
     Q1_0 = 41,
     Q2_0 = 42,
+    /// <summary>PrismML Bonsai ternary PQ2_0: 128 {-1,0,+1} weights at 2 bits
+    /// per trit (32 packed bytes) plus one FP16 scale, 34 bytes per block.
+    /// The id is the Bonsai fork's own numbering — stock ggml's ternary types
+    /// are TQ1_0/TQ2_0 at 34/35 with a different trit packing, so a file using
+    /// this type loads only in that fork.</summary>
+    Pq2_0 = 142,
+    /// <summary>PrismML Bonsai ternary PTQ1_0: 128 weights as 5 trits per byte
+    /// (26 packed bytes) plus one FP16 scale, 28 bytes per block. See
+    /// <see cref="Pq2_0"/> for the fork-vs-stock caveat.</summary>
+    Ptq1_0 = 143,
 }
 
 /// <summary>
@@ -80,6 +90,9 @@ public static class GgufTypeSizing
         GgufType.Mxfp4 => ((elements + 31) / 32) * 17,
         // NVFP4: 36 bytes per 64-element block (4 UE4M3 sub-block scales + 32 nibbles)
         GgufType.Nvfp4 => ((elements + 63) / 64) * 36,
+        // Bonsai ternary: 128-element blocks, FP16 scale then packed trits
+        GgufType.Pq2_0 => ((elements + 127) / 128) * 34,
+        GgufType.Ptq1_0 => ((elements + 127) / 128) * 28,
         // Q4_K: 144 bytes per 256-element super-block
         GgufType.Q4_K => ((elements + 255) / 256) * 144,
         _ => checked(elements * ElementSize(type)),
@@ -91,8 +104,20 @@ public static class GgufTypeSizing
     {
         GgufType.Q4_0 or GgufType.Q8_0 or GgufType.Mxfp4 or GgufType.Nvfp4
             or GgufType.Q4_K or GgufType.TQ1_0 or GgufType.TQ2_0
-            or GgufType.Q1_0 or GgufType.Q2_0 => true,
+            or GgufType.Q1_0 or GgufType.Q2_0
+            or GgufType.Pq2_0 or GgufType.Ptq1_0 => true,
         _ => false,
+    };
+
+    /// <summary>Elements per scale block for a block-quantized type, which is
+    /// what an eligibility check has to divide by — Q4_0 and friends block at
+    /// 32, the Bonsai ternary packings at 128.</summary>
+    public static int BlockElements(GgufType type) => type switch
+    {
+        GgufType.Pq2_0 or GgufType.Ptq1_0 => 128,
+        GgufType.Nvfp4 => 64,
+        GgufType.Q4_K => 256,
+        _ => 32,
     };
 
     /// <summary>Bytes per value, for the plain dtypes only.</summary>

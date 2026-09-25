@@ -1,3 +1,5 @@
+using Amql.Safetensors;
+
 namespace Amql.Gguf;
 
 /// <summary>
@@ -13,7 +15,7 @@ namespace Amql.Gguf;
 /// written from the same wrong assumption still passes.
 /// </para>
 /// </summary>
-internal static class GgmlQuant
+public static class GgmlQuant
 {
     /// <summary>Elements sharing one scale block (QK_MXFP4, QK4_0, QK8_0).</summary>
     public const int BlockElements = 32;
@@ -101,13 +103,66 @@ internal static class GgmlQuant
         return result;
     }
 
-    /// <summary>Encodes one block of floats with the given type.</summary>
-    public static byte[] Encode(GgufType type, float[] values) => type switch
+    /// <summary>Encodes one block of floats with the given type.
+    /// <paramref name="cols"/> is the row width of the logical matrix: the
+    /// ternary packings rotate row-wise in 1024-column blocks, so they cannot
+    /// be computed from a flat array alone.</summary>
+    public static byte[] Encode(GgufType type, float[] values, int cols) => type switch
     {
         GgufType.Mxfp4 => QuantizeMxfp4(values),
         GgufType.Q8_0 => QuantizeQ8_0(values),
+        GgufType.Ptq1_0 => QuantizeTernaryGguf(values, cols, ptq1: true),
+        GgufType.Pq2_0 => QuantizeTernaryGguf(values, cols, ptq1: false),
         _ => throw new GgufException($"no ggml block encoder for {type} in this build"),
     };
+
+    /// <summary>Encodes to the Bonsai fork's GGUF ternary block: per 128
+    /// elements, the FP16 scale followed by the packed trits. The safetensors
+    /// codec keeps scales and packed data in two separate arrays; a GGUF block
+    /// interleaves them, scale first, matching every other ggml block type.
+    /// <para>
+    /// That ordering is ggml's convention, not something the Bonsai whitepaper
+    /// specifies — the paper gives the rates (26 and 32 packed bytes per 128)
+    /// but no byte order — and no reference file exists to check it against.
+    /// A GGUF carrying type 142/143 loads only in the fork, and whether the
+    /// fork agrees on the interleaving is unverified here.
+    /// </para>
+    /// </summary>
+    public static byte[] QuantizeTernaryGguf(float[] values, int cols, bool ptq1)
+    {
+        if (cols <= 0 || values.Length % cols != 0)
+        {
+            throw new GgufException(
+                $"ternary encode needs a row width that divides {values.Length} values, got {cols}");
+        }
+        int rows = values.Length / cols;
+
+        // EncodePtq1/EncodePq2 rotate their argument in place, so hand them a
+        // copy and keep the caller's array intact.
+        var (packed, scales) = ptq1
+            ? Ternary.EncodePtq1((float[])values.Clone(), rows, cols)
+            : Ternary.EncodePq2((float[])values.Clone(), rows, cols);
+
+        int packedPerBlock = ptq1 ? Ternary.Ptq1BytesPerBlock : Ternary.Pq2BytesPerBlock;
+        int blocks = scales.Length / 2;
+        int blockBytes = 2 + packedPerBlock;
+        if (packed.Length != blocks * packedPerBlock)
+        {
+            throw new GgufException(
+                $"ternary encode produced {packed.Length} packed bytes for {blocks} blocks, "
+                + $"expected {blocks * packedPerBlock}");
+        }
+
+        var result = new byte[blocks * blockBytes];
+        for (int b = 0; b < blocks; b++)
+        {
+            int o = b * blockBytes;
+            result[o] = scales[b * 2];
+            result[o + 1] = scales[b * 2 + 1];
+            Array.Copy(packed, b * packedPerBlock, result, o + 2, packedPerBlock);
+        }
+        return result;
+    }
 
     /// <summary>ggml's <c>GGML_E8M0_TO_FP32_HALF</c>. Because
     /// <see cref="Fp4KValues"/> holds the grid doubled, the scale that pairs

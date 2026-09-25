@@ -347,8 +347,10 @@ public static class CommandCatalog
                       + "~2.13 bpw); both use 128-element blocks with FP16 scales and a blockwise "
                       + "Hadamard rotation, and produce PrismML Bonsai-compatible checkpoints for the "
                       + "Bonsai llama.cpp fork. Their 142/143 type ids are that fork's own numbering, "
-                      + "not stock ggml's, so these two are not GGUF-writable. The CLI takes the "
-                      + "packing explicitly — there is no bare 'ternary' option."),
+                      + "not stock ggml's. The list is shorter than to-gguf's on purpose: safetensors "
+                      + "has no dtype for Q4_0, and mxfp4_moe is a GGUF recipe, so those live only in "
+                      + "to-gguf. The CLI takes the packing explicitly — there is no bare 'ternary' "
+                      + "option."),
             new ParamDef("arch", "--arch", ParamKind.Option, EditorKind.Choice, Flag: "--arch", DefaultValue: "qwen3.x",
                 Choices: new[] { "qwen3.x", "qwen4-next" },
                 Help: "Target architecture: qwen3.x (default Qwen3.5) or qwen4-next (Flash-Next)."),
@@ -358,11 +360,13 @@ public static class CommandCatalog
             new ParamDef("checkpointDir", "checkpoint dir", ParamKind.Positional, EditorKind.Directory),
             new ParamDef("out", "--out file.gguf", ParamKind.Option, EditorKind.File, Flag: "--out"),
             new ParamDef("quant", "--quant", ParamKind.Option, EditorKind.Choice, Flag: "--quant", DefaultValue: "none",
-                Choices: new[] { "none", "f16", "q4_0", "mxfp4", "mxfp4_moe" },
+                Choices: new[] { "none", "f16", "q4_0", "mxfp4", "mxfp4_moe", "ptq1", "pq2" },
                 Help: "Weight encoding: none/f16 (full precision), q4_0 (ggml 4-bit, ftype 2), "
-                      + "mxfp4 (OCP MXFP4, ggml type 39) for every quantizable weight, or mxfp4_moe "
+                      + "mxfp4 (OCP MXFP4, ggml type 39) for every quantizable weight, mxfp4_moe "
                       + "(llama.cpp ftype 38) which puts 3-D MoE expert stacks in MXFP4 and every "
-                      + "other quantizable weight in Q8_0. Norms, embeddings, the output head, "
+                      + "other quantizable weight in Q8_0, or ptq1/pq2 — the PrismML Bonsai ternary "
+                      + "packings at ggml type ids 143/142, which only the Bonsai fork loads. "
+                      + "Norms, embeddings, the output head, "
                       + "routers and 1-D tensors stay full precision in every mode."),
         }),
         new("export-onnx", CatExport, "Export a container as an ONNX model (.onnx).", new[]

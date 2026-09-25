@@ -2108,6 +2108,10 @@ internal static class Program
             in MXFP4 and every other quantizable weight in Q8_0. Norms,
             embeddings, the output head, MoE routers and all 1-D tensors stay
             full precision in every mode, matching llama-quantize's skip list.
+            ptq1 and pq2 write the PrismML Bonsai ternary packings (ggml type
+            ids 143 and 142, 128 trits per block with an FP16 scale); those ids
+            belong to the Bonsai fork, so stock llama.cpp will refuse such a
+            file and the conversion says so.
             Qwen3.5-family
             checkpoints (hybrid linear/full attention, optional MoE) are
             emitted as the qwen35 / qwen35moe architectures following

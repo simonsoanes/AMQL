@@ -67,9 +67,12 @@ public static class GgufConverter
     }
 
     /// <summary>The <c>--quant</c> modes this converter can emit: F16, Q4_0,
-    /// all-MXFP4, and llama.cpp's MXFP4_MOE recipe (expert stacks MXFP4,
-    /// every other quantizable weight Q8_0).</summary>
-    public static readonly IReadOnlyList<string> Quantizations = new[] { "none", "q4_0", "mxfp4", "mxfp4_moe" };
+    /// all-MXFP4, llama.cpp's MXFP4_MOE recipe (expert stacks MXFP4, every
+    /// other quantizable weight Q8_0), and the two Bonsai ternary packings.
+    /// The ternary modes write ggml type ids 142/143, which belong to the
+    /// PrismML fork — stock llama.cpp will not load them.</summary>
+    public static readonly IReadOnlyList<string> Quantizations =
+        new[] { "none", "q4_0", "mxfp4", "mxfp4_moe", "ptq1", "pq2" };
 
     public static GgufConversion Convert(string checkpointDir, string outFile, string quantization = "none")
     {
@@ -297,6 +300,12 @@ public static class GgufConverter
         {
             "q4_0" => 2u,
             "mxfp4" or "mxfp4_moe" => 38u,
+            // The Bonsai ternary packings have no ftype in stock ggml's enum,
+            // and the fork's number is not documented anywhere we can read.
+            // GUESSED (1024) is the honest value: the per-tensor types are what
+            // a loader reads for layout, and pretending to a specific recipe
+            // would be a claim we cannot back.
+            "ptq1" or "pq2" => 1024u,
             _ => 1u,
         };
         writer.Kv("general.file_type", GgufValue.Uint32(fileType));
@@ -426,6 +435,10 @@ public static class GgufConverter
                       + "quantizable weight in Q8_0; norms, embeddings, output head and routers kept full precision"
                     : "MXFP4_MOE recipe (llama.cpp ftype 38) requested for a dense model — there are no expert "
                       + "stacks, so every quantizable weight is Q8_0",
+                "ptq1" => "Bonsai ternary PTQ1_0 (ggml type 143: 128 trits at 5 per byte plus one FP16 scale "
+                    + "per 28-byte block); FORK-ONLY — stock llama.cpp has no type 143 and will refuse the file",
+                "pq2" => "Bonsai ternary PQ2_0 (ggml type 142: 128 trits at 2 bits each plus one FP16 scale "
+                    + "per 34-byte block); FORK-ONLY — stock llama.cpp has no type 142 and will refuse the file",
                 _ => "weights written as F16 (BF16 sources; lossless in the normal range); F32 routers kept",
             },
         };
@@ -544,7 +557,7 @@ public static class GgufConverter
                 float[] sliceValues = LoadFloats(slice, sliceInfo.Shape[0] * sliceInfo.Shape[1]);
                 // ne0 is sliceCols in GGUF order; slices are written in source
                 // row-major order, which already matches [ne0=sliceCols, ne1=sliceRows].
-                writer.Data.Write(EncodeBlocks(type, sliceValues));
+                writer.Data.Write(EncodeBlocks(type, sliceValues, (int)sliceInfo.Shape[1]));
             }
             writer.FinishTensor(index);
             return;
@@ -562,15 +575,17 @@ public static class GgufConverter
             }
         }
 
-        writer.Data.Write(EncodeBlocks(type, values));
+        writer.Data.Write(EncodeBlocks(type, values, (int)info.Shape[1]));
         writer.FinishTensor(index);
     }
 
-    /// <summary>Encodes a float array into the given block type.</summary>
-    private static byte[] EncodeBlocks(GgufType type, float[] values) => type switch
+    /// <summary>Encodes a float array into the given block type.
+    /// <paramref name="cols"/> is the logical row width, which the ternary
+    /// packings need for their row-wise Hadamard rotation.</summary>
+    private static byte[] EncodeBlocks(GgufType type, float[] values, int cols) => type switch
     {
         GgufType.Q4_0 => QuantizeQ4_0(values),
-        _ => GgmlQuant.Encode(type, values),
+        _ => GgmlQuant.Encode(type, values, cols),
     };
 
     // ── descriptors ────────────────────────────────────────────────────────
@@ -580,20 +595,24 @@ public static class GgufConverter
         // Block quantization for eligible weight tensors.
         if (ShouldQuantize(entry))
         {
-            switch (quantization)
+            GgufType? candidate = quantization switch
             {
-                case "q4_0":
-                    return GgufType.Q4_0;
-                case "mxfp4":
-                    return GgufType.Mxfp4;
-                case "mxfp4_moe":
-                    // llama.cpp's MXFP4_MOE recipe (ftype 38): the 3-D expert
-                    // stacks become MXFP4 and every other quantizable weight
-                    // becomes Q8_0. Keeping the shared attention path at 8 bit
-                    // is the point of the recipe — 4-bit there costs more
-                    // quality than the expert stacks do, and on a dense model
-                    // with no expert stacks this degrades to plain Q8_0.
-                    return entry.Transform == Transform.Stack ? GgufType.Mxfp4 : GgufType.Q8_0;
+                "q4_0" => GgufType.Q4_0,
+                "mxfp4" => GgufType.Mxfp4,
+                "ptq1" => GgufType.Ptq1_0,
+                "pq2" => GgufType.Pq2_0,
+                // llama.cpp's MXFP4_MOE recipe (ftype 38): the 3-D expert
+                // stacks become MXFP4 and every other quantizable weight
+                // becomes Q8_0. Keeping the shared attention path at 8 bit
+                // is the point of the recipe — 4-bit there costs more
+                // quality than the expert stacks do, and on a dense model
+                // with no expert stacks this degrades to plain Q8_0.
+                "mxfp4_moe" => entry.Transform == Transform.Stack ? GgufType.Mxfp4 : GgufType.Q8_0,
+                _ => null,
+            };
+            if (candidate is { } type && AlignedFor(entry, type))
+            {
+                return type;
             }
         }
 
@@ -648,18 +667,23 @@ public static class GgufConverter
         {
             elements *= d;
         }
-        if (elements < MinQuantElements || elements % GgmlQuant.BlockElements != 0)
-        {
-            return GgufType.F16;
-        }
-        return quantization switch
+        GgufType candidate = quantization switch
         {
             "q4_0" => GgufType.Q4_0,
             "mxfp4" => GgufType.Mxfp4,
+            "ptq1" => GgufType.Ptq1_0,
+            "pq2" => GgufType.Pq2_0,
             // matches the recipe: a 2-D tensor under MXFP4_MOE becomes Q8_0
             "mxfp4_moe" => GgufType.Q8_0,
             _ => GgufType.F16,
         };
+        if (candidate == GgufType.F16
+            || elements < MinQuantElements
+            || elements % GgufTypeSizing.BlockElements(candidate) != 0)
+        {
+            return GgufType.F16;
+        }
+        return candidate;
     }
 
     /// <summary>Determines if a tensor is eligible for block quantization, in
@@ -689,10 +713,9 @@ public static class GgufConverter
         // Skip non-2D tensors (conv weights, stacked MoE experts, etc.)
         if (shape.Length != 2) return false;
 
-        // ggml blocks along the contiguous dimension, so anything that is not
-        // a whole number of blocks has no valid encoding in any of these types
-        // and must stay full precision rather than be padded.
-        if (totalElements % GgmlQuant.BlockElements != 0) return false;
+        // Block alignment is checked per candidate type in AlignedFor, because
+        // the block size differs: 32 for Q4_0/MXFP4/Q8_0, 128 for the Bonsai
+        // ternary packings.
 
         // Skip the transforms that must stay F32 (see GgufTypeFor). The
         // reordering projections are not in this list: their head permutation
@@ -702,6 +725,20 @@ public static class GgufConverter
             return false;
 
         return true;
+    }
+
+    /// <summary>True when the tensor's element count divides exactly by the
+    /// candidate type's block size. A tensor that misses it stays full
+    /// precision rather than being padded into a partial block, which would
+    /// make the declared size and the decoded values disagree.</summary>
+    private static bool AlignedFor(PlanEntry entry, GgufType type)
+    {
+        long elements = 1;
+        foreach (long d in entry.Source!.Info.Shape)
+        {
+            elements *= d;
+        }
+        return elements % GgufTypeSizing.BlockElements(type) == 0;
     }
 
     private static long[] GgufDims(PlanEntry entry, bool reorderLinear)
@@ -979,7 +1016,7 @@ public static class GgufConverter
             }
         }
 
-        WriteTypedFloats(writer, entry, quantization, reordered);
+        WriteTypedFloats(writer, entry, quantization, reordered, (int)cols);
     }
 
     /// <summary>Permutes the columns of out_proj, whose input dimension carries
@@ -1014,19 +1051,20 @@ public static class GgufConverter
             }
         }
 
-        WriteTypedFloats(writer, entry, quantization, reordered);
+        WriteTypedFloats(writer, entry, quantization, reordered, (int)cols);
     }
 
     /// <summary>Emits floats in whatever type the header already declared for
     /// this tensor, so a permuted projection can be block-quantized, F16 or
     /// F32 without the reorder needing to know which. Does not call
     /// FinishTensor; the caller's switch does.</summary>
-    private static void WriteTypedFloats(GgufWriter writer, PlanEntry entry, string quantization, float[] values)
+    private static void WriteTypedFloats(GgufWriter writer, PlanEntry entry, string quantization,
+        float[] values, int cols)
     {
         var type = GgufTypeFor(entry, quantization);
         if (GgufTypeSizing.IsBlockQuantized(type))
         {
-            writer.Data.Write(EncodeBlocks(type, values));
+            writer.Data.Write(EncodeBlocks(type, values, cols));
             return;
         }
         switch (type)

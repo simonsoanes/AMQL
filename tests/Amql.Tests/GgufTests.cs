@@ -403,6 +403,62 @@ public class GgufTests
         Assert.Equal(GgufType.F32, all.GetTensor("blk.0.ffn_gate_inp.weight").Type);
     }
 
+    /// <summary>
+    /// The GGUF ternary block interleaves the FP16 scale with the packed trits
+    /// (scale first, like every other ggml block type) whereas the safetensors
+    /// codec keeps them in two separate arrays. A wrong interleave would yield
+    /// blocks that decode to noise, and there is no external oracle for type
+    /// ids 142/143 — they belong to the PrismML fork and no reference file
+    /// exists — so this de-interleaves and runs the existing decoder, pinning
+    /// the layout against the codec that produced the trits and asserting the
+    /// decode stays correlated with the input, which a mis-ordering would not.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void Ternary_Gguf_Blocks_Interleave_Scale_Then_Trits(bool ptq1)
+    {
+        const int rows = 8, cols = 128;
+        var values = new float[rows * cols];
+        var rng = new Random(7);
+        for (int i = 0; i < values.Length; i++)
+        {
+            values[i] = (float)(rng.NextDouble() * 2 - 1);
+        }
+
+        byte[] bytes = GgmlQuant.QuantizeTernaryGguf(values, cols, ptq1);
+        int packedPerBlock = ptq1 ? Ternary.Ptq1BytesPerBlock : Ternary.Pq2BytesPerBlock;
+        int blocks = rows * cols / Ternary.BlockElements;
+        Assert.Equal(blocks * (2 + packedPerBlock), bytes.Length);
+
+        var packed = new byte[blocks * packedPerBlock];
+        var scales = new byte[blocks * 2];
+        for (int b = 0; b < blocks; b++)
+        {
+            int o = b * (2 + packedPerBlock);
+            scales[b * 2] = bytes[o];
+            scales[b * 2 + 1] = bytes[o + 1];
+            Array.Copy(bytes, o + 2, packed, b * packedPerBlock, packedPerBlock);
+        }
+
+        float[] decoded = ptq1
+            ? Ternary.DecodePtq1(packed, scales, values.Length, rows, cols)
+            : Ternary.DecodePq2(packed, scales, values.Length, rows, cols);
+
+        double sumSq = 0, errSq = 0, dot = 0;
+        for (int i = 0; i < values.Length; i++)
+        {
+            sumSq += (double)values[i] * values[i];
+            errSq += (double)(decoded[i] - values[i]) * (decoded[i] - values[i]);
+            dot += (double)values[i] * decoded[i];
+        }
+        string name = ptq1 ? "ptq1" : "pq2";
+        Assert.True(dot > 0.5 * sumSq,
+            $"{name}: decode is decorrelated from the input (dot/||x||^2 = {dot / sumSq:F3}) — the interleave is wrong");
+        Assert.True(Math.Sqrt(errSq / sumSq) < 1.0,
+            $"{name}: relL2 {Math.Sqrt(errSq / sumSq):F3} reads as a layout error rather than quantization loss");
+    }
+
     // 2 key heads × 3 value heads per key × head_dim 4, so a grouped row
     // (k, vp, h) becomes the tiled row (vp, k, h). num_v_per_k differing from
     // num_k_heads is what makes the permutation non-self-inverse, matching the
