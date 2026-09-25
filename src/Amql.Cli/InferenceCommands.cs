@@ -29,7 +29,8 @@ public static class InferenceRunner
         bool TraceTensors,
         WeightWorkingSet? WeightWorkingSet = null,
         string? TraceJsonPath = null,
-        Func<int, string>? TokenText = null);
+        Func<int, string>? TokenText = null,
+        Action<TensorTraceLine>? OnTensorLoad = null);
 
     /// <summary>How many top candidates a traced step records.</summary>
     private const int TraceTopK = 10;
@@ -56,16 +57,14 @@ public static class InferenceRunner
         var session = new DecodeSession(plan, store, patch, options?.WeightWorkingSet);
         var rng = new Random(config.Seed);
         bool tracing = options is { Trace: true } or { TraceTensors: true };
-        bool tensorTrace = options is { TraceTensors: true };
 
-        // Wire tensor-load trace for --trace-tensors.
-        var tensorLoads = tensorTrace ? new List<TensorTraceLine>() : null;
-        if (tensorLoads is not null)
+        // --trace-tensors forwards every weight load to the caller. This used
+        // to collect into a local list that was never returned and never
+        // printed, so the flag ran, cost the lock, and showed nothing.
+        if (options is { TraceTensors: true, OnTensorLoad: { } onTensorLoad })
         {
             session.Runtime.Weights.LoadTrace = (objId, tensor, shape, hit) =>
-            {
-                lock (tensorLoads) { tensorLoads.Add(new TensorTraceLine(objId, tensor, shape, hit)); }
-            };
+                onTensorLoad(new TensorTraceLine(objId, tensor, shape, hit));
         }
 
         session.Prefill(tokens);
@@ -121,12 +120,6 @@ public static class InferenceRunner
                 session.Position,
                 CandidatesFor(logits, showTopK),
                 trace));
-
-            // Dump tensor loads after the first step.
-            if (tensorLoads is not null && step == 0)
-            {
-                // Collected during prefill + first step — report once.
-            }
         }
 
         if (recorder is not null && options?.TraceJsonPath is { } tracePath)

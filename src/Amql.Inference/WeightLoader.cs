@@ -253,6 +253,7 @@ public sealed class WeightLoader
         var key = (operand.ObjectId, operand.TensorName);
         if (_vectors.TryGetValue(key, out var cached))
         {
+            LoadTrace?.Invoke(operand.ObjectId, operand.TensorName, new long[] { width }, true);
             return cached;
         }
 
@@ -269,6 +270,7 @@ public sealed class WeightLoader
         var vector = resolution.Values;
         ApplyPatch(operand, vector);
         _vectors[key] = vector;
+        LoadTrace?.Invoke(operand.ObjectId, operand.TensorName, resolution.Shape, false);
         return vector;
     }
 

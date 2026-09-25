@@ -767,10 +767,6 @@ public sealed class GenericRuntime
     /// (<c>--trace</c>).</summary>
     public Action<int, int, float, float>? LayerNormTrace { get; set; }
 
-    /// <summary>When set, every tensor load reports its name, shape, and
-    /// whether it hit the cache (<c>--trace-tensors</c>).</summary>
-    public Action<string, long[], bool>? TensorLoadTrace { get; set; }
-
     /// <summary>When set, each operator reports its output statistics as it
     /// runs — the per-operator seam the inference visualiser draws from, where
     /// <see cref="LayerNormTrace"/> only sees two scalars per layer. Left null

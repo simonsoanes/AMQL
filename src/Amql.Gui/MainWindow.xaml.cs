@@ -827,8 +827,9 @@ public partial class MainWindow : Window
             "AMQL Studio — a project-based WPF front-end for amql-cli.\n\n" +
             "Every command, option and global flag of the CLI is available; projects (.amqlproj) " +
             "store all parameters plus run status, progress and output tails.\n\n" +
-            "The GUI drives amql-cli as a child process for transforms and references " +
-            "Vindex3 + Safetensors libraries for direct container inspection in the Explorer.",
+            "The GUI drives amql-cli as a child process for transforms, and references the " +
+            "Vindex3, Safetensors and Inference libraries directly for container inspection in " +
+            "the Explorer and for the inference visualiser's trace model.",
             "About AMQL Studio", MessageBoxButton.OK, MessageBoxImage.Information);
     }
 

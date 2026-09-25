@@ -625,13 +625,15 @@ internal static class Program
         }
 
         string? traceJson = OptionValue(args, "--trace-json");
+        var tensorLoads = traceTensors ? new List<TensorTraceLine>() : null;
         var genOpts = (trace || traceTensors || traceJson is not null || workingSet is not null)
             ? new InferenceRunner.GenerateOptions(Trace: trace, TraceTensors: traceTensors,
                 WeightWorkingSet: workingSet, TraceJsonPath: traceJson,
                 // Resolve token text at capture time so a saved trace reads as
                 // words when reopened, rather than depending on the tokenizer
                 // still being to hand.
-                TokenText: tokenizer is not null ? id => tokenizer.Decode(new[] { id }) : null)
+                TokenText: tokenizer is not null ? id => tokenizer.Decode(new[] { id }) : null,
+                OnTensorLoad: tensorLoads is not null ? line => tensorLoads.Add(line) : null)
             : null;
 
         var (prefill, steps2) = InferenceRunner.Generate(
@@ -666,14 +668,33 @@ internal static class Program
             }
         }
 
-        // Dump tensor-load trace at the end.
-        if (traceTensors)
+        if (tensorLoads is not null)
         {
+            // Grouped rather than listed raw: a decode step reloads every
+            // weight it touched on the previous one, so the interesting number
+            // is how many distinct tensors were pulled and how often each was
+            // cold, not the several thousand individual cache hits.
+            var distinct = tensorLoads
+                .GroupBy(l => (l.ObjectId, l.TensorName))
+                .Select(g => (g.Key.ObjectId, g.Key.TensorName, Shape: g.First().Shape,
+                    Loads: g.Count(), Cold: g.Count(l => !l.CacheHit)))
+                .OrderByDescending(t => t.Cold)
+                .ThenBy(t => t.TensorName, StringComparer.Ordinal)
+                .ToList();
+
             Console.WriteLine();
-            Console.WriteLine("tensor loads:");
-            // The trace is populated during runtime — we need to access it.
-            // For now, note that tracing was enabled.
-            Console.WriteLine("  (tensor-level trace enabled — see runtime log above)");
+            Console.WriteLine($"tensor loads: {tensorLoads.Count:N0} total, {distinct.Count} distinct, "
+                + $"{tensorLoads.Count(l => !l.CacheHit)} cold");
+            const int shown = 40;
+            foreach (var t in distinct.Take(shown))
+            {
+                Console.WriteLine($"  {t.ObjectId}/{t.TensorName} [{string.Join("x", t.Shape)}]"
+                    + $"  {t.Loads} load{(t.Loads == 1 ? string.Empty : "s")}, {t.Cold} cold");
+            }
+            if (distinct.Count > shown)
+            {
+                Console.WriteLine($"  … and {distinct.Count - shown} more");
+            }
         }
 
         if (tokenizer is not null)
@@ -1883,6 +1904,7 @@ internal static class Program
                               [--steps 8] [--temperature 0] [--top-k 0] [--top-p 0]
                               [--seed 42] [--logits K] [--component target]
                               [--patch <patch.safetensors>]
+                              [--trace] [--trace-tensors] [--weights f32|bf16|mxfp4]
                               [--trace-json <trace.json>]
               amql-cli inspect-token <container-dir> <token>
                               [--tokens ctx,ids] [--neighbors 5] [--logits K]

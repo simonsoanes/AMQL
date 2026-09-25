@@ -11,10 +11,13 @@ namespace Amql.Gui.Run;
 public sealed record CliInvocation(string FileName, IReadOnlyList<string> PrefixArguments);
 
 /// <summary>
-/// Launches amql-cli as a child process and streams its output. The GUI
-/// deliberately references no AMQL library: driving the CLI keeps it at
-/// feature parity with the command line by construction and insulated from
-/// concurrent core changes.
+/// Launches amql-cli as a child process and streams its output. Transforms and
+/// anything long-running go through the CLI, which keeps the GUI at feature
+/// parity with the command line by construction and insulated from concurrent
+/// core changes. The GUI does reference Amql.Vindex3, Amql.Safetensors and
+/// Amql.Inference directly — for container inspection in the Explorer and for
+/// the inference visualiser's trace model — so this is the default path for
+/// commands, not a rule that nothing is linked in.
 /// </summary>
 public sealed class CliRunner
 {

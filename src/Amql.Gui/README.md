@@ -4,15 +4,21 @@ A project-based WPF front-end for `amql-cli`. Every command and option of the
 CLI is exposed as a form; projects are stored in a single `.amqlproj` file that
 holds all parameters **and** the status/progress/output of every run.
 
-## Design principle: contained by construction
+## Design principle: the CLI is the default path
 
-`Amql.Gui` references **no AMQL library**. It drives `amql-cli` as a child
-process (`Process` + `ArgumentList`, stdout/stderr streamed), so:
+Commands run by driving `amql-cli` as a child process (`Process` +
+`ArgumentList`, stdout/stderr streamed), so:
 
 - feature parity with the command line is structural — same binary, same flags;
 - concurrent work on the AMQL core cannot break the GUI (or vice versa);
 - the global `--cpu` / `--gpu` flags and the `AMQL_WEIGHTS` env var are
   surfaced as project settings.
+
+The GUI does link three AMQL libraries directly, where shelling out would be
+the wrong tool: `Amql.Vindex3` and `Amql.Safetensors` so the Container Explorer
+can read tensors without spawning a process per click, and `Amql.Inference` for
+the inference visualiser's trace model (`RunTrace`, `TraceMetrics`). Note that
+`Amql.Inference` brings the CUDA shim into the GUI process with it.
 
 Three ways to reach the CLI (in priority order):
 
