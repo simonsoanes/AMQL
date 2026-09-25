@@ -29,21 +29,48 @@ Or build the published standalone executable:
 .\scripts\publish-exe.cmd
 ```
 
+### Shared output folder
+
+Every project under `src/` writes to a single `bin/<Configuration>/` at the
+repository root, rather than to a per-project `bin/`. So `bin/Release/` holds
+`amql-cli.exe`, `amql-gui.exe` and all the `Amql.*` libraries side by side:
+
+```bash
+.\bin\Release\amql-cli.exe help
+.\bin\Release\amql-gui.exe
+```
+
+This is configured in `src/Directory.Build.props` and is deliberately scoped to
+`src/` — `tests/Amql.Tests` keeps its own output folder so xunit and its runner
+do not land in the directory people launch things from. It also means the GUI
+finds the CLI without configuration: `CliAutoDetect` looks beside itself first.
+Because the two target frameworks in play (`net10.0` and the GUI's
+`net10.0-windows`) share the folder, `AppendTargetFrameworkToOutputPath` is off;
+each entry point still carries its own `runtimeconfig.json`.
+
+`bin/` is gitignored. If you have an older checkout, the stale per-project
+`src/*/bin/` folders are no longer written to and can be deleted.
+
 ### Project Structure
 
 ```
 AMQL/
 ├── src/
+│   ├── Directory.Build.props  # shared bin/<Configuration>/ output for all of src/
 │   ├── Amql.Cli/        # CLI front-end (amql-cli)
-│   ├── Amql.Safetensors/ # Safetensors I/O & MXFP4 codec
+│   ├── Amql.Gui/        # WPF desktop GUI (amql-gui): explorer, command runner, visualiser
+│   ├── Amql.Safetensors/ # Safetensors I/O, MXFP4 and ternary codecs
 │   ├── Amql.Vindex3/     # VIndex3 container graph & schema
 │   ├── Amql.Inference/   # Tensor inference engine & tracing
+│   ├── Amql.Gguf/        # GGUF v3 reader/writer and HF-checkpoint conversion
 │   ├── Amql.Hf/          # Hugging Face checkpoint integration
-│   └── Amql.Merge/       # Model merging (token alignment, provenance)
+│   ├── Amql.Merge/       # Model merging (token alignment, provenance)
+│   └── Amql.Onnx/        # ONNX export
 ├── tests/
 │   └── Amql.Tests/       # Unit & integration tests
 ├── scripts/
 │   └── publish-exe.cmd   # Windows standalone publish script
+├── bin/                  # shared build output (gitignored)
 ├── README.md
 └── LICENSE
 ```

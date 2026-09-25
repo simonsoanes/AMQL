@@ -19,19 +19,24 @@ public static class CliAutoDetect
         var parent = Path.Combine(Path.GetDirectoryName(baseDir) ?? baseDir, "amql-cli.exe");
         if (File.Exists(parent)) return parent;
 
-        // 3. Debug build: src/Amql.Cli/bin/Debug/net10.0/amql-cli.exe
+        // 3. Shared solution output: every project under src/ writes to
+        // <repo>/bin/<Configuration>/ (see src/Directory.Build.props), so the
+        // CLI built from this working tree is here whether the GUI itself was
+        // launched from there or from somewhere else.
         var repoRoot = FindRepoRoot(baseDir);
         if (repoRoot is not null)
         {
-            var debugExe = Path.Combine(repoRoot, "src", "Amql.Cli", "bin", "Debug", "net10.0", "amql-cli.exe");
-            if (File.Exists(debugExe)) return debugExe;
+            foreach (var configuration in new[] { "Debug", "Release" })
+            {
+                var built = Path.Combine(repoRoot, "bin", configuration, "amql-cli.exe");
+                if (File.Exists(built)) return built;
+            }
         }
 
-        // 4. Release publish (self-contained): .../Release/net10.0/win-x64/publish/amql-cli.exe
+        // 4. Release publish (self-contained)
         if (repoRoot is not null)
         {
-            var releaseExe = Path.Combine(repoRoot, "src", "Amql.Cli", "bin", "Release",
-                "net10.0", "win-x64", "publish", "amql-cli.exe");
+            var releaseExe = Path.Combine(repoRoot, "bin", "Release", "win-x64", "publish", "amql-cli.exe");
             if (File.Exists(releaseExe)) return releaseExe;
         }
 

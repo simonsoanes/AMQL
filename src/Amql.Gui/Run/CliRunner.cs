@@ -55,6 +55,17 @@ public sealed class CliRunner
             return new CliInvocation("dotnet", new[] { "run", "--no-launch-profile", "--project", cliProject, "--" });
         }
 
+        // No explicit exe and no repo path: try autodetect before giving up on
+        // PATH. This is what makes the shared bin/<Configuration>/ output
+        // useful — a CLI built beside the GUI is found with no configuration,
+        // which matters for windows that are not opened from a project (the
+        // inference visualiser launched via `amql-gui --trace`, say) and so
+        // have default settings.
+        if (CliAutoDetect.FindExe() is { } detected)
+        {
+            return new CliInvocation(detected, Array.Empty<string>());
+        }
+
         // Last resort: amql-cli on PATH.
         return new CliInvocation("amql-cli", Array.Empty<string>());
     }

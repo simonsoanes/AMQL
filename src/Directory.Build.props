@@ -1,0 +1,28 @@
+<Project>
+
+  <!--
+    Every project under src/ writes into one shared bin/<Configuration>/ folder
+    at the repository root, so amql-cli.exe and amql-gui.exe sit side by side.
+    That is not just tidiness: CliAutoDetect looks for the CLI adjacent to the
+    GUI first, so a shared folder means the GUI finds the right CLI with no
+    configuration and no stale hardcoded path.
+
+    Scoped to src/ by living here rather than at the repository root. MSBuild
+    stops at the nearest Directory.Build.props, so tests/Amql.Tests keeps its
+    own output folder and does not spill xunit and its runner into the folder
+    people actually launch things from.
+
+    AppendTargetFrameworkToOutputPath is off because the two target frameworks
+    in play — net10.0 for the libraries and CLI, net10.0-windows for the GUI —
+    would otherwise land in separate subfolders and defeat the point. Mixing
+    them in one directory is safe: each entry point carries its own
+    runtimeconfig.json and deps.json, and the GUI's net10.0 dependencies belong
+    beside it anyway.
+  -->
+  <PropertyGroup>
+    <OutputPath>$(MSBuildThisFileDirectory)..\bin\$(Configuration)\</OutputPath>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
+  </PropertyGroup>
+
+</Project>
