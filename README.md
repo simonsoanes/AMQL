@@ -228,12 +228,27 @@ violet tab on any operator that reads exactly one weight tensor.
 
 The map is meant to be acted on, not just read:
 
+- **Run** a prompt from the window (`▶ Run…`) and watch the map fill in as each
+  token completes. Inference runs in a CLI child process and the window tails its
+  stream, so the model is never loaded into the GUI and stopping a run kills the
+  process rather than unwinding a thread.
 - **Rank** operators by mean/peak activation or time, filtered to weight-bearing ones.
 - **Scrub** a single step, or view the aggregate over the whole run.
 - **Right-click** a weight node to copy the `edit-tensor` command that scales or zeroes that
   whole tensor, and the `generate --patch … --trace-json …` command that re-runs with it.
 - **Compare** two traces: the map recolours on a diverging ramp showing which operators got
   louder (red) or quieter (blue) after the edit.
+
+Three overlays answer questions activation magnitude cannot:
+
+- `--attribute --attribute-corrupt <text>` runs ROME-style causal attribution — corrupt one
+  prompt token, restore each layer's clean residual in turn, re-measure the target's
+  probability. Colouring by **causal share** shows what actually mattered rather than what
+  was loud. Per layer, not per operator, and one extra forward per layer.
+- `--logit-lens` projects each layer's residual through the output head, showing the depth
+  at which the prediction forms. Costs a head GEMM per layer per step.
+- `--trace-attention` records each softmax head's weights for the last query row. Recurrent
+  layers produce none, and the panel says so rather than leaving them to look missing.
 
 `edit-tensor` is the whole-tensor counterpart to `change-tensor`; a single-cell edit to a
 multi-million-element matrix is too small to measure downstream. See

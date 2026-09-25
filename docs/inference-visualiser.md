@@ -173,9 +173,9 @@ an aggregate-only mode keeps just the per-node reductions for very long runs.
 | 1 | Recorder + JSON + `generate --trace-json` | **Done.** `OpTrace` / `ExpertRoutingTrace` hooks in `GenericRuntime`, `TraceRecorder`, `--trace-json`. Verified headlessly on the 0.8B; instrumentation produces byte-identical text with and without the flag. |
 | 2 | Static map: layout, zoom/pan, LOD, colour by aggregate | **Done.** `ModelMapCanvas` + `TraceMetrics`. |
 | 3 | Step scrubber, per-step metrics, top-k panel | **Done.** |
-| 4 | Live in-process run from the GUI | Not started. The GUI references `Amql.Inference` now, so the plumbing exists; what is missing is a run panel and a throttled dispatcher feed. |
+| 4 | Live in-process run from the GUI | **Done, but not in-process.** A `▶ Run…` button drives `generate` in a CLI child process and tails its `--trace-stream` file, applying each step as it lands (no animation, per request). Chosen over hosting `DecodeSession` in the window: the model stays out of the GUI process, the existing kill-the-process-tree path is the cancel mechanism (there is no `CancellationToken` in `Amql.Inference`), and a runtime crash cannot take the window with it. |
 | 5 | Ranking + edit → re-run loop | **Done, with one deliberate gap.** Ranking and the right-click menu exist, but the menu *copies* the `edit-tensor` / `generate --patch` commands rather than running them — the main window already has a command runner with output capture, and a second place that knows how to invoke the CLI is a second place to keep in step. `edit-tensor` (whole-tensor scale/zero/offset) was added for this, because `change-tensor` edits a single cell and a single cell of a 4M-element matrix is unmeasurable downstream. |
-| 6 | Compare mode; causal and logit-lens overlays | **Compare done** (diverging ramp, nodes matched on layer+op+weight). Causal attribution via `CausalTracer` and the logit lens are **not started** — both are the strongest answers to "which tensors matter" and are the obvious next work. |
+| 6 | Compare mode; causal and logit-lens overlays | **All done.** Compare recolours on a diverging ramp with nodes matched on layer+op+weight. `generate --attribute` runs `CausalTracer` and stores per-layer shares; `--logit-lens` projects each layer's residual through the head; `--trace-attention` records per-head weights for the last query row. |
 
 ## 10. Risks — as resolved
 
@@ -191,22 +191,34 @@ an aggregate-only mode keeps just the per-node reductions for very long runs.
 - **Trace size.** 211 KB for 16 tokens over 150 operator nodes on the 0.8B, with topology
   interned once. A 27B run has roughly four times the operators; the per-step cost is what
   scales, and `--trace-steps` is not implemented yet.
-- **Linear-attention layers have no attention matrix.** Still true and still unhandled in
-  the UI: 3 of every 4 Qwen3.5 layers report `linear_attn` as a single operator with no
-  per-head breakdown, and the map does not claim otherwise.
+- **Linear-attention layers have no attention matrix.** Still true, and now
+  handled in the UI: the attention panel says how many softmax layers it is
+  showing out of the total, so three absent columns in four read as expected
+  rather than as missing data. The linear-attention mixer itself is broken out
+  into its eight projections plus the recurrent core, so those layers are not
+  second-class on the map.
 
 ## 11. Known limitations of what shipped
 
-- **The rendering has not been seen by a human.** The window was confirmed to open and
-  finish loading a real trace (by enumerating its top-level windows, since the title is only
-  set once parsing, layout and ranking have all succeeded), but the layout, colour ramp and
-  label legibility are unjudged.
-- **No attention or per-head overlay.** `AttentionTrace` already captures per-(layer, head)
-  weights; nothing surfaces them yet.
-- **No logit lens.** Projecting each layer's residual through the output head — the most
-  legible way to see where a prediction forms — is designed but unbuilt.
-- **Prefill is not traced.** The recorder attaches after prefill, so the map shows decode
-  steps only. For a long prompt that is the cheaper half of the run.
-- **One operator per mixer family.** `linear_attn` and `conv` are single nodes; their
-  internal projections (`in_proj_qkv`, `in_proj_z`, `out_proj`) are not separately
-  instrumented, so a linear-attention layer shows fewer editable tensors than a softmax one.
+- **The rendering has not been judged by a human for the lens, attention or live
+  panels.** The window has been confirmed to open and load a real trace, and the
+  stream tail has been proven against a file being actively appended to, but
+  nobody has clicked `▶ Run…` or looked at the two new panels.
+- **Prefill is not traced.** The recorder attaches after prefill, so the map shows
+  decode steps only. For a long prompt that is the cheaper half of the run. The
+  lens and attention hooks are inside `RunLayerInternal` and `StepForward`, so
+  extending coverage means attaching before prefill and giving it its own step
+  record.
+- **One operator per conv mixer.** `RunConv` is a single node; its `in_proj` and
+  `out_proj` are not separately instrumented. The linear-attention mixer and the
+  softmax mixer are fully broken out.
+- **Attention is the last query row only**, which is what `AttentionTrace`
+  captures. It is not the full attention matrix, and the panel says so.
+- **Causal attribution is per layer**, not per operator, and its cost is one
+  forward per traced layer plus two. On a 64-layer model that is 66 forwards.
+- **The logit lens costs a full head GEMM per layer per step**, so it is
+  impractical on a large model. It is opt-in and the help text says so.
+- **No GUI tests.** `Amql.Tests` targets `net10.0` and cannot reference the
+  `net10.0-windows` GUI project, which is why every reduction, layout and
+  comparison rule lives in `TraceMetrics` and `TraceRecorder` where it can be
+  tested. The WPF layer is deliberately thin.

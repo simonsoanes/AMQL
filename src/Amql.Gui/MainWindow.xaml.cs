@@ -865,6 +865,7 @@ public partial class MainWindow : Window
         // Non-modal, so the map can stay open beside the container explorer
         // while a tensor is being edited and the run repeated.
         var window = new Visualiser.InferenceVisualiserWindow(dlg.FileName) { Owner = this };
+        window.SetCliSettings(_project.Cli);
         window.Show();
         StatusText.Text = $"Visualiser: {System.IO.Path.GetFileName(dlg.FileName)}";
     }

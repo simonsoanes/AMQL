@@ -97,15 +97,29 @@ public sealed class ModelMapCanvas : FrameworkElement
         InvalidateVisual();
     }
 
-    /// <summary>Loads a trace and frames it. A null trace clears the map.</summary>
-    public void SetTrace(RunTrace? trace)
+    /// <summary>Loads a trace. A null trace clears the map.</summary>
+    /// <param name="refit">Frame the map and drop the selection. Pass false for
+    /// a live update: the layout grows as steps land, and re-fitting plus
+    /// clearing the selection on every one would make the view jump and lose
+    /// whatever the user had picked.</param>
+    public void SetTrace(RunTrace? trace, bool refit = true)
     {
         _trace = trace;
-        _selectedNode = -1;
-        _hoveredNode = -1;
+        if (refit)
+        {
+            _selectedNode = -1;
+            _hoveredNode = -1;
+        }
         Rebuild();
-        FitToView();
-        NodeSelected?.Invoke(null);
+        if (refit)
+        {
+            FitToView();
+            NodeSelected?.Invoke(null);
+        }
+        else
+        {
+            InvalidateVisual();
+        }
     }
 
     /// <summary>Switches between the whole-run aggregate and one step's values.

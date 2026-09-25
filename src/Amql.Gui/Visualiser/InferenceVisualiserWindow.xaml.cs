@@ -1,7 +1,12 @@
+using System.Globalization;
+using System.IO;
 using System.Text;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
+using System.Windows.Threading;
+using Amql.Gui.Model;
+using Amql.Gui.Run;
 using Amql.Inference.Tracing;
 using Microsoft.Win32;
 
@@ -24,6 +29,20 @@ public sealed partial class InferenceVisualiserWindow : Window
     private RunTrace? _trace;
     private string? _tracePath;
     private IReadOnlyList<NodeDelta> _deltas = Array.Empty<NodeDelta>();
+
+    // Live run state. Inference runs in a CLI child process and this window
+    // tails its trace stream, so the model never loads here.
+    private CliSettings _cli = new();
+    private CancellationTokenSource? _liveCts;
+    private DispatcherTimer? _liveTimer;
+    private string? _livePath;
+    private bool _liveFitted;
+    private int _liveSteps;
+    private bool _liveAutoFit = true;
+
+    /// <summary>Supplies the CLI location and device/weights settings, normally
+    /// from the open project. Without it the runner falls back to autodetect.</summary>
+    public void SetCliSettings(CliSettings settings) => _cli = settings;
 
     /// <summary>Set once construction has finished. Several controls declare a
     /// default state in XAML (<c>IsChecked="True"</c>, a selected ComboBoxItem),
@@ -75,33 +94,7 @@ public sealed partial class InferenceVisualiserWindow : Window
                 _trace = TraceRecorder.ReadJson(path);
             }
             _tracePath = path;
-
-            var trace = _trace!;
-            ModelText.Text = trace.Model;
-            SummaryText.Text =
-                $"{trace.Layers} layers · {trace.Nodes.Count} operators · {trace.Steps.Count} steps · {trace.HiddenSize} wide";
-
-            StepSlider.Maximum = Math.Max(0, trace.Steps.Count - 1);
-            StepSlider.Value = 0;
-            StepSlider.IsEnabled = trace.Steps.Count > 0;
-            AggregateCheck.IsChecked = true;
-
-            Map.SetTrace(trace);
-            CausalMetricItem.IsEnabled = trace.Causal is not null;
-            // SetCausal also selects the metric when attribution is present, so
-            // a trace captured with --attribute opens showing the thing that
-            // actually answers "which layers mattered".
-            Map.SetCausal(trace.Causal);
-            MetricBox.SelectedIndex = trace.Causal is not null ? 3 : 0;
-            if (trace.Causal is null)
-            {
-                Map.SetMetric(MapMetric.MeanL2);
-            }
-            RefreshRanking();
-            ShowStepInfo(-1);
-            ShowLens(-1);
-            ShowAttention(-1);
-            ShowMetricHint();
+            PresentTrace(_trace!, refit: true);
             Title = $"Inference Visualiser — {System.IO.Path.GetFileName(path)}";
         }
         catch (Exception ex)
@@ -110,6 +103,168 @@ public sealed partial class InferenceVisualiserWindow : Window
                 "Inference Visualiser", MessageBoxButton.OK, MessageBoxImage.Error);
         }
     }
+
+    /// <summary>Pushes a trace into every part of the window. Shared by opening
+    /// a saved file and by the live tail, so the two cannot present the same
+    /// data differently.</summary>
+    private void PresentTrace(RunTrace trace, bool refit)
+    {
+        _trace = trace;
+        _deltas = Array.Empty<NodeDelta>();
+
+        ModelText.Text = trace.Model;
+        SummaryText.Text =
+            $"{trace.Layers} layers · {trace.Nodes.Count} operators · {trace.Steps.Count} steps · {trace.HiddenSize} wide";
+
+        StepSlider.Maximum = Math.Max(0, trace.Steps.Count - 1);
+        if (StepSlider.Value > StepSlider.Maximum)
+        {
+            StepSlider.Value = StepSlider.Maximum;
+        }
+        StepSlider.IsEnabled = trace.Steps.Count > 0 && AggregateCheck.IsChecked != true;
+        CausalMetricItem.IsEnabled = trace.Causal is not null;
+
+        Map.SetTrace(trace, refit);
+        Map.SetCausal(trace.Causal);
+        if (trace.Causal is not null && MetricBox.SelectedIndex != 3)
+        {
+            MetricBox.SelectedIndex = 3;
+        }
+        else if (trace.Causal is null && MetricBox.SelectedIndex == 3)
+        {
+            MetricBox.SelectedIndex = 0;
+            Map.SetMetric(MapMetric.MeanL2);
+        }
+
+        RefreshRanking();
+        int step = AggregateCheck.IsChecked == true ? -1 : (int)StepSlider.Value;
+        ShowStepInfo(step);
+        ShowLens(step);
+        ShowAttention(step);
+        ShowMetricHint();
+    }
+
+    // ── live run ───────────────────────────────────────────────────────────
+
+    /// <summary>Starts a generation in a CLI child process and tails its trace
+    /// stream, updating the map as each step lands. Pressing the button again
+    /// cancels: there is no CancellationToken inside Amql.Inference, so the
+    /// child process is the unit that can actually be stopped.</summary>
+    private async void OnRunLive(object sender, RoutedEventArgs e)
+    {
+        if (_liveCts is not null)
+        {
+            _liveCts.Cancel();
+            return;
+        }
+
+        var dialog = new RunInferenceDialog(_trace?.ContainerPath ?? string.Empty, "The capital of France is")
+        {
+            Owner = this,
+        };
+        if (dialog.ShowDialog() != true)
+        {
+            return;
+        }
+
+        // Scratch owned by this window, so it goes in the temp directory rather
+        // than beside the user's containers.
+        _livePath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "amql-gui",
+            $"live-{DateTime.Now:yyyyMMdd-HHmmss}-{Guid.NewGuid().ToString("N")[..8]}.jsonl");
+        _liveFitted = false;
+        _liveSteps = -1;
+        _liveAutoFit = dialog.AutoFit;
+
+        var args = new List<string>
+        {
+            dialog.ContainerPath,
+            "--prompt", dialog.Prompt,
+            "--steps", dialog.Steps.ToString(CultureInfo.InvariantCulture),
+            "--temperature", dialog.Temperature.ToString(CultureInfo.InvariantCulture),
+            "--trace-stream", _livePath,
+        };
+        if (dialog.LogitLens)
+        {
+            args.Add("--logit-lens");
+        }
+        if (dialog.TraceAttention)
+        {
+            args.Add("--trace-attention");
+        }
+
+        _liveCts = new CancellationTokenSource();
+        _liveTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(250) };
+        _liveTimer.Tick += (_, _) => RefreshLive();
+        _liveTimer.Start();
+        RunButton.Content = "■ Stop";
+        AggregateCheck.IsChecked = true;
+        HoverText.Text = $"running: amql-cli generate … --trace-stream ({dialog.Steps} steps)";
+
+        // Initialised because a finally block is reachable from anywhere in the
+        // try, including before the assignment.
+        int exit = -1;
+        try
+        {
+            exit = await CliRunner.RunAsync(_cli, "generate", args,
+                line => Dispatcher.BeginInvoke(() => HoverText.Text = Truncate(line, 190)),
+                onProgress: null, _liveCts.Token, machineProgress: false);
+        }
+        catch (Exception ex)
+        {
+            HoverText.Text = $"run failed: {ex.Message}";
+            exit = -1;
+        }
+        finally
+        {
+            _liveTimer?.Stop();
+            _liveTimer = null;
+            bool cancelled = _liveCts?.IsCancellationRequested == true;
+            _liveCts?.Dispose();
+            _liveCts = null;
+            RunButton.Content = "▶ Run…";
+            // One last read: the final steps are written after the process has
+            // already exited, and stopping the timer first would lose them.
+            RefreshLive();
+            HoverText.Text = cancelled
+                ? $"cancelled after {_liveSteps} step(s) — the trace is partial"
+                : exit == 0
+                    ? $"run complete: {_liveSteps} step(s) → {_livePath}"
+                    : $"run exited {exit}: {Truncate(HoverText.Text, 160)}";
+        }
+    }
+
+    private void RefreshLive()
+    {
+        if (_livePath is null || !File.Exists(_livePath))
+        {
+            return;
+        }
+        try
+        {
+            var trace = TraceRecorder.ReadStream(_livePath);
+            if (trace.Steps.Count == _liveSteps && _liveFitted)
+            {
+                return;     // nothing new since the last tick
+            }
+            _liveSteps = trace.Steps.Count;
+            _tracePath = _livePath;
+            // Refit while the map is still growing if the user asked for it, and
+            // always on the first read so the run starts framed.
+            bool refit = !_liveFitted || _liveAutoFit;
+            _liveFitted = true;
+            PresentTrace(trace, refit);
+        }
+        catch (IOException)
+        {
+            // Caught mid-append; the next tick picks it up.
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
+    }
+
+    private static string Truncate(string text, int max)
+        => text.Length <= max ? text : text[..(max - 1)] + "…";
 
     // ── toolbar ────────────────────────────────────────────────────────────
 

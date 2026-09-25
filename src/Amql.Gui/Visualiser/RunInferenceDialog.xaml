@@ -1,0 +1,56 @@
+<Window x:Class="Amql.Gui.Visualiser.RunInferenceDialog"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Run Inference" SizeToContent="Height" Width="620"
+        WindowStyle="ToolWindow" WindowStartupLocation="CenterOwner"
+        ResizeMode="NoResize" Background="#FFFBFCFD">
+    <StackPanel Margin="14">
+        <TextBlock Text="Container" FontSize="10" FontWeight="Bold" Foreground="#FF7A8798"/>
+        <Grid Margin="0,3,0,10">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <TextBox x:Name="ContainerBox" Grid.Column="0" Padding="4,3"
+                     FontFamily="Cascadia Mono, Consolas" FontSize="12"/>
+            <Button x:Name="BrowseButton" Grid.Column="1" Content="Browse…" Margin="6,0,0,0"
+                    Padding="10,3" Click="OnBrowse"/>
+        </Grid>
+
+        <TextBlock Text="Prompt" FontSize="10" FontWeight="Bold" Foreground="#FF7A8798"/>
+        <TextBox x:Name="PromptBox" Margin="0,3,0,10" Padding="4,3" MinHeight="52"
+                 TextWrapping="Wrap" AcceptsReturn="True" VerticalScrollBarVisibility="Auto"
+                 FontFamily="Cascadia Mono, Consolas" FontSize="12"/>
+
+        <Grid Margin="0,0,0,10">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="70"/>
+                <ColumnDefinition Width="20"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="70"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock Grid.Column="0" Text="Steps" VerticalAlignment="Center" FontSize="11" Margin="0,0,6,0"/>
+            <TextBox x:Name="StepsBox" Grid.Column="1" Text="8" Padding="4,2" FontSize="12"/>
+            <TextBlock Grid.Column="3" Text="Temperature" VerticalAlignment="Center" FontSize="11" Margin="0,0,6,0"/>
+            <TextBox x:Name="TempBox" Grid.Column="4" Text="0" Padding="4,2" FontSize="12"/>
+        </Grid>
+
+        <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
+            <CheckBox x:Name="LensCheck" Content="Logit lens" FontSize="11" Margin="0,0,16,0"
+                      ToolTip="Project each layer's residual through the output head. Slow on a large model."/>
+            <CheckBox x:Name="AttentionCheck" Content="Attention rows" FontSize="11" Margin="0,0,16,0"
+                      ToolTip="Record each softmax head's weights for the last query row."/>
+            <CheckBox x:Name="AutoFitCheck" Content="Refit map as it grows" FontSize="11" IsChecked="True"/>
+        </StackPanel>
+
+        <TextBlock FontSize="10.5" Foreground="Gray" TextWrapping="Wrap" Margin="0,0,0,12"
+                   Text="Runs amql-cli as a child process and tails its trace stream, so the model stays out of this process and cancelling kills the run rather than the window."/>
+
+        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+            <Button x:Name="RunButton" Content="Run" Width="86" Padding="0,4" IsDefault="True" Click="OnRun"/>
+            <Button Content="Cancel" Width="86" Padding="0,4" Margin="8,0,0,0" IsCancel="True"/>
+        </StackPanel>
+    </StackPanel>
+</Window>

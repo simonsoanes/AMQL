@@ -11,6 +11,8 @@
         <Border DockPanel.Dock="Top" Padding="8,6" Background="#FFF4F6FA"
                 BorderBrush="#FFD0D7E2" BorderThickness="0,0,0,1">
             <StackPanel Orientation="Horizontal">
+                <Button x:Name="RunButton" Content="▶ Run…" Click="OnRunLive" Padding="10,3" Margin="0,0,6,0"
+                        ToolTip="Run a prompt through a container and watch the map fill in as each token completes. Inference runs in a CLI child process; the model is not loaded into this window."/>
                 <Button x:Name="OpenButton" Content="📂 Open trace…" Click="OnOpenTrace" Padding="10,3"/>
                 <TextBlock x:Name="ModelText" Margin="14,0,0,0" VerticalAlignment="Center"
                            FontSize="13" FontWeight="SemiBold" Foreground="#FF2B3A4A"/>
