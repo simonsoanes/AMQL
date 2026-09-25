@@ -34,7 +34,8 @@ public static class InferenceRunner
         bool Attribute = false,
         int AttributeSourceRow = -1,
         int AttributeCorruptTokenId = -1,
-        int AttributeLayerEnd = -1);
+        int AttributeLayerEnd = -1,
+        bool LogitLens = false);
 
     /// <summary>How many top candidates a traced step records.</summary>
     private const int TraceTopK = 10;
@@ -81,6 +82,17 @@ public static class InferenceRunner
         {
             session.Runtime.OpTrace = recorder.Observe;
             session.Runtime.ExpertRoutingTrace = (_, experts) => recorder.ObserveExperts(experts);
+            if (options is { LogitLens: true })
+            {
+                session.Runtime.LogitLensTrace = (layer, logits) =>
+                {
+                    var top = CandidatesForTrace(logits, options.TokenText);
+                    if (top.Count > 0)
+                    {
+                        recorder.ObserveLens(layer, top[0].Id, top[0].Probability, top);
+                    }
+                };
+            }
         }
 
         var outcomes = new List<StepOutcome>(steps);
@@ -134,6 +146,7 @@ public static class InferenceRunner
         {
             session.Runtime.OpTrace = null;
             session.Runtime.ExpertRoutingTrace = null;
+            session.Runtime.LogitLensTrace = null;
         }
 
         CausalInfo? causal = null;

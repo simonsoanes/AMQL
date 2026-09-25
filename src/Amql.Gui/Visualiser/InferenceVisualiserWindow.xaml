@@ -68,6 +68,7 @@
                     <RowDefinition Height="Auto"/>
                     <RowDefinition Height="Auto"/>
                     <RowDefinition Height="*"/>
+                    <RowDefinition Height="Auto"/>
                 </Grid.RowDefinitions>
 
                 <!-- Selected node -->
@@ -153,6 +154,38 @@
                         <DataGridTextColumn Header="value" Binding="{Binding Display}" Width="*"/>
                     </DataGrid.Columns>
                 </DataGrid>
+                <!-- Logit lens -->
+                <Border Grid.Row="3" x:Name="LensPanel" Visibility="Collapsed" Padding="10,8"
+                        BorderBrush="#FFE1E6EE" BorderThickness="0,1,0,0">
+                    <StackPanel>
+                        <TextBlock Text="LOGIT LENS" FontSize="10" FontWeight="Bold"
+                                   Foreground="#FF7A8798"/>
+                        <TextBlock Text="what each layer would have emitted had it stopped there"
+                                   FontSize="10" Foreground="Gray" TextWrapping="Wrap" Margin="0,0,0,4"/>
+                        <TextBlock x:Name="LensStepText" FontSize="10.5" Foreground="#FF3A5A8A" Margin="0,0,0,6"/>
+                        <ScrollViewer MaxHeight="230" VerticalScrollBarVisibility="Auto">
+                            <ItemsControl x:Name="LensList" FontFamily="Cascadia Mono, Consolas" FontSize="11">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <Grid Margin="0,1">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="34"/>
+                                                <ColumnDefinition Width="56"/>
+                                                <ColumnDefinition Width="*"/>
+                                            </Grid.ColumnDefinitions>
+                                            <TextBlock Grid.Column="0" Text="{Binding LayerLabel}" Foreground="Gray"/>
+                                            <TextBlock Grid.Column="1" Text="{Binding ProbabilityLabel}"
+                                                       Foreground="{Binding ProbabilityBrush}"/>
+                                            <TextBlock Grid.Column="2" Text="{Binding Token}"
+                                                       FontWeight="{Binding Weight}"
+                                                       TextTrimming="CharacterEllipsis"/>
+                                        </Grid>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </ScrollViewer>
+                    </StackPanel>
+                </Border>
             </Grid>
         </Border>
 

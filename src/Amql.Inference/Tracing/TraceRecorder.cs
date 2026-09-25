@@ -33,6 +33,13 @@ public readonly record struct OpSample(int NodeId, float L2, float MaxAbs, float
 /// days later still reads as words rather than ids.</summary>
 public sealed record TokenCandidate(int Id, float Logit, float Probability, string? Text = null);
 
+/// <summary>The logit lens at one layer: what the model would have predicted had
+/// it stopped there and emitted immediately. Reading this down the layers shows
+/// the depth at which the eventual token forms — something activation magnitude
+/// cannot tell you, since a layer can be quiet and still be where the decision
+/// lands.</summary>
+public sealed record LensRow(int Layer, int TokenId, float Probability, IReadOnlyList<TokenCandidate> TopK);
+
 /// <summary>Everything observed during one generated token.</summary>
 public sealed record StepTrace(
     int Index,
@@ -43,7 +50,8 @@ public sealed record StepTrace(
     float Top1Margin,
     IReadOnlyList<TokenCandidate> TopK,
     IReadOnlyList<int> RoutedExperts,
-    IReadOnlyList<OpSample> Ops);
+    IReadOnlyList<OpSample> Ops,
+    IReadOnlyList<LensRow>? Lens = null);
 
 /// <summary>
 /// Layer-level causal attribution captured alongside a run, when asked for.
@@ -162,6 +170,7 @@ public sealed class TraceRecorder
     private readonly List<StepTrace> _steps = new();
     private List<OpSample> _samples = new();
     private readonly List<int> _experts = new();
+    private readonly List<LensRow> _lens = new();
     private int _stepIndex;
     private int _position;
 
@@ -195,6 +204,7 @@ public sealed class TraceRecorder
         _position = position;
         _samples = new List<OpSample>();
         _experts.Clear();
+        _lens.Clear();
     }
 
     /// <summary>Records one operator observation from the runtime hook. Taken
@@ -217,11 +227,20 @@ public sealed class TraceRecorder
         }
     }
 
+    /// <summary>Records the logit lens at one layer, already reduced to its top
+    /// candidates. The full distribution is vocab-sized per layer per step,
+    /// which on a 24-layer model would dwarf everything else in the trace.</summary>
+    public void ObserveLens(int layer, int tokenId, float probability, IReadOnlyList<TokenCandidate> topK)
+    {
+        _lens.Add(new LensRow(layer, tokenId, probability, topK));
+    }
+
     public void EndStep(int tokenId, string? tokenText, IReadOnlyList<TokenCandidate> topK,
         float entropy, float top1Margin)
     {
         _steps.Add(new StepTrace(_stepIndex++, _position, tokenId, tokenText, entropy, top1Margin,
-            topK, _experts.ToArray(), _samples.ToArray()));
+            topK, _experts.ToArray(), _samples.ToArray(),
+            _lens.Count == 0 ? null : _lens.ToArray()));
     }
 
     public RunTrace ToRunTrace(string model, string componentId, int hiddenSize, int layers,

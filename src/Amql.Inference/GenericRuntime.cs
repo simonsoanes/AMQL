@@ -738,6 +738,14 @@ public sealed class GenericRuntime
                 deltaNorm += d * d;
             }
             LayerNormTrace?.Invoke(position, layer, residualNorm, (float)Math.Sqrt(deltaNorm));
+
+            if (LogitLensTrace is { } lens)
+            {
+                // Clone before projecting — see LogitLensTrace. FinalNormAndHead
+                // normalises in place and would otherwise eat the residual that
+                // every remaining layer still needs.
+                lens(layer, FinalNormAndHead(hidden.Clone()));
+            }
         }
         SessionPosition++;
         return hidden;
@@ -777,6 +785,21 @@ public sealed class GenericRuntime
     /// the row that decides the next token, as (layer, expert ids). Genuinely
     /// sparse, and the most interpretable thing a MoE layer tells you.</summary>
     public Action<int, IReadOnlyList<int>>? ExpertRoutingTrace { get; set; }
+
+    /// <summary>When set, the logit lens is on: after each layer the residual is
+    /// projected through the final norm and output head, and the resulting
+    /// logits handed out as (layer, logits). That shows at which depth the
+    /// eventual prediction forms, which activation magnitude cannot.
+    /// <para>
+    /// The projection runs on a CLONE. <see cref="FinalNormAndHead"/> normalises
+    /// in place, so projecting the live residual would corrupt every later layer
+    /// and quietly change what the model generates — a debugging feature that
+    /// alters the thing being debugged is worse than no feature. It also costs a
+    /// full head GEMM per layer per step, so it is opt-in and impractical on a
+    /// large model.
+    /// </para>
+    /// </summary>
+    public Action<int, Tensor2D>? LogitLensTrace { get; set; }
 
     /// <summary>A timestamp for an observation about to be made, or 0 when
     /// nothing is listening so the untraced path never queries the clock.</summary>

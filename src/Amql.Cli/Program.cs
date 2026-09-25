@@ -646,6 +646,12 @@ internal static class Program
         }
         int attributeSource = IntOption(args, "--attribute-source", -1);
         int attributeLayerEnd = IntOption(args, "--attribute-layers", -1);
+        bool logitLens = HasOption(args, "--logit-lens");
+        if (logitLens && traceJson is null)
+        {
+            throw new CliException(
+                "--logit-lens records into the operator trace, so it also needs --trace-json <path>");
+        }
 
         var tensorLoads = traceTensors ? new List<TensorTraceLine>() : null;
         var genOpts = (trace || traceTensors || traceJson is not null || workingSet is not null || attribute)
@@ -659,7 +665,8 @@ internal static class Program
                 Attribute: attribute,
                 AttributeSourceRow: attributeSource,
                 AttributeCorruptTokenId: corruptId,
-                AttributeLayerEnd: attributeLayerEnd)
+                AttributeLayerEnd: attributeLayerEnd,
+                LogitLens: logitLens)
             : null;
 
         var (prefill, steps2) = InferenceRunner.Generate(
@@ -763,6 +770,32 @@ internal static class Program
                     .Where(x => x.share > 0.001f)
                     .Select(x => $"L{x.layer} {x.share * 100:F1}%");
                 Console.WriteLine($"           largest shares: {string.Join(", ", peaks)}");
+            }
+
+            var lensed = written.Steps.LastOrDefault(s => s.Lens is { Count: > 0 });
+            if (lensed?.Lens is { } lensRows)
+            {
+                // Reading this top to bottom is the point of the lens: the depth
+                // at which the emitted token first appears, and how its
+                // probability climbs from there.
+                Console.WriteLine($"logit lens (step {lensed.Index + 1} — what each layer would have emitted):");
+                // The lens at the final layer predicts the token this step
+                // PRODUCES, which is the next step's input. StepTrace.TokenText
+                // is the token the step consumed, so comparing against that
+                // would mark the wrong row.
+                string? produced = written.Steps.Count > lensed.Index + 1
+                    ? written.Steps[lensed.Index + 1].TokenText
+                    : null;
+                foreach (var row in lensRows)
+                {
+                    string topText = row.TopK.Count > 0 && row.TopK[0].Text is { } t
+                        ? t
+                        : row.TokenId.ToString();
+                    string shown = topText.Replace("\n", "\\n");
+                    bool matches = produced is not null && shown == produced.Replace("\n", "\\n");
+                    Console.WriteLine($"  L{row.Layer,2}  {row.Probability,7:P2}  \"{shown}\""
+                        + (matches ? "   ← what this step produced" : string.Empty));
+                }
             }
         }
         return 0;
@@ -1952,6 +1985,7 @@ internal static class Program
                               [--trace-json <trace.json>]
                               [--attribute --attribute-corrupt <text>]
                               [--attribute-source <row>] [--attribute-layers <end>]
+                              [--logit-lens]
               amql-cli inspect-token <container-dir> <token>
                               [--tokens ctx,ids] [--neighbors 5] [--logits K]
                               [--tokenizer <checkpoint-dir>] [--component target]

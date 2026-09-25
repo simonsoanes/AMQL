@@ -99,6 +99,7 @@ public sealed partial class InferenceVisualiserWindow : Window
             }
             RefreshRanking();
             ShowStepInfo(-1);
+            ShowLens(-1);
             ShowMetricHint();
             Title = $"Inference Visualiser — {System.IO.Path.GetFileName(path)}";
         }
@@ -178,6 +179,7 @@ public sealed partial class InferenceVisualiserWindow : Window
         Map.SetStep(step);
         StepText.Text = aggregate ? "aggregate" : $"step {step + 1} / {_trace.Steps.Count}";
         ShowStepInfo(step);
+        ShowLens(step);
     }
 
     private void OnFit(object sender, RoutedEventArgs e) => Map.FitToView();
@@ -359,6 +361,54 @@ public sealed partial class InferenceVisualiserWindow : Window
             + $"max ‖·‖ {stats.MaxL2:F2}   mean |x| {stats.MeanAbs:F4}   {stats.MeanMs:F3} ms   "
             + $"intensity {stats.Intensity * 100:F1}%";
     }
+
+    private sealed record LensRowVm(string LayerLabel, string ProbabilityLabel, string Token,
+        Brush ProbabilityBrush, FontWeight Weight);
+
+    /// <summary>Renders the logit lens for a step: what each layer would have
+    /// emitted had the model stopped there. The row matching the token the step
+    /// actually produced is bolded, so reading down the list shows the depth at
+    /// which the decision formed and how early a wrong turn was already visible.
+    /// Only present when the trace was captured with --logit-lens.</summary>
+    private void ShowLens(int step)
+    {
+        if (_trace is null || LensPanel is null)
+        {
+            return;
+        }
+        int index = step < 0 ? _trace.Steps.Count - 1 : Math.Min(step, _trace.Steps.Count - 1);
+        var current = index >= 0 && index < _trace.Steps.Count ? _trace.Steps[index] : null;
+        if (current?.Lens is not { Count: > 0 } rows)
+        {
+            LensPanel.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        LensPanel.Visibility = Visibility.Visible;
+        // The lens at the final layer predicts what the step PRODUCED, which is
+        // the next step's input — not the token this step consumed.
+        string? produced = _trace.Steps.Count > index + 1 ? _trace.Steps[index + 1].TokenText : null;
+        LensStepText.Text = step < 0
+            ? $"last step ({index + 1} of {_trace.Steps.Count})"
+            : $"step {index + 1} of {_trace.Steps.Count}";
+
+        var confident = new SolidColorBrush(Color.FromRgb(0xC0, 0x39, 0x2B));
+        var tentative = new SolidColorBrush(Color.FromRgb(0x6A, 0x77, 0x88));
+        LensList.ItemsSource = rows.Select(r =>
+        {
+            string token = Escape(r.TopK.Count > 0 && r.TopK[0].Text is { } t ? t : r.TokenId.ToString());
+            bool isProduced = produced is not null && token == Escape(produced);
+            return new LensRowVm(
+                $"L{r.Layer}",
+                r.Probability.ToString("P1"),
+                token,
+                r.Probability >= 0.15f ? confident : tentative,
+                isProduced ? FontWeights.Bold : FontWeights.Normal);
+        }).ToList();
+    }
+
+    private static string Escape(string text)
+        => text.Replace("\n", "\\n").Replace("\r", "\\r").Replace("\t", "\\t");
 
     // ── editing a tensor the map has identified ────────────────────────────
 

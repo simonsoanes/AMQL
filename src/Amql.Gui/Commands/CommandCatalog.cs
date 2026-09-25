@@ -235,6 +235,26 @@ public static class CommandCatalog
                 Help: "Writes a per-operator trace of every generated token: which operators ran, "
                       + "their output magnitude, which experts a MoE layer routed to, and the "
                       + "resulting top-k distribution. This is the file the inference visualiser opens."),
+            new ParamDef("logitLens", "--logit-lens", ParamKind.Switch, EditorKind.Choice, Flag: "--logit-lens",
+                DefaultValue: "", Choices: new[] { "", "1" },
+                Help: "Also project each layer's residual through the final norm and output head, "
+                      + "recording what that layer would have emitted. Shows the depth at which the "
+                      + "prediction forms. Costs a full head GEMM per layer per step, so it is slow "
+                      + "on a large model. Requires --trace-json."),
+            new ParamDef("attribute", "--attribute", ParamKind.Switch, EditorKind.Choice, Flag: "--attribute",
+                DefaultValue: "", Choices: new[] { "", "1" },
+                Help: "Run ROME-style causal attribution after generating: corrupt one prompt token, "
+                      + "then restore each layer's clean residual in turn and re-measure the target's "
+                      + "probability. One extra forward per layer. Requires --trace-json and "
+                      + "--attribute-corrupt."),
+            new ParamDef("attributeCorrupt", "--attribute-corrupt text", ParamKind.Option, EditorKind.Text,
+                Flag: "--attribute-corrupt",
+                Help: "The token that replaces the source position in the corrupted runs, e.g. 'the'. "
+                      + "There is no default: the replacement defines the question being asked."),
+            new ParamDef("attributeSource", "--attribute-source row", ParamKind.Option, EditorKind.Int,
+                Flag: "--attribute-source", Help: "Prompt row to corrupt. Empty = the last prompt token."),
+            new ParamDef("attributeLayers", "--attribute-layers end", ParamKind.Option, EditorKind.Int,
+                Flag: "--attribute-layers", Help: "Trace only layers below this index. Empty = all."),
             ComponentParam,
             PatchParam,
         }),
