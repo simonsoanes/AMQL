@@ -86,7 +86,7 @@ public sealed class GgufReader : IDisposable
             _input.ReadExactly(scratch);
             ulong offset = BinaryPrimitives.ReadUInt64LittleEndian(scratch);
 
-            long dataBytes = ElementSize(type) * DimsElements(dims);
+            long dataBytes = GgufTypeSizing.DataBytes(type, dims);
             var tensor = new GgufTensor { Name = name, Type = type, Dims = dims, Offset = offset };
             _ordered.Add(tensor);
             _tensors[name] = (tensor, dataBytes);
@@ -206,24 +206,6 @@ public sealed class GgufReader : IDisposable
         }
         return GgufValue.ArrayOf(elementKind, items);
     }
-
-    private static long DimsElements(long[] dims)
-    {
-        long elements = 1;
-        foreach (long d in dims)
-        {
-            elements *= d;
-        }
-        return elements;
-    }
-
-    private static long ElementSize(GgufType type) => type switch
-    {
-        GgufType.F32 or GgufType.I32 => 4,
-        GgufType.F16 or GgufType.BF16 or GgufType.I16 => 2,
-        GgufType.I8 => 1,
-        _ => throw new GgufException($"cannot size tensor type {type}"),
-    };
 
     public void Dispose() => _input.Dispose();
 }

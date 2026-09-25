@@ -171,7 +171,13 @@ public static class GgufConverter
 
         Add("model.language_model.embed_tokens.weight", "token_embd.weight", Transform.Transpose);
         Add("model.language_model.norm.weight", "output_norm.weight", qwen35 ? Transform.Q35Norm : Transform.Copy);
-        Add("lm_head.weight", "output.weight", Transform.Transpose);
+        // A tied head has no lm_head tensor in the checkpoint. llama.cpp
+        // infers tying from the ABSENCE of output.weight, so emitting a copy
+        // of the embedding would both waste space and misreport the model.
+        if (names.Contains("lm_head.weight"))
+        {
+            Add("lm_head.weight", "output.weight", Transform.Transpose);
+        }
 
         for (int layer = 0; layer < layers; layer++)
         {
@@ -197,8 +203,12 @@ public static class GgufConverter
                     reorderLinear ? Transform.Q35B : Transform.Transpose);
                 Add(b + "linear_attn.out_proj.weight", blk + "ssm_out.weight",
                     reorderLinear ? Transform.Q35Out : Transform.Transpose);
+                // conv1d is [C, 1, K] in HF, which in ggml's ne order is
+                // already [ne0=K, ne1=C] — a straight copy, not a transpose.
+                // Transposing here reads the shape as [C, 1] and writes a
+                // quarter of the payload.
                 Add(b + "linear_attn.conv1d.weight", blk + "ssm_conv1d.weight",
-                    reorderLinear ? Transform.Q35Conv : Transform.Transpose);
+                    reorderLinear ? Transform.Q35Conv : Transform.Copy);
                 Add(b + "linear_attn.A_log", blk + "ssm_a",
                     reorderLinear ? Transform.Q35ALog : Transform.Q35ALog);
                 Add(b + "linear_attn.dt_bias", blk + "ssm_dt.bias",
@@ -233,6 +243,15 @@ public static class GgufConverter
                     AddZeros(blk + "ffn_up_shexp.weight", hidden, expertIntermediate);
                     AddZeros(blk + "ffn_down_shexp.weight", expertIntermediate, hidden);
                 }
+            }
+            else
+            {
+                // Dense FFN. Without this branch a non-MoE checkpoint exports
+                // with no feed-forward weights at all, and llama.cpp fails at
+                // load with "tensor 'blk.N.ffn_gate.weight' not found".
+                Add(b + "mlp.gate_proj.weight", blk + "ffn_gate.weight", Transform.Transpose);
+                Add(b + "mlp.up_proj.weight", blk + "ffn_up.weight", Transform.Transpose);
+                Add(b + "mlp.down_proj.weight", blk + "ffn_down.weight", Transform.Transpose);
             }
         }
 
@@ -285,7 +304,7 @@ public static class GgufConverter
             writer.Kv($"{arch}.attention.recurrent_layers",
                 GgufValue.BoolArray(layerTypes.Select(t => t.Contains("linear", StringComparison.OrdinalIgnoreCase)).ToList()));
             int fullCount = layerTypes.Count(t => !t.Contains("linear", StringComparison.OrdinalIgnoreCase));
-            writer.Kv($"{arch}.attention.full_attention_interval",
+            writer.Kv($"{arch}.full_attention_interval",
                 GgufValue.Uint32((uint)(fullCount > 0 ? layers / fullCount : layers)));
         }
 
@@ -345,9 +364,11 @@ public static class GgufConverter
             qwen35 ? "Qwen3-Next value transforms applied: A_log = -exp(A_log), norms +1, conv1d squeezed" : "",
             "MTP drafter (mtp.safetensors + mtp.config.json) stays a separate companion shard — not embedded",
             quantization == "q4_0"
-                ? "Q4_0 quantization applied to weight matrices including the stacked 3-D MoE expert " +
-                  "tensors (every expert slice quantized); norms, embeddings, output head and MoE " +
-                  "routers kept full precision"
+                ? "Q4_0 quantization applied to weight matrices"
+                  + (hasMoe && experts > 0
+                        ? " including the stacked 3-D MoE expert tensors (every expert slice quantized)"
+                        : "")
+                  + "; norms, embeddings, output head and routers kept full precision"
                 : "weights written as F16 (BF16 sources; lossless in the normal range); F32 routers kept",
         };
 
@@ -384,63 +405,64 @@ public static class GgufConverter
     /// <summary>Q4_0 block size: 32 elements per block.</summary>
     private const int Q4_0BlockSize = 32;
 
-    /// <summary>Quantizes a float array to Q4_0 format.
-    /// Each 32-element block: [scale (F16, 2 bytes), 16 bytes of 4-bit weights].
-    /// Returns the quantized byte array.</summary>
+    /// <summary>Quantizes a float array to ggml's Q4_0 format: one 18-byte
+    /// block per 32 values, a float16 scale followed by 16 bytes of nibbles.
+    /// Byte j carries element j in its low nibble and element j+16 in its high
+    /// nibble — packing even/odd pairs instead permutes every row, and the
+    /// result still loads and passes any check that shares the same wrong
+    /// assumption while the model generates garbage. Mirrors
+    /// quantize_row_q4_0_ref in ggml-quants.c, including the scale and the
+    /// truncating rounding, so the bytes match llama.cpp's own quantizer.</summary>
     private static byte[] QuantizeQ4_0(float[] values)
     {
-        int numBlocks = (values.Length + Q4_0BlockSize - 1) / Q4_0BlockSize;
-        var result = new byte[numBlocks * 18]; // 2 bytes scale + 16 bytes data per block
+        if (values.Length % Q4_0BlockSize != 0)
+            throw new GgufException($"cannot Q4_0-quantize {values.Length} values: not a multiple of {Q4_0BlockSize}");
+
+        int numBlocks = values.Length / Q4_0BlockSize;
+        var result = new byte[numBlocks * 18];
 
         for (int block = 0; block < numBlocks; block++)
         {
             int start = block * Q4_0BlockSize;
-            int count = Math.Min(Q4_0BlockSize, values.Length - start);
 
-            // Find max absolute value in block
-            float maxAbs = 0f;
-            for (int i = 0; i < count; i++)
+            // The signed value with the largest magnitude, not the magnitude:
+            // its sign makes the stored scale negative so that the decoded
+            // range [-8d, 7d] straddles the block instead of sitting above it.
+            float amax = 0f, max = 0f;
+            for (int i = 0; i < Q4_0BlockSize; i++)
             {
-                float abs = MathF.Abs(values[start + i]);
-                if (abs > maxAbs) maxAbs = abs;
+                float v = values[start + i];
+                float abs = MathF.Abs(v);
+                if (amax < abs) { amax = abs; max = v; }
             }
 
-            // Compute scale: maxAbs / 7 (Q4_0 uses signed 4-bit: -8 to 7)
-            float scale = maxAbs / 7.0f;
-            if (scale == 0f) scale = 1e-10f; // avoid division by zero
+            float d = max / -8f;
+            float id = d != 0f ? 1f / d : 0f;
 
-            // Write scale as F16
-            ushort scaleBits = BitConverter.HalfToUInt16Bits((Half)scale);
+            ushort scaleBits = BitConverter.HalfToUInt16Bits((Half)d);
             result[block * 18] = (byte)(scaleBits & 0xFF);
             result[block * 18 + 1] = (byte)(scaleBits >> 8);
 
-            // Quantize each value to 4-bit
-            for (int i = 0; i < Q4_0BlockSize; i++)
+            int nibbles = block * 18 + 2;
+            for (int j = 0; j < Q4_0BlockSize / 2; j++)
             {
-                int byteIdx = block * 18 + 2 + (i / 2);
-                int nibbleShift = (i % 2) * 4;
-
-                byte nibble;
-                if (i < count)
-                {
-                    // Quantize: round(value / scale), clamp to [-8, 7]
-                    float quantized = values[start + i] / scale;
-                    int q = (int)MathF.Round(quantized);
-                    q = Math.Clamp(q, -8, 7);
-                    // Convert to unsigned 4-bit: -8 → 0, 7 → 15
-                    nibble = (byte)(q + 8);
-                }
-                else
-                {
-                    nibble = 8; // padding: represents 0
-                }
-
-                // Clear old nibble, set new one
-                result[byteIdx] = (byte)((result[byteIdx] & ~(0xF << nibbleShift)) | (nibble << nibbleShift));
+                byte lo = QuantizeNibble(values[start + j], id);
+                byte hi = QuantizeNibble(values[start + Q4_0BlockSize / 2 + j], id);
+                result[nibbles + j] = (byte)(lo | (hi << 4));
             }
         }
 
         return result;
+    }
+
+    /// <summary>Maps one value to its stored 4-bit code. ggml truncates
+    /// x*id + 8.5 toward zero and clamps to [0, 15] instead of rounding to
+    /// nearest, so the top of the range saturates one step early; matching
+    /// that keeps the bytes identical to llama-quantize's.</summary>
+    private static byte QuantizeNibble(float value, float inverseScale)
+    {
+        float q = MathF.Truncate(value * inverseScale + 8.5f);
+        return (byte)Math.Clamp((int)q, 0, 15);
     }
 
     /// <summary>Writes a Q4_0 quantized tensor payload. Loads the source
@@ -483,19 +505,8 @@ public static class GgufConverter
             }
         }
 
-        // Transpose if needed (GGUF uses [in, out] layout)
-        if (entry.Transform == Transform.Transpose)
-        {
-            var transposed = new float[values.Length];
-            for (long r = 0; r < rows; r++)
-            {
-                for (long c = 0; c < cols; c++)
-                {
-                    transposed[c * rows + r] = values[r * cols + c];
-                }
-            }
-            values = transposed;
-        }
+        // No physical transpose: GGUF reverses the declared dims but keeps
+        // the source row-major byte order (see Transform.Transpose above).
 
         // Quantize to Q4_0
         byte[] quantized = QuantizeQ4_0(values);
@@ -513,6 +524,19 @@ public static class GgufConverter
         if (quantization == "q4_0" && ShouldQuantize(entry))
         {
             return GgufType.Q4_0;
+        }
+
+        // ggml requires F32 for every norm weight and for the SSM depthwise
+        // conv in the qwen35 hybrid path. Writing these as F16 (which is what
+        // a BF16 source maps to) makes the loader die during graph build —
+        // verified against a working qwen35 GGUF, which keeps all *_norm.weight
+        // and ssm_conv1d in F32.
+        if (entry.Name.EndsWith("_norm.weight", StringComparison.Ordinal)
+            || entry.Name.Contains("ssm_conv1d", StringComparison.Ordinal)
+            || entry.Name == "ssm_a"
+            || entry.Name.EndsWith("ssm_dt.bias", StringComparison.Ordinal))
+        {
+            return GgufType.F32;
         }
 
         return entry.Transform switch
@@ -558,6 +582,11 @@ public static class GgufConverter
         // Skip non-2D tensors (conv weights, stacked MoE experts, etc.)
         if (shape.Length != 2) return false;
 
+        // ggml blocks along the contiguous dimension, so anything that is not
+        // a whole number of 32-element blocks has no valid Q4_0 encoding and
+        // must stay full precision rather than be padded.
+        if (totalElements % Q4_0BlockSize != 0) return false;
+
         // Skip transforms that need F32
         if (entry.Transform is Transform.Q35ALog or Transform.Q35Dt or Transform.Q35A
             or Transform.Q35B or Transform.Q35Conv or Transform.Q35Out
@@ -591,6 +620,17 @@ public static class GgufConverter
                     return new[] { shape[2], shape[0] };
                 }
                 return new[] { shape[1], shape[0] };
+            case Transform.Copy:
+                // A depthwise conv1d arrives as [C, 1, K], which in ggml's ne
+                // order is already [ne0=K, ne1=C]: the payload needs no
+                // rearrangement, but the declared dims must be squeezed or
+                // llama.cpp rejects the tensor as 3-D. Anything else copies
+                // through with its own shape.
+                if (shape.Length == 3)
+                {
+                    return new[] { shape[2], shape[0] };
+                }
+                return shape.ToArray();
             default:
                 return shape.ToArray();
         }
@@ -628,7 +668,14 @@ public static class GgufConverter
                 }
                 break;
             case Transform.Copy:
-                CopyRaw(entry.RequiredSource, writer.Data, entry.AddOne);
+                if (GgufTypeFor(entry, quantization) == GgufType.F32 && entry.RequiredSource.Info.Dtype != Dtype.F32)
+                {
+                    CopyAsF32(entry.RequiredSource, writer.Data, entry.AddOne);
+                }
+                else
+                {
+                    CopyRaw(entry.RequiredSource, writer.Data, entry.AddOne);
+                }
                 break;
             case Transform.Stack:
                 foreach (var slice in entry.StackSlices!)
@@ -637,10 +684,31 @@ public static class GgufConverter
                 }
                 break;
             case Transform.Transpose:
-                WriteTransposed(writer, entry, index, addOne: entry.AddOne, columnReorder: null);
+                // GGUF stores ne[] as the HF shape REVERSED but keeps the
+                // bytes in row-major source order — gguf-py does shape[::-1]
+                // and writes the buffer unchanged. Physically transposing here
+                // double-transposes every nn.Linear weight ([out,in] in HF),
+                // which loads fine and then generates garbage.
+                if (GgufTypeFor(entry, quantization) == GgufType.F32 && entry.RequiredSource.Info.Dtype != Dtype.F32)
+                {
+                    CopyAsF32(entry.RequiredSource, writer.Data, entry.AddOne);
+                }
+                else
+                {
+                    CopyRaw(entry.RequiredSource, writer.Data, entry.AddOne);
+                }
                 break;
             case Transform.Q35Norm:
-                CopyRaw(entry.RequiredSource, writer.Data, addOne: true);
+                // Norms must land as F32; the source is usually BF16, so widen
+                // rather than emit the half-width payload CopyRaw would write.
+                if (entry.RequiredSource.Info.Dtype != Dtype.F32)
+                {
+                    CopyAsF32(entry.RequiredSource, writer.Data, addOne: NormPlusOne);
+                }
+                else
+                {
+                    CopyRaw(entry.RequiredSource, writer.Data, addOne: NormPlusOne);
+                }
                 break;
             case Transform.Q35Qkv:
                 // split rows into q | k | v, reorder v tiled, concatenate, transpose
@@ -706,6 +774,50 @@ public static class GgufConverter
             remaining -= take;
         }
     }
+
+    /// <summary>Copies a source tensor widened to F32. Used where ggml
+    /// requires float32 (norm weights, the SSM depthwise conv) but the
+    /// checkpoint stores BF16/F16 — writing the narrow type would leave the
+    /// payload half the size the header declares.</summary>
+    private static void CopyAsF32(Source source, Stream output, bool addOne)
+    {
+        var dtype = source.Info.Dtype;
+        int srcElem = dtype.ElementSize();
+        long elements = source.Info.DataLength / srcElem;
+        var chunk = new byte[Math.Min(elements, 1 << 18) * srcElem];
+        var outBuf = new byte[chunk.Length / srcElem * 4];
+        long done = 0;
+        while (done < elements)
+        {
+            long take = Math.Min(elements - done, chunk.Length / srcElem);
+            byte[] read = source.File.ReadBytes(source.Info, done * srcElem, (int)(take * srcElem));
+            var span = outBuf.AsSpan(0, (int)take * 4);
+            for (int i = 0; i < take; i++)
+            {
+                float v = dtype switch
+                {
+                    Dtype.F32 => BitConverter.ToSingle(read, i * 4),
+                    Dtype.BF16 => BitConverter.UInt32BitsToSingle((uint)BitConverter.ToUInt16(read, i * 2) << 16),
+                    Dtype.F16 => (float)BitConverter.UInt16BitsToHalf(BitConverter.ToUInt16(read, i * 2)),
+                    _ => throw new GgufException($"cannot widen dtype {dtype.Label()} to F32"),
+                };
+                if (addOne)
+                {
+                    v += 1.0f;
+                }
+                BitConverter.TryWriteBytes(span.Slice(i * 4, 4), v);
+            }
+            output.Write(span);
+            done += take;
+        }
+    }
+
+    /// <summary>Whether norm weights are stored as (w - 1) in the source and
+    /// need +1 on the way out. Qwen3-Next does this for some checkpoints and
+    /// not others, so it is switchable for A/B verification against a runtime:
+    /// set AMQL_GGUF_NORM_PLUS_ONE=0 to write the weights unchanged.</summary>
+    private static readonly bool NormPlusOne =
+        Environment.GetEnvironmentVariable("AMQL_GGUF_NORM_PLUS_ONE") != "0";
 
     private static void WriteTransposed(GgufWriter writer, PlanEntry entry, int index, bool addOne,
         (int NumVHeads, int NumKHeads, int HeadVDim, int VPerK)? columnReorder = null)
@@ -904,12 +1016,26 @@ public static class GgufConverter
         var source = entry.RequiredSource;
         var info = source.Info;
         byte[] bytes = source.File.ReadBytes(info);
-        int n = info.Shape[0] > 0 ? (int)info.Shape[0] : (int)(bytes.Length / 2);
+        int n = info.Shape[0] > 0 ? (int)info.Shape[0] : (int)(bytes.Length / info.Dtype.ElementSize());
+        // The source dtype varies: A_log is F32 in Qwen3.5 checkpoints but
+        // BF16 in others. Reading F32 bytes as BF16 pairs takes the low half
+        // of each float (zero for BF16-origin values) for even slots and the
+        // real high half for odd ones — producing -exp(0) = -1 in half the
+        // head slots and silently dropping the other half of the heads.
         var outBytes = new byte[n * 4];
         for (int i = 0; i < n; i++)
         {
-            ushort bf = (ushort)(bytes[i * 2] | (bytes[i * 2 + 1] << 8));
-            float f = BitConverter.UInt32BitsToSingle((uint)bf << 16);
+            float f = info.Dtype switch
+            {
+                Dtype.F32 => BitConverter.UInt32BitsToSingle(
+                    BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan(i * 4))),
+                Dtype.BF16 => BitConverter.UInt32BitsToSingle(
+                    (uint)(ushort)(bytes[i * 2] | (bytes[i * 2 + 1] << 8)) << 16),
+                Dtype.F16 => (float)BitConverter.UInt16BitsToHalf(
+                    (ushort)(bytes[i * 2] | (bytes[i * 2 + 1] << 8))),
+                _ => throw new GgufException(
+                    $"cannot read '{info.Name}' dtype {info.Dtype.Label()} as a scalar 1-D tensor"),
+            };
             if (negateExp)
             {
                 f = -MathF.Exp(f);

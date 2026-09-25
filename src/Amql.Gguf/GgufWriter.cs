@@ -37,30 +37,8 @@ public sealed class GgufWriter : IDisposable
     /// agree.</summary>
     public void Tensor(string name, GgufType type, long[] dims)
     {
-        long elements = 1;
-        foreach (long d in dims)
-        {
-            elements = checked(elements * d);
-        }
-        long size = type switch
-        {
-            // Q4_0: 18 bytes per 32-element block (2 bytes scale + 16 bytes data)
-            GgufType.Q4_0 => ((elements + 31) / 32) * 18,
-            // Q4_K: 144 bytes per 256-element super-block
-            GgufType.Q4_K => ((elements + 255) / 256) * 144,
-            // Plain dtypes
-            _ => checked(elements * ElementSize(type)),
-        };
-        _tensors.Add((name, type, dims, size));
+        _tensors.Add((name, type, dims, GgufTypeSizing.DataBytes(type, dims)));
     }
-
-    private static int ElementSize(GgufType type) => type switch
-    {
-        GgufType.F32 or GgufType.I32 => 4,
-        GgufType.F16 or GgufType.BF16 or GgufType.I16 => 2,
-        GgufType.I8 => 1,
-        _ => throw new NotSupportedException($"gguf type {type} is not a plain dtype"),
-    };
 
     private static ulong AlignUp(ulong value, uint alignment)
         => (value + alignment - 1) / alignment * alignment;

@@ -82,18 +82,22 @@ public class GgufTests
         using var reader = GgufReader.Open(outFile);
 
         // layer 1 is full_attention: k_proj is [kv*head_dim, hidden] = [16, 32].
-        // The GGUF tensor is transposed to [hidden, kv*head_dim] = [32, 16]:
-        // element (c, r) = source (r, c), in F16.
+        // GGUF writes ne[] as the HF shape REVERSED ([32, 16]) but leaves the
+        // row-major buffer untouched — gguf-py does shape[::-1] and writes the
+        // data unchanged. An HF nn.Linear is already [out, in], which is
+        // [in, out] in ggml's order, so physically transposing the bytes here
+        // double-transposes every weight: the file still loads and then
+        // generates garbage.
         var kBytes = reader.ReadBytes("blk.1.attn_k.weight");
         Assert.Equal(32 * 16 * 2, kBytes.Length);
         var tensor = reader.GetTensor("blk.1.attn_k.weight");
-        // stored in llama.cpp's ne[] order: [in, out] for the transposed k
+        // stored in llama.cpp's ne[] order: [in, out] for the reversed k
         Assert.Equal(new long[] { 32, 16 }, tensor.Dims);
         for (int r = 0; r < 16; r++)
         {
             for (int c = 0; c < 32; c++)
             {
-                ushort actual = BinaryPrimitives.ReadUInt16LittleEndian(kBytes.AsSpan((c * 16 + r) * 2));
+                ushort actual = BinaryPrimitives.ReadUInt16LittleEndian(kBytes.AsSpan((r * 32 + c) * 2));
                 ushort expected = BitConverter.HalfToUInt16Bits((Half)SourceValue(r * 32 + c));
                 Assert.Equal(expected, actual);
             }
@@ -127,6 +131,47 @@ public class GgufTests
         ushort actual = BinaryPrimitives.ReadUInt16LittleEndian(bytes.AsSpan((2 * Hidden * ExpertMid) * 2));
         ushort expected = BitConverter.HalfToUInt16Bits((Half)SourceValue(0));
         Assert.Equal(expected, actual);
+    }
+
+    /// <summary>
+    /// Pins the Q4_0 byte layout to ggml's. The golden bytes come from
+    /// quantize_row_q4_0_ref (via gguf-py's numpy port) applied to the
+    /// synthetic ramp SourceValue(0..31) = -1, -0.9375 … 0.9375, which is
+    /// block 0 of blk.1.attn_k.weight since the buffer is a verbatim copy.
+    /// Byte j holds element j in its low nibble and element j+16 in its high
+    /// nibble. Pairing even with odd instead yields 0x10, 0x21, 0x32, … and
+    /// every row decodes as a permutation of itself — the file still loads,
+    /// and only inference reveals the damage, so this needs an explicit test.
+    /// </summary>
+    [Fact]
+    public void Q4_0_Blocks_Use_Ggml_Nibble_Layout()
+    {
+        using var temp = new TempDir();
+        BuildCheckpoint(temp.Path);
+
+        string outFile = Path.Combine(temp.Path, "model-q4.gguf");
+        GgufConverter.Convert(temp.Path, outFile, quantization: "q4_0");
+
+        using var reader = GgufReader.Open(outFile);
+        var tensor = reader.GetTensor("blk.1.attn_k.weight");
+        Assert.Equal(GgufType.Q4_0, tensor.Type);
+        Assert.Equal(new long[] { 32, 16 }, tensor.Dims);
+
+        byte[] bytes = reader.ReadBytes("blk.1.attn_k.weight");
+        Assert.Equal(32 * 16 / 32 * 18, bytes.Length); // 512 values → 16 blocks
+
+        byte[] golden =
+        {
+            0x00, 0x30,                                     // scale 0.125 as F16 LE
+            0x80, 0x91, 0x91, 0xA2, 0xA2, 0xB3, 0xB3, 0xC4, // elements 0-7 | 16-23
+            0xC4, 0xD5, 0xD5, 0xE6, 0xE6, 0xF7, 0xF7, 0xF8, // elements 8-15 | 24-31
+        };
+        Assert.Equal(golden, bytes[..18]);
+
+        // the skip list survives quantization: norms stay F32, embeddings F16
+        Assert.Equal(GgufType.F32, reader.GetTensor("blk.1.attn_norm.weight").Type);
+        Assert.Equal(GgufType.F32, reader.GetTensor("blk.0.ffn_gate_inp.weight").Type);
+        Assert.Equal(GgufType.F16, reader.GetTensor("token_embd.weight").Type);
     }
 
     // ── synthetic checkpoint ───────────────────────────────────────────────

@@ -41,6 +41,45 @@ public enum GgufType : uint
     BF16 = 30,
 }
 
+/// <summary>
+/// Byte sizing for a GGUF tensor payload, shared by the writer and the reader
+/// so the two cannot drift. Quantised types are block-packed rather than
+/// per-element, so a reader that sized them as plain dtypes could not parse a
+/// file the writer had just produced.
+/// </summary>
+public static class GgufTypeSizing
+{
+    /// <summary>Bytes occupied by the payload of a tensor with these dims.</summary>
+    public static long DataBytes(GgufType type, long[] dims)
+    {
+        long elements = 1;
+        foreach (long d in dims)
+        {
+            elements = checked(elements * d);
+        }
+        return DataBytes(type, elements);
+    }
+
+    /// <summary>Bytes occupied by the payload of that many values.</summary>
+    public static long DataBytes(GgufType type, long elements) => type switch
+    {
+        // Q4_0: 18 bytes per 32-element block (2-byte F16 scale + 16 nibble bytes)
+        GgufType.Q4_0 => ((elements + 31) / 32) * 18,
+        // Q4_K: 144 bytes per 256-element super-block
+        GgufType.Q4_K => ((elements + 255) / 256) * 144,
+        _ => checked(elements * ElementSize(type)),
+    };
+
+    /// <summary>Bytes per value, for the plain dtypes only.</summary>
+    public static int ElementSize(GgufType type) => type switch
+    {
+        GgufType.F32 or GgufType.I32 => 4,
+        GgufType.F16 or GgufType.BF16 or GgufType.I16 => 2,
+        GgufType.I8 => 1,
+        _ => throw new GgufException($"gguf type {type} is not a plain dtype"),
+    };
+}
+
 /// <summary>The GGUF metadata value-type tags.</summary>
 public enum GgufValueType : uint
 {
