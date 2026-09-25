@@ -78,6 +78,11 @@ public sealed class ModelMapCanvas : FrameworkElement
     /// <summary>Raised as the cursor moves, for the status line.</summary>
     public event Action<NodeStats?>? NodeHovered;
 
+    /// <summary>Raised on right-click with the node under the cursor, or null
+    /// when the click landed on empty canvas. The window owns the menu itself —
+    /// what to offer depends on the trace, not on the rendering.</summary>
+    public event Action<NodeStats?, Point>? NodeRightClicked;
+
     public NodeStats? Selected => StatsOf(_selectedNode);
 
     public void SetMetric(MapMetric metric)
@@ -583,6 +588,18 @@ public sealed class ModelMapCanvas : FrameworkElement
             NodeHovered?.Invoke(StatsOf(hit));
             InvalidateVisual();
         }
+    }
+
+    protected override void OnMouseRightButtonUp(MouseButtonEventArgs e)
+    {
+        base.OnMouseRightButtonUp(e);
+        int hit = HitTest(e.GetPosition(this));
+        if (hit >= 0)
+        {
+            SelectNode(hit);
+        }
+        NodeRightClicked?.Invoke(StatsOf(hit), e.GetPosition(this));
+        e.Handled = true;
     }
 
     protected override void OnRenderSizeChanged(SizeChangedInfo sizeInfo)

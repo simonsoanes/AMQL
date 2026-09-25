@@ -38,6 +38,7 @@ public sealed partial class InferenceVisualiserWindow : Window
         InitializeComponent();
         Map.NodeSelected += OnNodeSelected;
         Map.NodeHovered += OnNodeHovered;
+        Map.NodeRightClicked += OnNodeRightClicked;
         _ready = true;
     }
 
@@ -331,6 +332,104 @@ public sealed partial class InferenceVisualiserWindow : Window
             $"layer {stats.Layer} · {stats.Op}{weight}   mean ‖·‖ {stats.MeanL2:F2}   "
             + $"max ‖·‖ {stats.MaxL2:F2}   mean |x| {stats.MeanAbs:F4}   {stats.MeanMs:F3} ms   "
             + $"intensity {stats.Intensity * 100:F1}%";
+    }
+
+    // ── editing a tensor the map has identified ────────────────────────────
+
+    private void OnNodeRightClicked(NodeStats? stats, Point at)
+    {
+        if (stats is null)
+        {
+            return;
+        }
+        var menu = new ContextMenu { PlacementTarget = Map };
+        if (stats.HasWeight)
+        {
+            menu.Items.Add(MenuItem("Scale this tensor × 0.5", () => CopyEditCommand(stats, "--scale 0.5")));
+            menu.Items.Add(MenuItem("Scale this tensor × 2", () => CopyEditCommand(stats, "--scale 2")));
+            menu.Items.Add(MenuItem("Zero this tensor", () => CopyEditCommand(stats, "--zero")));
+            menu.Items.Add(new Separator());
+            menu.Items.Add(MenuItem("Copy re-run command (with this patch)", () => CopyRerunCommand(stats)));
+            menu.Items.Add(new Separator());
+        }
+        menu.Items.Add(MenuItem("Copy tensor reference",
+            () => CopyToClipboard($"{stats.WeightObject}/{stats.WeightTensor}")));
+        menu.IsOpen = true;
+    }
+
+    private static MenuItem MenuItem(string header, Action onClick)
+    {
+        var item = new MenuItem { Header = header };
+        item.Click += (_, _) => onClick();
+        return item;
+    }
+
+    /// <summary>
+    /// The patch file an edit to this node would write, kept deterministic so
+    /// the edit command and the re-run command agree without any state between
+    /// them.
+    /// </summary>
+    private string PatchPathFor(NodeStats stats)
+    {
+        string dir = string.IsNullOrEmpty(_tracePath)
+            ? Environment.CurrentDirectory
+            : System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(_tracePath))!;
+        string safe = stats.Op.Replace('/', '_');
+        return System.IO.Path.Combine(dir, $"patch-L{stats.Layer}-{safe}.safetensors");
+    }
+
+    private string TracePathFor(NodeStats stats)
+    {
+        string dir = string.IsNullOrEmpty(_tracePath)
+            ? Environment.CurrentDirectory
+            : System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(_tracePath))!;
+        return System.IO.Path.Combine(dir, $"trace-L{stats.Layer}-{stats.Op}-edited.json");
+    }
+
+    /// <summary>Builds the edit-tensor command for this node's weight and puts
+    /// it on the clipboard. The window does not run it: the main window already
+    /// has a command runner with output capture, and a second place that knows
+    /// how to invoke the CLI would be a second place to keep in step.</summary>
+    private void CopyEditCommand(NodeStats stats, string operation)
+    {
+        if (string.IsNullOrEmpty(_trace?.ContainerPath))
+        {
+            MessageBox.Show(this,
+                "This trace does not record the container it was generated from, so the command "
+                + "cannot be completed.\n\nRe-capture it with a current build of "
+                + "'generate --trace-json', or substitute the container path yourself.",
+                "Inference Visualiser", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+        CopyToClipboard(
+            $"amql-cli edit-tensor \"{_trace!.ContainerPath}\" {stats.WeightObject} {stats.WeightTensor} "
+            + $"{operation} --out \"{PatchPathFor(stats)}\"");
+    }
+
+    private void CopyRerunCommand(NodeStats stats)
+    {
+        if (string.IsNullOrEmpty(_trace?.ContainerPath))
+        {
+            CopyEditCommand(stats, "--scale 1");   // reports the same missing-container problem
+            return;
+        }
+        CopyToClipboard(
+            $"amql-cli generate \"{_trace!.ContainerPath}\" --prompt \"…\" "
+            + $"--steps {_trace.Steps.Count} --temperature 0 "
+            + $"--patch \"{PatchPathFor(stats)}\" --trace-json \"{TracePathFor(stats)}\"");
+    }
+
+    private void CopyToClipboard(string text)
+    {
+        try
+        {
+            Clipboard.SetText(text);
+            HoverText.Text = $"copied to clipboard: {text}";
+        }
+        catch (Exception ex)
+        {
+            HoverText.Text = $"clipboard unavailable: {ex.Message}";
+        }
     }
 
     // ── ranking ────────────────────────────────────────────────────────────

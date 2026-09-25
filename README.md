@@ -172,15 +172,36 @@ deterministic.
 
 ### Quantized Export
 
+`export --quant` writes an **HF checkpoint** in a reduced-precision weight format:
+
 | Flag | Format | Bits/Weight | Scheme |
 |------|--------|------------|--------|
 | `--quant mxfp4` | MXFP4 (OCP) | ~4.0 | FP4 E2M1, E8M0 block scales, 32-element blocks |
-| `--quant ptq1` | PTQ1_0 (type 143) | ~1.75 | 5 trits/byte (base-3 dense), FP16 scale, 128-block, Hadamard |
-| `--quant pq2` | PQ2_0 (type 142) | ~2.13 | 2 bits/trit, FP16 scale, 128-block, Hadamard |
+| `--quant ptq1` | PTQ1_0 (Bonsai type 143) | ~1.75 | 5 trits/byte (base-3 dense), FP16 scale, 128-block, Hadamard |
+| `--quant pq2` | PQ2_0 (Bonsai type 142) | ~2.13 | 2 bits/trit, FP16 scale, 128-block, Hadamard |
 
 All three quantise stack projections only; embeddings, norms, and the output head stay
 full precision. `ptq1`/`pq2` produce PrismML Bonsai-compatible checkpoints for use with
-the PrismML llama.cpp fork.
+the PrismML llama.cpp fork — those 142/143 ids are the fork's own numbering, not upstream
+ggml's (stock ggml ternary is `TQ1_0` = 34 / `TQ2_0` = 35 with a different trit packing).
+
+### GGUF Export
+
+`to-gguf` converts an exported checkpoint into a GGUF v3 file for llama.cpp / LM Studio,
+quantising with AMQL's own encoders rather than shelling out to `llama-quantize`. Each
+encoder mirrors the corresponding `quantize_row_*_ref` in `ggml-quants.c` byte for byte:
+
+| `--quant` | Tensor types | `general.file_type` |
+|-----------|--------------|---------------------|
+| `none` / `f16` | F16 weights, F32 norms and scalars | 1 (mostly F16) |
+| `q4_0` | Q4_0 (18 B / 32 values) | 2 (mostly Q4_0) |
+| `mxfp4` | MXFP4 (17 B / 32 values, ggml type 39) | 38 |
+| `mxfp4_moe` | llama.cpp's MXFP4_MOE recipe: 3-D MoE expert stacks in MXFP4, every other quantizable weight in Q8_0 | 38 |
+
+In every mode norms, embeddings, the output head, MoE routers and all 1-D tensors stay full
+precision, matching `llama-quantize`'s skip list. A `chat_template.jinja` in the checkpoint
+is embedded as `tokenizer.chat_template`; without one the run reports the GGUF as
+completion-only.
 
 ### ONNX Export
 
@@ -195,6 +216,28 @@ history, and a **Container Explorer** tab. The explorer drills into the VIndex3 
 (components → layers → objects → edges) with right-click context menus for viewing tensor
 values in a spreadsheet grid, browsing the tokenizer vocabulary, and inspecting
 hidden-state edge connections.
+
+### Inference Visualiser
+
+`generate --trace-json trace.json` records every operator of every generated token — output
+magnitude, timing, which experts a MoE layer routed to, and the resulting top-k with entropy
+and top-1 margin. Opening that file in **Explorer → Inference Visualiser** (or running
+`amql-gui --trace trace.json`) draws the forward pass as a zoomable map: one column per
+layer, operators in computation order, edges thickened and coloured by activation, and a
+violet tab on any operator that reads exactly one weight tensor.
+
+The map is meant to be acted on, not just read:
+
+- **Rank** operators by mean/peak activation or time, filtered to weight-bearing ones.
+- **Scrub** a single step, or view the aggregate over the whole run.
+- **Right-click** a weight node to copy the `edit-tensor` command that scales or zeroes that
+  whole tensor, and the `generate --patch … --trace-json …` command that re-runs with it.
+- **Compare** two traces: the map recolours on a diverging ramp showing which operators got
+  louder (red) or quieter (blue) after the edit.
+
+`edit-tensor` is the whole-tensor counterpart to `change-tensor`; a single-cell edit to a
+multi-million-element matrix is too small to measure downstream. See
+[docs/inference-visualiser.md](docs/inference-visualiser.md).
 
 ## Configuration
 
@@ -214,6 +257,7 @@ hidden-state edge connections.
 - [Flash-Next Export](docs/export-qwen3.8-flash-next.md) — qwen4-next architecture mapping
 - [Classifier Models](docs/classifier-models-jev.md) — Jev/NLI classification design
 - [Embedding Models](docs/embedding-models-nomic-embed-text.md) — nomic-bert encoder
+- [Inference Visualiser](docs/inference-visualiser.md) — operator trace format and the map UI
 - [CUDA Backend Plan](docs/CUDA_PLAN.md) — GPU kernel roadmap
 - [MTP Drafter](docs/MTP_DRAFTER.md) — speculative decoding drafter design
 

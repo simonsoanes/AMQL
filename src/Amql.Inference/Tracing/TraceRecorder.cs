@@ -52,6 +52,7 @@ public sealed record StepTrace(
 public sealed record RunTrace(
     string Model,
     string ComponentId,
+    string ContainerPath,
     int HiddenSize,
     int Layers,
     IReadOnlyList<int> PromptTokens,
@@ -177,9 +178,10 @@ public sealed class TraceRecorder
     }
 
     public RunTrace ToRunTrace(string model, string componentId, int hiddenSize, int layers,
-        IReadOnlyList<int> promptTokens, string sampling, string weightWorkingSet)
-        => new(model, componentId, hiddenSize, layers, promptTokens, sampling, weightWorkingSet,
-            DateTime.UtcNow.ToString("O"), _nodes.ToArray(), _steps.ToArray());
+        IReadOnlyList<int> promptTokens, string sampling, string weightWorkingSet,
+        string containerPath = "")
+        => new(model, componentId, containerPath, hiddenSize, layers, promptTokens, sampling,
+            weightWorkingSet, DateTime.UtcNow.ToString("O"), _nodes.ToArray(), _steps.ToArray());
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {

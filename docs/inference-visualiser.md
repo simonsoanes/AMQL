@@ -1,8 +1,9 @@
 # Inference Visualiser — watching a request flow through the model
 
-**Status:** Design proposal
+**Status:** Phases 1, 2, 3 and 6 (compare) implemented; 4 (live run) and the
+causal/logit-lens overlays not started
 **Author:** AMQL / Ariadne
-**Date:** 2026-09-25
+**Date:** 2026-09-25 (design), updated 2026-09-25 (implementation status)
 
 ## 1. Purpose
 
@@ -167,30 +168,45 @@ an aggregate-only mode keeps just the per-node reductions for very long runs.
 
 ## 9. Phasing
 
-Each phase is independently useful and testable.
+| # | Phase | Status |
+|---|---|---|
+| 1 | Recorder + JSON + `generate --trace-json` | **Done.** `OpTrace` / `ExpertRoutingTrace` hooks in `GenericRuntime`, `TraceRecorder`, `--trace-json`. Verified headlessly on the 0.8B; instrumentation produces byte-identical text with and without the flag. |
+| 2 | Static map: layout, zoom/pan, LOD, colour by aggregate | **Done.** `ModelMapCanvas` + `TraceMetrics`. |
+| 3 | Step scrubber, per-step metrics, top-k panel | **Done.** |
+| 4 | Live in-process run from the GUI | Not started. The GUI references `Amql.Inference` now, so the plumbing exists; what is missing is a run panel and a throttled dispatcher feed. |
+| 5 | Ranking + edit → re-run loop | **Done, with one deliberate gap.** Ranking and the right-click menu exist, but the menu *copies* the `edit-tensor` / `generate --patch` commands rather than running them — the main window already has a command runner with output capture, and a second place that knows how to invoke the CLI is a second place to keep in step. `edit-tensor` (whole-tensor scale/zero/offset) was added for this, because `change-tensor` edits a single cell and a single cell of a 4M-element matrix is unmeasurable downstream. |
+| 6 | Compare mode; causal and logit-lens overlays | **Compare done** (diverging ramp, nodes matched on layer+op+weight). Causal attribution via `CausalTracer` and the logit lens are **not started** — both are the strongest answers to "which tensors matter" and are the obvious next work. |
 
-1. **Recorder + JSON + CLI flag.** Per-operator hook in `GenericRuntime`, trace model,
-   `--trace-json`. Verifiable headlessly on the 0.8B with no GUI involved.
-2. **Static map.** Layout + zoom/pan + LOD, colour by an aggregate over a loaded trace.
-3. **Step scrubber.** Timeline, play/pause, per-step metrics, top-k logit panel.
-4. **Live in-process run** from the GUI.
-5. **Ranking + edit loop.** Sortable tensor table; right-click → scale/zero/patch → re-run.
-6. **Compare mode.** Two traces, edges coloured by Δ; plus the causal-attribution and
-   logit-lens overlays.
+## 10. Risks — as resolved
 
-## 10. Risks to resolve in Phase 1
+- **Does the CUDA path bypass CPU-side hooks?** No. `StepForward` already reads
+  `hidden.Row(...)` unconditionally to feed `LayerNormTrace`, so activations are always
+  materialised in managed memory even when GEMMs run on device. The hooks see real values
+  on both paths.
+- **Native deps in the GUI process.** `Amql.Gui` now references `Amql.Inference`, which
+  brings the CUDA shim with it. Startup was checked on a machine with the runtime present
+  and is clean; startup on a machine *without* it has not been checked.
+- **Hook overhead.** Opt-in only: with no delegate attached, each observation site costs one
+  null check and the clock is never read. Not yet benchmarked under tracing.
+- **Trace size.** 211 KB for 16 tokens over 150 operator nodes on the 0.8B, with topology
+  interned once. A 27B run has roughly four times the operators; the per-step cost is what
+  scales, and `--trace-steps` is not implemented yet.
+- **Linear-attention layers have no attention matrix.** Still true and still unhandled in
+  the UI: 3 of every 4 Qwen3.5 layers report `linear_attn` as a single operator with no
+  per-head breakdown, and the map does not claim otherwise.
 
-- **The CUDA path may bypass CPU-side hooks.** `CudaShim` runs GEMMs on device; if operator
-  outputs never materialise as managed `float[]`, the recorder sees nothing. Needs an
-  explicit answer early — either force CPU when tracing, or instrument the device path too.
-  Tracing is a debugging tool, so forcing CPU is an acceptable answer if it is *stated*.
-- **Native deps in the GUI process.** Referencing `Amql.Inference` pulls CUDA natives into
-  `amql-gui`. Must confirm `CudaShim.Enabled` is lazy and that the GUI still starts on a
-  machine without the runtime.
-- **Hook overhead.** Per-operator callbacks on a hot loop cost something. Opt-in only, and
-  measured before it ships.
-- **Trace size.** Bounded by §7, but needs a real number from a 27B run before the format
-  is frozen.
-- **Linear-attention layers have no attention matrix.** 3 of every 4 layers in Qwen3.5 are
-  recurrent; their "attention" overlay is the recurrent state, not a softmax grid. The map
-  must not imply otherwise.
+## 11. Known limitations of what shipped
+
+- **The rendering has not been seen by a human.** The window was confirmed to open and
+  finish loading a real trace (by enumerating its top-level windows, since the title is only
+  set once parsing, layout and ranking have all succeeded), but the layout, colour ramp and
+  label legibility are unjudged.
+- **No attention or per-head overlay.** `AttentionTrace` already captures per-(layer, head)
+  weights; nothing surfaces them yet.
+- **No logit lens.** Projecting each layer's residual through the output head — the most
+  legible way to see where a prediction forms — is designed but unbuilt.
+- **Prefill is not traced.** The recorder attaches after prefill, so the map shows decode
+  steps only. For a long prompt that is the cheaper half of the run.
+- **One operator per mixer family.** `linear_attn` and `conv` are single nodes; their
+  internal projections (`in_proj_qkv`, `in_proj_z`, `out_proj`) are not separately
+  instrumented, so a linear-attention layer shows fewer editable tensors than a softmax one.

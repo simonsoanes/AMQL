@@ -137,7 +137,11 @@ public static class InferenceRunner
                 recorder.ToRunTrace(
                     container.Index.Model, componentId, plan.HiddenSize, plan.Layers.Count, tokens,
                     $"temperature={config.Temperature} top_k={config.TopK} top_p={config.TopP} seed={config.Seed}",
-                    (options?.WeightWorkingSet ?? WeightWorkingSetExtensions.FromEnv()).ToString()!),
+                    (options?.WeightWorkingSet ?? WeightWorkingSetExtensions.FromEnv()).ToString()!,
+                    // Recorded so the visualiser can offer an edit-tensor command
+                    // for whatever the user clicks, without asking them which
+                    // container the run came from.
+                    container.Root),
                 tracePath);
         }
 
