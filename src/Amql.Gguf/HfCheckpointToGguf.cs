@@ -289,7 +289,18 @@ public static class GgufConverter
         using var writer = new GgufWriter(new FileStream(outFile, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20));
 
         writer.Kv("general.architecture", GgufValue.String(arch));
-        writer.Kv("general.name", GgufValue.String(Path.GetFileName(checkpointDir)));
+        // The model's own name when the checkpoint carries one — AMQL exports
+        // write it into the safetensors __metadata__ — falling back to the
+        // directory name. Deriving it from the directory alone reports whatever
+        // the folder happened to be called, which for a temporary bridge
+        // directory is a GUID.
+        string modelName = directory.Shards.Count > 0
+            && directory.Shards[0].Metadata is { } shardMeta
+            && shardMeta.TryGetValue("model", out var fromMeta)
+            && fromMeta.Length > 0
+                ? fromMeta
+                : Path.GetFileName(checkpointDir);
+        writer.Kv("general.name", GgufValue.String(modelName));
         // ggml ftype: 1 = mostly F16, 2 = mostly Q4_0, 38 = mostly MXFP4_MOE.
         // Declaring F16 over a file whose weights are block-quantized
         // misreports the model to every consumer. There is no plain

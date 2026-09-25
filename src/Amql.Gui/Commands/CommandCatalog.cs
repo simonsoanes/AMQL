@@ -357,7 +357,10 @@ public static class CommandCatalog
         }),
         new("to-gguf", CatExport, "Convert an exported HF checkpoint to GGUF v3.", new[]
         {
-            new ParamDef("checkpointDir", "checkpoint dir", ParamKind.Positional, EditorKind.Directory),
+            new ParamDef("checkpointDir", "checkpoint or container dir", ParamKind.Positional, EditorKind.Directory,
+                Help: "An exported HF checkpoint, or a VINDEX3 container — a container is bridged "
+                      + "through a temporary checkpoint beside the output file and cleaned up after, "
+                      + "so one command goes straight from container to GGUF."),
             new ParamDef("out", "--out file.gguf", ParamKind.Option, EditorKind.File, Flag: "--out"),
             new ParamDef("quant", "--quant", ParamKind.Option, EditorKind.Choice, Flag: "--quant", DefaultValue: "none",
                 Choices: new[] { "none", "f16", "q4_0", "mxfp4", "mxfp4_moe", "ptq1", "pq2" },

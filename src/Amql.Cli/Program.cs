@@ -1195,9 +1195,61 @@ internal static class Program
 
     private static int ToGguf(string[] args)
     {
-        var checkpointDir = Arg(args, 0) ?? throw new CliException(
-            "to-gguf requires a checkpoint directory, e.g. 'amql-cli to-gguf <checkpoint-dir> --out <model.gguf>'");
+        var sourceDir = Arg(args, 0) ?? throw new CliException(
+            "to-gguf requires a checkpoint or container directory, e.g. 'amql-cli to-gguf <checkpoint-dir> --out <model.gguf>'");
         string outFile = OptionValue(args, "--out") ?? throw new CliException("to-gguf requires '--out <file.gguf>'");
+
+        // A container is bridged through a temporary HF checkpoint, because the
+        // converter's source access and its config parsing are both shaped
+        // around a checkpoint directory. The temp dir sits beside the output
+        // file rather than in the system temp: a 20 GB model should not land on
+        // whatever drive %TEMP% is on, and the output's drive is the one the
+        // user chose for the artifact. It is deleted afterwards, so the
+        // intermediate is not something anyone has to manage.
+        string checkpointDir = sourceDir;
+        string? tempCheckpoint = null;
+        bool looksLikeContainer = File.Exists(Path.Combine(sourceDir, "index.json"))
+            && !File.Exists(Path.Combine(sourceDir, "config.json"));
+        if (looksLikeContainer)
+        {
+            string outDir = Path.GetDirectoryName(Path.GetFullPath(outFile))
+                ?? Directory.GetCurrentDirectory();
+            tempCheckpoint = Path.Combine(outDir, $".amql-gguf-{Guid.NewGuid():N}");
+            Console.WriteLine($"container detected — bridging through a temporary checkpoint at {tempCheckpoint}");
+            using (var container = Vindex3Container.Open(sourceDir))
+            {
+                ModelExporter.Export(container, tempCheckpoint, patch: null);
+            }
+            checkpointDir = tempCheckpoint;
+        }
+        else if (!File.Exists(Path.Combine(sourceDir, "config.json")))
+        {
+            throw new CliException(
+                $"'{sourceDir}' has neither config.json (an exported checkpoint) nor index.json (a container)");
+        }
+
+        try
+        {
+            return ToGgufFromCheckpoint(args, checkpointDir, outFile);
+        }
+        finally
+        {
+            if (tempCheckpoint is not null)
+            {
+                try
+                {
+                    Directory.Delete(tempCheckpoint, recursive: true);
+                }
+                catch (IOException)
+                {
+                    Console.WriteLine($"warning: could not remove the temporary checkpoint at {tempCheckpoint}");
+                }
+            }
+        }
+    }
+
+    private static int ToGgufFromCheckpoint(string[] args, string checkpointDir, string outFile)
+    {
         string quantization = OptionValue(args, "--quant") ?? "none";
         if (quantization == "f16")
         {
@@ -2029,8 +2081,8 @@ internal static class Program
               amql-cli export <container-dir> --out <checkpoint-dir>
                               [--patch <patch.safetensors>] [--quant mxfp4]
                               [--arch qwen4-next]
-              amql-cli to-gguf <checkpoint-dir> --out <file.gguf> [--force]
-                    [--quant none|f16|q4_0|mxfp4|mxfp4_moe]
+              amql-cli to-gguf <checkpoint-dir|container-dir> --out <file.gguf> [--force]
+                    [--quant none|f16|q4_0|mxfp4|mxfp4_moe|ptq1|pq2]
               amql-cli export-mtp <container-dir> --out <drafter-dir>
               amql-cli generate-mtp <container-dir> --out <out>
                               [--text <corpus.txt>] [--sample 4096] [--fit]

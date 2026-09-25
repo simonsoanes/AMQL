@@ -459,6 +459,27 @@ public class GgufTests
             $"{name}: relL2 {Math.Sqrt(errSq / sumSq):F3} reads as a layout error rather than quantization loss");
     }
 
+    /// <summary>
+    /// general.name used to be the checkpoint directory's name. That is
+    /// harmless until a container is bridged to GGUF through a temporary
+    /// checkpoint, at which point the model's name in the header is a GUID.
+    /// AMQL exports write the model id into the safetensors __metadata__, and
+    /// that is what the GGUF should carry; the folder is only a fallback for
+    /// checkpoints with no metadata of their own.
+    /// </summary>
+    [Fact]
+    public void General_Name_Prefers_The_Checkpoint_Metadata_Over_The_Folder()
+    {
+        using var temp = new TempDir();
+        BuildCheckpoint(temp.Path);
+
+        string outFile = Path.Combine(temp.Path, "some-arbitrary-folder-name.gguf");
+        GgufConverter.Convert(temp.Path, outFile);
+
+        using var reader = GgufReader.Open(outFile);
+        Assert.Equal("synth-qwen35moe", reader.Get("general.name").AsString());
+    }
+
     // 2 key heads × 3 value heads per key × head_dim 4, so a grouped row
     // (k, vp, h) becomes the tiled row (vp, k, h). num_v_per_k differing from
     // num_k_heads is what makes the permutation non-self-inverse, matching the
@@ -666,6 +687,6 @@ public class GgufTests
         File.WriteAllText(Path.Combine(dir, "tokenizer.json"), tokenizer);
 
         SafetensorsWriter.Write(Path.Combine(dir, "model.safetensors"), tensors,
-            new Dictionary<string, string> { ["format"] = "pt" });
+            new Dictionary<string, string> { ["format"] = "pt", ["model"] = "synth-qwen35moe" });
     }
 }

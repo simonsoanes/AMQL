@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Amql.Cli;
+using Amql.Gguf;
 using Amql.Hf;
 using Amql.Inference;
 using Amql.Merge;
