@@ -294,6 +294,103 @@ public class GgufTests
         Assert.False(reader.TryGet("tokenizer.chat_template", out _));
     }
 
+    /// <summary>
+    /// Pins the MXFP4 and Q8_0 byte layouts to ggml's. The golden bytes come
+    /// from gguf-py's numpy ports of quantize_row_mxfp4_ref and
+    /// quantize_row_q8_0 applied to the synthetic ramp SourceValue(0..31)
+    /// (amax 1.0), which is block 0 of blk.1.attn_k.weight because the payload
+    /// is a verbatim copy. MXFP4 stores one E8M0 exponent byte then 16 nibble
+    /// bytes; Q8_0 stores an F16 scale then 32 signed bytes.
+    /// </summary>
+    [Fact]
+    public void Mxfp4_And_Q8_0_Blocks_Use_Ggml_Layout()
+    {
+        using var temp = new TempDir();
+        BuildCheckpoint(temp.Path);
+
+        // MXFP4: amax 1.0 → e = floor(log2(1)) - 2 + 127 = 125 = 0x7D, and
+        // the scale that pairs with the doubled E2M1 grid is 2^(125-128) = 0.125.
+        string mxfp4File = Path.Combine(temp.Path, "model-mxfp4.gguf");
+        GgufConverter.Convert(temp.Path, mxfp4File, quantization: "mxfp4");
+        using (var reader = GgufReader.Open(mxfp4File))
+        {
+            Assert.Equal(GgufType.Mxfp4, reader.GetTensor("blk.1.attn_k.weight").Type);
+            Assert.Equal(38u, reader.Get("general.file_type").AsUInt32());
+            byte[] bytes = reader.ReadBytes("blk.1.attn_k.weight");
+            Assert.Equal(32 * 16 / 32 * 17, bytes.Length); // 512 values → 16 blocks
+            byte[] golden =
+            {
+                0x7D,                                     // E8M0 exponent 125
+                0x0E, 0x0E, 0x1D, 0x1D, 0x2D, 0x2D, 0x3C, 0x3C, // elements 0-7 | 16-23
+                0x4C, 0x4B, 0x4B, 0x5A, 0x5A, 0x59, 0x59, 0x60, // elements 8-15 | 24-31
+            };
+            Assert.Equal(golden, bytes[..17]);
+        }
+
+        // Q8_0: d = amax/127 = 1/127, stored F16 little-endian as 0x2008.
+        string moeFile = Path.Combine(temp.Path, "model-mxfp4-moe.gguf");
+        GgufConverter.Convert(temp.Path, moeFile, quantization: "mxfp4_moe");
+        using (var reader = GgufReader.Open(moeFile))
+        {
+            Assert.Equal(GgufType.Q8_0, reader.GetTensor("blk.1.attn_k.weight").Type);
+            byte[] bytes = reader.ReadBytes("blk.1.attn_k.weight");
+            Assert.Equal(32 * 16 / 32 * 34, bytes.Length);
+            byte[] golden =
+            {
+                0x08, 0x20,                               // scale 1/127 as F16 LE
+                0x81, 0x89, 0x91, 0x99, 0xA1, 0xA9, 0xB1, 0xB9,
+                0xC0, 0xC8, 0xD0, 0xD8, 0xE0, 0xE8, 0xF0, 0xF8,
+                0x00, 0x08, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38,
+                0x40, 0x47, 0x4F, 0x57, 0x5F, 0x67, 0x6F, 0x77,
+            };
+            Assert.Equal(golden, bytes[..34]);
+        }
+    }
+
+    /// <summary>
+    /// llama.cpp's MXFP4_MOE recipe (ftype 38) keys on the tensor being a 3-D
+    /// expert stack: those become MXFP4 and every other quantizable weight
+    /// becomes Q8_0, which is what keeps the shared attention path out of
+    /// 4-bit. Norms, routers, embeddings and 1-D tensors stay full precision.
+    /// </summary>
+    [Fact]
+    public void Mxfp4_Moe_Follows_The_Llama_Cpp_Recipe()
+    {
+        using var temp = new TempDir();
+        BuildCheckpoint(temp.Path);
+
+        string outFile = Path.Combine(temp.Path, "model-moe.gguf");
+        GgufConverter.Convert(temp.Path, outFile, quantization: "mxfp4_moe");
+
+        using var reader = GgufReader.Open(outFile);
+        Assert.Equal(38u, reader.Get("general.file_type").AsUInt32());
+        Assert.Equal(2u, reader.Get("general.quantization_version").AsUInt32());
+
+        // 3-D expert stacks → MXFP4
+        Assert.Equal(GgufType.Mxfp4, reader.GetTensor("blk.0.ffn_gate_exps.weight").Type);
+        Assert.Equal(GgufType.Mxfp4, reader.GetTensor("blk.0.ffn_up_exps.weight").Type);
+        Assert.Equal(GgufType.Mxfp4, reader.GetTensor("blk.0.ffn_down_exps.weight").Type);
+
+        // every other quantizable weight → Q8_0
+        Assert.Equal(GgufType.Q8_0, reader.GetTensor("blk.1.attn_q.weight").Type);
+        Assert.Equal(GgufType.Q8_0, reader.GetTensor("blk.0.attn_qkv.weight").Type);
+        Assert.Equal(GgufType.Q8_0, reader.GetTensor("blk.0.ssm_out.weight").Type);
+
+        // the skip list is unchanged: routers and norms stay F32, embeddings F16
+        Assert.Equal(GgufType.F32, reader.GetTensor("blk.0.ffn_gate_inp.weight").Type);
+        Assert.Equal(GgufType.F32, reader.GetTensor("blk.1.attn_norm.weight").Type);
+        Assert.Equal(GgufType.F32, reader.GetTensor("blk.0.ssm_conv1d.weight").Type);
+        Assert.Equal(GgufType.F16, reader.GetTensor("token_embd.weight").Type);
+
+        // all-MXFP4 mode quantizes the non-expert weights too
+        string allFile = Path.Combine(temp.Path, "model-all.gguf");
+        GgufConverter.Convert(temp.Path, allFile, quantization: "mxfp4");
+        using var all = GgufReader.Open(allFile);
+        Assert.Equal(GgufType.Mxfp4, all.GetTensor("blk.1.attn_q.weight").Type);
+        Assert.Equal(GgufType.Mxfp4, all.GetTensor("blk.0.ffn_gate_exps.weight").Type);
+        Assert.Equal(GgufType.F32, all.GetTensor("blk.0.ffn_gate_inp.weight").Type);
+    }
+
     // 2 key heads × 3 value heads per key × head_dim 4, so a grouped row
     // (k, vp, h) becomes the tiled row (vp, k, h). num_v_per_k differing from
     // num_k_heads is what makes the permutation non-self-inverse, matching the

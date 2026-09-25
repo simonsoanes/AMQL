@@ -965,9 +965,17 @@ internal static class Program
             "to-gguf requires a checkpoint directory, e.g. 'amql-cli to-gguf <checkpoint-dir> --out <model.gguf>'");
         string outFile = OptionValue(args, "--out") ?? throw new CliException("to-gguf requires '--out <file.gguf>'");
         string quantization = OptionValue(args, "--quant") ?? "none";
-        if (quantization != "none" && quantization != "f16" && quantization != "q4_0")
+        if (quantization == "f16")
         {
-            throw new CliException($"unknown quantization '{quantization}' — this build supports 'none', 'f16', or 'q4_0'");
+            // 'f16' is the user-facing alias for "do not quantize".
+            quantization = "none";
+        }
+        if (!GgufConverter.Quantizations.Contains(quantization))
+        {
+            throw new CliException(
+                $"unknown quantization '{quantization}' — this build supports "
+                + string.Join(", ", GgufConverter.Quantizations.Select(q => $"'{q}'"))
+                + ", plus 'f16' as an alias for 'none'");
         }
         if (File.Exists(outFile))
         {
@@ -1779,6 +1787,7 @@ internal static class Program
                               [--patch <patch.safetensors>] [--quant mxfp4]
                               [--arch qwen4-next]
               amql-cli to-gguf <checkpoint-dir> --out <file.gguf> [--force]
+                    [--quant none|f16|q4_0|mxfp4|mxfp4_moe]
               amql-cli export-mtp <container-dir> --out <drafter-dir>
               amql-cli generate-mtp <container-dir> --out <out>
                               [--text <corpus.txt>] [--sample 4096] [--fit]
@@ -1848,6 +1857,14 @@ internal static class Program
             embedded as tokenizer.chat_template when the directory carries
             chat_template.jinja (or one inside tokenizer_config.json);
             without it the GGUF is completion-only and the run says so.
+            --quant picks the weight encoding: none/f16 writes F16, q4_0
+            writes ggml's Q4_0 (ftype 2), mxfp4 writes OCP MXFP4 for every
+            quantizable weight (ggml type 39: 32 E2M1 values sharing one
+            E8M0 exponent per 17-byte block), and mxfp4_moe follows
+            llama.cpp's MXFP4_MOE recipe (ftype 38) — 3-D MoE expert stacks
+            in MXFP4 and every other quantizable weight in Q8_0. Norms,
+            embeddings, the output head, MoE routers and all 1-D tensors stay
+            full precision in every mode, matching llama-quantize's skip list.
             Qwen3.5-family
             checkpoints (hybrid linear/full attention, optional MoE) are
             emitted as the qwen35 / qwen35moe architectures following

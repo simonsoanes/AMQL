@@ -300,8 +300,12 @@ public static class CommandCatalog
             new ParamDef("checkpointDir", "checkpoint dir", ParamKind.Positional, EditorKind.Directory),
             new ParamDef("out", "--out file.gguf", ParamKind.Option, EditorKind.File, Flag: "--out"),
             new ParamDef("quant", "--quant", ParamKind.Option, EditorKind.Choice, Flag: "--quant", DefaultValue: "none",
-                Choices: new[] { "none", "f16", "q4_0" },
-                Help: "Quantization: none/f16 (full precision) or q4_0 (4-bit, ~50% size reduction)."),
+                Choices: new[] { "none", "f16", "q4_0", "mxfp4", "mxfp4_moe" },
+                Help: "Weight encoding: none/f16 (full precision), q4_0 (ggml 4-bit, ftype 2), "
+                      + "mxfp4 (OCP MXFP4, ggml type 39) for every quantizable weight, or mxfp4_moe "
+                      + "(llama.cpp ftype 38) which puts 3-D MoE expert stacks in MXFP4 and every "
+                      + "other quantizable weight in Q8_0. Norms, embeddings, the output head, "
+                      + "routers and 1-D tensors stay full precision in every mode."),
         }),
         new("export-onnx", CatExport, "Export a container as an ONNX model (.onnx).", new[]
         {

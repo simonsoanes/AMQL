@@ -39,6 +39,15 @@ public enum GgufType : uint
     F64 = 28,
     IQ1_M = 29,
     BF16 = 30,
+    TQ1_0 = 34,
+    TQ2_0 = 35,
+    /// <summary>OCP microscaling FP4: 32 E2M1 elements sharing one E8M0
+    /// exponent, 17 bytes per block. What gpt-oss ships natively and what
+    /// Unsloth's MXFP4_MOE recipe uses for the expert stacks.</summary>
+    Mxfp4 = 39,
+    Nvfp4 = 40,
+    Q1_0 = 41,
+    Q2_0 = 42,
 }
 
 /// <summary>
@@ -65,9 +74,25 @@ public static class GgufTypeSizing
     {
         // Q4_0: 18 bytes per 32-element block (2-byte F16 scale + 16 nibble bytes)
         GgufType.Q4_0 => ((elements + 31) / 32) * 18,
+        // Q8_0: 34 bytes per 32-element block (2-byte F16 scale + 32 int8)
+        GgufType.Q8_0 => ((elements + 31) / 32) * 34,
+        // MXFP4: 17 bytes per 32-element block (1-byte E8M0 scale + 16 nibbles)
+        GgufType.Mxfp4 => ((elements + 31) / 32) * 17,
+        // NVFP4: 36 bytes per 64-element block (4 UE4M3 sub-block scales + 32 nibbles)
+        GgufType.Nvfp4 => ((elements + 63) / 64) * 36,
         // Q4_K: 144 bytes per 256-element super-block
         GgufType.Q4_K => ((elements + 255) / 256) * 144,
         _ => checked(elements * ElementSize(type)),
+    };
+
+    /// <summary>True for the block-packed types, whose payload size is a
+    /// function of the block count rather than the element count.</summary>
+    public static bool IsBlockQuantized(GgufType type) => type switch
+    {
+        GgufType.Q4_0 or GgufType.Q8_0 or GgufType.Mxfp4 or GgufType.Nvfp4
+            or GgufType.Q4_K or GgufType.TQ1_0 or GgufType.TQ2_0
+            or GgufType.Q1_0 or GgufType.Q2_0 => true,
+        _ => false,
     };
 
     /// <summary>Bytes per value, for the plain dtypes only.</summary>

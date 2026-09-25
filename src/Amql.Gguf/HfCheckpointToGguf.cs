@@ -66,8 +66,19 @@ public static class GgufConverter
         Q35Norm,    // norms:       copy with +1 (Qwen3-Next convention)
     }
 
+    /// <summary>The <c>--quant</c> modes this converter can emit: F16, Q4_0,
+    /// all-MXFP4, and llama.cpp's MXFP4_MOE recipe (expert stacks MXFP4,
+    /// every other quantizable weight Q8_0).</summary>
+    public static readonly IReadOnlyList<string> Quantizations = new[] { "none", "q4_0", "mxfp4", "mxfp4_moe" };
+
     public static GgufConversion Convert(string checkpointDir, string outFile, string quantization = "none")
     {
+        if (!Quantizations.Contains(quantization))
+        {
+            throw new GgufException(
+                $"unknown quantization '{quantization}' — expected one of: {string.Join(", ", Quantizations)}");
+        }
+
         string configPath = Path.Combine(checkpointDir, "config.json");
         if (!File.Exists(configPath))
         {
@@ -260,11 +271,20 @@ public static class GgufConverter
 
         writer.Kv("general.architecture", GgufValue.String(arch));
         writer.Kv("general.name", GgufValue.String(Path.GetFileName(checkpointDir)));
-        // ggml ftype: 1 = mostly F16, 2 = mostly Q4_0. Declaring F16 over a
-        // file whose weights are Q4_0 misreports the model to every consumer.
-        bool quantizedQ4 = quantization == "q4_0";
-        writer.Kv("general.file_type", GgufValue.Uint32(quantizedQ4 ? 2u : 1u));
-        if (quantizedQ4)
+        // ggml ftype: 1 = mostly F16, 2 = mostly Q4_0, 38 = mostly MXFP4_MOE.
+        // Declaring F16 over a file whose weights are block-quantized
+        // misreports the model to every consumer. There is no plain
+        // MOSTLY_MXFP4 in llama.cpp's enum, so an all-MXFP4 file declares the
+        // MXFP4_MOE ftype too — the per-tensor types in the header are what
+        // the loader actually reads.
+        uint fileType = quantization switch
+        {
+            "q4_0" => 2u,
+            "mxfp4" or "mxfp4_moe" => 38u,
+            _ => 1u,
+        };
+        writer.Kv("general.file_type", GgufValue.Uint32(fileType));
+        if (quantization != "none")
         {
             writer.Kv("general.quantization_version", GgufValue.Uint32(2));
         }
@@ -374,13 +394,24 @@ public static class GgufConverter
                 ? "no chat template found (chat_template.jinja or tokenizer_config.json) — the GGUF is completion-only"
                 : $"chat template embedded ({chatTemplate.Length} chars)",
             "MTP drafter (mtp.safetensors + mtp.config.json) stays a separate companion shard — not embedded",
-            quantization == "q4_0"
-                ? "Q4_0 quantization applied to weight matrices"
-                  + (hasMoe && experts > 0
+            quantization switch
+            {
+                "q4_0" => "Q4_0 quantization applied to weight matrices"
+                    + (hasMoe && experts > 0
                         ? " including the stacked 3-D MoE expert tensors (every expert slice quantized)"
                         : "")
-                  + "; norms, embeddings, output head and routers kept full precision"
-                : "weights written as F16 (BF16 sources; lossless in the normal range); F32 routers kept",
+                    + "; norms, embeddings, output head and routers kept full precision",
+                "mxfp4" => "MXFP4 quantization applied to weight matrices (ggml type 39: 32 E2M1 values "
+                    + "sharing one E8M0 exponent per 17-byte block)"
+                    + (hasMoe && experts > 0 ? " including the stacked 3-D MoE expert tensors" : "")
+                    + "; norms, embeddings, output head and routers kept full precision",
+                "mxfp4_moe" => hasMoe && experts > 0
+                    ? "MXFP4_MOE recipe (llama.cpp ftype 38): 3-D MoE expert stacks in MXFP4, every other "
+                      + "quantizable weight in Q8_0; norms, embeddings, output head and routers kept full precision"
+                    : "MXFP4_MOE recipe (llama.cpp ftype 38) requested for a dense model — there are no expert "
+                      + "stacks, so every quantizable weight is Q8_0",
+                _ => "weights written as F16 (BF16 sources; lossless in the normal range); F32 routers kept",
+            },
         };
 
         return new GgufConversion
@@ -476,10 +507,11 @@ public static class GgufConverter
         return (byte)Math.Clamp((int)q, 0, 15);
     }
 
-    /// <summary>Writes a Q4_0 quantized tensor payload. Loads the source
-    /// tensor as floats, applies transforms (transpose, addOne), quantizes
-    /// to Q4_0, and writes the quantized bytes.</summary>
-    private static void WriteQ4_0Payload(GgufWriter writer, PlanEntry entry, int index)
+    /// <summary>Writes a block-quantized tensor payload: loads the source as
+    /// floats, applies any additive transform, encodes the blocks and writes
+    /// them. No physical transpose — GGUF reverses the declared dims but keeps
+    /// the source row-major byte order.</summary>
+    private static void WriteQuantizedPayload(GgufWriter writer, PlanEntry entry, int index, GgufType type)
     {
         // Stacked MoE experts: the header declares all N slices, so every
         // slice must be quantized and concatenated. Writing only slice 0
@@ -490,11 +522,10 @@ public static class GgufConverter
             foreach (var slice in entry.StackSlices!)
             {
                 var sliceInfo = slice.Info;
-                long sliceRows = sliceInfo.Shape[0], sliceCols = sliceInfo.Shape[1];
-                float[] sliceValues = LoadFloats(slice, sliceRows * sliceCols);
+                float[] sliceValues = LoadFloats(slice, sliceInfo.Shape[0] * sliceInfo.Shape[1]);
                 // ne0 is sliceCols in GGUF order; slices are written in source
                 // row-major order, which already matches [ne0=sliceCols, ne1=sliceRows].
-                writer.Data.Write(QuantizeQ4_0(sliceValues));
+                writer.Data.Write(EncodeBlocks(type, sliceValues));
             }
             writer.FinishTensor(index);
             return;
@@ -502,12 +533,8 @@ public static class GgufConverter
 
         var source = entry.RequiredSource;
         var info = source.Info;
-        long rows = info.Shape[0], cols = info.Shape[1];
+        float[] values = LoadFloats(source, info.Shape[0] * info.Shape[1]);
 
-        // Load as floats
-        float[] values = LoadFloats(source, rows * cols);
-
-        // Apply addOne transform if needed (for norms)
         if (entry.AddOne)
         {
             for (long i = 0; i < values.Length; i++)
@@ -516,25 +543,39 @@ public static class GgufConverter
             }
         }
 
-        // No physical transpose: GGUF reverses the declared dims but keeps
-        // the source row-major byte order (see Transform.Transpose above).
-
-        // Quantize to Q4_0
-        byte[] quantized = QuantizeQ4_0(values);
-
-        // Write to GGUF
-        writer.Data.Write(quantized);
+        writer.Data.Write(EncodeBlocks(type, values));
         writer.FinishTensor(index);
     }
+
+    /// <summary>Encodes a float array into the given block type.</summary>
+    private static byte[] EncodeBlocks(GgufType type, float[] values) => type switch
+    {
+        GgufType.Q4_0 => QuantizeQ4_0(values),
+        _ => GgmlQuant.Encode(type, values),
+    };
 
     // ── descriptors ────────────────────────────────────────────────────────
 
     private static GgufType GgufTypeFor(PlanEntry entry, string quantization)
     {
-        // Q4_0 quantization for eligible weight tensors
-        if (quantization == "q4_0" && ShouldQuantize(entry))
+        // Block quantization for eligible weight tensors.
+        if (ShouldQuantize(entry))
         {
-            return GgufType.Q4_0;
+            switch (quantization)
+            {
+                case "q4_0":
+                    return GgufType.Q4_0;
+                case "mxfp4":
+                    return GgufType.Mxfp4;
+                case "mxfp4_moe":
+                    // llama.cpp's MXFP4_MOE recipe (ftype 38): the 3-D expert
+                    // stacks become MXFP4 and every other quantizable weight
+                    // becomes Q8_0. Keeping the shared attention path at 8 bit
+                    // is the point of the recipe — 4-bit there costs more
+                    // quality than the expert stacks do, and on a dense model
+                    // with no expert stacks this degrades to plain Q8_0.
+                    return entry.Transform == Transform.Stack ? GgufType.Mxfp4 : GgufType.Q8_0;
+            }
         }
 
         // ggml requires F32 for every norm weight and for the SSM depthwise
@@ -573,10 +614,12 @@ public static class GgufConverter
         };
     }
 
-    /// <summary>Determines if a tensor should be quantized to Q4_0.
-    /// Norms, embeddings, output heads, MoE routers, and small tensors stay
-    /// full precision — matching llama.cpp's own quantize skip list, since
-    /// 4-bit routers measurably degrade expert selection.</summary>
+    /// <summary>Determines if a tensor is eligible for block quantization, in
+    /// any of the supported types. Norms, embeddings, output heads, MoE
+    /// routers and small tensors stay full precision — matching the skip list
+    /// in llama.cpp's <c>tensor_allows_quantization</c>, since 4-bit routers
+    /// measurably degrade expert selection and its 1-D tensors are never
+    /// quantized at all.</summary>
     private static bool ShouldQuantize(PlanEntry entry)
     {
         if (entry.Source is null) return false;
@@ -598,9 +641,9 @@ public static class GgufConverter
         if (shape.Length != 2) return false;
 
         // ggml blocks along the contiguous dimension, so anything that is not
-        // a whole number of 32-element blocks has no valid Q4_0 encoding and
-        // must stay full precision rather than be padded.
-        if (totalElements % Q4_0BlockSize != 0) return false;
+        // a whole number of blocks has no valid encoding in any of these types
+        // and must stay full precision rather than be padded.
+        if (totalElements % GgmlQuant.BlockElements != 0) return false;
 
         // Skip the transforms that must stay F32 (see GgufTypeFor). The
         // reordering projections are not in this list: their head permutation
@@ -659,13 +702,14 @@ public static class GgufConverter
     {
         writer.SeekTensor(index);
 
-        // Q4_0 quantization: load floats, quantize, write Q4_0 bytes. The
-        // reordering projections are excluded here because their V-head
-        // permutation has to happen before the values are cut into blocks;
-        // they quantize inside their own write path instead.
-        if (quantization == "q4_0" && ShouldQuantize(entry) && !ReordersHeads(entry.Transform))
+        // Block quantization: load floats, encode, write. The reordering
+        // projections are excluded here because their V-head permutation has
+        // to happen before the values are cut into blocks; they encode inside
+        // their own write path instead.
+        var declared = GgufTypeFor(entry, quantization);
+        if (GgufTypeSizing.IsBlockQuantized(declared) && !ReordersHeads(entry.Transform))
         {
-            WriteQ4_0Payload(writer, entry, index);
+            WriteQuantizedPayload(writer, entry, index, declared);
             return;
         }
 
@@ -922,16 +966,19 @@ public static class GgufConverter
     }
 
     /// <summary>Emits floats in whatever type the header already declared for
-    /// this tensor, so a permuted projection can be Q4_0, F16 or F32 without
-    /// the reorder needing to know which. Does not call FinishTensor; the
-    /// caller's switch does.</summary>
+    /// this tensor, so a permuted projection can be block-quantized, F16 or
+    /// F32 without the reorder needing to know which. Does not call
+    /// FinishTensor; the caller's switch does.</summary>
     private static void WriteTypedFloats(GgufWriter writer, PlanEntry entry, string quantization, float[] values)
     {
-        switch (GgufTypeFor(entry, quantization))
+        var type = GgufTypeFor(entry, quantization);
+        if (GgufTypeSizing.IsBlockQuantized(type))
         {
-            case GgufType.Q4_0:
-                writer.Data.Write(QuantizeQ4_0(values));
-                break;
+            writer.Data.Write(EncodeBlocks(type, values));
+            return;
+        }
+        switch (type)
+        {
             case GgufType.F32:
                 writer.Data.Write(MakeF32Bytes(values));
                 break;
