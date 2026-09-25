@@ -625,6 +625,7 @@ internal static class Program
         }
 
         string? traceJson = OptionValue(args, "--trace-json");
+        string? traceStream = OptionValue(args, "--trace-stream");
         bool attribute = HasOption(args, "--attribute");
         int corruptId = -1;
         if (attribute)
@@ -647,16 +648,18 @@ internal static class Program
         int attributeSource = IntOption(args, "--attribute-source", -1);
         int attributeLayerEnd = IntOption(args, "--attribute-layers", -1);
         bool logitLens = HasOption(args, "--logit-lens");
-        if (logitLens && traceJson is null)
+        if (logitLens && traceJson is null && traceStream is null)
         {
             throw new CliException(
-                "--logit-lens records into the operator trace, so it also needs --trace-json <path>");
+                "--logit-lens records into the operator trace, so it also needs "
+                + "--trace-json <path> or --trace-stream <path>");
         }
 
         var tensorLoads = traceTensors ? new List<TensorTraceLine>() : null;
-        var genOpts = (trace || traceTensors || traceJson is not null || workingSet is not null || attribute)
+        var genOpts = (trace || traceTensors || traceJson is not null || traceStream is not null
+                       || workingSet is not null || attribute)
             ? new InferenceRunner.GenerateOptions(Trace: trace, TraceTensors: traceTensors,
-                WeightWorkingSet: workingSet, TraceJsonPath: traceJson,
+                WeightWorkingSet: workingSet, TraceJsonPath: traceJson, TraceStreamPath: traceStream,
                 // Resolve token text at capture time so a saved trace reads as
                 // words when reopened, rather than depending on the tokenizer
                 // still being to hand.
@@ -2010,6 +2013,7 @@ internal static class Program
                               [--attribute --attribute-corrupt <text>]
                               [--attribute-source <row>] [--attribute-layers <end>]
                               [--logit-lens] [--trace-attention]
+                              [--trace-stream <trace.jsonl>]
               amql-cli inspect-token <container-dir> <token>
                               [--tokens ctx,ids] [--neighbors 5] [--logits K]
                               [--tokenizer <checkpoint-dir>] [--component target]

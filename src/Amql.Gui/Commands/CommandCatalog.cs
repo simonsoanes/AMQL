@@ -235,6 +235,11 @@ public static class CommandCatalog
                 Help: "Writes a per-operator trace of every generated token: which operators ran, "
                       + "their output magnitude, which experts a MoE layer routed to, and the "
                       + "resulting top-k distribution. This is the file the inference visualiser opens."),
+            new ParamDef("traceStream", "--trace-stream file.jsonl", ParamKind.Option, EditorKind.File,
+                Flag: "--trace-stream",
+                Help: "Like --trace-json but line-delimited and flushed per record, so it can be "
+                      + "tailed while the run is still going. This is what the visualiser's live "
+                      + "view reads."),
             new ParamDef("logitLens", "--logit-lens", ParamKind.Switch, EditorKind.Choice, Flag: "--logit-lens",
                 DefaultValue: "", Choices: new[] { "", "1" },
                 Help: "Also project each layer's residual through the final norm and output head, "

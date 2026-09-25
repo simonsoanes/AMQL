@@ -225,6 +225,70 @@ public class TraceTests
         Assert.Equal((2, TraceMetrics.OpOrder.Count), TraceMetrics.LayoutSize(run));
     }
 
+    /// <summary>
+    /// The stream is what the GUI tails during a live run, so it has to rebuild
+    /// the same trace the document format does — and it has to survive being
+    /// read while incomplete, because a run still in progress, or one that was
+    /// cancelled, leaves the file with a partial trailing line and no end
+    /// record. Treating that as an error would mean the live view breaks at
+    /// exactly the moment it is being used.
+    /// </summary>
+    [Fact]
+    public void Trace_Stream_Round_Trips_And_Tolerates_A_Partial_File()
+    {
+        using var dir = new TempDir();
+        string streamPath = Path.Combine(dir.Path, "live.jsonl");
+
+        var recorder = new TraceRecorder();
+        recorder.AttachStream(streamPath, new RunHeader("model-x", "target", Path.Combine("containers", "x"),
+            8, 2, new[] { 1, 2 }, "temperature=0", "ResidentF32"));
+
+        recorder.BeginStep(2);
+        recorder.Observe(Op(0, "attn_q", QProj, l2: 3f, ms: 0.5));
+        recorder.EndStep(101, " capital", new[] { new TokenCandidate(101, 5f, 0.7f, " capital") }, 0.4f, 0.3f);
+        recorder.BeginStep(3);
+        recorder.Observe(Op(1, "ffn_dense", null, l2: 1.5f, ms: 0.25));
+        recorder.EndStep(102, " of", Array.Empty<TokenCandidate>(), 0.9f, 0.1f);
+        recorder.StreamCausal(new CausalInfo(1, 2, 3, 101, 0.5f, 0.25f,
+            new float[] { 0.1f, 0.9f }, new float[] { 0.1f, 0.9f }));
+        recorder.CloseStream();
+
+        var trace = TraceRecorder.ReadStream(streamPath);
+        Assert.Equal("model-x", trace.Model);
+        Assert.Equal("target", trace.ComponentId);
+        Assert.Equal(8, trace.HiddenSize);
+        Assert.Equal(2, trace.Layers);
+        Assert.Equal(new[] { 1, 2 }, trace.PromptTokens);
+        Assert.Equal("temperature=0", trace.Sampling);
+        Assert.Equal(2, trace.Nodes.Count);
+        Assert.Equal(QProj.ObjectId, trace.Nodes[0].Weight!.ObjectId);
+        Assert.Equal(2, trace.Steps.Count);
+        Assert.Equal(101, trace.Steps[0].TokenId);
+        Assert.Equal(" capital", trace.Steps[0].TokenText);
+        Assert.Equal(0.7f, trace.Steps[0].TopK[0].Probability);
+        Assert.Equal(1.5f, Assert.Single(trace.Steps[1].Ops).L2);
+        Assert.NotNull(trace.Causal);
+        Assert.Equal(0.9f, trace.Causal!.LayerShare[1]);
+
+        // the reductions work identically whichever format produced the trace
+        Assert.Equal(3f, TraceMetrics.Reduce(trace).Single(s => s.Op == "attn_q").MeanL2, precision: 5);
+
+        // A file caught mid-write: the end record is missing and the last line
+        // is truncated. Everything before it must still be readable.
+        var lines = File.ReadAllLines(streamPath);
+        Assert.Equal("end", System.Text.Json.JsonDocument.Parse(lines[^1])
+            .RootElement.GetProperty("kind").GetString());
+        string partialPath = streamPath + ".partial";
+        File.WriteAllLines(partialPath,
+            lines.Take(lines.Length - 1).Append("{\"kind\":\"step\",\"inde"));
+        var partial = TraceRecorder.ReadStream(partialPath);
+        Assert.Equal(2, partial.Steps.Count);
+        // only the truncated trailing line is dropped; every complete record
+        // before it survives, including the attribution
+        Assert.NotNull(partial.Causal);
+        Assert.Equal(0.9f, partial.Causal!.LayerShare[1]);
+    }
+
     [Fact]
     public void Compare_Matches_Nodes_By_Identity_Not_By_Interned_Id()
     {

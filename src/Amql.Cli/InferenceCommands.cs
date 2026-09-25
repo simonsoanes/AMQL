@@ -29,6 +29,7 @@ public static class InferenceRunner
         bool TraceTensors,
         WeightWorkingSet? WeightWorkingSet = null,
         string? TraceJsonPath = null,
+        string? TraceStreamPath = null,
         Func<int, string>? TokenText = null,
         Action<TensorTraceLine>? OnTensorLoad = null,
         bool Attribute = false,
@@ -75,12 +76,29 @@ public static class InferenceRunner
 
         session.Prefill(tokens);
 
+        // Recorded once and reused, so the stream header and the finished
+        // document cannot drift apart.
+        string sampling =
+            $"temperature={config.Temperature} top_k={config.TopK} top_p={config.TopP} seed={config.Seed}";
+
         // The operator trace is attached only after prefill: the recorder's
         // step buffer is what gives an observation its context, and prefill
         // runs before any step exists.
-        var recorder = options?.TraceJsonPath is not null ? new TraceRecorder() : null;
+        var recorder = options?.TraceJsonPath is not null || options?.TraceStreamPath is not null
+            ? new TraceRecorder()
+            : null;
         if (recorder is not null)
         {
+            if (options?.TraceStreamPath is { } streamPath)
+            {
+                // The stream header has to carry the same identity the finished
+                // document will, or a live view and a saved one disagree about
+                // what they are showing.
+                recorder.AttachStream(streamPath, new RunHeader(
+                    container.Index.Model, componentId, container.Root, plan.HiddenSize,
+                    plan.Layers.Count, tokens, sampling,
+                    (options.WeightWorkingSet ?? WeightWorkingSetExtensions.FromEnv()).ToString()!));
+            }
             session.Runtime.OpTrace = recorder.Observe;
             session.Runtime.ExpertRoutingTrace = (_, experts) => recorder.ObserveExperts(experts);
             if (options is { LogitLens: true })
@@ -171,10 +189,11 @@ public static class InferenceRunner
         CausalInfo? causal = null;
         if (options is { Attribute: true })
         {
-            if (recorder is null || options.TraceJsonPath is null)
+            if (recorder is null || (options.TraceJsonPath is null && options.TraceStreamPath is null))
             {
                 throw new CliException(
-                    "--attribute records into the operator trace, so it also needs --trace-json <path>");
+                    "--attribute records into the operator trace, so it also needs "
+                    + "--trace-json <path> or --trace-stream <path>");
             }
             if (options.AttributeCorruptTokenId < 0)
             {
@@ -212,12 +231,18 @@ public static class InferenceRunner
             TraceRecorder.WriteJson(
                 recorder.ToRunTrace(
                     container.Index.Model, componentId, plan.HiddenSize, plan.Layers.Count, tokens,
-                    $"temperature={config.Temperature} top_k={config.TopK} top_p={config.TopP} seed={config.Seed}",
+                    sampling,
                     (options?.WeightWorkingSet ?? WeightWorkingSetExtensions.FromEnv()).ToString()!,
                     container.Root,
                     causal),
                 tracePath);
         }
+
+        if (causal is not null)
+        {
+            recorder?.StreamCausal(causal);
+        }
+        recorder?.CloseStream();
 
         return (tokens, outcomes);
     }

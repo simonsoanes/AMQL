@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Amql.Vindex3;
@@ -164,6 +165,73 @@ public sealed record NodeAggregate(float MeanL2, float MaxL2, double MeanMs, int
 public readonly record struct OpObservation(
     int Layer, string Op, OperandRef? Weight, float L2, float MaxAbs, float MeanAbs, double Ms);
 
+/// <summary>The identity of a run, written as the first record of a trace
+/// stream so a consumer knows what it is watching before any step lands.</summary>
+public sealed record RunHeader(
+    string Model,
+    string ComponentId,
+    string ContainerPath,
+    int HiddenSize,
+    int Layers,
+    IReadOnlyList<int> PromptTokens,
+    string Sampling,
+    string WeightWorkingSet);
+
+/// <summary>
+/// Line-delimited trace output, flushed per record so a consumer can tail the
+/// file while generation is still running. The single JSON document
+/// <see cref="TraceRecorder.WriteJson"/> produces is only complete once the run
+/// ends, which is exactly what makes it useless for watching a run happen.
+/// <para>
+/// Each line is an object with a <c>kind</c> of <c>header</c>, <c>node</c>,
+/// <c>step</c>, <c>causal</c> or <c>end</c>. Node definitions are interleaved
+/// with the steps rather than collected up front, because operators are
+/// discovered as the run proceeds.
+/// </para>
+/// </summary>
+public sealed class TraceStream : IDisposable
+{
+    private readonly StreamWriter _writer;
+
+    public TraceStream(string path)
+    {
+        string? dir = Path.GetDirectoryName(path);
+        if (!string.IsNullOrEmpty(dir))
+        {
+            Directory.CreateDirectory(dir);
+        }
+        // Truncate: a stale stream from a previous run must not be mistaken for
+        // the current one by whoever is tailing it.
+        _writer = new StreamWriter(path, append: false, new UTF8Encoding(false))
+        {
+            AutoFlush = true,
+        };
+    }
+
+    public void WriteHeader(RunHeader header) => Write("header", header);
+
+    public void WriteNode(OpNode node) => Write("node", node);
+
+    public void WriteStep(StepTrace step) => Write("step", step);
+
+    public void WriteCausal(CausalInfo causal) => Write("causal", causal);
+
+    /// <summary>Marks the stream complete. A consumer that never sees this knows
+    /// the run died partway, which is worth distinguishing from a short one.</summary>
+    public void WriteEnd() => _writer.WriteLine("{\"kind\":\"end\"}");
+
+    private void Write(string kind, object payload)
+    {
+        string json = JsonSerializer.Serialize(payload, TraceRecorder.JsonOptions);
+        // Splice the discriminator in rather than wrapping every record in an
+        // envelope type: the payload stays exactly the shape the document
+        // format uses, so one set of records serves both.
+        _writer.WriteLine(json.Insert(1, $"\"kind\":\"{kind}\","));
+    }
+
+    public void Dispose() => _writer.Dispose();
+}
+
 /// <summary>
 /// Collects <see cref="OpSample"/>s into a <see cref="RunTrace"/>. Attach its
 /// <see cref="Observe"/> to <c>GenericRuntime.OpTrace</c>; call
@@ -181,6 +249,32 @@ public sealed class TraceRecorder
     private readonly List<AttentionRow> _attention = new();
     private int _stepIndex;
     private int _position;
+    private TraceStream? _stream;
+
+    /// <summary>Starts mirroring every record to a line-delimited file as it
+    /// happens, so a consumer can watch the run rather than wait for it.</summary>
+    public void AttachStream(string path, RunHeader header)
+    {
+        _stream = new TraceStream(path);
+        _stream.WriteHeader(header);
+        // Anything interned before the stream was attached still has to appear,
+        // or the consumer sees step records referencing node ids it never got.
+        foreach (var node in _nodes)
+        {
+            _stream.WriteNode(node);
+        }
+    }
+
+    public void StreamCausal(CausalInfo causal) => _stream?.WriteCausal(causal);
+
+    /// <summary>Finishes the stream. A consumer that never sees the end record
+    /// knows the run was cut short rather than merely short.</summary>
+    public void CloseStream()
+    {
+        _stream?.WriteEnd();
+        _stream?.Dispose();
+        _stream = null;
+    }
 
     /// <summary>Number of operators recorded so far — a cheap liveness check
     /// for tests and for the GUI's status line.</summary>
@@ -202,8 +296,10 @@ public sealed class TraceRecorder
             return id;
         }
         id = _nodes.Count;
-        _nodes.Add(new OpNode(id, layer, op, weight));
+        var node = new OpNode(id, layer, op, weight);
+        _nodes.Add(node);
         _nodeIds[key] = id;
+        _stream?.WriteNode(node);
         return id;
     }
 
@@ -251,10 +347,12 @@ public sealed class TraceRecorder
     public void EndStep(int tokenId, string? tokenText, IReadOnlyList<TokenCandidate> topK,
         float entropy, float top1Margin)
     {
-        _steps.Add(new StepTrace(_stepIndex++, _position, tokenId, tokenText, entropy, top1Margin,
+        var step = new StepTrace(_stepIndex++, _position, tokenId, tokenText, entropy, top1Margin,
             topK, _experts.ToArray(), _samples.ToArray(),
             _lens.Count == 0 ? null : _lens.ToArray(),
-            _attention.Count == 0 ? null : _attention.ToArray()));
+            _attention.Count == 0 ? null : _attention.ToArray());
+        _steps.Add(step);
+        _stream?.WriteStep(step);
     }
 
     public RunTrace ToRunTrace(string model, string componentId, int hiddenSize, int layers,
@@ -263,7 +361,7 @@ public sealed class TraceRecorder
         => new(model, componentId, containerPath, hiddenSize, layers, promptTokens, sampling,
             weightWorkingSet, DateTime.UtcNow.ToString("O"), _nodes.ToArray(), _steps.ToArray(), causal);
 
-    private static readonly JsonSerializerOptions JsonOptions = new()
+    internal static readonly JsonSerializerOptions JsonOptions = new()
     {
         WriteIndented = false,
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
@@ -283,4 +381,67 @@ public sealed class TraceRecorder
     public static RunTrace ReadJson(string path)
         => JsonSerializer.Deserialize<RunTrace>(File.ReadAllText(path), JsonOptions)
            ?? throw new InvalidOperationException($"'{path}' did not deserialize to a run trace");
+
+    /// <summary>
+    /// Rebuilds a run trace from a line-delimited stream file — the format the
+    /// GUI tails during a live run. Tolerates a truncated final line and missing
+    /// <c>end</c>, because a run that is still going, or one that was cancelled,
+    /// leaves the file in exactly that state and the steps captured so far are
+    /// still worth showing.
+    /// </summary>
+    public static RunTrace ReadStream(string path)
+    {
+        RunHeader? header = null;
+        var nodes = new List<OpNode>();
+        var steps = new List<StepTrace>();
+        CausalInfo? causal = null;
+
+        foreach (string line in File.ReadLines(path))
+        {
+            if (line.Length == 0)
+            {
+                continue;
+            }
+            try
+            {
+                using var doc = JsonDocument.Parse(line);
+                string kind = doc.RootElement.TryGetProperty("kind", out var k)
+                    ? k.GetString() ?? string.Empty
+                    : string.Empty;
+                switch (kind)
+                {
+                    case "header":
+                        header = doc.RootElement.Deserialize<RunHeader>(JsonOptions);
+                        break;
+                    case "node":
+                        if (doc.RootElement.Deserialize<OpNode>(JsonOptions) is { } node)
+                        {
+                            nodes.Add(node);
+                        }
+                        break;
+                    case "step":
+                        if (doc.RootElement.Deserialize<StepTrace>(JsonOptions) is { } step)
+                        {
+                            steps.Add(step);
+                        }
+                        break;
+                    case "causal":
+                        causal = doc.RootElement.Deserialize<CausalInfo>(JsonOptions);
+                        break;
+                }
+            }
+            catch (JsonException)
+            {
+                // A partially flushed trailing line. Everything before it is
+                // still valid, and the next read will pick up the rest.
+            }
+        }
+
+        header ??= new RunHeader(string.Empty, string.Empty, string.Empty, 0,
+            nodes.Count == 0 ? 0 : nodes.Max(n => n.Layer) + 1,
+            Array.Empty<int>(), string.Empty, string.Empty);
+        return new RunTrace(header.Model, header.ComponentId, header.ContainerPath,
+            header.HiddenSize, header.Layers, header.PromptTokens, header.Sampling,
+            header.WeightWorkingSet, DateTime.UtcNow.ToString("O"), nodes, steps, causal);
+    }
 }
