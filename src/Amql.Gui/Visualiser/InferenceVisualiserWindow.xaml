@@ -40,6 +40,8 @@
                            Text="aggregate"/>
 
                 <Separator Margin="14,2" Width="1" Background="#FFD0D7E2"/>
+                <Button x:Name="CompareButton" Content="⇄ Compare with…" Click="OnCompare" Padding="8,3" Margin="0,0,4,0"
+                        ToolTip="Load a second trace of the same model and colour the map by how much each operator moved — the point of the whole exercise is judging an edit"/>
                 <Button Content="⤢ Fit" Click="OnFit" Padding="8,3" Margin="0,0,4,0"/>
                 <Button Content="Clear selection" Click="OnClearSelection" Padding="8,3"/>
             </StackPanel>
@@ -121,6 +123,7 @@
                             <ComboBoxItem Content="Mean activation" IsSelected="True"/>
                             <ComboBoxItem Content="Peak activation"/>
                             <ComboBoxItem Content="Mean time"/>
+                            <ComboBoxItem Content="Change vs baseline"/>
                         </ComboBox>
                         <CheckBox x:Name="WeightsOnlyCheck" Content="weights only" Margin="12,0,0,0"
                                   FontSize="11" VerticalAlignment="Center" IsChecked="True"

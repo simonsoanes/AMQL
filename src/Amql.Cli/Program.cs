@@ -79,6 +79,7 @@ internal static class Program
                 "generate" => Generate(args[1..]),
                 "inspect-token" => InspectToken(args[1..]),
                 "change-tensor" => ChangeTensor(args[1..]),
+                "edit-tensor" => EditTensor(args[1..]),
                 "save-lora" => SaveLora(args[1..]),
                 "export" => Export(args[1..]),
                 "to-gguf" => ToGguf(args[1..]),
@@ -699,6 +700,92 @@ internal static class Program
                 });
             Console.WriteLine($"           busiest operators: {string.Join(", ", top)}");
         }
+        return 0;
+    }
+
+    // ── edit-tensor: whole-tensor scale / zero / offset ────────────────────
+
+    /// <summary>
+    /// The whole-tensor counterpart to <c>change-tensor</c>. A single-cell edit
+    /// to a multi-million-element matrix is unmeasurable downstream, so it
+    /// cannot answer the question the inference visualiser exists to raise:
+    /// if I turn this tensor down, what happens?
+    /// </summary>
+    private static int EditTensor(string[] args)
+    {
+        var containerDir = Arg(args, 0) ?? throw new CliException(
+            "edit-tensor requires a container directory, e.g. 'amql-cli edit-tensor <container> target.decoder_stack 3.self_attn.q_proj.weight --scale 0.5 --out patch.safetensors'");
+        var pos = Positionals(args.Skip(1).ToArray(), "--out", "--set", "--add", "--scale", "--zero", "--patch");
+        var problems = new List<string>();
+        string? objectId = pos.Length > 0 ? pos[0] : null;
+        string? tensorName = pos.Length > 1 ? pos[1] : null;
+        if (objectId is null) problems.Add("missing object id (e.g. target.decoder_stack)");
+        if (tensorName is null) problems.Add("missing tensor name (e.g. 3.self_attn.q_proj.weight)");
+        if (pos.Length > 2)
+        {
+            problems.Add($"unexpected argument '{pos[2]}' — edit-tensor takes no cell index; "
+                + "use change-tensor to edit a single cell");
+        }
+        string? outPatch = OptionValue(args, "--out");
+        if (outPatch is null) problems.Add("missing '--out <patch.safetensors>'");
+        TensorEditOp op = TensorEditOp.Set;
+        float value = 0f;
+        try
+        {
+            op = ParseEditOp(args);
+            value = ParseEditValue(args, op);
+        }
+        catch (CliException e)
+        {
+            problems.Add(e.Message);
+        }
+        if (problems.Count > 0)
+        {
+            throw new CliException("edit-tensor is missing or rejects arguments:" + Environment.NewLine +
+                string.Join(Environment.NewLine, problems.Select(p => "  - " + p)));
+        }
+
+        string obj = objectId!;
+        string tensor = tensorName!;
+        string patchOut = outPatch!;
+        string? existingPath = File.Exists(patchOut) ? patchOut : null;
+        var existing = TensorPatchTools.LoadOrEmpty(existingPath);
+
+        using var container = Vindex3Container.Open(containerDir);
+        var result = TensorPatchTools.ApplyTensorEdit(container, obj, tensor, op, value, existing);
+
+        string describe = op switch
+        {
+            TensorEditOp.Scale => $"× {value:0.######}",
+            TensorEditOp.Add => $"+ {value:0.######}",
+            _ => $"set to {value:0.######}",
+        };
+
+        if (result.Removed)
+        {
+            if (existingPath is not null)
+            {
+                File.Delete(existingPath);
+                Console.WriteLine($"patch {existingPath}: '{obj}/{tensor}' is back at its base values; patch cleared.");
+            }
+            else
+            {
+                Console.WriteLine($"'{obj}/{tensor}': {describe} leaves it unchanged; nothing written.");
+            }
+            return 0;
+        }
+
+        WeightPatch.Save(patchOut, result.Entries, container.Index.Model);
+        double normChange = result.NormBefore == 0f
+            ? 0.0
+            : (result.NormAfter - result.NormBefore) / result.NormBefore * 100.0;
+        Console.WriteLine($"'{obj}/{tensor}' [{string.Join("x", result.Shape)}] {result.DtypeLabel}  "
+            + $"{result.ElementCount:N0} elements, every one edited ({describe})");
+        Console.WriteLine($"  mean element: {result.MeanBefore:0.######} → {result.MeanAfter:0.######}");
+        Console.WriteLine($"  tensor norm:  {result.NormBefore:0.###} → {result.NormAfter:0.###}  ({normChange:+0.##;-0.##;0}%)");
+        Console.WriteLine($"patch: {patchOut} ({result.Entries.Count} tensor{(result.Entries.Count == 1 ? string.Empty : "s")})");
+        Console.WriteLine("re-run and diff it against the baseline trace:");
+        Console.WriteLine($"  amql-cli generate {containerDir} --prompt \"…\" --patch {patchOut} --trace-json after.json");
         return 0;
     }
 
@@ -1802,6 +1889,9 @@ internal static class Program
                               [--tokenizer <checkpoint-dir>] [--component target]
                               [--patch <patch.safetensors>]
               amql-cli change-tensor <container-dir> <object> <tensor> <cell>
+                              (--set V | --add V | --scale F | --zero)
+                              --out <patch.safetensors>
+              amql-cli edit-tensor <container-dir> <object> <tensor>
                               (--set V | --add V | --scale F | --zero)
                               --out <patch.safetensors>
               amql-cli save-lora <patch.safetensors> --out <lora-dir>

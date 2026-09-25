@@ -155,4 +155,81 @@ public static class TraceMetrics
         int layers = trace.Nodes.Count == 0 ? 0 : trace.Nodes.Max(n => n.Layer) + 1;
         return (Math.Max(layers, trace.Layers), OpSlots(trace.Nodes).Count);
     }
+
+    /// <summary>
+    /// Differences two runs of the same model node by node. This is what makes
+    /// an edit judgeable: change one weight, re-run, and see what moved —
+    /// including everything downstream of the edit, which is where the
+    /// interesting effects are.
+    /// <para>
+    /// Nodes are matched on (layer, operator, weight) rather than on node id,
+    /// because ids are assigned in first-seen order during a run and are not
+    /// guaranteed to agree between two captures.
+    /// </para>
+    /// </summary>
+    public static IReadOnlyList<NodeDelta> Compare(RunTrace baseline, RunTrace modified)
+    {
+        var baseStats = Reduce(baseline);
+        var modStats = Reduce(modified);
+
+        var byKey = baseStats.ToDictionary(KeyOf);
+        var deltas = new List<NodeDelta>(modStats.Count);
+        foreach (var m in modStats)
+        {
+            if (!byKey.TryGetValue(KeyOf(m), out var b))
+            {
+                continue;   // an operator the baseline never ran
+            }
+            float absolute = m.MeanL2 - b.MeanL2;
+            float relative = Math.Abs(absolute) / Math.Max(MathF.Abs(b.MeanL2), 1e-6f);
+            deltas.Add(new NodeDelta(m.NodeId, m.Layer, m.Op, m.WeightObject, m.WeightTensor,
+                b.MeanL2, m.MeanL2, absolute, relative)
+            {
+                Intensity = 0f,
+            });
+        }
+
+        // Scale against the largest relative movement in this comparison, so
+        // the ramp always uses its full range whatever the size of the edit.
+        float peak = deltas.Count == 0 ? 0f : deltas.Max(d => d.RelativeChange);
+        if (peak > 0f)
+        {
+            for (int i = 0; i < deltas.Count; i++)
+            {
+                deltas[i] = deltas[i] with { Intensity = deltas[i].RelativeChange / peak };
+            }
+        }
+        return deltas;
+    }
+
+    /// <summary>True when two traces describe the same model, which is the
+    /// minimum for a comparison to mean anything.</summary>
+    public static bool Comparable(RunTrace a, RunTrace b)
+        => a.Layers == b.Layers && a.HiddenSize == b.HiddenSize && a.Nodes.Count == b.Nodes.Count;
+
+    private static (int, string, string?, string?) KeyOf(NodeStats s)
+        => (s.Layer, s.Op, s.WeightObject, s.WeightTensor);
+}
+
+/// <summary>How one operator moved between two runs. <see cref="Intensity"/> is
+/// the relative movement scaled to the largest movement in the comparison, for
+/// colouring; <see cref="AbsoluteChange"/> keeps the sign, so a renderer can use
+/// a diverging ramp and show shrinkage differently from growth.</summary>
+public sealed record NodeDelta(
+    int NodeId,
+    int Layer,
+    string Op,
+    string? WeightObject,
+    string? WeightTensor,
+    float BaselineMeanL2,
+    float ModifiedMeanL2,
+    float AbsoluteChange,
+    float RelativeChange)
+{
+    public float Intensity { get; init; }
+
+    public bool HasWeight => WeightObject is not null;
+
+    /// <summary>Did this operator get louder or quieter?</summary>
+    public bool Increased => AbsoluteChange > 0f;
 }

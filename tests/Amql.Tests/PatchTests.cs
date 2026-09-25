@@ -88,6 +88,80 @@ public class PatchTests
         Close(-0.5f, patched.Data[cell]);
     }
 
+    // ── whole-tensor edits ─────────────────────────────────────────────────
+
+    /// <summary>
+    /// A single-cell edit to a multi-million-element matrix is unmeasurable
+    /// downstream, so the visualiser's identify-edit-rerun loop needs the
+    /// tensor as a unit. Scaling every element must produce a delta of
+    /// (factor − 1) × base across the whole tensor, and the patched loader
+    /// must serve the scaled values.
+    /// </summary>
+    [Fact]
+    public void EditTensor_Scales_Every_Element_And_The_Loader_Sees_It()
+    {
+        using var dir = new TempDir();
+        var containerPath = WriteSynthContainer(dir);
+        const float factor = 0.5f;
+
+        TensorPatchTools.TensorEditResult result;
+        using (var container = Vindex3Container.Open(containerPath))
+        {
+            result = TensorPatchTools.ApplyTensorEdit(container, "target.embedding", "weight",
+                TensorEditOp.Scale, factor, Array.Empty<WeightPatchEntry>());
+        }
+
+        Assert.False(result.Removed);
+        Assert.Equal(12 * 4, result.ElementCount);
+        Close(result.NormBefore * factor, result.NormAfter, 1e-4f);
+        Close(result.MeanBefore * factor, result.MeanAfter, 1e-6f);
+
+        var entry = Assert.Single(result.Entries);
+        Assert.Equal("target.embedding/weight", entry.Key);
+        Assert.Equal(new long[] { 12, 4 }, entry.Shape);
+
+        using var open = Vindex3Container.Open(containerPath);
+        using var store = open.CreateOperandStore();
+        var resolution = store.Resolve("target.embedding", "weight");
+        var baseValues = BitPattern.WidenToF32(resolution.Dtype, resolution.Payload);
+
+        // delta = scaled − base = (factor − 1) × base, for every element
+        for (int i = 0; i < baseValues.Length; i++)
+        {
+            Close((factor - 1f) * baseValues[i], entry.Delta[i], 1e-6f);
+        }
+
+        // and the patched loader serves base + delta = base × factor
+        var plan = Planner.Plan(open, "target", store);
+        var patch = WeightPatch.FromEntries(result.Entries, "synth-patch");
+        var patched = new WeightLoader(store, patch).Matrix(plan.Embedding!.Table, 12, 4);
+        for (int i = 0; i < baseValues.Length; i++)
+        {
+            Close(baseValues[i] * factor, patched.Data[i], 1e-6f);
+        }
+    }
+
+    [Fact]
+    public void EditTensor_Zero_Clears_The_Tensor_And_Scaling_By_One_Records_Nothing()
+    {
+        using var dir = new TempDir();
+        var containerPath = WriteSynthContainer(dir);
+        using var container = Vindex3Container.Open(containerPath);
+
+        var zeroed = TensorPatchTools.ApplyTensorEdit(container, "target.embedding", "weight",
+            TensorEditOp.Set, 0f, Array.Empty<WeightPatchEntry>());
+        Assert.False(zeroed.Removed);
+        Assert.Equal(0f, zeroed.MeanAfter);
+        Assert.Equal(0f, zeroed.NormAfter);
+        Assert.Equal(12 * 4, Assert.Single(zeroed.Entries).Delta.Length);
+
+        // scaling by 1 leaves every delta at zero, so there is nothing to store
+        var identity = TensorPatchTools.ApplyTensorEdit(container, "target.embedding", "weight",
+            TensorEditOp.Scale, 1f, Array.Empty<WeightPatchEntry>());
+        Assert.Empty(identity.Entries);
+        Close(identity.NormBefore, identity.NormAfter, 1e-5f);
+    }
+
     [Fact]
     public void ApplyEdit_Add_Composes_Across_Runs()
     {

@@ -147,6 +147,153 @@ public static class TensorPatchTools
             resolution.Dtype.Label(), flatIndex, before, after, removed);
     }
 
+    /// <summary>Outcome of a whole-tensor edit.</summary>
+    public sealed record TensorEditResult(
+        IReadOnlyList<WeightPatchEntry> Entries,
+        string ObjectId,
+        string TensorName,
+        long[] Shape,
+        string DtypeLabel,
+        long ElementCount,
+        float MeanBefore,
+        float MeanAfter,
+        float NormBefore,
+        float NormAfter,
+        bool Removed);
+
+    /// <summary>
+    /// Applies an edit to EVERY element of a weight rather than to one cell.
+    /// Halving a single cell of a four-million-element matrix moves the model
+    /// by about one part in 10⁹, which no downstream measurement can see; the
+    /// inference visualiser's whole point is to change a tensor the map says
+    /// matters and watch what moves, and that needs the tensor as a unit.
+    /// <para>
+    /// Composes with existing patch entries exactly as <see cref="ApplyEdit"/>
+    /// does: the edit lands on base + delta, so repeated calls accumulate, and
+    /// an edit that returns the tensor to its base value removes the entry.
+    /// </para>
+    /// </summary>
+    public static TensorEditResult ApplyTensorEdit(
+        Vindex3Container container,
+        string objectId,
+        string tensorName,
+        TensorEditOp op,
+        float value,
+        IReadOnlyList<WeightPatchEntry> existing)
+    {
+        using var store = container.CreateOperandStore();
+        var resolution = store.ResolveWidened(objectId, tensorName);
+        if (resolution.Shape.Length is not (1 or 2))
+        {
+            throw new CliException(
+                $"tensor '{objectId}/{tensorName}' is {resolution.Shape.Length}-D " +
+                $"([{string.Join("x", resolution.Shape)}]) — patches edit 1-D vectors and 2-D matrices");
+        }
+
+        var baseValues = resolution.Values;
+        var current = (float[])baseValues.Clone();
+        var entries = existing.ToList();
+        string key = objectId + "/" + tensorName;
+        int found = entries.FindIndex(e => e.Key == key);
+        if (found >= 0)
+        {
+            var entry = entries[found];
+            if (entry.Delta.Length != current.Length)
+            {
+                throw new CliException(
+                    $"patch entry '{entry.Key}' holds {entry.Delta.Length} deltas but the tensor has " +
+                    $"{current.Length} elements — the patch was made for a different container");
+            }
+            for (int i = 0; i < current.Length; i++)
+            {
+                current[i] += entry.Delta[i];
+            }
+        }
+
+        float meanBefore = Mean(current);
+        float normBefore = Norm(current);
+        switch (op)
+        {
+            case TensorEditOp.Scale:
+                for (int i = 0; i < current.Length; i++)
+                {
+                    current[i] *= value;
+                }
+                break;
+            case TensorEditOp.Add:
+                for (int i = 0; i < current.Length; i++)
+                {
+                    current[i] += value;
+                }
+                break;
+            case TensorEditOp.Set:
+                Array.Fill(current, value);
+                break;
+            default:
+                throw new CliException($"unknown edit operation '{op}'");
+        }
+        float meanAfter = Mean(current);
+        float normAfter = Norm(current);
+
+        // Store the delta against base, which is what the patch format holds.
+        for (int i = 0; i < current.Length; i++)
+        {
+            current[i] -= baseValues[i];
+        }
+
+        bool removed;
+        if (WeightPatch.HasNonZero(current))
+        {
+            var entry = new WeightPatchEntry(objectId, tensorName, resolution.Shape, current);
+            if (found >= 0)
+            {
+                entries[found] = entry;
+            }
+            else
+            {
+                entries.Add(entry);
+            }
+            removed = false;
+        }
+        else if (found >= 0)
+        {
+            entries.RemoveAt(found);
+            removed = true;
+        }
+        else
+        {
+            removed = false;
+        }
+
+        return new TensorEditResult(entries, objectId, tensorName, resolution.Shape,
+            resolution.Dtype.Label(), current.Length, meanBefore, meanAfter,
+            normBefore, normAfter, removed);
+    }
+
+    private static float Mean(float[] values)
+    {
+        if (values.Length == 0)
+        {
+            return 0f;
+        }
+        double sum = 0;
+        for (int i = 0; i < values.Length; i++)
+        {
+            sum += values[i];
+        }
+        return (float)(sum / values.Length);
+    }
+
+    private static float Norm(float[] values)
+    {
+        double sumSq = 0;
+        for (int i = 0; i < values.Length; i++)
+        {
+            sumSq += (double)values[i] * values[i];
+        }
+        return (float)Math.Sqrt(sumSq);
+    }
+
     /// <summary>Loads an existing patch file, or an empty entry list when
     /// none exists yet.</summary>
     public static IReadOnlyList<WeightPatchEntry> LoadOrEmpty(string? patchPath)

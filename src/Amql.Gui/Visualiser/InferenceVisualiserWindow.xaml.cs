@@ -22,6 +22,8 @@ public sealed partial class InferenceVisualiserWindow : Window
     private sealed record RankRow(int NodeId, int Layer, string Op, string Display);
 
     private RunTrace? _trace;
+    private string? _tracePath;
+    private IReadOnlyList<NodeDelta> _deltas = Array.Empty<NodeDelta>();
 
     /// <summary>Set once construction has finished. Several controls declare a
     /// default state in XAML (<c>IsChecked="True"</c>, a selected ComboBoxItem),
@@ -61,13 +63,19 @@ public sealed partial class InferenceVisualiserWindow : Window
         }
     }
 
-    private void LoadTrace(string path)
+    private void LoadTrace(string path, bool quiet = false)
     {
         try
         {
-            var trace = TraceRecorder.ReadJson(path);
-            _trace = trace;
+            // Re-reading is skipped when only the chrome needs restoring, e.g.
+            // after leaving compare mode.
+            if (!quiet || _trace is null)
+            {
+                _trace = TraceRecorder.ReadJson(path);
+            }
+            _tracePath = path;
 
+            var trace = _trace!;
             ModelText.Text = trace.Model;
             SummaryText.Text =
                 $"{trace.Layers} layers · {trace.Nodes.Count} operators · {trace.Steps.Count} steps · {trace.HiddenSize} wide";
@@ -148,6 +156,83 @@ public sealed partial class InferenceVisualiserWindow : Window
     private void OnFit(object sender, RoutedEventArgs e) => Map.FitToView();
 
     private void OnClearSelection(object sender, RoutedEventArgs e) => Map.ClearSelection();
+
+    // ── comparison ─────────────────────────────────────────────────────────
+
+    /// <summary>Loads a second trace of the same model and recolours the map by
+    /// how much each operator moved. Clicking again clears the comparison. This
+    /// is the half of the loop that makes an edit judgeable: change a weight,
+    /// re-run with the same prompt, and diff the two runs.</summary>
+    private void OnCompare(object sender, RoutedEventArgs e)
+    {
+        if (Map.IsComparing)
+        {
+            ClearComparison();
+            return;
+        }
+        if (_trace is null)
+        {
+            MessageBox.Show(this, "Open a trace first.", "Inference Visualiser",
+                MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        var dialog = new OpenFileDialog
+        {
+            Title = "Open the baseline trace to compare against",
+            Filter = "Inference trace (*.json)|*.json|All files (*.*)|*.*",
+        };
+        if (dialog.ShowDialog(this) != true)
+        {
+            return;
+        }
+
+        try
+        {
+            var baseline = TraceRecorder.ReadJson(dialog.FileName);
+            if (!TraceMetrics.Comparable(baseline, _trace))
+            {
+                MessageBox.Show(this,
+                    $"These traces do not describe the same model:\n\n"
+                    + $"  loaded : {_trace.Model}, {_trace.Layers} layers, {_trace.Nodes.Count} operators\n"
+                    + $"  baseline: {baseline.Model}, {baseline.Layers} layers, {baseline.Nodes.Count} operators\n\n"
+                    + "Comparing them would line up unrelated operators.",
+                    "Inference Visualiser", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+
+            _deltas = TraceMetrics.Compare(baseline, _trace);
+            Map.SetComparison(_deltas.ToDictionary(d => d.NodeId));
+
+            CompareButton.Content = "⇄ Exit compare";
+            AggregateCheck.IsChecked = true;
+            MetricBox.IsEnabled = false;
+            RankBox.SelectedIndex = 3;
+            RefreshRanking();
+
+            int moved = _deltas.Count(d => d.RelativeChange > 0.01f);
+            SummaryText.Text =
+                $"comparing against {System.IO.Path.GetFileName(dialog.FileName)} · "
+                + $"{moved} of {_deltas.Count} operators moved >1%";
+            Title = $"Inference Visualiser — {System.IO.Path.GetFileName(_tracePath ?? "trace")} vs "
+                + $"{System.IO.Path.GetFileName(dialog.FileName)}";
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, $"Could not read the baseline trace:\n\n{ex.Message}",
+                "Inference Visualiser", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+    }
+
+    private void ClearComparison()
+    {
+        _deltas = Array.Empty<NodeDelta>();
+        Map.SetComparison(null);
+        CompareButton.Content = "⇄ Compare with…";
+        MetricBox.IsEnabled = true;
+        RankBox.SelectedIndex = 0;
+        LoadTrace(_tracePath!, quiet: true);
+    }
 
     // ── step detail ────────────────────────────────────────────────────────
 
@@ -262,6 +347,24 @@ public sealed partial class InferenceVisualiserWindow : Window
     {
         if (_trace is null || RankGrid is null)
         {
+            return;
+        }
+
+        // Comparing ranks a different type, so it builds its own rows.
+        if (RankBox.SelectedIndex == 3)
+        {
+            IEnumerable<NodeDelta> deltas = _deltas
+                .OrderByDescending(d => d.RelativeChange)
+                .ThenBy(d => d.NodeId);
+            if (WeightsOnlyCheck.IsChecked == true)
+            {
+                deltas = deltas.Where(d => d.HasWeight);
+            }
+            RankGrid.ItemsSource = deltas
+                .Select(d => new RankRow(d.NodeId, d.Layer, d.Op,
+                    $"{(d.Increased ? "+" : "−")}{d.RelativeChange * 100:F1}%   "
+                    + $"{d.BaselineMeanL2:F1} → {d.ModifiedMeanL2:F1}"))
+                .ToList();
             return;
         }
 

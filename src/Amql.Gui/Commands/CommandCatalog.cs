@@ -266,6 +266,22 @@ public static class CommandCatalog
                 Help: "patch.safetensors to write (existing patch is loaded and composed)."),
             PatchParam,
         }),
+        new("edit-tensor", CatPatching, "Scale, zero or offset an entire weight tensor into a patch file.", new[]
+        {
+            ContainerParam,
+            new ParamDef("objectId", "object id", ParamKind.Positional, EditorKind.Text, Help: "e.g. target.decoder_stack"),
+            new ParamDef("tensorName", "tensor name", ParamKind.Positional, EditorKind.Text, Help: "e.g. 3.self_attn.q_proj.weight"),
+            new ParamDef("op", "operation", ParamKind.Option, EditorKind.Choice, Flag: null, DefaultValue: "--scale",
+                Choices: new[] { "--scale", "--zero", "--add", "--set" },
+                Help: "Applied to every element. --scale 0.5 halves the tensor; --zero removes its "
+                      + "contribution entirely. To edit a single cell use change-tensor, though one "
+                      + "cell of a large matrix is too small to measure downstream."),
+            new ParamDef("value", "value", ParamKind.Option, EditorKind.Float, Flag: null,
+                Help: "Value for --scale/--add/--set (ignored for --zero)."),
+            new ParamDef("out", "--out patch", ParamKind.Option, EditorKind.File, Flag: "--out",
+                Help: "patch.safetensors to write (existing patch is loaded and composed)."),
+            PatchParam,
+        }),
         new("save-lora", CatPatching, "Factor a patch's 2-D deltas into lora_A/lora_B.", new[]
         {
             new ParamDef("patchFile", "patch file", ParamKind.Positional, EditorKind.File),

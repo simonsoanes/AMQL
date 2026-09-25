@@ -13,6 +13,8 @@ public enum MapMetric
     MaxL2,
     MeanMs,
     Step,
+    /// <summary>Difference against a baseline run, on a diverging ramp.</summary>
+    Compare,
 }
 
 /// <summary>
@@ -47,6 +49,7 @@ public sealed class ModelMapCanvas : FrameworkElement
     private IReadOnlyList<NodeStats> _stats = Array.Empty<NodeStats>();
     private IReadOnlyDictionary<int, NodeStats> _statsById = new Dictionary<int, NodeStats>();
     private IReadOnlyDictionary<int, float>? _stepValues;
+    private IReadOnlyDictionary<int, NodeDelta>? _deltas;
     private readonly Dictionary<int, Rect> _nodeRects = new();
     private readonly List<(int From, int To)> _edges = new();
     private readonly List<(int Layer, Rect Header)> _headers = new();
@@ -112,6 +115,19 @@ public sealed class ModelMapCanvas : FrameworkElement
         NodeSelected?.Invoke(null);
     }
 
+    /// <summary>Switches the map to difference-against-baseline colouring, or
+    /// back to the run aggregate when given null. The deltas are keyed by the
+    /// node ids of the trace currently on screen, which is the modified run.</summary>
+    public void SetComparison(IReadOnlyDictionary<int, NodeDelta>? deltas)
+    {
+        _deltas = deltas;
+        _stepValues = null;
+        Metric = deltas is null ? MapMetric.MeanL2 : MapMetric.Compare;
+        InvalidateVisual();
+    }
+
+    public bool IsComparing => _deltas is not null;
+
     /// <summary>Frames the whole map in the viewport.</summary>
     public void FitToView()
     {
@@ -157,6 +173,9 @@ public sealed class ModelMapCanvas : FrameworkElement
             _stats = Array.Empty<NodeStats>();
             _statsById = new Dictionary<int, NodeStats>();
             _stepValues = null;
+            _deltas = null;
+            _peakMaxL2 = 0f;
+            _peakMeanMs = 0f;
             _extent = default;
             InvalidateVisual();
             return;
@@ -165,6 +184,8 @@ public sealed class ModelMapCanvas : FrameworkElement
         _stats = TraceMetrics.Reduce(_trace);
         _statsById = _stats.ToDictionary(s => s.NodeId);
         _stepValues = null;
+        _deltas = null;
+        RecomputePeaks();
         var slots = TraceMetrics.OpSlots(_trace.Nodes);
 
         var columns = _stats
@@ -216,21 +237,59 @@ public sealed class ModelMapCanvas : FrameworkElement
     private NodeStats? StatsOf(int nodeId)
         => nodeId >= 0 && _statsById.TryGetValue(nodeId, out var s) ? s : null;
 
+    /// <summary>Peaks for normalising each metric, computed once per trace.
+    /// OnRender runs on every pan frame, so a Max() over all nodes inside the
+    /// per-node colour lookup would make redraw quadratic.</summary>
+    private float _peakMaxL2;
+    private float _peakMeanMs;
+
+    private void RecomputePeaks()
+    {
+        _peakMaxL2 = 0f;
+        _peakMeanMs = 0f;
+        foreach (var s in _stats)
+        {
+            if (s.MaxL2 > _peakMaxL2)
+            {
+                _peakMaxL2 = s.MaxL2;
+            }
+            if (s.MeanMs > _peakMeanMs)
+            {
+                _peakMeanMs = (float)s.MeanMs;
+            }
+        }
+    }
+
     /// <summary>The 0..1 value driving a node's colour: one step's normalised
-    /// magnitude when a step is selected, otherwise the run aggregate for the
-    /// chosen metric.</summary>
+    /// magnitude when a step is selected, the movement against a baseline when
+    /// comparing, otherwise the run aggregate for the chosen metric.</summary>
     private float IntensityOf(NodeStats s)
     {
+        if (_deltas is { } deltas)
+        {
+            return deltas.TryGetValue(s.NodeId, out var delta) ? delta.Intensity : 0f;
+        }
         if (_stepValues is { } sv)
         {
             return sv.TryGetValue(s.NodeId, out float v) ? v : 0f;
         }
         return Metric switch
         {
-            MapMetric.MaxL2 => Normalised(s.MaxL2, _stats.Max(x => x.MaxL2)),
-            MapMetric.MeanMs => Normalised((float)s.MeanMs, (float)_stats.Max(x => x.MeanMs)),
+            MapMetric.MaxL2 => Normalised(s.MaxL2, _peakMaxL2),
+            MapMetric.MeanMs => Normalised((float)s.MeanMs, _peakMeanMs),
             _ => s.Intensity,
         };
+    }
+
+    private Color ColorFor(NodeStats s)
+    {
+        float intensity = IntensityOf(s);
+        if (_deltas is { } deltas)
+        {
+            return DeltaColor(intensity,
+                deltas.TryGetValue(s.NodeId, out var delta) && delta.Increased);
+        }
+        return RampColor(intensity);
     }
 
     private static float Normalised(float value, float peak) => peak <= 0f ? 0f : value / peak;
@@ -250,6 +309,19 @@ public sealed class ModelMapCanvas : FrameworkElement
         var mid = Color.FromRgb(0xE8, 0xB4, 0x3C);
         var hot = Color.FromRgb(0xC0, 0x39, 0x2B);
         return t < 0.5f ? Lerp(cold, mid, t * 2f) : Lerp(mid, hot, (t - 0.5f) * 2f);
+    }
+
+    /// <summary>Diverging ramp for a comparison: blue for an operator that went
+    /// quieter than the baseline, red for one that got louder, grey for
+    /// unchanged. A single-hue ramp would hide the direction, and direction is
+    /// the whole point of diffing two runs.</summary>
+    internal static Color DeltaColor(float intensity, bool increased)
+    {
+        intensity = Math.Clamp(intensity, 0f, 1f);
+        var neutral = Color.FromRgb(0xD8, 0xDD, 0xE4);
+        var loud = Color.FromRgb(0xC0, 0x39, 0x2B);
+        var quiet = Color.FromRgb(0x1F, 0x6F, 0xEB);
+        return Lerp(neutral, increased ? loud : quiet, intensity);
     }
 
     // ── rendering ──────────────────────────────────────────────────────────
@@ -294,8 +366,12 @@ public sealed class ModelMapCanvas : FrameworkElement
             {
                 continue;
             }
-            float intensity = _statsById.TryGetValue(from, out var src) ? IntensityOf(src) : 0f;
-            var pen = new Pen(new SolidColorBrush(RampColor(intensity)), 1 + 5.5 * intensity)
+            if (!_statsById.TryGetValue(from, out var src))
+            {
+                continue;
+            }
+            float intensity = IntensityOf(src);
+            var pen = new Pen(new SolidColorBrush(ColorFor(src)), 1 + 5.5 * intensity)
             {
                 LineJoin = PenLineJoin.Round,
                 StartLineCap = PenLineCap.Round,
@@ -325,7 +401,7 @@ public sealed class ModelMapCanvas : FrameworkElement
         {
             var stats = _statsById[id];
             float intensity = IntensityOf(stats);
-            var fill = new SolidColorBrush(RampColor(intensity));
+            var fill = new SolidColorBrush(ColorFor(stats));
             var border = id == _selectedNode ? SelectedBorder
                 : id == _hoveredNode ? HoverBorder
                 : NodeBorder;
@@ -360,6 +436,9 @@ public sealed class ModelMapCanvas : FrameworkElement
                     MapMetric.MeanMs => $"{stats.MeanMs:F2} ms",
                     MapMetric.MaxL2 => $"max {stats.MaxL2:F1}",
                     MapMetric.Step => $"{intensity * 100:F0}%",
+                    MapMetric.Compare => _deltas is { } d && d.TryGetValue(id, out var delta)
+                        ? $"{(delta.Increased ? "+" : "−")}{delta.RelativeChange * 100:F0}%"
+                        : "—",
                     _ => $"‖·‖ {stats.MeanL2:F1}",
                 };
                 var sub = new FormattedText(value, CultureInfo.InvariantCulture, FlowDirection.LeftToRight,

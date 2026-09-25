@@ -204,4 +204,49 @@ public class TraceTests
         Assert.Empty(TraceMetrics.StepValues(run, 99));
         Assert.Equal((2, 14), TraceMetrics.LayoutSize(run));
     }
+
+    [Fact]
+    public void Compare_Matches_Nodes_By_Identity_Not_By_Interned_Id()
+    {
+        // Two runs of the same model whose operators were first seen in a
+        // different order, so the interned ids disagree. Matching on id would
+        // silently compare the wrong operators against each other.
+        var first = new TraceRecorder();
+        first.BeginStep(0);
+        first.Observe(Op(0, "attn_q", QProj, l2: 4f));
+        first.Observe(Op(0, "ffn_dense", KProj, l2: 2f));
+        first.EndStep(1, null, Array.Empty<TokenCandidate>(), 0f, 0f);
+        var baseline = first.ToRunTrace("m", "c", 8, 1, new[] { 1 }, "greedy", "F32");
+
+        var second = new TraceRecorder();
+        second.BeginStep(0);
+        second.Observe(Op(0, "ffn_dense", KProj, l2: 3f));   // seen first this run
+        second.Observe(Op(0, "attn_q", QProj, l2: 4f));
+        second.EndStep(1, null, Array.Empty<TokenCandidate>(), 0f, 0f);
+        var modified = second.ToRunTrace("m", "c", 8, 1, new[] { 1 }, "greedy", "F32");
+
+        // the ids genuinely do differ, so this test can fail
+        Assert.NotEqual(
+            baseline.Nodes.First(n => n.Op == "attn_q").Id,
+            modified.Nodes.First(n => n.Op == "attn_q").Id);
+        Assert.True(TraceMetrics.Comparable(baseline, modified));
+
+        var deltas = TraceMetrics.Compare(baseline, modified).ToDictionary(d => d.Op);
+        Assert.Equal(2, deltas.Count);
+
+        // unchanged operator
+        Assert.Equal(0f, deltas["attn_q"].AbsoluteChange, precision: 5);
+        Assert.Equal(0f, deltas["attn_q"].Intensity, precision: 5);
+
+        // the one that moved: 2 → 3
+        var moved = deltas["ffn_dense"];
+        Assert.Equal(2f, moved.BaselineMeanL2, precision: 5);
+        Assert.Equal(3f, moved.ModifiedMeanL2, precision: 5);
+        Assert.Equal(1f, moved.AbsoluteChange, precision: 5);
+        Assert.True(moved.Increased);
+        Assert.Equal(0.5f, moved.RelativeChange, precision: 5);   // 1 / 2
+        Assert.Equal(1f, moved.Intensity, precision: 5);          // largest movement in the run
+        Assert.True(moved.HasWeight);
+        Assert.Equal(KProj.TensorName, moved.WeightTensor);
+    }
 }
