@@ -46,28 +46,20 @@ public static class ModelFinetuner
         WeightPatch? basePatch = null)
     {
         if (lr <= 0)
-        {
             throw new MergeException("learning rate must be positive");
-        }
         if (epochs <= 0)
-        {
             throw new MergeException("epochs must be positive");
-        }
 
         var lines = File.ReadAllLines(dataPath);
         var pairs = ParsePairs(lines, dataPath);
         if (pairs.Count == 0)
-        {
             throw new MergeException($"'{dataPath}' contains no valid training pairs");
-        }
 
         using var store = container.CreateOperandStore();
         var plan = Planner.Plan(container, componentId, store);
         if (plan.Output is null)
-        {
             throw new MergeException(
                 $"component '{componentId}' carries no output head — fine-tuning needs one");
-        }
 
         int vocabSize = plan.Output.VocabSize;
         int hiddenSize = plan.Output.HiddenSize;
@@ -75,76 +67,67 @@ public static class ModelFinetuner
         string headTensorName = plan.Output.Projection.TensorName;
         bool headReusesEmbedding = plan.Output.ReusesEmbedding;
 
-        // Accumulate deltas in double precision to avoid cancellation.
+        // ── pre-encode every pair ─────────────────────────────────────
+        // Tokenize once so we don't re-tokenize per epoch.
+        var encoded = new List<(int[] PromptIds, int[] CompletionIds)>(pairs.Count);
+        foreach (var (prompt, completion) in pairs)
+        {
+            var pIds = tokenizer.EncodeToIds(prompt).ToArray();
+            var cIds = tokenizer.EncodeToIds(completion).ToArray();
+            if (pIds.Length > 0 && cIds.Length > 0)
+                encoded.Add((pIds, cIds));
+        }
+        if (encoded.Count == 0)
+            throw new MergeException($"'{dataPath}' contains no tokenizable training pairs");
+
+        // ── accumulator ────────────────────────────────────────────────
         var accum = new double[vocabSize * hiddenSize];
         int totalSteps = 0;
         var notes = new List<string>();
 
-        // Resolve the final-norm weight once (same for every forward).
-        var finalNormW = store.ResolveWidened(
-            plan.FinalNorm.Weight).Values;
+        // ── one runtime for the whole session (keeps weight cache warm) ─
+        var rt = new GenericRuntime(plan, store, basePatch);
+        var finalNormW = store.ResolveWidened(plan.FinalNorm.Weight).Values;
 
         for (int epoch = 0; epoch < epochs; epoch++)
         {
-            foreach (var (prompt, completion) in pairs)
+            foreach (var (promptIds, completionIds) in encoded)
             {
-                var promptIds = tokenizer.EncodeToIds(prompt).ToArray();
-                var completionIds = tokenizer.EncodeToIds(completion).ToArray();
-                if (promptIds.Length == 0 || completionIds.Length == 0)
-                {
-                    continue;
-                }
+                // Reset KV cache — keep weights loaded.
+                rt.ResetKvCache();
 
-                // Fresh runtime per pair — the KV cache and recurrent
-                // state are local to one example.
-                var rt = new GenericRuntime(plan, store, basePatch);
-
-                // ── prefill the prompt ──────────────────────────────────
+                // ── prefill the prompt ──────────────────────────────
                 var hidden = rt.Embed(promptIds);
                 var positions = Enumerable.Range(0, promptIds.Length).ToArray();
                 for (int layer = 0; layer < plan.Layers.Count; layer++)
-                {
-                    hidden = rt.RunLayerInternal(
-                        hidden, layer, positions, positions, appendKv: true);
-                }
-                int pos = promptIds.Length; // position of the next token
+                    hidden = rt.RunLayerInternal(hidden, layer, positions, positions, appendKv: true);
+                int pos = promptIds.Length;
 
-                // ── teacher-force each completion token ─────────────────
+                // ── teacher-force each completion token ─────────────
                 foreach (var targetId in completionIds)
                 {
                     if (targetId < 0 || targetId >= vocabSize)
                     {
-                        notes.Add(
-                            $"token {targetId} outside vocabulary [0, {vocabSize}) — skipped");
+                        notes.Add($"token {targetId} outside vocabulary — skipped");
                         break;
                     }
 
-                    // Clone before applying the in-place final norm.
                     var hNorm = hidden.Clone();
-                    Norms.ApplyInPlace(
-                        hNorm, plan.FinalNorm.Kind, plan.FinalNorm.Eps,
+                    Norms.ApplyInPlace(hNorm, plan.FinalNorm.Kind, plan.FinalNorm.Eps,
                         finalNormW, plan.FinalNorm.WeightOffset);
 
-                    // Δhead[target, :] += lr · h_norm
                     var row = hNorm.Row(hNorm.Rows - 1);
                     int baseOffset = targetId * hiddenSize;
                     for (int d = 0; d < hiddenSize; d++)
-                    {
                         accum[baseOffset + d] += lr * row[d];
-                    }
-
                     totalSteps++;
 
-                    // Step forward with the target token (teacher forcing).
-                    // Embed one token, run all layers, append KV.
+                    // Step forward with the target token.
                     hidden = rt.Embed(new[] { targetId });
                     var qpos = new[] { pos };
                     var kvpos = Enumerable.Range(0, pos + 1).ToArray();
                     for (int layer = 0; layer < plan.Layers.Count; layer++)
-                    {
-                        hidden = rt.RunLayerInternal(
-                            hidden, layer, qpos, kvpos, appendKv: true);
-                    }
+                        hidden = rt.RunLayerInternal(hidden, layer, qpos, kvpos, appendKv: true);
                     pos++;
                 }
             }

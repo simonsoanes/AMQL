@@ -442,6 +442,14 @@ public sealed class GenericRuntime
         }
     }
 
+    /// <summary>Clears the KV cache and resets session state — reuse the
+    /// same runtime for a new prompt without re-loading weights.</summary>
+    public void ResetKvCache()
+    {
+        Kv.Reset();
+        ResetSession();
+    }
+
     private LinearAttentionState StateFor(int layer, LinearAttentionOp op)
     {
         if (!_linearStates.TryGetValue(layer, out var state))
