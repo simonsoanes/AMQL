@@ -148,7 +148,7 @@ public static class OnnxExporter
 
             // Pre-attention RMSNorm
             string preAttnNormWeight = InitNorm(layerPrefix, l, "input_layernorm");
-            string normed = RmsNorm(N(), input, preAttnNormWeight, hidden, surface.Norm.Pre.Eps, nodes);
+            string normed = RmsNorm(N(), input, preAttnNormWeight, hidden, surface.Norm.Pre.Eps, nodes, initializers);
 
             // Q, K, V projections
             string qWeight = Init(layerPrefix, $"{l}.self_attn.q_proj.weight", new[] { numHeads * headDim, hidden });
@@ -169,7 +169,7 @@ public static class OnnxExporter
             // verbose in ONNX primitives. This emits a representative
             // single-head attention that ONNX Runtime can trace.
             string attnOut = SimpleAttention(N(), ropeOutQ, ropeOutK, v, "attention_mask",
-                MathF.Sqrt(headDim), numHeads, hidden, nodes);
+                MathF.Sqrt(headDim), numHeads, hidden, nodes, initializers);
 
             // Output projection
             string projOut = Gemm(N(), attnOut, oWeight, nodes);
@@ -179,7 +179,7 @@ public static class OnnxExporter
 
             // Pre-FFN RMSNorm
             string preFfnNormWeight = InitNorm(layerPrefix, l, "post_attention_layernorm");
-            string ffnNormed = RmsNorm(N(), postAttn, preFfnNormWeight, hidden, surface.Norm.Pre.Eps, nodes);
+            string ffnNormed = RmsNorm(N(), postAttn, preFfnNormWeight, hidden, surface.Norm.Pre.Eps, nodes, initializers);
 
             // Gated FFN: gate_proj, up_proj, down_proj
             string gateWeight = Init(layerPrefix, $"{l}.mlp.gate_proj.weight",
@@ -200,36 +200,30 @@ public static class OnnxExporter
 
         // ── Final norm ──────────────────────────────────────────────────
         string finalNormWeight = InitNorm("target.final_norm", -1, "weight");
-        current = RmsNorm(N(), current, finalNormWeight, hidden, surface.Norm.Pre.Eps, nodes);
+        current = RmsNorm(N(), current, finalNormWeight, hidden, surface.Norm.Pre.Eps, nodes, initializers);
 
         // ── Output ──────────────────────────────────────────────────────
         if (isClassifier)
         {
-            // Pool last-non-pad token → score head
             string pooled = PoolLast(N(), current, "attention_mask", nodes);
             string scoreWeight = Init("target.classifier_head", "weight",
                 new[] { surface.Classifier!.NumLabels, hidden });
-            string logits = Gemm(N(), pooled, scoreWeight, nodes);
+            Gemm("logits", pooled, scoreWeight, nodes);
             outputs.Add(new OnnxVar { Name = "logits", ElementType = OnnxTypes.Float,
                 Shape = new[] { OnnxDim.Parametric("batch"), OnnxDim.Fixed(surface.Classifier.NumLabels) }});
-            current = logits;
         }
         else if (isEmbedding)
         {
-            // Mean pool (masked) → L2 normalize
             string pooled = MeanPool(N(), current, "attention_mask", nodes);
-            string normed2 = L2Normalize(N(), pooled, nodes);
+            L2Normalize("embeddings", pooled, nodes);
             outputs.Add(new OnnxVar { Name = "embeddings", ElementType = OnnxTypes.Float,
                 Shape = new[] { OnnxDim.Parametric("batch"), OnnxDim.Fixed(hidden) }});
-            current = normed2;
         }
         else
         {
-            // Generative: MatMul with head
-            string logits = Gemm(N(), current, headWeightName!, nodes);
+            Gemm("logits", current, headWeightName!, nodes);
             outputs.Add(new OnnxVar { Name = "logits", ElementType = OnnxTypes.Float,
                 Shape = new[] { OnnxDim.Parametric("batch"), OnnxDim.Parametric("seq"), OnnxDim.Fixed(vocab) }});
-            current = logits;
         }
 
         var onnxGraph = new OnnxGraph
@@ -241,7 +235,7 @@ public static class OnnxExporter
             Initializers = initializers,
         };
 
-        OnnxWriter.Write(outPath, onnxGraph);
+        OnnxWriter.Write(outPath, onnxGraph, outPath + ".data");
 
         return new OnnxExportResult(outPath, container.Index.Model, nodes.Count, initializers.Count);
     }
@@ -282,7 +276,7 @@ public static class OnnxExporter
     }
 
     private static string RmsNorm(string name, string input, string weight, int hidden, double eps,
-        List<OnnxNode> nodes)
+        List<OnnxNode> nodes, List<OnnxInitializer> initializers)
     {
         // RMSNorm: x * weight * rsqrt(mean(x^2) + eps)
         // Built from ReduceMean, Sqrt, Div, Mul, Add, Reciprocal.
@@ -297,7 +291,11 @@ public static class OnnxExporter
             Attributes = { ["axes"] = new[] { -1 }, ["keepdims"] = 1L },
         });
         string epsInit = $"{name}_eps";
-        // Add eps to initializers (scalar)
+        initializers.Add(new OnnxInitializer
+        {
+            Name = epsInit, DataType = OnnxTypes.Float, Dims = new long[] { 1 },
+            RawData = F32ToRaw(new[] { (float)eps }),
+        });
         string epsPlus = $"{name}_ep";
         nodes.Add(new OnnxNode
         {
@@ -313,10 +311,21 @@ public static class OnnxExporter
             Inputs = new[] { $"{rsqrt}_tmp" },
             Outputs = new[] { rsqrt },
         });
-        // We need to add the eps initializer here — it will be handled by caller
         string scaled = $"{name}_sc";
         nodes.Add(new OnnxNode { OpType = "Mul", Inputs = new[] { input, rsqrt }, Outputs = new[] { scaled } });
         nodes.Add(new OnnxNode { OpType = "Mul", Inputs = new[] { scaled, weight }, Outputs = new[] { name } });
+        return name;
+    }
+
+    static string AddInt64Scalar(string name, long value, List<OnnxNode> nodes, List<OnnxInitializer> initializers)
+    {
+        initializers.Add(new OnnxInitializer
+        {
+            Name = name, DataType = OnnxTypes.Int64, Dims = new long[] { 1 },
+            RawData = BitConverter.GetBytes(value),
+        });
+        nodes.Add(new OnnxNode { OpType = "Constant", Inputs = Array.Empty<string>(), Outputs = new[] { name },
+            Attributes = { ["value_int"] = value } });
         return name;
     }
 
@@ -394,20 +403,20 @@ public static class OnnxExporter
 
         // freqs = pos[:, None] * inv_freq[None, :] → [seq_len, halfDim]
         string posUnsq = $"{name}_pu";
+        string posAxesInit = AddInt64Scalar($"{name}_pa", 1, nodes, initializers);
         nodes.Add(new OnnxNode
         {
             OpType = "Unsqueeze",
-            Inputs = new[] { posFloat },
+            Inputs = new[] { posFloat, posAxesInit },
             Outputs = new[] { posUnsq },
-            Attributes = { ["axes"] = new[] { 1L } }, // [seq_len, 1]
         });
         string freqUnsq = $"{name}_fu";
+        string freqAxesInit = AddInt64Scalar($"{name}_fa", 0, nodes, initializers);
         nodes.Add(new OnnxNode
         {
             OpType = "Unsqueeze",
-            Inputs = new[] { invFreqName },
+            Inputs = new[] { invFreqName, freqAxesInit },
             Outputs = new[] { freqUnsq },
-            Attributes = { ["axes"] = new[] { 0L } }, // [1, halfDim]
         });
         string freqsName = $"{name}_fr";
         nodes.Add(new OnnxNode
@@ -444,19 +453,18 @@ public static class OnnxExporter
         // Broadcast cos/sin for batch dim: unsqueeze at axis 0
         string cosBName = $"{name}_cos_b";
         string sinBName = $"{name}_sin_b";
+        string bcastAxes = AddInt64Scalar($"{name}_ba", 0, nodes, initializers);
         nodes.Add(new OnnxNode
         {
             OpType = "Unsqueeze",
-            Inputs = new[] { cos2Name },
+            Inputs = new[] { cos2Name, bcastAxes },
             Outputs = new[] { cosBName },
-            Attributes = { ["axes"] = new[] { 0L } },
         });
         nodes.Add(new OnnxNode
         {
             OpType = "Unsqueeze",
-            Inputs = new[] { sin2Name },
+            Inputs = new[] { sin2Name, bcastAxes },
             Outputs = new[] { sinBName },
-            Attributes = { ["axes"] = new[] { 0L } },
         });
 
         // Split x's last dim into two halves (even/odd pairs)
@@ -588,8 +596,9 @@ public static class OnnxExporter
         // Unsqueeze back to [B, S, D/2, 1], then Concat
         string reU = $"{name}_reu";
         string roU = $"{name}_rou";
-        nodes.Add(new OnnxNode { OpType = "Unsqueeze", Inputs = new[] { rotEven }, Outputs = new[] { reU }, Attributes = { ["axes"] = new[] { 3L } } });
-        nodes.Add(new OnnxNode { OpType = "Unsqueeze", Inputs = new[] { rotOdd }, Outputs = new[] { roU }, Attributes = { ["axes"] = new[] { 3L } } });
+        string rotAxesName = AddInt64Scalar($"{name}_ra", 3, nodes, initializers);
+        nodes.Add(new OnnxNode { OpType = "Unsqueeze", Inputs = new[] { rotEven, rotAxesName }, Outputs = new[] { reU } });
+        nodes.Add(new OnnxNode { OpType = "Unsqueeze", Inputs = new[] { rotOdd, rotAxesName }, Outputs = new[] { roU } });
 
         string rotConcat = $"{name}_rc";
         nodes.Add(new OnnxNode
@@ -612,10 +621,15 @@ public static class OnnxExporter
     }
 
     private static string SimpleAttention(string name, string q, string k, string v,
-        string maskName, float scale, int numHeads, int hidden, List<OnnxNode> nodes)
+        string maskName, float scale, int numHeads, int hidden, List<OnnxNode> nodes,
+        List<OnnxInitializer> initializers)
     {
-        // Scale Q
         string scaleInit = $"{name}_scale";
+        initializers.Add(new OnnxInitializer
+        {
+            Name = scaleInit, DataType = OnnxTypes.Float, Dims = new long[] { 1 },
+            RawData = F32ToRaw(new[] { scale }),
+        });
         string qScaled = $"{name}_qs";
         nodes.Add(new OnnxNode
         {
@@ -685,7 +699,7 @@ public static class OnnxExporter
             OpType = "Constant",
             Inputs = Array.Empty<string>(),
             Outputs = new[] { gatherIdx },
-            Attributes = { ["value"] = new[] { -1 } },
+            Attributes = { ["value_ints"] = new[] { -1 } },
         });
         string gathered = $"{name}_g";
         nodes.Add(new OnnxNode

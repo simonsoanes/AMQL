@@ -26,7 +26,7 @@ internal sealed class ProtoWriter : IDisposable
     public void Float(int field, float v) { Tag(field, Fixed32); WriteFixed32(v); }
     public void String(int field, string v) { Tag(field, LengthDelim); WriteBytes(System.Text.Encoding.UTF8.GetBytes(v)); }
     public void Bytes(int field, byte[] v) { Tag(field, LengthDelim); WriteBytes(v); }
-    public void Message(int field, Action write) { Tag(field, LengthDelim); var ms = new MemoryStream(); var w = new ProtoWriter(ms); write(); w.Dispose(); var b = ms.ToArray(); WriteBytes(b); }
+    public void Message(int field, Action<ProtoWriter> write) { Tag(field, LengthDelim); var ms = new MemoryStream(); var inner = new ProtoWriter(ms); write(inner); inner.Dispose(); var b = ms.ToArray(); WriteBytes(b); }
 
     // ── wire encoders ──────────────────────────────────────────────────
 
@@ -124,127 +124,151 @@ public sealed class OnnxGraph
 }
 
 /// <summary>Serialises an OnnxGraph to the binary .onnx format
-/// (ModelProto wrapped in a protobuf stream).</summary>
+/// (ModelProto wrapped in a protobuf stream).
+///
+/// When <paramref name="externalDataPath"/> is non-null, initializer
+/// payloads are written to that file and referenced by offset/length
+/// in the protobuf — required for models whose on-disk weights exceed
+/// the 2 GiB protobuf message limit.</summary>
 public static class OnnxWriter
 {
-    public static void Write(string path, OnnxGraph graph)
+    private const string ExtLocation = "location";
+    private const string ExtOffset = "offset";
+    private const string ExtLength = "length";
+
+    public static void Write(string path, OnnxGraph graph, string? externalDataPath = null)
     {
+        string? dataFileName = externalDataPath is { } fname
+            ? Path.GetFileName(fname)
+            : null;
+        using var dataFile = externalDataPath is { } extPath
+            ? File.Create(extPath)
+            : null;
+
+        // Pre-compute external-data offsets so we don't need mutable
+        // state smuggled into lambdas.
+        long offset = 0;
+        var offsets = new long[graph.Initializers.Count];
+        for (int i = 0; i < graph.Initializers.Count; i++)
+        {
+            offsets[i] = offset;
+            offset += graph.Initializers[i].RawData.Length;
+        }
+
         using var fs = File.Create(path);
         using var w = new ProtoWriter(fs);
 
-        // ModelProto
-        w.Message(1, () =>
+        // ModelProto — fields written directly; no wrapper.
+        w.Int64(1, 10);                          // ir_version = 10
+        w.Message(8, inner =>                    // opset_import
         {
-            w.Int64(1, 10);                          // ir_version = 10
-            w.Message(8, () =>                        // opset_import
+            inner.String(1, OnnxOpsets.Domain);
+            inner.Int64(2, OnnxOpsets.Version);
+        });
+        w.String(2, "amql-cli");                  // producer_name
+
+        // GraphProto (field 7 of ModelProto)
+        w.Message(7, g =>
+        {
+            g.String(2, graph.Name);
+
+            foreach (var node in graph.Nodes)
             {
-                w.String(1, OnnxOpsets.Domain);
-                w.Int64(2, OnnxOpsets.Version);
-            });
-            w.String(2, "amql-cli");                  // producer_name
+                g.Message(1, n => WriteNode(n, node));
+            }
 
-            // GraphProto (field 7 of ModelProto)
-            w.Message(7, () =>
+            int initIdx = 0;
+            foreach (var init in graph.Initializers)
             {
-                // name
-                w.String(2, graph.Name);
+                long initOffset = offsets[initIdx++];
+                g.Message(5, i => WriteInitializer(i, init, dataFile, dataFileName, initOffset));
+            }
 
-                // node (repeated, field 1)
-                foreach (var node in graph.Nodes)
-                {
-                    w.Message(1, () => WriteNode(w, node));
-                }
+            foreach (var input in graph.Inputs)
+            {
+                g.Message(11, vi => WriteValueInfo(vi, input));
+            }
 
-                // initializer (repeated, field 5)
-                foreach (var init in graph.Initializers)
-                {
-                    w.Message(5, () => WriteInitializer(w, init));
-                }
-
-                // input (repeated, field 11)
-                foreach (var input in graph.Inputs)
-                {
-                    w.Message(11, () => WriteValueInfo(w, input));
-                }
-
-                // output (repeated, field 12)
-                foreach (var output in graph.Outputs)
-                {
-                    w.Message(12, () => WriteValueInfo(w, output));
-                }
-            });
+            foreach (var output in graph.Outputs)
+            {
+                g.Message(12, vo => WriteValueInfo(vo, output));
+            }
         });
     }
 
     private static void WriteNode(ProtoWriter w, OnnxNode node)
     {
-        // input (repeated string, field 1)
         foreach (var i in node.Inputs) w.String(1, i);
-        // output (repeated string, field 2)
         foreach (var o in node.Outputs) w.String(2, o);
-        // op_type (string, field 4)
         w.String(4, node.OpType);
-        // attribute (repeated, field 5)
         foreach (var (name, value) in node.Attributes)
         {
-            w.Message(5, () =>
+            w.Message(5, a =>
             {
-                w.String(1, name); // name
+                a.String(1, name);
                 switch (value)
                 {
-                    case float f: w.Float(2, f); break;            // f
-                    case long l: w.Int64(3, l); break;             // i
-                    case string s: w.String(4, s); break;          // s
-                    case int[] ints:                               // ints
-                        foreach (var ii in ints) w.Int64(8, ii);   // packed repeated
+                    case float f:
+                        a.Int32(20, 1); a.Float(2, f); break;
+                    case long l:
+                        a.Int32(20, 2); a.Int64(3, l); break;
+                    case string s:
+                        a.Int32(20, 3); a.String(4, s); break;
+                    case int[] ints:
+                        a.Int32(20, 7);
+                        foreach (var ii in ints) a.Int64(8, ii);
+                        break;
+                    case long[] longs:
+                        a.Int32(20, 7);
+                        foreach (var ll in longs) a.Int64(8, ll);
                         break;
                 }
             });
         }
     }
 
-    private static void WriteInitializer(ProtoWriter w, OnnxInitializer init)
+    private static void WriteInitializer(ProtoWriter w, OnnxInitializer init,
+        Stream? dataFile, string? dataFileName, long offset)
     {
-        // dims (repeated int64, field 1)
         foreach (var d in init.Dims) w.Int64(1, d);
-        // data_type (int32, field 2)
         w.Int32(2, init.DataType);
-        // name (string, field 8)
         w.String(8, init.Name);
-        // raw_data (bytes, field 9)
-        w.Bytes(9, init.RawData);
+
+        if (dataFile is not null && dataFileName is not null)
+        {
+            long length = init.RawData.Length;
+            dataFile.Write(init.RawData);
+            w.Int32(14, 1);
+            w.Message(13, e => { e.String(1, ExtLocation); e.String(2, dataFileName); });
+            w.Message(13, e => { e.String(1, ExtOffset); e.String(2, offset.ToString()); });
+            w.Message(13, e => { e.String(1, ExtLength); e.String(2, length.ToString()); });
+        }
+        else
+        {
+            w.Bytes(9, init.RawData);
+        }
     }
 
     private static void WriteValueInfo(ProtoWriter w, OnnxVar var)
     {
-        // name (string, field 1)
         w.String(1, var.Name);
-        // type (TypeProto, field 2)
-        w.Message(2, () =>
+        w.Message(2, t =>
         {
-            // tensor_type (TensorTypeProto, field 1)
-            w.Message(1, () =>
+            t.Message(1, tt =>
             {
-                // elem_type (int32, field 1)
-                w.Int32(1, var.ElementType);
-                // shape (TensorShapeProto, field 2)
+                tt.Int32(1, var.ElementType);
                 if (var.Shape is { } shape)
                 {
-                    w.Message(2, () =>
+                    tt.Message(2, s =>
                     {
                         foreach (var dim in shape)
                         {
-                            w.Message(1, () =>
+                            s.Message(1, d =>
                             {
                                 if (dim.Value is { } v && dim.Param is null)
-                                {
-                                    w.Int64(1, v);  // dim_value
-                                }
+                                    d.Int64(1, v);
                                 else if (dim.Param is { } p)
-                                {
-                                    w.String(2, p); // dim_param
-                                }
-                                // else: empty dimension (unknown)
+                                    d.String(2, p);
                             });
                         }
                     });
