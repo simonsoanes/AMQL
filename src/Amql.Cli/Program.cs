@@ -555,6 +555,7 @@ internal static class Program
     {
         var containerDir = Arg(args, 0) ?? throw new CliException("generate requires a container directory");
         string? prompt = OptionValue(args, "--prompt");
+        bool useChat = HasOption(args, "--chat");
 
         // Prompt mode: the tokenizer comes from --tokenizer, or from the
         // container when encode placed a tokenizer.json beside it.
@@ -565,6 +566,18 @@ internal static class Program
         {
             tokenizerSource = ResolveTokenizerDir(containerDir, args);
             tokenizer = Tokenizer(tokenizerSource);
+
+            if (useChat)
+            {
+                string? chatTmpl = ChatTemplate.Load(tokenizerSource);
+                if (chatTmpl is null)
+                    throw new CliException("--chat requires a chat template, but none was found in " +
+                        "chat_template.jinja or tokenizer_config.json at the tokenizer directory");
+                string? system = OptionValue(args, "--system");
+                prompt = ChatTemplate.Apply(chatTmpl, prompt, system);
+                Console.WriteLine("chat:      prompt formatted via chat template");
+            }
+
             tokens = tokenizer.EncodeToIds(prompt).ToArray();
             if (tokens.Length == 0)
             {
