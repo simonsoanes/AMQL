@@ -68,6 +68,8 @@ internal static class OnnxTypes
     public const int Float = 1;
     public const int Int64 = 7;
     public const int String = 8;
+    public const int Float16 = 10;
+    public const int Int4 = 22; // opset 21+
 }
 
 /// <summary>ONNX operator set we target.</summary>

@@ -1967,7 +1967,6 @@ internal static class Program
         string outPath = OptionValue(args, "--out") ?? throw new CliException("export-onnx requires '--out <model.onnx>'");
         string component = OptionValue(args, "--component") ?? "target";
         bool int4 = Array.IndexOf(args, "--int4") >= 0;
-        Console.Error.WriteLine($"DEBUG int4={int4} args=[{string.Join(", ", args)}]");
 
         using var container = Vindex3Container.Open(containerDir);
         var patch = LoadPatch(args, container);
