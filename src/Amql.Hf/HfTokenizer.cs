@@ -113,9 +113,26 @@ public sealed class HfTokenizer
             var merges = model.GetProperty("merges");
             for (int i = 0; i < merges.GetArrayLength(); i++)
             {
-                var pair = merges[i].GetString() ?? throw new TokenizerException($"'{path}': null merge entry at {i}");
-                int splitAt = (pair.Length - 1) - ' ';
-                splitAt = pair.LastIndexOf(' ');
+                // tokenizers ≤ 0.20 writes a merge as one "left right" string;
+                // ≥ 0.21 (Granite's file) writes the pair as a two-element
+                // array. Joining the parts with the separator reproduces the
+                // string form exactly, so both rank identically.
+                var entry = merges[i];
+                string pair;
+                if (entry.ValueKind == JsonValueKind.Array)
+                {
+                    if (entry.GetArrayLength() != 2)
+                    {
+                        throw new TokenizerException(
+                            $"'{path}': merge entry {i} is an array of {entry.GetArrayLength()} parts, expected 2");
+                    }
+                    pair = $"{entry[0].GetString()} {entry[1].GetString()}";
+                }
+                else
+                {
+                    pair = entry.GetString() ?? throw new TokenizerException($"'{path}': null merge entry at {i}");
+                }
+                int splitAt = pair.LastIndexOf(' ');
                 if (splitAt <= 0)
                 {
                     throw new TokenizerException($"'{path}': malformed merge '{pair}'");
@@ -177,6 +194,11 @@ public sealed class HfTokenizer
         }
     }
 
+    /// <summary>The canonical GPT-2 split regex tokenizers applies under
+    /// ByteLevel(use_regex=true) — the pre-tokenizer Granite's file declares.</summary>
+    private const string Gpt2SplitPattern =
+        @"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+";
+
     private static Regex BuildSplitRegex(JsonElement root)
     {
         string? pattern = null;
@@ -185,7 +207,16 @@ public sealed class HfTokenizer
             switch (pre.GetProperty("type").GetString())
             {
                 case "ByteLevel":
-                    break; // no splitting; regex = null → whole-string tokens
+                    // A bare ByteLevel with use_regex=true IS the GPT-2
+                    // pre-tokenizer: tokenizers applies the canonical GPT-2
+                    // split regex under that flag (Granite's tokenizer.json
+                    // is exactly this shape). Without the flag there is no
+                    // split of our own to judge.
+                    if (pre.TryGetProperty("use_regex", out var useRegex) && useRegex.GetBoolean())
+                    {
+                        pattern = Gpt2SplitPattern;
+                    }
+                    break;
                 case "Sequence":
                 {
                     foreach (var child in pre.GetProperty("pretokenizers").EnumerateArray())

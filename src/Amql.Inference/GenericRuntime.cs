@@ -94,21 +94,21 @@ public sealed class GenericRuntime
             long t = TraceStart;
             var mixerOut = RunLinearAttention(h, layer, linear);
             Report(layer, "linear_attn", null, mixerOut, t);
-            AddInPlace(x, mixerOut);
+            AddResidualInPlace(x, mixerOut);
         }
         else if (layerPlan.Conv is { } conv)
         {
             long t = TraceStart;
             var mixerOut = RunConv(h, layer, conv);
             Report(layer, "conv", null, mixerOut, t);
-            AddInPlace(x, mixerOut);
+            AddResidualInPlace(x, mixerOut);
         }
         else
         {
             long t = TraceStart;
             var mixerOut = RunSoftmaxAttention(h, layer, layerPlan, queryPositions, kvPositions, appendKv);
             Report(layer, "softmax_attn", null, mixerOut, t);
-            AddInPlace(x, mixerOut);
+            AddResidualInPlace(x, mixerOut);
         }
 
         // Pre-FFN norm.
@@ -152,7 +152,7 @@ public sealed class GenericRuntime
                 Norms.ApplyInPlace(ffnOut, postFfnNorm.Kind, postFfnNorm.Eps, postFfnW, postFfnNorm.WeightOffset);
                 Report(layer, "post_ffn_norm", postFfnNorm.Weight, ffnOut, tn);
             }
-            AddInPlace(x, ffnOut);
+            AddResidualInPlace(x, ffnOut);
         }
 
         ApplyPatches(x, layer, queryPositions);
@@ -160,6 +160,22 @@ public sealed class GenericRuntime
         // an operation with a duration of its own.
         Report(layer, "residual_out", null, x, 0);
         return x;
+    }
+
+    /// <summary>Granite's decoder join is h' = h·residual_multiplier + branch
+    /// at BOTH the mixer and the FFN add; families without the knob carry
+    /// scale 1.0 and this is the plain add.</summary>
+    private void AddResidualInPlace(Tensor2D x, Tensor2D branch)
+    {
+        double scale = _plan.ResidualScale;
+        if (scale != 1.0)
+        {
+            for (int i = 0; i < x.Data.Length; i++)
+            {
+                x.Data[i] = (float)(x.Data[i] * scale);
+            }
+        }
+        AddInPlace(x, branch);
     }
 
     // ── softmax attention mixer ─────────────────────────────────────────────

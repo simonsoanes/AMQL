@@ -88,7 +88,11 @@ public static class ArchMapper
                 NumQHeads = facts.NumQueryHeads,
                 NumKvHeads = facts.NumKvHeads,
                 HeadDim = facts.HeadDim,
-                ScoreScale = 1.0 / Math.Sqrt(facts.HeadDim),
+                // Granite replaces the usual 1/sqrt(head_dim) with an explicit
+                // attention_multiplier; families that do not declare one get the
+                // standard scale. Reading it here rather than defaulting is what
+                // keeps a Granite import numerically faithful.
+                ScoreScale = facts.AttentionMultiplier ?? 1.0 / Math.Sqrt(facts.HeadDim),
                 QkNormScope = QkNormScope.PerHead,
                 QkNormWeightOffset = NormWeightOffsetFor(facts.ModelType),
                 AttentionBias = facts.AttentionBias,
@@ -122,7 +126,20 @@ public static class ArchMapper
             {
                 VocabSize = facts.VocabSize,
                 HeadReusesEmbedding = facts.TieWordEmbeddings,
+                // Granite's embedding_multiplier scales every looked-up row; the
+                // runtime applies EmbeddingOp.Scale, so carrying it here is what
+                // makes the knob live rather than decorative.
+                EmbedScale = facts.EmbeddingMultiplier,
+                // Granite divides the logits by logits_scaling; the head op
+                // multiplies, so the two are reciprocals.
+                OutputMultiplier = facts.LogitsScaling is { } scaling && scaling != 0.0
+                    ? 1.0 / scaling
+                    : null,
             },
+            // Granite multiplies the incoming stream by residual_multiplier at
+            // BOTH decoder adds (h' = h*rm + branch); the runtime scales the
+            // residual before each AddInPlace when this is set.
+            ResidualScale = facts.ResidualMultiplier,
             LinearAttention = facts.LinearAttention is { } la
                 ? JsonSerializer.SerializeToElement(new
                 {
@@ -675,7 +692,11 @@ public static class ArchMapper
                 NumQHeads = facts.NumQueryHeads,
                 NumKvHeads = facts.NumKvHeads,
                 HeadDim = facts.HeadDim,
-                ScoreScale = 1.0 / Math.Sqrt(facts.HeadDim),
+                // Granite replaces the usual 1/sqrt(head_dim) with an explicit
+                // attention_multiplier; families that do not declare one get the
+                // standard scale. Reading it here rather than defaulting is what
+                // keeps a Granite import numerically faithful.
+                ScoreScale = facts.AttentionMultiplier ?? 1.0 / Math.Sqrt(facts.HeadDim),
             },
             Ffn = new FfnSurface
             {

@@ -20,6 +20,7 @@ public class InferenceTests
         int T = tokens.Length;
         float eps = (float)d.NormEps;
         float scale = (float)(1.0 / Math.Sqrt(d.HeadDim));
+        float rm = (float)d.ResidualScale;
 
         float[] Wm(int rows, int cols, int salt, int l)
         {
@@ -192,7 +193,7 @@ public class InferenceTests
             var o = MatMulTransposedB(ao, T, qDim, Wm(hidden, qDim, 5, l), hidden);
             for (int i = 0; i < x.Length; i++)
             {
-                x[i] += o[i];
+                x[i] = x[i] * rm + o[i];
             }
 
             // Pre-FFN norm.
@@ -211,7 +212,7 @@ public class InferenceTests
             var down = MatMulTransposedB(up, T, d.Intermediate, Wm(hidden, d.Intermediate, 8, l), hidden);
             for (int i = 0; i < x.Length; i++)
             {
-                x[i] += down[i];
+                x[i] = x[i] * rm + down[i];
             }
         }
 
@@ -274,6 +275,22 @@ public class InferenceTests
     public void Prefill_Matches_NaiveReference()
     {
         var d = new Dims();
+        var tokens = new[] { 1, 3, 5 };
+        using var dir = new TempDir();
+        var containerPath = EncodeTo(SyntheticModel.BuildSpec(d), dir);
+
+        var actual = RunRuntime(containerPath, d, tokens);
+        var expected = NaiveForward(d, tokens, applyRope: true, window: null);
+
+        AssertClose(actual, LastRowOf(expected, d), 2e-3);
+    }
+
+    [Fact]
+    public void ResidualScale_Matches_NaiveReference()
+    {
+        // Granite's decoder join (h' = h·rm + branch) at both adds; the naive
+        // reference applies the same scale independently of the runtime.
+        var d = new Dims(ResidualScale: 0.5);
         var tokens = new[] { 1, 3, 5 };
         using var dir = new TempDir();
         var containerPath = EncodeTo(SyntheticModel.BuildSpec(d), dir);

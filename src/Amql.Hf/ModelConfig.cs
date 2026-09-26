@@ -71,7 +71,11 @@ public sealed record TextArchitectureFacts(
     LinearAttentionFacts? LinearAttention,
     double PartialRotaryFactor,
     MoeFacts? Moe,
-    VisionFacts? Vision);
+    VisionFacts? Vision,
+    double? AttentionMultiplier,
+    double? EmbeddingMultiplier,
+    double? ResidualMultiplier,
+    double? LogitsScaling);
 
 /// <summary>G1 reader: <c>config.json</c> → <see cref="TextArchitectureFacts"/>.</summary>
 public static class ModelConfig
@@ -251,7 +255,18 @@ public static class ModelConfig
                 LinearAttention: linear,
                 PartialRotaryFactor: partialRotaryFactor,
                 Moe: moe,
-                Vision: vision);
+                Vision: vision,
+                // IBM Granite carries four explicit scalings where other
+                // families bake the equivalents into constants: the attention
+                // score scale (replacing 1/sqrt(head_dim)), an embedding
+                // multiplier, a residual multiplier applied at both decoder
+                // adds, and a divisor on the logits. Absent means the family
+                // does not use them; present-but-1.0 is recorded as absent so
+                // the graph stays clean.
+                AttentionMultiplier: OptionalDouble(text, "attention_multiplier"),
+                EmbeddingMultiplier: OptionalDouble(text, "embedding_multiplier"),
+                ResidualMultiplier: OptionalDouble(text, "residual_multiplier"),
+                LogitsScaling: OptionalDouble(text, "logits_scaling"));
         }
     }
 
@@ -275,6 +290,19 @@ public static class ModelConfig
             return value.GetInt64();
         }
         throw new ModelConfigException($"config is missing required field '{name}'");
+    }
+
+    /// <summary>Reads an optional scaling factor, treating an explicit 1.0 the
+    /// same as absence: it is the identity, and recording it would put noise in
+    /// every graph for the families that spell out their defaults.</summary>
+    private static double? OptionalDouble(JsonElement obj, string name)
+    {
+        if (!obj.TryGetProperty(name, out var value) || value.ValueKind != JsonValueKind.Number)
+        {
+            return null;
+        }
+        double parsed = value.GetDouble();
+        return parsed == 1.0 ? null : parsed;
     }
 
     /// <summary>Lifts the top-level classifier keys from config.json when a

@@ -149,4 +149,69 @@ public class TokenizerTests
         var ex = Assert.Throws<TokenizerException>(() => tokenizer.EncodeToIds("z"));
         Assert.Contains("'z'", ex.Message);
     }
+
+    // ── tokenizer.json forms shipped by newer tokenizers (Granite) ───────
+
+    [Fact]
+    public void Array_Form_Merges_Rank_Like_String_Form()
+    {
+        // tokenizers ≥ 0.21 writes each merge as a two-element array; the
+        // older "left right" string must rank identically.
+        using var dir = new TempDir();
+        var arrayPath = Path.Combine(dir.Path, "merges-array.json");
+        var stringPath = Path.Combine(dir.Path, "merges-string.json");
+        File.WriteAllText(arrayPath, MiniBpe("[ \"a\", \"b\" ]", Gpt2PreTokenizer));
+        File.WriteAllText(stringPath, MiniBpe("\"a b\"", Gpt2PreTokenizer));
+
+        var arrayForm = HfTokenizer.FromTokenizerFile(arrayPath);
+        var stringForm = HfTokenizer.FromTokenizerFile(stringPath);
+
+        // The merge fires under both spellings: "ab" is the single merged id.
+        Assert.Equal(new[] { 3 }, arrayForm.EncodeToIds("ab"));
+        Assert.Equal(arrayForm.EncodeToIds("ab"), stringForm.EncodeToIds("ab"));
+        Assert.Equal("ab", arrayForm.Decode(arrayForm.EncodeToIds("ab")));
+    }
+
+    [Fact]
+    public void ByteLevel_UseRegex_Serves_The_Gpt2_Split()
+    {
+        // A bare ByteLevel pre-tokenizer with use_regex=true IS the GPT-2
+        // split: the leading space rides the word piece ("Ġab"), where a
+        // whitespace-split fallback would emit the bare piece twice.
+        using var dir = new TempDir();
+        var path = Path.Combine(dir.Path, "gpt2-style.json");
+        File.WriteAllText(path, MiniBpe("[ \"a\", \"b\" ], [ \"Ġ\", \"ab\" ]", Gpt2PreTokenizer));
+
+        var tokenizer = HfTokenizer.FromTokenizerFile(path);
+        Assert.Equal(new[] { 3, 5 }, tokenizer.EncodeToIds("ab ab"));
+        Assert.Equal("ab ab", tokenizer.Decode(tokenizer.EncodeToIds("ab ab")));
+    }
+
+    private const string Gpt2PreTokenizer =
+        "{ \"type\": \"ByteLevel\", \"add_prefix_space\": false, \"trim_offsets\": true, \"use_regex\": true }";
+
+    private static string MiniBpe(string mergesJson, string preTokenizerJson) => $$"""
+        {
+          "version": "1.0.0",
+          "truncation": null,
+          "padding": null,
+          "added_tokens": [],
+          "normalizer": { "type": "NFC" },
+          "pre_tokenizer": {{preTokenizerJson}},
+          "post_processor": null,
+          "decoder": { "type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": false },
+          "model": {
+            "type": "BPE",
+            "dropout": null,
+            "unk_token": null,
+            "continuing_subword_prefix": null,
+            "end_of_word_suffix": null,
+            "fuse_unk": false,
+            "byte_fallback": false,
+            "ignore_merges": false,
+            "vocab": { "a": 1, "b": 2, "ab": 3, "Ġ": 4, "Ġab": 5, ",": 6 },
+            "merges": [ {{mergesJson}} ]
+          }
+        }
+        """;
 }

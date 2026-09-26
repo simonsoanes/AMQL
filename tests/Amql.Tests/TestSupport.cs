@@ -37,7 +37,8 @@ public sealed record Dims(
     int TopK = 1,
     bool WeightedQkNorm = false,
     bool OutputGate = false,
-    bool LinearLayer0 = false)
+    bool LinearLayer0 = false,
+    double ResidualScale = 1.0)
 {
     public int QDim => NumQHeads * HeadDim;
     public int KvDim => NumKvHeads * HeadDim;
@@ -214,6 +215,7 @@ public static class SyntheticModel
                 Placement = NormPlacement.PreOnly,
             },
             Head = new HeadSurface { VocabSize = d.Vocab },
+            ResidualScale = d.ResidualScale == 1.0 ? null : d.ResidualScale,
         };
 
         var policies = new List<AttentionLayerPolicy>();

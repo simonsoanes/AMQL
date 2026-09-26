@@ -69,6 +69,7 @@ public static class Planner
             Layers = layers,
             FinalNorm = BindNorm(store, finalNormObj.Id, "weight", normSurface.FinalNorm, component.HiddenSize),
             Output = BuildOutput(store, embedObj, headObj, surface, component.HiddenSize),
+            ResidualScale = surface.ResidualScale ?? 1.0,
         };
     }
 

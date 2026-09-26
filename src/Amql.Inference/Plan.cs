@@ -231,5 +231,10 @@ public sealed class ComponentOpPlan
     public required NormOp FinalNorm { get; init; }
     public OutputOp? Output { get; init; }
 
+    /// <summary>Multiplier on the incoming residual stream at every decoder
+    /// add (Granite: h' = h·scale + branch, at both the mixer and the FFN
+    /// join). 1.0 is the plain add every other family uses.</summary>
+    public double ResidualScale { get; init; } = 1.0;
+
     public int HiddenSize => FinalNorm.Width;
 }
