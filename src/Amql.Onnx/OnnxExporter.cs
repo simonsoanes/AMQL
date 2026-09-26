@@ -58,16 +58,37 @@ public static class OnnxExporter
         // Helper: add a weight initializer from the store.
         string Init(string objectId, string tensorName, int[]? transposeTo = null)
         {
-            var res = store.ResolveWidened(objectId, tensorName);
-            byte[] raw = F32ToRaw(res.Values);
+            var res = store.Resolve(objectId, tensorName);
             long[] dims = transposeTo is { } t
                 ? t.Select(x => (long)x).ToArray()
                 : res.Shape;
             string name = $"w_{objectId.Replace('.', '_')}_{tensorName}";
+            // Container weights are BF16; export as FP16 (type 10) to match the
+            // container's native footprint. ONNX Runtime needs explicit Cast
+            // nodes where FP16 tensors meet F32 ops, so every weight gets a
+            // trailing Cast → F32 node whose output name is the one the graph
+            // wires into the rest of the model.
+            bool isBf16 = res.Dtype.Label() == "BF16";
+            byte[] raw = isBf16
+                ? Bf16ToFp16(res.Payload)
+                : F32ToRaw(BitPattern.WidenToF32(res.Dtype, res.Payload));
+            int dt = isBf16 ? 10 : OnnxTypes.Float;
             initializers.Add(new OnnxInitializer
             {
-                Name = name, DataType = OnnxTypes.Float, Dims = dims, RawData = raw,
+                Name = name, DataType = dt, Dims = dims, RawData = raw,
             });
+            if (isBf16)
+            {
+                string castName = $"{name}_c";
+                nodes.Add(new OnnxNode
+                {
+                    OpType = "Cast",
+                    Inputs = new[] { name },
+                    Outputs = new[] { castName },
+                    Attributes = { ["to"] = OnnxTypes.Float },
+                });
+                return castName;
+            }
             return name;
         }
 
@@ -759,5 +780,19 @@ public static class OnnxExporter
         var bytes = new byte[values.Length * 4];
         Buffer.BlockCopy(values, 0, bytes, 0, bytes.Length);
         return bytes;
+    }
+
+    private static byte[] Bf16ToFp16(byte[] bf16)
+    {
+        int n = bf16.Length / 2;
+        var fp16 = new byte[n * 2];
+        for (int i = 0; i < n; i++)
+        {
+            ushort bits = (ushort)(bf16[i * 2] | (bf16[i * 2 + 1] << 8));
+            float f = BitConverter.Int32BitsToSingle(bits << 16);
+            fp16[i * 2] = (byte)(ushort)(Half)f;
+            fp16[i * 2 + 1] = (byte)((ushort)(Half)f >> 8);
+        }
+        return fp16;
     }
 }
