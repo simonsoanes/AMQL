@@ -1966,10 +1966,12 @@ internal static class Program
             "export-onnx requires a container directory, e.g. 'amql-cli export-onnx <container> --out <model.onnx>'");
         string outPath = OptionValue(args, "--out") ?? throw new CliException("export-onnx requires '--out <model.onnx>'");
         string component = OptionValue(args, "--component") ?? "target";
+        bool int4 = Array.IndexOf(args, "--int4") >= 0;
+        Console.Error.WriteLine($"DEBUG int4={int4} args=[{string.Join(", ", args)}]");
 
         using var container = Vindex3Container.Open(containerDir);
         var patch = LoadPatch(args, container);
-        var result = OnnxExporter.Export(container, component, outPath, patch);
+        var result = OnnxExporter.Export(container, component, outPath, patch, int4Weights: int4);
 
         Console.WriteLine($"onnx:      {result.Path}");
         Console.WriteLine($"model:     {result.Model}");

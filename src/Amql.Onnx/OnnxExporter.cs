@@ -23,7 +23,8 @@ public static class OnnxExporter
         Vindex3Container container,
         string componentId,
         string outPath,
-        WeightPatch? patch = null)
+        WeightPatch? patch = null,
+        bool int4Weights = false)
     {
         using var store = container.CreateOperandStore();
         var plan = Planner.Plan(container, componentId, store);
@@ -58,16 +59,96 @@ public static class OnnxExporter
         // Helper: add a weight initializer from the store.
         string Init(string objectId, string tensorName, int[]? transposeTo = null)
         {
+            Console.Error.WriteLine($"Init: {objectId}/{tensorName}");
             var res = store.Resolve(objectId, tensorName);
             long[] dims = transposeTo is { } t
                 ? t.Select(x => (long)x).ToArray()
                 : res.Shape;
             string name = $"w_{objectId.Replace('.', '_')}_{tensorName}";
-            // Container weights are BF16; export as FP16 (type 10) to match the
-            // container's native footprint. ONNX Runtime needs explicit Cast
-            // nodes where FP16 tensors meet F32 ops, so every weight gets a
-            // trailing Cast → F32 node whose output name is the one the graph
-            // wires into the rest of the model.
+
+            if (int4Weights && res.Dtype.Label() == "BF16" && dims.Length >= 2)
+            {
+                Console.Error.WriteLine($"INT4 ON: {objectId}/{tensorName} dtype={res.Dtype.Label()} dims={dims.Length} rows={dims[0]} cols={dims[1]} payload={res.Payload.Length}");
+                int rows = (int)dims[0], cols = (int)dims[1];
+                int total = rows * cols;
+                var scales = new float[cols];
+                var packed = new byte[(total + 1) / 2];
+
+                // Chunked BF16→F32: never allocate the full float[]. Two passes:
+                //  1. scan rows in chunks, updating per-column max-abs
+                //  2. scan again, quantizing and packing on the fly
+                const int ChunkRows = 256;
+                var chunk = new float[ChunkRows * cols];
+                byte[] bf16 = res.Payload;
+
+                // Pass 1: max-abs per column
+                for (int startRow = 0; startRow < rows; startRow += ChunkRows)
+                {
+                    int endRow = Math.Min(startRow + ChunkRows, rows);
+                    int chunkLen = endRow - startRow;
+                    int srcOff = startRow * cols * 2;  // BF16 = 2 bytes per element
+                    // Decode BF16 → F32 for this chunk
+                    for (int i = 0; i < chunkLen * cols; i++)
+                    {
+                        ushort bits = (ushort)(bf16[srcOff + i * 2] | (bf16[srcOff + i * 2 + 1] << 8));
+                        chunk[i] = BitConverter.Int32BitsToSingle(bits << 16);
+                    }
+                    // Update per-column max-abs
+                    for (int r = 0; r < chunkLen; r++)
+                    {
+                        int rowBase = r * cols;
+                        for (int c = 0; c < cols; c++)
+                        {
+                            float abs = MathF.Abs(chunk[rowBase + c]);
+                            if (abs > scales[c]) scales[c] = abs;
+                        }
+                    }
+                }
+
+                // Compute per-column scales
+                for (int c = 0; c < cols; c++)
+                {
+                    float sc = scales[c] / 7f;
+                    if (sc == 0f) sc = 1f;
+                    scales[c] = sc;
+                }
+
+                // Pass 2: quantize and pack
+                int ti = 0;
+                for (int startRow = 0; startRow < rows; startRow += ChunkRows)
+                {
+                    int endRow = Math.Min(startRow + ChunkRows, rows);
+                    int chunkLen = endRow - startRow;
+                    int srcOff = startRow * cols * 2;
+                    for (int i = 0; i < chunkLen * cols; i++)
+                    {
+                        ushort bits = (ushort)(bf16[srcOff + i * 2] | (bf16[srcOff + i * 2 + 1] << 8));
+                        chunk[i] = BitConverter.Int32BitsToSingle(bits << 16);
+                    }
+                    for (int r = 0; r < chunkLen; r++)
+                    {
+                        int rowBase = r * cols;
+                        for (int c = 0; c < cols; c++)
+                        {
+                            float v = chunk[rowBase + c] / scales[c];
+                            int q = (int)MathF.Round(Math.Clamp(v, -8f, 7f));
+                            if (ti % 2 == 0)
+                                packed[ti / 2] = (byte)(q & 0xF);
+                            else
+                                packed[ti / 2] |= (byte)((q & 0xF) << 4);
+                            ti++;
+                        }
+                    }
+                }
+                string sname = $"{name}_s";
+                string dqname = $"{name}_dq";
+                initializers.Add(new OnnxInitializer { Name = name, DataType = 12, Dims = dims, RawData = packed });
+                initializers.Add(new OnnxInitializer { Name = sname, DataType = OnnxTypes.Float, Dims = new long[] { cols }, RawData = F32ToRaw(scales) });
+                nodes.Add(new OnnxNode { OpType = "DequantizeLinear", Inputs = new[] { name, sname }, Outputs = new[] { dqname }, Attributes = { ["axis"] = 1L } });
+                return dqname;
+            }
+
+            // FP16 path (default): no quantization, just Cast to F32.
             bool isBf16 = res.Dtype.Label() == "BF16";
             byte[] raw = isBf16
                 ? Bf16ToFp16(res.Payload)
