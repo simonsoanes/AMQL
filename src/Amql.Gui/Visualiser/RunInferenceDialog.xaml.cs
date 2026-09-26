@@ -26,6 +26,7 @@ public sealed partial class RunInferenceDialog : Window
     public float Temperature { get; private set; }
     public bool LogitLens => LensCheck.IsChecked == true;
     public bool TraceAttention => AttentionCheck.IsChecked == true;
+    public bool UseChat => ChatCheck.IsChecked == true;
     public bool AutoFit => AutoFitCheck.IsChecked == true;
 
     private void OnBrowse(object sender, RoutedEventArgs e)

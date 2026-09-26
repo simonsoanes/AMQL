@@ -224,6 +224,10 @@ public sealed partial class InferenceVisualiserWindow : Window
         {
             args.Add("--trace-attention");
         }
+        if (dialog.UseChat)
+        {
+            args.Add("--chat");
+        }
 
         _liveCts = new CancellationTokenSource();
         _liveTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(250) };
