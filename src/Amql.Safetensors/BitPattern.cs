@@ -348,4 +348,21 @@ public static class BitPattern
                     $"dtype {dtype.Label()} cannot be widened to f32 — unsupported dtype");
         }
     }
+
+    /// <summary>Converts a widened f32 array to raw FP16 bytes, rounding
+    /// to nearest even. Used for uploading weights to the CUDA device when
+    /// the stored dtype is BF16, I8, FP8, or any format that widens to f32
+    /// — the F32 intermediate is already available from the widen step, so
+    /// this avoids a second per-dtype conversion path.</summary>
+    public static byte[] F32ToFp16Bytes(ReadOnlySpan<float> f32)
+    {
+        var fp16 = new byte[f32.Length * 2];
+        for (int i = 0; i < f32.Length; i++)
+        {
+            ushort h = BitConverter.HalfToUInt16Bits((Half)f32[i]);
+            fp16[i * 2] = (byte)h;
+            fp16[i * 2 + 1] = (byte)(h >> 8);
+        }
+        return fp16;
+    }
 }

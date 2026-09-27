@@ -76,6 +76,27 @@ if (models.All(m => m.Capabilities == Capability.None))
     return 2;
 }
 
+// CUDA status — same diagnostic the CLI prints, so the operator knows
+// whether GPU acceleration is engaged before the first request lands.
+{
+    var ws = Amql.Inference.WeightWorkingSetExtensions.FromEnv();
+    if (Amql.Inference.CudaShim.Enabled)
+    {
+        if (ws == Amql.Inference.WeightWorkingSet.Mxfp4)
+        {
+            Console.WriteLine("cuda:      MXFP4 packs resident on device — GEMMs run on the GPU (FP16 tensor cores, FP32 accumulate)");
+        }
+        else
+        {
+            Console.WriteLine($"cuda:      GPU available — {ws} weights uploaded as FP16 for device GEMMs");
+        }
+    }
+    else
+    {
+        Console.WriteLine("cuda:      GPU not available or disabled (AMQL_GPU) — all GEMMs run on the CPU");
+    }
+}
+
 var app = ServerApp.Build(models, new ServerSettings(apiKey, maxTokens));
 app.Urls.Add(urls);
 Console.WriteLine($"listening on {urls}{(apiKey is null ? " (no API key — requests are not authenticated)" : "")}");

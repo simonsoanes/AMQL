@@ -156,11 +156,13 @@ public sealed class WeightLoader
         return matrix;
     }
 
-    /// <summary>BF16 on-demand path: the tensor's stored bytes stay
-    /// resident (2 B/element; halving the f32 working set) and the f32
-    /// view comes from the LRU, widened from the stored payload on a
-    /// miss. Widening is lossless, so this is the resident path's
-    /// numerics with a bounded working set.</summary>
+    /// <summary>On-demand path: the tensor's stored bytes stay resident
+    /// (BF16: 2 B/element, halving the f32 working set; also serves F16, I8
+    /// and FP8 dtypes) and the f32 view comes from the LRU, widened from
+    /// the stored payload on a miss. Widening is lossless for BF16/F16, so
+    /// this is the resident path's numerics with a bounded working set.
+    /// When the CUDA backend is available the widened f32 weights are also
+    /// uploaded to the device as FP16 so GEMMs run on the GPU.</summary>
     private Tensor2D MatrixOnDemandBf16(OperandRef operand, int rows, int cols)
     {
         var key = (operand.ObjectId, operand.TensorName);
@@ -178,7 +180,22 @@ public sealed class WeightLoader
 
         var widened = BitPattern.WidenToF32(stored.Dtype, stored.Payload);
         ApplyPatch(operand, widened);
-        return new Tensor2D(widened, rows, cols);
+        var matrix = new Tensor2D(widened, rows, cols);
+        if (CudaShim.Enabled)
+        {
+            string deviceKey = $"{operand.ObjectId}/{operand.TensorName}";
+            if (!CudaShim.TryGetDeviceWeight(operand.ObjectId, operand.TensorName, out _, out _))
+            {
+                var fp16 = BitPattern.F32ToFp16Bytes(widened);
+                matrix.DeviceWeightF16 = CudaShim.UploadRawF16(deviceKey, fp16, rows, cols);
+            }
+            else
+            {
+                CudaShim.TryGetDeviceWeight(operand.ObjectId, operand.TensorName, out var ptr, out _);
+                matrix.DeviceWeightF16 = ptr;
+            }
+        }
+        return matrix;
     }
 
     /// <summary>MXFP4 path: the tensor's projection is resident as a

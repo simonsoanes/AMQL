@@ -424,6 +424,11 @@ public sealed class ModernBertEncoder
 /// </summary>
 public static class EncoderGemm
 {
+    /// <summary>The GPU dispatch floor — same threshold as
+    /// <see cref="TensorOps"/>. Below this, launch and copy-back overhead
+    /// dominate the work.</summary>
+    private const long CudaMinimumMacs = 8L << 20; // 8M MACs
+
     public static Tensor2D MatMulTransposedB(Tensor2D x, Tensor2D w)
     {
         int m = x.Rows, k = x.Cols, n = w.Rows;
@@ -431,6 +436,17 @@ public static class EncoderGemm
         {
             throw new ArgumentException($"shape mismatch: x {m}x{k}, weight {n}x{w.Cols}");
         }
+
+        // GPU fast path: when the weight carries a device-resident FP16
+        // copy (uploaded by the encoder loader or the MXFP4/OnDemand paths),
+        // dispatch to CUDA before falling into the CPU kernels.
+        long macs = (long)m * k * n;
+        if (w.DeviceWeightF16 != IntPtr.Zero && macs >= CudaMinimumMacs &&
+            CudaShim.TryGemmTransposedB(x.Data, m, k, w.DeviceWeightF16, n, out var gpuResult))
+        {
+            return new Tensor2D(gpuResult!, m, n);
+        }
+
         int vw = System.Numerics.Vector<float>.Count;
         if (k % vw != 0 || m < 4)
         {
@@ -576,30 +592,60 @@ public sealed class OptionMarkerScorer
         {
             throw new ContainerException($"scorer dense is [{s}x{h}], the surface says [{facts.ScorerHiddenSize}x{component.HiddenSize}]");
         }
+        var denseTensor = new Tensor2D(BitPattern.WidenToF32(dense.Dtype, dense.Payload), s, h);
+        if (CudaShim.Enabled)
+        {
+            var fp16 = BitPattern.F32ToFp16Bytes(denseTensor.Data);
+            denseTensor.DeviceWeightF16 = CudaShim.UploadRawF16($"{obj}/dense.weight", fp16, s, h);
+        }
         return new OptionMarkerScorer(
             V("input_norm.weight"), V("input_norm.bias"),
-            new Tensor2D(BitPattern.WidenToF32(dense.Dtype, dense.Payload), s, h), V("dense.bias"),
+            denseTensor, V("dense.bias"),
             V("norm.weight"), V("norm.bias"), V("out_proj.weight"), V("out_proj.bias")[0], facts.NormEps)
         {
             Facts = facts,
         };
     }
 
-    /// <summary>One logit per marker row of the encoder output.</summary>
+    /// <summary>One logit per marker row of the encoder output.
+    /// Marker rows are gathered into one matrix so the dense projection
+    /// beams a single GEMM — fast on CPU (cache-blocked) and dispatchable
+    /// on GPU when the scorer's weights carry a device pointer.</summary>
     public float[] Score(Tensor2D hidden, IReadOnlyList<int> markerRows)
     {
-        var logits = new float[markerRows.Count];
-        for (int k = 0; k < markerRows.Count; k++)
+        int k = markerRows.Count;
+        if (k == 0)
         {
-            var x = hidden.Row(markerRows[k]).ToArray();
-            LayerNorm(x, _inNormW, _inNormB, _eps);
-            var y = new float[_dense.Rows];
-            for (int r = 0; r < y.Length; r++)
+            return Array.Empty<float>();
+        }
+        int h = hidden.Cols;
+        int s = _dense.Rows;
+
+        // Gather marker hidden states → [K, H], apply input LayerNorm.
+        var hMat = new Tensor2D(new float[k * h], k, h);
+        for (int i = 0; i < k; i++)
+        {
+            var row = hidden.Row(markerRows[i]);
+            row.CopyTo(hMat.Row(i));
+            LayerNorm(hMat.Row(i), _inNormW, _inNormB, _eps);
+        }
+
+        // Dense projection: [K, H] × [S, H]^T → [K, S] — the single GEMM
+        // that replaces the per-marker loop.  When _dense carries a device
+        // pointer (scorer weights uploaded at load time) this runs on GPU.
+        var projected = TensorOps.MatMulTransposedB(hMat, _dense);
+
+        // GeLU + bias → second LayerNorm → out projection, per marker.
+        var logits = new float[k];
+        for (int i = 0; i < k; i++)
+        {
+            var y = projected.Row(i);
+            for (int c = 0; c < s; c++)
             {
-                y[r] = Gelu.Exact(TensorOps.Dot(x, _dense.Row(r)) + _denseB[r]);
+                y[c] = Gelu.Exact(y[c] + _denseB[c]);
             }
             LayerNorm(y, _normW, _normB, _eps);
-            logits[k] = TensorOps.Dot(y, _outW) + _outB;
+            logits[i] = TensorOps.Dot(y, _outW) + _outB;
         }
         return logits;
     }

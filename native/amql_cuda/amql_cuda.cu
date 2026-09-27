@@ -17,10 +17,18 @@
 #include <cuda_runtime.h>
 #include <cublasLt.h>
 #include <cublas_v2.h>
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 
-#define AMQL_EXPORT extern "C" __declspec(dllexport)
+// Cross-platform ABI: Windows needs __declspec(dllexport); Linux/macOS use
+// visibility("default") with -fvisibility=hidden (or default visibility).
+// Both paths use extern "C" for symbol-name stability.
+#if defined(_WIN32) || defined(_MSC_VER)
+  #define AMQL_EXPORT extern "C" __declspec(dllexport)
+#else
+  #define AMQL_EXPORT extern "C" __attribute__((visibility("default")))
+#endif
 
 // ── FP4 E2M1 codec (mirror of the managed BitPattern grid) ────────────────
 
@@ -102,20 +110,6 @@ struct GpuContext
 static GpuContext gCtx{};
 static bool gCtxValid = false;
 
-// cuBLASLt plan cache: decode hits the same (m,k,n) every token, and the
-// descriptor/layout/heuristic setup dwarfs a small GEMM — cache it once.
-struct LtPlan
-{
-    cublasLtMatmulDesc_t desc;
-    cublasLtMatrixLayout_t a, b, c;
-    cublasLtMatmulAlgo_t algo;
-    bool valid;
-};
-
-static LtPlan gPlans[16];
-static int64_t gPlanKeys[16];
-static int gPlanCount = 0;
-
 static int ctx_ensure()
 {
     if (gCtxValid)
@@ -177,99 +171,6 @@ static int scratch_reserve(void** slot, size_t* slotBytes, size_t want)
         return -1;
     }
     *slotBytes = want;
-    return 0;
-}
-
-/// <summary>Row-major layout dims (stored rows/cols/ld) for the A/B/C
-/// tensors of an opA/opB combo. C is always [m, n] with opC=N.</summary>
-static void row_layout_dims(
-    int m, int k, int n, cublasOperation_t opA, cublasOperation_t opB,
-    int* aRows, int* aCols, int* bRows, int* bCols)
-{
-    if (opA == CUBLAS_OP_T)
-    {
-        *aRows = k; *aCols = m;      // stored [k, m], reused as [m, k]ᵀ
-    }
-    else
-    {
-        *aRows = m; *aCols = k;
-    }
-    if (opB == CUBLAS_OP_T)
-    {
-        *bRows = n; *bCols = k;      // stored [n, k], reused as [k, n]ᵀ
-    }
-    else
-    {
-        *bRows = k; *bCols = n;
-    }
-}
-
-/// <summary>Finds or builds a cached plan for the (m,k,n) GEMM with
-/// explicit opA/opB and B dtype. Returns 0 and the plan, or a negative
-/// error.</summary>
-static int plan_get_ext(int m, int k, int n, cublasOperation_t opA, cublasOperation_t opB,
-    cudaDataType_t bDtype, LtPlan** outPlan)
-{
-    int64_t key = ((int64_t)m << 40) ^ ((int64_t)k << 20) ^ (int64_t)n
-        ^ ((int64_t)opA << 4) ^ ((int64_t)opB << 2) ^ (int64_t)bDtype;
-    for (int i = 0; i < gPlanCount; i++)
-    {
-        if (gPlanKeys[i] == key)
-        {
-            *outPlan = &gPlans[i];
-            return 0;
-        }
-    }
-    if (gPlanCount >= 16)
-    {
-        return -7; // plan cache full — fall back without caching
-    }
-
-    cublasStatus_t status = cublasLtMatmulDescCreate(&gPlans[gPlanCount].desc, CUBLAS_COMPUTE_32F, CUDA_R_32F);
-    if (status != CUBLAS_STATUS_SUCCESS)
-    {
-        return -6;
-    }
-    cublasLtMatmulDescSetAttribute(gPlans[gPlanCount].desc, CUBLASLT_MATMUL_DESC_TRANSA, &opA, sizeof(opA));
-    cublasLtMatmulDescSetAttribute(gPlans[gPlanCount].desc, CUBLASLT_MATMUL_DESC_TRANSB, &opB, sizeof(opB));
-
-    int aRows, aCols, bRows, bCols;
-    row_layout_dims(m, k, n, opA, opB, &aRows, &aCols, &bRows, &bCols);
-    cublasLtMatrixLayoutCreate(&gPlans[gPlanCount].a, CUDA_R_32F, aRows, aCols, aCols);
-    cublasLtMatrixLayoutCreate(&gPlans[gPlanCount].b, bDtype, bRows, bCols, bCols);
-    cublasLtMatrixLayoutCreate(&gPlans[gPlanCount].c, CUDA_R_32F, m, n, n);
-    int32_t rowMajor = CUBLASLT_ORDER_ROW;
-    cublasLtMatrixLayoutSetAttribute(gPlans[gPlanCount].a, CUBLASLT_MATRIX_LAYOUT_ORDER, &rowMajor, sizeof(rowMajor));
-    cublasLtMatrixLayoutSetAttribute(gPlans[gPlanCount].b, CUBLASLT_MATRIX_LAYOUT_ORDER, &rowMajor, sizeof(rowMajor));
-    cublasLtMatrixLayoutSetAttribute(gPlans[gPlanCount].c, CUBLASLT_MATRIX_LAYOUT_ORDER, &rowMajor, sizeof(rowMajor));
-
-    cublasLtMatmulPreference_t pref = nullptr;
-    cublasLtMatmulPreferenceCreate(&pref);
-    cublasLtMatmulPreferenceSetAttribute(pref,
-        CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &gCtx.workspaceBytes, sizeof(gCtx.workspaceBytes));
-
-    gPlans[gPlanCount].algo = cublasLtMatmulAlgo_t{};
-    gPlans[gPlanCount].valid = false;
-    cublasLtMatmulHeuristicResult_t heuristic{};
-    int returned = 0;
-    status = cublasLtMatmulAlgoGetHeuristic(
-        gCtx.lt, gPlans[gPlanCount].desc,
-        gPlans[gPlanCount].a, gPlans[gPlanCount].b,
-        gPlans[gPlanCount].c, gPlans[gPlanCount].c,
-        pref, 1, &heuristic, &returned);
-    if (status == CUBLAS_STATUS_SUCCESS && returned > 0)
-    {
-        gPlans[gPlanCount].algo = heuristic.algo;
-        gPlans[gPlanCount].valid = true;
-    }
-    if (pref)
-    {
-        cublasLtMatmulPreferenceDestroy(pref);
-    }
-
-    gPlanKeys[gPlanCount] = key;
-    *outPlan = &gPlans[gPlanCount];
-    gPlanCount++;
     return 0;
 }
 
