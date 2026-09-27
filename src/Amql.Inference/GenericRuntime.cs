@@ -937,11 +937,19 @@ public sealed class GenericRuntime
         }
     }
 
-    public Tensor2D FinalNormAndHead(Tensor2D hidden)
+    /// <summary>The final norm alone, in place — the hidden state a pooled
+    /// head (a classifier's score linear) reads.</summary>
+    public Tensor2D FinalNorm(Tensor2D hidden)
     {
         var finalNorm = _plan.FinalNorm;
         var w = _weights.Vector(finalNorm.Weight, hidden.Cols);
         Norms.ApplyInPlace(hidden, finalNorm.Kind, finalNorm.Eps, w, finalNorm.WeightOffset);
+        return hidden;
+    }
+
+    public Tensor2D FinalNormAndHead(Tensor2D hidden)
+    {
+        FinalNorm(hidden);
 
         if (_plan.Output is not { } output)
         {

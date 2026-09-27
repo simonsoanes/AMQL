@@ -87,6 +87,11 @@ public class HybridLayerTests
         AssertAgainstOracle(actual, "mixed_logits", 5e-3);
     }
 
+    /// <summary><c>linear_logits</c> in synth_oracle.json was regenerated from
+    /// <see cref="Naive.LinearOnly"/> after the decay-order fix; the recurrence
+    /// itself is pinned to transformers by
+    /// <see cref="GatedDelta_Recurrence_Matches_Transformers"/>. The previous
+    /// values encoded the state being decayed after predicting v.</summary>
     [Fact]
     public void LinearLayer_Only_Matches_Reference()
     {
@@ -128,6 +133,43 @@ public class HybridLayerTests
         Assert.NotNull(plan.Layers[0].LinearAttention);
         Assert.False(plan.Layers[1].IsStateful);
         Assert.NotNull(plan.Layers[1].Attention);
+    }
+
+    /// <summary>The recurrence against transformers' own
+    /// <c>torch_recurrent_gated_delta_rule</c> (fixtures/gated_delta_golden.json,
+    /// from make_gated_delta_golden.py): output and final state, over enough
+    /// positions that a decay applied in the wrong place cannot hide.</summary>
+    [Fact]
+    public void GatedDelta_Recurrence_Matches_Transformers()
+    {
+        var g = System.Text.Json.JsonDocument.Parse(
+            File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "fixtures", "gated_delta_golden.json"))).RootElement;
+        int t = g.GetProperty("T").GetInt32(), heads = g.GetProperty("heads").GetInt32();
+        int kDim = g.GetProperty("k_dim").GetInt32(), vDim = g.GetProperty("v_dim").GetInt32();
+        float[] F(string name) => g.GetProperty(name).EnumerateArray().Select(e => e.GetSingle()).ToArray();
+
+        var state = new LinearAttentionState(heads, kDim, vDim, channels: 1, convKernel: 1);
+        var output = GatedDeltaKernel.Recurrent(
+            new Tensor2D(F("q"), t, heads * kDim), new Tensor2D(F("k"), t, heads * kDim), new Tensor2D(F("v"), t, heads * vDim),
+            new Tensor2D(F("g"), t, heads), new Tensor2D(F("beta"), t, heads), heads, kDim, vDim, state);
+
+        var expectedOut = F("out");
+        for (int i = 0; i < expectedOut.Length; i++)
+        {
+            Assert.True(Math.Abs(expectedOut[i] - output.Data[i]) < 1e-5, $"out[{i}] {output.Data[i]} vs {expectedOut[i]}");
+        }
+        var expectedState = F("state");     // [heads, kDim, vDim]
+        for (int h = 0; h < heads; h++)
+        {
+            for (int kk = 0; kk < kDim; kk++)
+            {
+                for (int d = 0; d < vDim; d++)
+                {
+                    float e = expectedState[(h * kDim + kk) * vDim + d];
+                    Assert.True(Math.Abs(e - state.S[h][kk, d]) < 1e-5, $"S[{h}][{kk},{d}] {state.S[h][kk, d]} vs {e}");
+                }
+            }
+        }
     }
 
     [Fact]
@@ -459,6 +501,15 @@ internal static class Naive
                 var sH = s[hh] ??= new float[Dims.LinKHeadDim, Dims.LinVHeadDim];
                 double decay = Math.Exp(gL[hh]);
                 float betaV = betaL[hh];
+                // transformers' torch_recurrent_gated_delta_rule decays the
+                // state before predicting v from it.
+                for (int i = 0; i < Dims.LinKHeadDim; i++)
+                {
+                    for (int dd = 0; dd < Dims.LinVHeadDim; dd++)
+                    {
+                        sH[i, dd] = (float)(sH[i, dd] * decay);
+                    }
+                }
                 var kvMem = new float[Dims.LinVHeadDim];
                 for (int dd = 0; dd < Dims.LinVHeadDim; dd++)
                 {
@@ -474,7 +525,7 @@ internal static class Naive
                     for (int dd = 0; dd < Dims.LinVHeadDim; dd++)
                     {
                         float delta = (vL[hh * Dims.LinVHeadDim + dd] - kvMem[dd]) * betaV;
-                        sH[i, dd] = (float)(sH[i, dd] * decay) + kh[i] * delta;
+                        sH[i, dd] += kh[i] * delta;
                     }
                 }
                 for (int dd = 0; dd < Dims.LinVHeadDim; dd++)

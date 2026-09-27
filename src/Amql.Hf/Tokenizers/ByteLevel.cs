@@ -42,6 +42,22 @@ public static class ByteLevel
         return Encoding.UTF8.GetString(bytes);
     }
 
+    /// <summary>Appends the raw bytes a byte-level token stands for. Tokens
+    /// are fragments of UTF-8, so text is only decoded once they are joined —
+    /// a character split across two tokens decodes whole.</summary>
+    public static bool TryAppendBytes(string byteLevel, List<byte> into)
+    {
+        foreach (char c in byteLevel)
+        {
+            if (!CharToByte.TryGetValue(c, out var b))
+            {
+                return false;
+            }
+            into.Add(b);
+        }
+        return true;
+    }
+
     public static bool TryDecodeWord(string byteLevel, out string word)
     {
         var bytes = new byte[byteLevel.Length];

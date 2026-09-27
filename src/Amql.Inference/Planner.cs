@@ -23,6 +23,15 @@ public static class Planner
         var normSurface = surface.Norm;
 
         var objects = graph.Objects.Where(o => o.Component == componentId).ToList();
+        // Head-ownership contract: a score head and its surface come together
+        // or not at all — one without the other is a container defect.
+        bool ownsClassifierHead = objects.Any(o => o.Kind == ObjectKind.ClassifierHead);
+        if (ownsClassifierHead != (surface.Classifier is not null) && surface.OptionMarker is null)
+        {
+            throw new ContainerException(ownsClassifierHead
+                ? $"component '{componentId}' owns a classifier_head object but its surface declares no classifier"
+                : $"component '{componentId}' declares a classifier surface but owns no classifier_head object");
+        }
         if (objects.Any(o => o.Kind == ObjectKind.EncoderStack))
         {
             // A refusal by name, not a malformed container: encoders (nomic-bert,

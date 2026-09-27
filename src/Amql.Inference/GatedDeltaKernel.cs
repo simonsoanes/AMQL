@@ -30,7 +30,8 @@ public sealed class LinearAttentionState
 /// The managed port of the reference <c>Qwen3_5GatedDeltaNet</c>: a
 /// depthwise causal conv1d (kernel K, left pad K-1, SiLU activation) over
 /// the qkv stream, then the gated delta-rule recurrence — per key head,
-/// <c>S ← exp(g)·S + k ⊗ (β·(v − Sᵀk))</c>, output <c>Sᵀq</c> — with Q/K
+/// <c>S ← exp(g)·S</c>, then <c>S ← S + k ⊗ (β·(v − Sᵀk))</c>, output
+/// <c>Sᵀq</c> — with Q/K
 /// L2-normalised (eps 1e-6), a z-gated RMSNorm over the value head dim,
 /// and the output projection. All arithmetic in f32, mirroring the
 /// reference's float32 computation. No positional rotation is applied by
@@ -180,7 +181,19 @@ public static class GatedDeltaKernel
                 int kBase = pos * k.Cols + h * kDim;
                 int vBase = pos * v.Cols + h * vDim;
 
-                // kv_mem = S^T k — the state's prediction of v.
+                // The reference decays the state FIRST and predicts v from the
+                // decayed state: S ← exp(g)·S; kv_mem = Sᵀk. Predicting from
+                // the undecayed state agrees only at position 0 (S = 0) and
+                // drifts from the second token on.
+                for (int kk = 0; kk < kDim; kk++)
+                {
+                    for (int d = 0; d < vDim; d++)
+                    {
+                        S[h][kk, d] = (float)(S[h][kk, d] * decay);
+                    }
+                }
+
+                // kv_mem = S^T k — the decayed state's prediction of v.
                 var kvMem = new float[vDim];
                 for (int d = 0; d < vDim; d++)
                 {
@@ -192,14 +205,14 @@ public static class GatedDeltaKernel
                     kvMem[d] = (float)acc;
                 }
 
-                // S = decay·S + k ⊗ (β·(v − kvMem))
+                // S = S + k ⊗ (β·(v − kvMem))
                 for (int kk = 0; kk < kDim; kk++)
                 {
                     float kVal = kn[kBase + kk];
                     for (int d = 0; d < vDim; d++)
                     {
                         float delta = (v.Data[vBase + d] - kvMem[d]) * betaV;
-                        S[h][kk, d] = (float)(S[h][kk, d] * decay) + kVal * delta;
+                        S[h][kk, d] += kVal * delta;
                     }
                 }
 

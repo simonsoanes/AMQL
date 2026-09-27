@@ -170,6 +170,9 @@ public static partial class ArchMapper
                         MaskPadding = true,
                     },
                     Template = classification.Template,
+                    Labels = classification.Labels,
+                    ScoreBias = classification.BiasTensor is not null,
+                    PadTokenId = classification.PadTokenId,
                 }
                 : null,
         };
@@ -217,8 +220,15 @@ public static partial class ArchMapper
         // Classifier head: a separate score linear (not a vocabulary head).
         if (classification is { HasScoreTensor: true })
         {
-            string scoreKey = inventory.TensorNames.FirstOrDefault(
-                n => n == "score.weight" || n.EndsWith(".score.weight") || n == "model.score.weight") ?? "model.score.weight";
+            long scoreWidth = inventory.Get(classification.WeightTensor).Shape[1];
+            if (scoreWidth != facts.HiddenSize)
+            {
+                throw new ModelConfigException(
+                    $"'{classification.WeightTensor}' reads {scoreWidth} features but the stack's hidden size is {facts.HiddenSize}");
+            }
+            // The object's prefix is the checkpoint's own ("score" or
+            // "model.score"), so export rebuilds the exact tensor names.
+            string scorePrefix = classification.WeightTensor[..^".weight".Length];
             objects.Add(new LogicalObject
             {
                 Id = "target.classifier_head",
@@ -229,7 +239,7 @@ public static partial class ArchMapper
                     new()
                     {
                         Artifact = prefix,
-                        TensorPrefix = scoreKey.Contains("model.score.") ? "model.score" : "score",
+                        TensorPrefix = scorePrefix,
                         Tensors = 1,
                         Bytes = 0,
                     },
@@ -401,7 +411,7 @@ public static partial class ArchMapper
         }
         if (classification is { HasScoreTensor: true })
         {
-            reps.Add(Rep("target.classifier_head", encoding, BindScoreHead(inventory, prefix)));
+            reps.Add(Rep("target.classifier_head", encoding, BindScoreHead(inventory, classification)));
         }
         if (options.IncludeMtp && inventory.CountUnder("mtp.") > 0)
         {
@@ -610,20 +620,17 @@ public static partial class ArchMapper
             "tie_word_embeddings is false but neither 'lm_head.weight' nor '<prefix>.lm_head.weight' is in the inventory");
     }
 
-    /// <summary>Binds the classifier score head: <c>model.score.weight</c>
-    /// or <c>score.weight</c> as the single tensor of a ClassifierHead
-    /// object, mapped to the object-relative name <c>weight</c>.</summary>
-    private static List<NamedTensorData> BindScoreHead(HfInventory inventory, string prefix)
+    /// <summary>Binds the classifier score head — its weight and, when the
+    /// checkpoint ships one, its bias — as the object-relative tensors
+    /// <c>weight</c> / <c>bias</c> of the ClassifierHead object.</summary>
+    private static List<NamedTensorData> BindScoreHead(HfInventory inventory, ClassificationFacts classification)
     {
-        foreach (var fullName in new[] { "model.score.weight", "score.weight", $"{prefix}.score.weight" })
+        var bound = new List<NamedTensorData> { ToTensorData(inventory, classification.WeightTensor, "weight") };
+        if (classification.BiasTensor is { } bias)
         {
-            if (inventory.TryGet(fullName, out _))
-            {
-                return new List<NamedTensorData> { ToTensorData(inventory, fullName, "weight") };
-            }
+            bound.Add(ToTensorData(inventory, bias, "bias"));
         }
-        throw new ModelConfigException(
-            "'model.score.weight' / 'score.weight' is required for a classifier but not found in the inventory");
+        return bound;
     }
 
     /// <summary>Binds a carried module (the MTP drafter's <c>mtp.</c> stem or
@@ -664,6 +671,14 @@ public static partial class ArchMapper
     private static ContainerSpec MapNomicBert(string modelId, TextArchitectureFacts facts, HfInventory inventory,
         EncodeOptions options, ClassificationFacts? classification, string prefix)
     {
+        if (classification is not null)
+        {
+            // This path binds no ClassifierHead object, so accepting the
+            // checkpoint would drop its score weights.
+            throw new ModelConfigException(
+                "a nomic-bert checkpoint with a sequence-classification head is not judged by this build — " +
+                "refusing rather than dropping the head");
+        }
         string encoding = EncodingFor(inventory, "encoder.layers.0.attn.Wqkv.weight") ??
                           EncodingFor(inventory, "embeddings.word_embeddings.weight") ??
                           "F32";
@@ -723,14 +738,6 @@ public static partial class ArchMapper
                 VocabSize = facts.VocabSize,
                 HeadReusesEmbedding = true,
             },
-            Classifier = classification is { HasScoreTensor: true }
-                ? new ClassifierSurface
-                {
-                    NumLabels = classification.NumLabels,
-                    ProblemType = classification.ProblemType,
-                    Pooling = new PoolingSurface { Kind = PoolingKind.Last, LastNonPad = true },
-                }
-                : null,
         };
 
         // Logical objects: EncoderStack for the bidirectional layers,

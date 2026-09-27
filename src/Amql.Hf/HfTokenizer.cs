@@ -48,6 +48,7 @@ public sealed class HfTokenizer
     private readonly HashSet<int> _specialIds;
     private readonly string[] _tokensById;
     private readonly (int[] Prefix, int[] Suffix)? _singleTemplate;
+    private readonly Dictionary<int, AddedToken> _addedById;
 
     private HfTokenizer(
         Dictionary<string, int> vocab,
@@ -60,6 +61,11 @@ public sealed class HfTokenizer
         (int[] Prefix, int[] Suffix)? singleTemplate)
     {
         _singleTemplate = singleTemplate;
+        _addedById = new Dictionary<int, AddedToken>();
+        foreach (var t in addedTokens)
+        {
+            _addedById[t.Id] = t;
+        }
         _vocab = vocab;
         _mergeRanks = mergeRanks;
         _addedByContent = addedByContent;
@@ -115,34 +121,37 @@ public sealed class HfTokenizer
                 vocab[entry.Name] = entry.Value.GetInt32();
             }
             var mergeRanks = new Dictionary<(string, string), int>();
-            var merges = model.GetProperty("merges");
-            for (int i = 0; i < merges.GetArrayLength(); i++)
+            // One pass with an enumerator: JsonElement's array indexer walks
+            // from the start for arrays of arrays (the ≥ 0.21 pair form), so
+            // merges[i] in a loop is quadratic — minutes for a 247k-merge file.
+            int rank = -1;
+            foreach (var entry in model.GetProperty("merges").EnumerateArray())
             {
+                rank++;
                 // tokenizers ≤ 0.20 writes a merge as one "left right" string;
                 // ≥ 0.21 (Granite's file) writes the pair as a two-element
                 // array. Joining the parts with the separator reproduces the
                 // string form exactly, so both rank identically.
-                var entry = merges[i];
                 string pair;
                 if (entry.ValueKind == JsonValueKind.Array)
                 {
                     if (entry.GetArrayLength() != 2)
                     {
                         throw new TokenizerException(
-                            $"'{path}': merge entry {i} is an array of {entry.GetArrayLength()} parts, expected 2");
+                            $"'{path}': merge entry {rank} is an array of {entry.GetArrayLength()} parts, expected 2");
                     }
                     pair = $"{entry[0].GetString()} {entry[1].GetString()}";
                 }
                 else
                 {
-                    pair = entry.GetString() ?? throw new TokenizerException($"'{path}': null merge entry at {i}");
+                    pair = entry.GetString() ?? throw new TokenizerException($"'{path}': null merge entry at {rank}");
                 }
                 int splitAt = pair.LastIndexOf(' ');
                 if (splitAt <= 0)
                 {
                     throw new TokenizerException($"'{path}': malformed merge '{pair}'");
                 }
-                mergeRanks[(pair[..splitAt], pair[(splitAt + 1)..])] = i;
+                mergeRanks[(pair[..splitAt], pair[(splitAt + 1)..])] = rank;
             }
 
             // Added / special tokens.
@@ -150,9 +159,8 @@ public sealed class HfTokenizer
             var addedByContent = new Dictionary<string, AddedToken>(StringComparer.Ordinal);
             if (root.TryGetProperty("added_tokens", out var added) && added.ValueKind == JsonValueKind.Array)
             {
-                for (int i = 0; i < added.GetArrayLength(); i++)
+                foreach (var entry in added.EnumerateArray())
                 {
-                    var entry = added[i];
                     int id = entry.GetProperty("id").GetInt32();
                     string content = entry.GetProperty("content").GetString() ?? string.Empty;
                     bool special = entry.TryGetProperty("special", out var sp) && sp.GetBoolean();
@@ -253,6 +261,42 @@ public sealed class HfTokenizer
             ids[prefix.Length + i] = body[i];
         }
         suffix.CopyTo(ids, prefix.Length + body.Count);
+        return ids;
+    }
+
+    /// <summary>
+    /// What HF's <c>tokenizer(text, truncation=True, max_length=n)</c> returns:
+    /// the body, truncated from the right so that it and the post-processor's
+    /// special tokens fit in <paramref name="maxLength"/>, then wrapped by the
+    /// single-sequence template when the tokenizer declares one (a ByteLevel
+    /// post-processor, as Qwen's, adds nothing). Reports whether it truncated.
+    /// </summary>
+    public int[] EncodeForModel(string text, int? maxLength, out bool truncated)
+    {
+        var (prefix, suffix) = _singleTemplate ?? (Array.Empty<int>(), Array.Empty<int>());
+        var body = EncodeToIds(text);
+        int keep = body.Count;
+        truncated = false;
+        if (maxLength is { } max)
+        {
+            int room = max - prefix.Length - suffix.Length;
+            if (room < 1)
+            {
+                throw new TokenizerException($"max length {max} leaves no room beside {prefix.Length + suffix.Length} special tokens");
+            }
+            if (keep > room)
+            {
+                keep = room;
+                truncated = true;
+            }
+        }
+        var ids = new int[prefix.Length + keep + suffix.Length];
+        prefix.CopyTo(ids, 0);
+        for (int i = 0; i < keep; i++)
+        {
+            ids[prefix.Length + i] = body[i];
+        }
+        suffix.CopyTo(ids, prefix.Length + keep);
         return ids;
     }
 
@@ -472,13 +516,12 @@ public sealed class HfTokenizer
 
     private TokenPiece PieceFor(int id)
     {
-        // Added/special tokens are judged FIRST: they live outside the BPE
-        // vocab and always decode to their content.
-        if (_specialIds.Contains(id))
+        // Added tokens are judged FIRST: they live outside the BPE vocab and
+        // always decode to their content — special or not (ModernBERT's
+        // whitespace runs are non-special added tokens).
+        if (_addedById.TryGetValue(id, out var added))
         {
-            var added = _addedTokens.FirstOrDefault(a => a.Id == id);
-            string content = added?.Content ?? string.Empty;
-            return new TokenPiece(id, content, content, true);
+            return new TokenPiece(id, added.Content, added.Content, added.IsSpecial);
         }
         if (id < 0 || id >= _tokensById.Length || _tokensById[id] is null)
         {
@@ -491,6 +534,46 @@ public sealed class HfTokenizer
 
     private TokenPiece PieceFor(AddedToken added, string content) =>
         new(added.Id, content, content, added.IsSpecial);
+
+    /// <summary>
+    /// The UTF-8 bytes a token sequence stands for, joined before any text
+    /// decoding — what HF's ByteLevel decoder does. Added tokens contribute
+    /// their content (special ones only when <paramref name="skipSpecialTokens"/>
+    /// is false).
+    /// </summary>
+    public byte[] DecodeBytes(IReadOnlyList<int> ids, bool skipSpecialTokens)
+    {
+        var bytes = new List<byte>();
+        foreach (int id in ids)
+        {
+            if (_addedById.TryGetValue(id, out var added))
+            {
+                if (!(added.IsSpecial && skipSpecialTokens))
+                {
+                    bytes.AddRange(Encoding.UTF8.GetBytes(added.Content));
+                }
+                continue;
+            }
+            if (id < 0 || id >= _tokensById.Length || _tokensById[id] is null ||
+                !ByteLevel.TryAppendBytes(_tokensById[id], bytes))
+            {
+                throw new TokenizerException($"cannot decode id {id}");
+            }
+        }
+        return bytes.ToArray();
+    }
+
+    /// <summary>Decodes to text through <see cref="DecodeBytes"/>; invalid
+    /// UTF-8 (a sequence cut mid-character) becomes U+FFFD.</summary>
+    public string DecodeText(IReadOnlyList<int> ids, bool skipSpecialTokens = true) =>
+        Encoding.UTF8.GetString(DecodeBytes(ids, skipSpecialTokens));
+
+    /// <summary>Whether an id is a special added token.</summary>
+    public bool IsSpecial(int id) => _specialIds.Contains(id);
+
+    /// <summary>The id of an added token by its content, if there is one.</summary>
+    public int? AddedTokenId(string content) =>
+        _addedByContent.TryGetValue(content, out var t) ? t.Id : null;
 
     /// <summary>Decodes ids to text: special tokens contribute their
     /// content, byte-level tokens their byte-decoded word.</summary>

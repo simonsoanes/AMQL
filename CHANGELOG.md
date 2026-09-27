@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- **feat:** `amql-server` (src/Amql.Server) — serves containers over HTTP, each on the endpoints its facts allow: TypeSafe `/v1/decisions` (+ `/v1/systemone`, and `/api/v1/decisions` in the jevai envelope) for Von, OpenAI `/v1/embeddings` for embedding containers, `/v1/chat/completions` and `/v1/responses` (SSE streaming) for generative decoders; `/v1/models`, `/health`, optional bearer API key. Chat rendering matches HF `apply_chat_template` on Qwen3.5's template; greedy generation matches transformers token for token
+- **feat:** `ChatTemplate.ApplyMessages` renders whole conversations (Qwen3 ChatML with think handling, ChatML, Llama 3); `HfTokenizer.DecodeText` decodes through bytes so split characters come out whole; `DecodeSession.PrefillHiddenStates` for pooled embeddings
+- **feat:** `amql-cli classify` serves sequence-classification containers (docs/classifier-models-jev.md C1–C6): template → tokenise → last-non-pad pooling → score head (with bias) → softmax / sigmoid / identity by `problem_type`, labelled from the carried `id2label`; `--format labels|json|jsonl|csv`, `--jsonl` batches, `--patch`. Matches transformers on `openjev` qwen3.5-0.8b-nli-v5 to 8e-6 in the logits
+- **feat:** classifier ingest carries `score.bias`, the label table, `pad_token_id` and a `classifier.json` mirror, checks every fact against the score tensor, and export regenerates the real labels instead of `LABEL_i`
 - **feat:** `amql-cli decide <container> --request <json | @file | ->` — answers TypeSafe `/v1/decisions` (OpenJEV `/v1/systemone`) requests with a Von container; `--envelope jevai` wraps the response as `{ code, message, data }`, invalid requests exit 2 with the API's 422 message. Answers are identical to the Von 1.2 SDK's on the real weights
 - **feat:** `ModernBertEncoder` / `OptionMarkerScorer` — a ModernBERT encoder written directly in C# (global + sliding bidirectional attention on position ids, RoPE per layer type, GeGLU with exact GELU, Von's order-invariant option mask); `verify` reports such containers as served
 - **feat:** the tokenizer honours `lstrip`/`rstrip` added tokens and `TemplateProcessing` post-processors (`EncodeWithSpecialTokens`)
@@ -21,6 +25,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- **fix(inference):** GatedDeltaNet decays its state before predicting `v` from it, as transformers does — the old order was exact at the first token and drifted from the second, so every multi-token Qwen3.5 forward (generate, classify) was off by up to ~5% in the final hidden state; pinned by a test against `torch_recurrent_gated_delta_rule`
+- **fix(tokenizer):** pair-form merges are enumerated once instead of indexed — loading Qwen3.5's tokenizer drops from ~3 minutes to 0.5 s
+- **perf(inference):** plans whose only stateful layers are GatedDeltaNet prefill layer-major (bit-identical, ~2.6× faster)
 - **perf:** `TensorOps.MatMulTransposedB` walks weight rows in cache-sized blocks (same arithmetic, so bit-identical results); `BitPattern.WidenToF32` copies an F32 payload once instead of twice
 - **inference:** planning an encoder container refuses with `UnsupportedOperatorException` naming the encoder stack, so `verify` reports it as not served instead of exiting with an error
 - **hf:** the config reader understands ModernBERT's `hidden_activation`, `norm_eps` and period-style `global_attn_every_n_layers` (previously a GELU encoder would have defaulted to SiLU)

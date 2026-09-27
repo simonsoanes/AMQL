@@ -7,8 +7,146 @@ namespace Amql.Cli;
 /// generic fallback that applies token substitution on the raw template
 /// for less common formats.
 /// </summary>
+/// <summary>One chat turn, already flattened to text.</summary>
+public sealed record ChatMessage(string Role, string Content);
+
 public static class ChatTemplate
 {
+    /// <summary>
+    /// Renders a whole conversation with the generation prompt appended — what
+    /// HF's <c>apply_chat_template(messages, add_generation_prompt=True)</c>
+    /// produces for the template families recognised here:
+    /// <list type="bullet">
+    /// <item>Qwen3-style ChatML (the template tracks <c>last_query_index</c>):
+    /// contents trimmed; <c>&lt;think&gt;</c> blocks stripped from assistant
+    /// turns before the last user query and re-rendered after it; the prompt
+    /// ends with an empty think block unless thinking is enabled.</item>
+    /// <item>Plain ChatML (<c>&lt;|im_start|&gt;</c>).</item>
+    /// <item>Llama 3 (<c>&lt;|start_header_id|&gt;</c>).</item>
+    /// </list>
+    /// Any other template is refused rather than approximated: a mis-rendered
+    /// prompt silently degrades every answer.
+    /// </summary>
+    public static string ApplyMessages(string template, IReadOnlyList<ChatMessage> messages, bool enableThinking = false)
+    {
+        if (messages.Count == 0)
+        {
+            throw new ChatTemplateException("no messages provided");
+        }
+        foreach (var m in messages)
+        {
+            if (m.Role is not ("system" or "user" or "assistant"))
+            {
+                throw new ChatTemplateException($"message role '{m.Role}' is not supported (system, user, assistant)");
+            }
+        }
+        for (int i = 1; i < messages.Count; i++)
+        {
+            if (messages[i].Role == "system")
+            {
+                throw new ChatTemplateException("a system message must be the first message");
+            }
+        }
+
+        if (template.Contains("<|im_start|>"))
+        {
+            return template.Contains("last_query_index")
+                ? RenderQwen3(template, messages, enableThinking)
+                : RenderChatMl(template, messages);
+        }
+        if (template.Contains("<|start_header_id|>"))
+        {
+            string bos = ExtractSpecial(template, "bos_token", "<|begin_of_text|>") ?? "<|begin_of_text|>";
+            string eot = ExtractSpecial(template, "eos_token", "<|eot_id|>") ?? "<|eot_id|>";
+            var sb = new System.Text.StringBuilder(bos);
+            foreach (var m in messages)
+            {
+                sb.Append("<|start_header_id|>").Append(m.Role).Append("<|end_header_id|>\n\n")
+                  .Append(m.Content.Trim()).Append(eot);
+            }
+            return sb.Append("<|start_header_id|>assistant<|end_header_id|>\n\n").ToString();
+        }
+        throw new ChatTemplateException(
+            "the container's chat template is not a family this build renders (Qwen3 ChatML, ChatML, Llama 3)");
+    }
+
+    private static string RenderChatMl(string template, IReadOnlyList<ChatMessage> messages)
+    {
+        var sb = new System.Text.StringBuilder();
+        foreach (var m in messages)
+        {
+            sb.Append("<|im_start|>").Append(m.Role).Append('\n').Append(m.Content).Append("<|im_end|>\n");
+        }
+        sb.Append("<|im_start|>assistant\n");
+        if (template.Contains(" thinking\n"))
+        {
+            sb.Append(" thinking\n");
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>The Qwen3 / Qwen3.5 template, statement for statement (tools
+    /// and vision content excluded — the server refuses those upstream).</summary>
+    private static string RenderQwen3(string template, IReadOnlyList<ChatMessage> messages, bool enableThinking)
+    {
+        int lastQuery = -1;
+        for (int i = messages.Count - 1; i >= 0; i--)
+        {
+            if (messages[i].Role == "user")
+            {
+                string c = PyFormat.Strip(messages[i].Content);
+                if (!(c.StartsWith("<tool_response>", StringComparison.Ordinal) && c.EndsWith("</tool_response>", StringComparison.Ordinal)))
+                {
+                    lastQuery = i;
+                    break;
+                }
+            }
+        }
+        if (lastQuery < 0)
+        {
+            throw new ChatTemplateException("no user query found in messages");
+        }
+
+        var sb = new System.Text.StringBuilder();
+        for (int i = 0; i < messages.Count; i++)
+        {
+            var m = messages[i];
+            string content = PyFormat.Strip(m.Content);
+            switch (m.Role)
+            {
+                case "system":
+                    sb.Append("<|im_start|>system\n").Append(content).Append("<|im_end|>\n");
+                    break;
+                case "user":
+                    sb.Append("<|im_start|>user\n").Append(content).Append("<|im_end|>\n");
+                    break;
+                case "assistant":
+                {
+                    string reasoning = string.Empty;
+                    int close = content.IndexOf("</think>", StringComparison.Ordinal);
+                    if (close >= 0)
+                    {
+                        string before = content[..content.IndexOf("</think>", StringComparison.Ordinal)].TrimEnd('\n');
+                        int open = before.LastIndexOf("<think>", StringComparison.Ordinal);
+                        reasoning = (open >= 0 ? before[(open + "<think>".Length)..] : before).TrimStart('\n');
+                        content = content[(content.LastIndexOf("</think>", StringComparison.Ordinal) + "</think>".Length)..].TrimStart('\n');
+                    }
+                    reasoning = PyFormat.Strip(reasoning);
+                    sb.Append("<|im_start|>assistant\n");
+                    if (i > lastQuery)
+                    {
+                        sb.Append("<think>\n").Append(reasoning).Append("\n</think>\n\n");
+                    }
+                    sb.Append(content).Append("<|im_end|>\n");
+                    break;
+                }
+            }
+        }
+        sb.Append("<|im_start|>assistant\n");
+        sb.Append(enableThinking ? "<think>\n" : "<think>\n\n</think>\n\n");
+        return sb.ToString();
+    }
+
     /// <summary>Loads the chat template from a container or checkpoint
     /// directory: first <c>chat_template.jinja</c>, then the
     /// <c>chat_template</c> key inside <c>tokenizer_config.json</c>.</summary>
@@ -244,4 +382,10 @@ public static class ChatTemplate
         // Look for {% set varName = "value" %} or just use default
         return defaultValue;
     }
+}
+
+/// <summary>A conversation the container's chat template cannot render.</summary>
+public sealed class ChatTemplateException : Exception
+{
+    public ChatTemplateException(string message) : base(message) { }
 }

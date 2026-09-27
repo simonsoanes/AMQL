@@ -36,6 +36,45 @@ public sealed class DecodeSession
     /// </summary>
     public Tensor2D Prefill(int[] tokens)
     {
+        var lastHidden = RunPrefill(tokens);
+        // The logits-session contract (mirroring the reference) returns the
+        // last position's row — the one `Step` continues from.
+        var allLogits = _runtime.FinalNormAndHead(lastHidden);
+        LastLogits = SliceLastRow(allLogits);
+        return LastLogits;
+    }
+
+    /// <summary>
+    /// Forward pass over a token sequence that stops at the final norm: the
+    /// post-norm hidden state of the LAST position (1 × hidden), the row a
+    /// last-token pooled head reads. No vocabulary projection is computed.
+    /// The session is left advanced, as after <see cref="Prefill"/>.
+    /// </summary>
+    public Tensor2D PrefillHidden(int[] tokens)
+    {
+        var hidden = RunPrefill(tokens);
+        var last = new float[hidden.Cols];
+        hidden.Row(hidden.Rows - 1).CopyTo(last);
+        return _runtime.FinalNorm(new Tensor2D(last, 1, hidden.Cols));
+    }
+
+    /// <summary>
+    /// Forward pass returning EVERY position's post-final-norm hidden state
+    /// (T × hidden) — what a pooled embedding (mean over tokens) reads. No
+    /// vocabulary projection is computed.
+    /// </summary>
+    public Tensor2D PrefillHiddenStates(int[] tokens)
+    {
+        var rows = new List<float[]>(tokens.Length);
+        var hidden = RunPrefill(tokens, rows);
+        var all = rows.Count > 0
+            ? new Tensor2D(rows.SelectMany(r => r).ToArray(), rows.Count, hidden.Cols)
+            : hidden;
+        return _runtime.FinalNorm(all);
+    }
+
+    private Tensor2D RunPrefill(int[] tokens, List<float[]>? everyRow = null)
+    {
         if (tokens.Length == 0)
         {
             throw new ArgumentException("prefill requires at least one token", nameof(tokens));
@@ -47,7 +86,14 @@ public sealed class DecodeSession
         }
 
         Tensor2D lastHidden;
-        if (_runtime.Plan.Layers.Any(l => l.IsStateful))
+        // GatedDeltaNet layers process a whole sequence in order inside the
+        // layer (the conv and the recurrence both loop over positions), so a
+        // plan whose only state is theirs runs layer-major like a softmax
+        // plan: the projections become real GEMMs instead of one matrix-vector
+        // product per token. Verified bit-identical to position-major on
+        // Qwen3.5. Other stateful operators keep the position-major path.
+        bool layerMajor = _runtime.Plan.Layers.All(l => l.Conv is null);
+        if (!layerMajor)
         {
             // Position-major: one token through every layer at a time, so
             // recurrent state advances in sequence. The softmax layers'
@@ -57,11 +103,12 @@ public sealed class DecodeSession
             foreach (var token in tokens)
             {
                 lastHidden = _runtime.StepForward(token);
+                everyRow?.Add(lastHidden.Row(lastHidden.Rows - 1).ToArray());
             }
         }
         else
         {
-            // Batched: every position through every layer in one pass.
+            // Batched: every position through every layer, layer by layer.
             var hidden = _runtime.Embed(tokens);
             var positions = Enumerable.Range(0, tokens.Length).ToArray();
             for (int layer = 0; layer < _runtime.Plan.Layers.Count; layer++)
@@ -71,12 +118,7 @@ public sealed class DecodeSession
             _runtime.SessionPosition = tokens.Length;
             lastHidden = hidden;
         }
-
-        // The logits-session contract (mirroring the reference) returns the
-        // last position's row — the one `Step` continues from.
-        var allLogits = _runtime.FinalNormAndHead(lastHidden);
-        LastLogits = SliceLastRow(allLogits);
-        return LastLogits;
+        return lastHidden;
     }
 
     private static Tensor2D SliceLastRow(Tensor2D logits)

@@ -1,0 +1,5 @@
+{
+ "tokenizer_class": "PreTrainedTokenizerFast",
+ "pad_token": "<|pad|>",
+ "padding_side": "right"
+}
