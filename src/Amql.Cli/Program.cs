@@ -641,7 +641,8 @@ internal static class Program
         var workingSetEffective = workingSet ?? WeightWorkingSetExtensions.FromEnv();
         if (workingSetEffective == WeightWorkingSet.Mxfp4 && CudaShim.Enabled)
         {
-            Console.WriteLine("cuda:      MXFP4 packs resident on device — GEMMs run on the GPU (FP16 tensor cores, FP32 accumulate)");
+            string memNote = CudaShim.IsUnifiedMemory ? " (unified memory — zero-copy)" : "";
+            Console.WriteLine($"cuda:      MXFP4 packs resident on device — GEMMs run on the GPU (FP16 tensor cores, FP32 accumulate){memNote}");
         }
         else if (workingSetEffective == WeightWorkingSet.Mxfp4)
         {
@@ -1886,7 +1887,8 @@ internal static class Program
         var workingSet = WeightWorkingSetExtensions.FromEnv();
         if (workingSet == WeightWorkingSet.Mxfp4 && CudaShim.Enabled)
         {
-            Console.WriteLine("cuda:      MXFP4 packs resident on device — GEMMs run on the GPU (FP16 tensor cores, FP32 accumulate)");
+            string memNote2 = CudaShim.IsUnifiedMemory ? " (unified memory — zero-copy)" : "";
+            Console.WriteLine($"cuda:      MXFP4 packs resident on device — GEMMs run on the GPU (FP16 tensor cores, FP32 accumulate){memNote2}");
         }
         else if (workingSet == WeightWorkingSet.Mxfp4)
         {

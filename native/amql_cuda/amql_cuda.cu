@@ -15,7 +15,6 @@
 // falls back to the CPU path on any failure.
 
 #include <cuda_runtime.h>
-#include <cublasLt.h>
 #include <cublas_v2.h>
 #include <algorithm>
 #include <cstdint>
@@ -90,11 +89,8 @@ __global__ void cast_f32_to_f16(const float* __restrict__ src, __half* __restric
 
 struct GpuContext
 {
-    cublasLtHandle_t lt;
-    cublasHandle_t cublas;   // classic cublas — the merge GEMMs use this
+    cublasHandle_t cublas;
     cudaStream_t stream;
-    void* workspace;
-    size_t workspaceBytes;
     void* scratchA;      // reusable host→device staging for A (grows)
     size_t scratchABytes;
     void* scratchC;      // reusable device→host staging for C (grows)
@@ -109,16 +105,13 @@ struct GpuContext
 
 static GpuContext gCtx{};
 static bool gCtxValid = false;
+static bool gUnifiedMemory = false;
 
 static int ctx_ensure()
 {
     if (gCtxValid)
     {
         return 0;
-    }
-    if (cublasLtCreate(&gCtx.lt) != CUBLAS_STATUS_SUCCESS)
-    {
-        return -1;
     }
     if (cublasCreate(&gCtx.cublas) != CUBLAS_STATUS_SUCCESS)
     {
@@ -132,11 +125,14 @@ static int ctx_ensure()
     {
         return -16;
     }
-    gCtx.workspaceBytes = 64u << 20;   // cuBLASLt scratch
-    if (cudaMalloc(&gCtx.workspace, gCtx.workspaceBytes) != cudaSuccess)
-    {
-        return -3;
-    }
+    // Probe unified memory (Grace-Hopper, integrated GPUs) — on these
+    // platforms host↔device cudaMemcpy is a page-table no-op and the GPU
+    // can access system memory directly through the NVLink-C2C coherent
+    // fabric.  The hot paths skip the scratch-buffer staging when set.
+    int integrated = 0;
+    cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, 0);
+    gUnifiedMemory = (integrated != 0);
+
     if (cudaMalloc(&gCtx.scratchPack, 1u << 20) != cudaSuccess)
     {
         return -19;
@@ -191,20 +187,27 @@ AMQL_EXPORT int amql_cuda_init(void)
     return ctx_ensure();
 }
 
+AMQL_EXPORT int amql_cuda_unified_memory(void)
+{
+    if (ctx_ensure() != 0)
+    {
+        return 0;
+    }
+    return gUnifiedMemory ? 1 : 0;
+}
+
 AMQL_EXPORT void amql_cuda_shutdown(void)
 {
     if (!gCtxValid)
     {
         return;
     }
-    if (gCtx.workspace) cudaFree(gCtx.workspace);
     if (gCtx.scratchA) cudaFree(gCtx.scratchA);
     if (gCtx.scratchC) cudaFree(gCtx.scratchC);
     if (gCtx.scratchPack) cudaFree(gCtx.scratchPack);
     if (gCtx.scratchScale) cudaFree(gCtx.scratchScale);
     if (gCtx.scratchAF16) cudaFree(gCtx.scratchAF16);
     cudaStreamDestroy(gCtx.stream);
-    cublasLtDestroy(gCtx.lt);
     cublasDestroy(gCtx.cublas);
     gCtxValid = false;
 }
@@ -221,16 +224,28 @@ AMQL_EXPORT int amql_cuda_free(void* ptr)
 
 AMQL_EXPORT int amql_cuda_host_to_device(void* dst, const void* src, size_t bytes)
 {
+    if (gUnifiedMemory)
+    {
+        return 0;   // GPU accesses host memory directly via NVLink-C2C
+    }
     return cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice) == cudaSuccess ? 0 : -1;
 }
 
 AMQL_EXPORT int amql_cuda_host_to_device_f32(void* dst, const float* src, size_t bytes)
 {
+    if (gUnifiedMemory)
+    {
+        return 0;
+    }
     return cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice) == cudaSuccess ? 0 : -1;
 }
 
 AMQL_EXPORT int amql_cuda_device_to_host(void* dst, const void* src, size_t bytes)
 {
+    if (gUnifiedMemory)
+    {
+        return 0;
+    }
     return cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost) == cudaSuccess ? 0 : -1;
 }
 
@@ -262,23 +277,40 @@ AMQL_EXPORT int amql_cuda_dequant_to_f16(
     // the stream-ordered scratch, so consecutive uploads reuse the same
     // device buffers without a per-call synchronise (the next memcpy on
     // the stream is ordered after the previous kernel consumed them).
+    //
+    // On unified-memory platforms (Grace-Hopper, integrated GPUs) the GPU
+    // can access host memory directly through the NVLink-C2C coherent
+    // fabric — the kernel reads from the host pointers and the scratch
+    // copies are skipped.
     size_t packedBytes = (size_t)((total + 1) / 2);
     size_t scaleBytes = (size_t)rows * ((cols + 31) / 32);
-    if (scratch_reserve(&gCtx.scratchPack, &gCtx.scratchPackBytes, packedBytes) != 0)
+    const unsigned char* packSrc;
+    const unsigned char* scaleSrc;
+    if (gUnifiedMemory)
     {
-        return -2;
+        packSrc = packed;
+        scaleSrc = scales;
     }
-    if (scratch_reserve(&gCtx.scratchScale, &gCtx.scratchScaleBytes, scaleBytes) != 0)
+    else
     {
-        return -3;
-    }
-    if (cudaMemcpyAsync(gCtx.scratchPack, packed, packedBytes, cudaMemcpyHostToDevice, stream) != cudaSuccess ||
-        cudaMemcpyAsync(gCtx.scratchScale, scales, scaleBytes, cudaMemcpyHostToDevice, stream) != cudaSuccess)
-    {
-        return -4;
+        if (scratch_reserve(&gCtx.scratchPack, &gCtx.scratchPackBytes, packedBytes) != 0)
+        {
+            return -2;
+        }
+        if (scratch_reserve(&gCtx.scratchScale, &gCtx.scratchScaleBytes, scaleBytes) != 0)
+        {
+            return -3;
+        }
+        if (cudaMemcpyAsync(gCtx.scratchPack, packed, packedBytes, cudaMemcpyHostToDevice, stream) != cudaSuccess ||
+            cudaMemcpyAsync(gCtx.scratchScale, scales, scaleBytes, cudaMemcpyHostToDevice, stream) != cudaSuccess)
+        {
+            return -4;
+        }
+        packSrc = (const unsigned char*)gCtx.scratchPack;
+        scaleSrc = (const unsigned char*)gCtx.scratchScale;
     }
     dequant_mxfp4_to_f16<<<blocks, threads, 0, stream>>>(
-        (const unsigned char*)gCtx.scratchPack, (const unsigned char*)gCtx.scratchScale, out, rows, cols);
+        packSrc, scaleSrc, out, rows, cols);
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
 
@@ -300,19 +332,22 @@ AMQL_EXPORT int amql_cuda_gemm_transposed_b(
     }
     cudaStream_t stream = streamOrdinal == 0 ? gCtx.stream : 0;
 
-    if (scratch_reserve(&gCtx.scratchA, &gCtx.scratchABytes, (size_t)m * k * 4) != 0)
+    const float* aSrc;
+    if (gUnifiedMemory)
     {
-        return -2;
+        aSrc = a;   // GPU accesses host memory directly via NVLink-C2C
     }
-    if (scratch_reserve(&gCtx.scratchC, &gCtx.scratchCBytes, (size_t)m * n * 4) != 0)
+    else
     {
-        return -3;
-    }
-    void* aD = gCtx.scratchA;
-    void* cD = gCtx.scratchC;
-    if (cudaMemcpyAsync(aD, a, (size_t)m * k * 4, cudaMemcpyHostToDevice, stream) != cudaSuccess)
-    {
-        return -4;
+        if (scratch_reserve(&gCtx.scratchA, &gCtx.scratchABytes, (size_t)m * k * 4) != 0)
+        {
+            return -2;
+        }
+        if (cudaMemcpyAsync(gCtx.scratchA, a, (size_t)m * k * 4, cudaMemcpyHostToDevice, stream) != cudaSuccess)
+        {
+            return -4;
+        }
+        aSrc = (const float*)gCtx.scratchA;
     }
     if (scratch_reserve(&gCtx.scratchAF16, &gCtx.scratchAF16Bytes, (size_t)m * k * 2) != 0)
     {
@@ -323,7 +358,7 @@ AMQL_EXPORT int amql_cuda_gemm_transposed_b(
     int actThreads = 256;
     int actBlocks = (int)((actCount + actThreads - 1) / actThreads);
     cast_f32_to_f16<<<actBlocks, actThreads, 0, stream>>>(
-        (const float*)aD, (__half*)aF16, actCount);
+        aSrc, (__half*)aF16, actCount);
     if (cudaGetLastError() != cudaSuccess)
     {
         return -6;
@@ -336,6 +371,19 @@ AMQL_EXPORT int amql_cuda_gemm_transposed_b(
     // operands viewed column-major at ld=k; D stored with ldc=n lands at
     // j + i·n, exactly the row-major [m,n] host output.
     float alpha = 1.0f, beta = 0.0f;
+    float* cOut;
+    if (gUnifiedMemory)
+    {
+        cOut = c;   // cuBLAS writes directly to host output buffer
+    }
+    else
+    {
+        if (scratch_reserve(&gCtx.scratchC, &gCtx.scratchCBytes, (size_t)m * n * 4) != 0)
+        {
+            return -3;
+        }
+        cOut = (float*)gCtx.scratchC;
+    }
     cublasStatus_t status = cublasGemmEx(
         gCtx.cublas, CUBLAS_OP_T, CUBLAS_OP_N,
         n, m, k,
@@ -343,10 +391,13 @@ AMQL_EXPORT int amql_cuda_gemm_transposed_b(
         (const void*)w, CUDA_R_16F, k,
         (const void*)aF16, CUDA_R_16F, k,
         &beta,
-        (void*)cD, CUDA_R_32F, n,
+        (void*)cOut, CUDA_R_32F, n,
         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
 
-    cudaMemcpyAsync(c, cD, (size_t)m * n * 4, cudaMemcpyDeviceToHost, stream);
+    if (!gUnifiedMemory)
+    {
+        cudaMemcpyAsync(c, (float*)gCtx.scratchC, (size_t)m * n * 4, cudaMemcpyDeviceToHost, stream);
+    }
     cudaStreamSynchronize(stream);
 
     return status == CUBLAS_STATUS_SUCCESS ? 0 : -7;
@@ -373,19 +424,22 @@ AMQL_EXPORT int amql_cuda_gemm_transposed_b_async(
     }
     cudaStream_t stream = streamOrdinal == 0 ? gCtx.stream : 0;
 
-    if (scratch_reserve(&gCtx.scratchA, &gCtx.scratchABytes, (size_t)m * k * 4) != 0)
+    const float* aSrc;
+    if (gUnifiedMemory)
     {
-        return -2;
+        aSrc = a;
     }
-    if (scratch_reserve(&gCtx.scratchC, &gCtx.scratchCBytes, (size_t)m * n * 4) != 0)
+    else
     {
-        return -3;
-    }
-    void* aD = gCtx.scratchA;
-    void* cD = gCtx.scratchC;
-    if (cudaMemcpyAsync(aD, a, (size_t)m * k * 4, cudaMemcpyHostToDevice, stream) != cudaSuccess)
-    {
-        return -4;
+        if (scratch_reserve(&gCtx.scratchA, &gCtx.scratchABytes, (size_t)m * k * 4) != 0)
+        {
+            return -2;
+        }
+        if (cudaMemcpyAsync(gCtx.scratchA, a, (size_t)m * k * 4, cudaMemcpyHostToDevice, stream) != cudaSuccess)
+        {
+            return -4;
+        }
+        aSrc = (const float*)gCtx.scratchA;
     }
     if (scratch_reserve(&gCtx.scratchAF16, &gCtx.scratchAF16Bytes, (size_t)m * k * 2) != 0)
     {
@@ -396,13 +450,26 @@ AMQL_EXPORT int amql_cuda_gemm_transposed_b_async(
     int actThreads = 256;
     int actBlocks = (int)((actCount + actThreads - 1) / actThreads);
     cast_f32_to_f16<<<actBlocks, actThreads, 0, stream>>>(
-        (const float*)aD, (__half*)aF16, actCount);
+        aSrc, (__half*)aF16, actCount);
     if (cudaGetLastError() != cudaSuccess)
     {
         return -6;
     }
 
     float alpha = 1.0f, beta = 0.0f;
+    float* cOut;
+    if (gUnifiedMemory)
+    {
+        cOut = c;
+    }
+    else
+    {
+        if (scratch_reserve(&gCtx.scratchC, &gCtx.scratchCBytes, (size_t)m * n * 4) != 0)
+        {
+            return -3;
+        }
+        cOut = (float*)gCtx.scratchC;
+    }
     cublasStatus_t status = cublasGemmEx(
         gCtx.cublas, CUBLAS_OP_T, CUBLAS_OP_N,
         n, m, k,
@@ -410,10 +477,13 @@ AMQL_EXPORT int amql_cuda_gemm_transposed_b_async(
         (const void*)w, CUDA_R_16F, k,
         (const void*)aF16, CUDA_R_16F, k,
         &beta,
-        (void*)cD, CUDA_R_32F, n,
+        (void*)cOut, CUDA_R_32F, n,
         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
 
-    cudaMemcpyAsync(c, cD, (size_t)m * n * 4, cudaMemcpyDeviceToHost, stream);
+    if (!gUnifiedMemory)
+    {
+        cudaMemcpyAsync(c, (float*)gCtx.scratchC, (size_t)m * n * 4, cudaMemcpyDeviceToHost, stream);
+    }
     // NO sync — caller batches and syncs once.
 
     return status == CUBLAS_STATUS_SUCCESS ? 0 : -7;
@@ -445,24 +515,32 @@ AMQL_EXPORT int amql_cuda_upload_activation_f16(
         return -2;
     }
 
-    // Staging: copy host→device FP32, then cast to FP16 on device.
-    if (scratch_reserve(&gCtx.scratchA, &gCtx.scratchABytes, (size_t)m * k * 4) != 0)
+    const float* aSrc;
+    if (gUnifiedMemory)
     {
-        cudaFree(*out);
-        *out = nullptr;
-        return -3;
+        aSrc = a;
     }
-    if (cudaMemcpyAsync(gCtx.scratchA, a, (size_t)m * k * 4, cudaMemcpyHostToDevice, stream) != cudaSuccess)
+    else
     {
-        cudaFree(*out);
-        *out = nullptr;
-        return -4;
+        if (scratch_reserve(&gCtx.scratchA, &gCtx.scratchABytes, (size_t)m * k * 4) != 0)
+        {
+            cudaFree(*out);
+            *out = nullptr;
+            return -3;
+        }
+        if (cudaMemcpyAsync(gCtx.scratchA, a, (size_t)m * k * 4, cudaMemcpyHostToDevice, stream) != cudaSuccess)
+        {
+            cudaFree(*out);
+            *out = nullptr;
+            return -4;
+        }
+        aSrc = (const float*)gCtx.scratchA;
     }
     long count = (long)m * k;
     int threads = 256;
     int blocks = (int)((count + threads - 1) / threads);
     cast_f32_to_f16<<<blocks, threads, 0, stream>>>(
-        (const float*)gCtx.scratchA, *out, count);
+        aSrc, *out, count);
     if (cudaGetLastError() != cudaSuccess)
     {
         cudaFree(*out);
@@ -493,11 +571,19 @@ AMQL_EXPORT int amql_cuda_gemm_device_a(
     }
     cudaStream_t stream = streamOrdinal == 0 ? gCtx.stream : 0;
 
-    if (scratch_reserve(&gCtx.scratchC, &gCtx.scratchCBytes, (size_t)m * n * 4) != 0)
+    float* cOut;
+    if (gUnifiedMemory)
     {
-        return -2;
+        cOut = c;
     }
-    void* cD = gCtx.scratchC;
+    else
+    {
+        if (scratch_reserve(&gCtx.scratchC, &gCtx.scratchCBytes, (size_t)m * n * 4) != 0)
+        {
+            return -2;
+        }
+        cOut = (float*)gCtx.scratchC;
+    }
 
     float alpha = 1.0f, beta = 0.0f;
     cublasStatus_t status = cublasGemmEx(
@@ -507,10 +593,13 @@ AMQL_EXPORT int amql_cuda_gemm_device_a(
         (const void*)w, CUDA_R_16F, k,
         (const void*)a_dev, CUDA_R_16F, k,
         &beta,
-        (void*)cD, CUDA_R_32F, n,
+        (void*)cOut, CUDA_R_32F, n,
         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
 
-    cudaMemcpyAsync(c, cD, (size_t)m * n * 4, cudaMemcpyDeviceToHost, stream);
+    if (!gUnifiedMemory)
+    {
+        cudaMemcpyAsync(c, (float*)gCtx.scratchC, (size_t)m * n * 4, cudaMemcpyDeviceToHost, stream);
+    }
     // NO sync.
 
     return status == CUBLAS_STATUS_SUCCESS ? 0 : -7;

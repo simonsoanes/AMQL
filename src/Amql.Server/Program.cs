@@ -82,13 +82,16 @@ if (models.All(m => m.Capabilities == Capability.None))
     var ws = Amql.Inference.WeightWorkingSetExtensions.FromEnv();
     if (Amql.Inference.CudaShim.Enabled)
     {
+        string memNote = Amql.Inference.CudaShim.IsUnifiedMemory
+            ? " (unified memory — zero-copy, scratch-buffer staging skipped)"
+            : "";
         if (ws == Amql.Inference.WeightWorkingSet.Mxfp4)
         {
-            Console.WriteLine("cuda:      MXFP4 packs resident on device — GEMMs run on the GPU (FP16 tensor cores, FP32 accumulate)");
+            Console.WriteLine($"cuda:      MXFP4 packs resident on device — GEMMs run on the GPU (FP16 tensor cores, FP32 accumulate){memNote}");
         }
         else
         {
-            Console.WriteLine($"cuda:      GPU available — {ws} weights uploaded as FP16 for device GEMMs");
+            Console.WriteLine($"cuda:      GPU available — {ws} weights uploaded as FP16 for device GEMMs{memNote}");
         }
     }
     else

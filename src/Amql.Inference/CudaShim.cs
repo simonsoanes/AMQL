@@ -46,11 +46,24 @@ public static class CudaShim
                 {
                     _probed = true;
                     _enabled = Probe();
+                    if (_enabled)
+                    {
+                        _unifiedMemory = amql_cuda_unified_memory() == 1;
+                    }
                 }
                 return _enabled;
             }
         }
     }
+
+    private static bool _unifiedMemory;
+
+    /// <summary>
+    /// True when the device has unified memory (Grace-Hopper, integrated GPU)
+    /// — the GPU accesses host memory directly through the coherent fabric and
+    /// the native backend skips scratch-buffer staging copies.
+    /// </summary>
+    public static bool IsUnifiedMemory => _unifiedMemory;
 
     /// <summary>
     /// Forces the CPU path for this process — must be called before the
@@ -502,6 +515,9 @@ public static class CudaShim
 
     [DllImport("amql_cuda")]
     private static extern int amql_cuda_init();
+
+    [DllImport("amql_cuda")]
+    private static extern int amql_cuda_unified_memory();
 
     [DllImport("amql_cuda")]
     private static extern int amql_cuda_malloc(out IntPtr ptr, nuint bytes);
