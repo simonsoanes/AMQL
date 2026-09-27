@@ -1939,12 +1939,163 @@ internal static class Program
 
     // ── classify: run a classifier (Jev/NLI-style) ──────────────────────
 
+    /// <summary>
+    /// Serves a sequence-classification container: each input is formatted by
+    /// the recorded template (pairs) or used verbatim (single texts),
+    /// tokenised with the container's tokenizer, pooled at the recorded token
+    /// and scored by the head. Inputs: <c>--premise/--hypothesis</c>,
+    /// <c>--text "premise|hypothesis"</c> (split on the first '|'; a single
+    /// text when no template is recorded), <c>--input "text"</c>, or
+    /// <c>--jsonl &lt;path | -&gt;</c> with one <c>{"premise","hypothesis"}</c> or
+    /// <c>{"text"}</c> object per line.
+    /// </summary>
     private static int Classify(string[] args)
     {
-        Console.WriteLine("classify is not yet implemented (Phase B — serve).");
-        Console.WriteLine("Classifier containers can be created via 'encode' and exported back via 'export'.");
-        Console.WriteLine("Use 'inspect <container> --classifier' to view the classifier surface.");
+        var containerDir = Arg(args, 0) ?? throw new CliException(
+            "classify requires a container directory, e.g. amql-cli classify <container> --premise \"…\" --hypothesis \"…\"");
+        string format = OptionValue(args, "--format") ?? "labels";
+        if (format is not ("labels" or "json" or "jsonl" or "csv"))
+        {
+            throw new CliException("--format must be labels, json, jsonl or csv");
+        }
+        int maxTokens = int.Parse(OptionValue(args, "--max-tokens") ?? ClassificationService.DefaultMaxTokens.ToString(),
+            System.Globalization.CultureInfo.InvariantCulture);
+        string? patchPath = OptionValue(args, "--patch");
+
+        using var container = Vindex3Container.Open(containerDir);
+        if (!ClassificationService.Serves(container))
+        {
+            throw new CliException("this container has no classifier head — encode a *ForSequenceClassification checkpoint, " +
+                                   "or add one with convert-to-classifier");
+        }
+        bool hasTemplate = container.Graph!.Components[0].Execution!.Classifier!.Template is not null;
+        var inputs = ReadClassificationInputs(args, hasTemplate);
+        if (inputs.Count == 0)
+        {
+            throw new CliException("classify needs an input: --premise/--hypothesis, --text, --input or --jsonl <path | ->");
+        }
+
+        using var store = container.CreateOperandStore();
+        CliProgress.Phase("load");
+        var service = ClassificationService.Load(container, store, patchPath is null ? null : WeightPatch.Load(patchPath), maxTokens);
+
+        CliProgress.Phase("classify", inputs.Count);
+        var results = new List<JsonObject>();
+        foreach (var input in inputs)
+        {
+            try
+            {
+                results.Add(service.Classify(input));
+            }
+            catch (ClassificationRequestException e)
+            {
+                throw new CliException(e.Message);
+            }
+            CliProgress.Advance(results.Count, inputs.Count);
+        }
+
+        var json = new JsonSerializerOptions
+        {
+            WriteIndented = format == "json",
+            Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+        };
+        switch (format)
+        {
+            case "labels":
+                foreach (var r in results)
+                {
+                    Console.WriteLine(service.LabelLine(r));
+                }
+                break;
+            case "json":
+                Console.WriteLine((results.Count == 1 ? (JsonNode)results[0] : new JsonArray(results.ToArray<JsonNode?>())).ToJsonString(json));
+                break;
+            case "jsonl":
+                foreach (var r in results)
+                {
+                    Console.WriteLine(r.ToJsonString(json));
+                }
+                break;
+            case "csv":
+            {
+                bool pairs = inputs.Any(i => i.IsPair);
+                var header = pairs ? new List<string> { "premise", "hypothesis" } : new List<string> { "text" };
+                header.Add("prediction");
+                header.AddRange(service.Labels);
+                Console.WriteLine(string.Join(",", header.Select(Csv)));
+                foreach (var (r, input) in results.Zip(inputs))
+                {
+                    var row = pairs
+                        ? new List<string> { input.Premise ?? input.Text ?? string.Empty, input.Hypothesis ?? string.Empty }
+                        : new List<string> { input.Text ?? string.Empty };
+                    row.Add(service.LabelLine(r));
+                    row.AddRange(r["scores"]!.AsObject().Select(kv =>
+                        kv.Value!.GetValue<double>().ToString("R", System.Globalization.CultureInfo.InvariantCulture)));
+                    Console.WriteLine(string.Join(",", row.Select(Csv)));
+                }
+                break;
+            }
+        }
         return 0;
+
+        static string Csv(string v) =>
+            v.IndexOfAny([',', '"', '\n', '\r']) >= 0 ? "\"" + v.Replace("\"", "\"\"") + "\"" : v;
+    }
+
+    private static List<ClassificationInput> ReadClassificationInputs(string[] args, bool hasTemplate)
+    {
+        var inputs = new List<ClassificationInput>();
+        string? premise = OptionValue(args, "--premise");
+        string? hypothesis = OptionValue(args, "--hypothesis");
+        if (premise is not null || hypothesis is not null)
+        {
+            if (premise is null || hypothesis is null)
+            {
+                throw new CliException("--premise and --hypothesis go together");
+            }
+            inputs.Add(ClassificationInput.Pair(premise, hypothesis));
+        }
+        if (OptionValue(args, "--text") is { } text)
+        {
+            int bar = text.IndexOf('|');
+            inputs.Add(hasTemplate && bar >= 0
+                ? ClassificationInput.Pair(text[..bar], text[(bar + 1)..])
+                : hasTemplate
+                    ? throw new CliException("--text needs 'premise|hypothesis' for a container with a pair template; use --input for a single text")
+                    : ClassificationInput.Single(text));
+        }
+        if (OptionValue(args, "--input") is { } single)
+        {
+            inputs.Add(ClassificationInput.Single(single));
+        }
+        if (OptionValue(args, "--jsonl") is { } source)
+        {
+            var lines = source == "-" ? Console.In.ReadToEnd().Split('\n') : File.ReadAllLines(source);
+            int n = 0;
+            foreach (var raw in lines)
+            {
+                n++;
+                if (string.IsNullOrWhiteSpace(raw))
+                {
+                    continue;
+                }
+                using var doc = JsonDocument.Parse(raw);
+                var o = doc.RootElement;
+                if (o.TryGetProperty("premise", out var p) && o.TryGetProperty("hypothesis", out var h))
+                {
+                    inputs.Add(ClassificationInput.Pair(p.GetString()!, h.GetString()!));
+                }
+                else if (o.TryGetProperty("text", out var t))
+                {
+                    inputs.Add(ClassificationInput.Single(t.GetString()!));
+                }
+                else
+                {
+                    throw new CliException($"--jsonl line {n}: expected {{\"premise\",\"hypothesis\"}} or {{\"text\"}}");
+                }
+            }
+        }
+        return inputs;
     }
 
     // ── decide: TypeSafe /v1/decisions against a Von container ──────────
@@ -2168,6 +2319,11 @@ internal static class Program
             Commands:
               amql-cli encode <model-dir> --out <container-dir>   map + materialise
               amql-cli verify <container-dir>                     integrity + readiness
+              amql-cli classify <classifier-container>
+                              (--premise "…" --hypothesis "…" | --text "premise|hypothesis"
+                               | --input "text" | --jsonl <path | ->)
+                              [--format labels|json|jsonl|csv] [--max-tokens 4096] [--patch <p>]
+                              run a sequence-classification head (template → pool → score)
               amql-cli decide <von-container> --request <json | @file | ->
                               [--envelope none|jevai] [--attention auto|independent|full] [--compact]
                               answer a TypeSafe /v1/decisions request (choice / score / noul

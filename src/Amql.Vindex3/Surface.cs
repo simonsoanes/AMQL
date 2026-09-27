@@ -270,6 +270,21 @@ public sealed class ClassifierSurface
 
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
     public bool ScoreHeadReusesEmbeddingLayout { get; init; }
+
+    /// <summary>The label table, <c>Labels[i]</c> naming logit <c>i</c> — the
+    /// checkpoint's <c>id2label</c>, carried so output reads "entailment" and
+    /// not 1, and so export regenerates the same map. Absent means the
+    /// checkpoint named none; export then writes <c>LABEL_i</c>, as HF does.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public IReadOnlyList<string>? Labels { get; init; }
+
+    /// <summary>The score head carries a bias (<c>score.bias</c>).</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool ScoreBias { get; init; }
+
+    /// <summary>The pad token the checkpoint pads (and pools) with.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? PadTokenId { get; init; }
 }
 
 // ── Bidirectional encoder surface (ModernBERT) ───────────────────────────

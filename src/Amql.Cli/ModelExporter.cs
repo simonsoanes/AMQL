@@ -1003,17 +1003,19 @@ internal static class ExportConfig
             {
                 config["nli_template"] = template;
             }
-            // id2label: synthetic 0→"LABEL_0", 1→"LABEL_1", …
-            // The real checkpoint carries the actual labels; here we
-            // regenerate from NumLabels since the surface records count
-            // but not the label strings (carried in classifier.json).
+            // The carried label table; HF's own LABEL_i default only when the
+            // source checkpoint named none.
             var id2Label = new JsonObject();
             var label2Id = new JsonObject();
             for (int i = 0; i < classifier.NumLabels; i++)
             {
-                string label = $"LABEL_{i}";
+                string label = classifier.Labels is { } labels ? labels[i] : $"LABEL_{i}";
                 id2Label[i.ToString()] = label;
                 label2Id[label] = i;
+            }
+            if (classifier.PadTokenId is { } pad)
+            {
+                config["pad_token_id"] = pad;
             }
             config["id2label"] = id2Label;
             config["label2id"] = label2Id;

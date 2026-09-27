@@ -53,6 +53,27 @@ public static class ModelToContainer
         // from the tensors, so the container is the only place to keep them.
         var ancillaryCopied = HfAncillaryFiles.CopyInto(modelDir, containerOut);
 
+        // A classifier's top-level facts, mirrored beside the graph (which is
+        // the authority) so they can be read without parsing it.
+        if (classification is not null)
+        {
+            var mirror = new System.Text.Json.Nodes.JsonObject
+            {
+                ["num_labels"] = classification.NumLabels,
+                ["problem_type"] = classification.ProblemType,
+                ["id2label"] = classification.Labels is { } labels
+                    ? new System.Text.Json.Nodes.JsonObject(labels.Select((l, i) =>
+                        KeyValuePair.Create(i.ToString(System.Globalization.CultureInfo.InvariantCulture), (System.Text.Json.Nodes.JsonNode?)l)))
+                    : null,
+                ["nli_template"] = classification.Template,
+                ["pad_token_id"] = classification.PadTokenId,
+                ["score_bias"] = classification.BiasTensor is not null,
+            };
+            File.WriteAllText(Path.Combine(containerOut, "classifier.json"),
+                mirror.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+            ancillaryCopied = ancillaryCopied.Append("classifier.json").ToList();
+        }
+
         long payload = spec.Representations.Sum(r => r.Tensors.Sum(t => (long)t.Data.Length));
         int tensors = spec.Representations.Sum(r => r.Tensors.Count);
         var encoding = result.Index.Representations.Values.FirstOrDefault()?.Encoding ?? "?";

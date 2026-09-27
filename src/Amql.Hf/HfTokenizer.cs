@@ -115,34 +115,37 @@ public sealed class HfTokenizer
                 vocab[entry.Name] = entry.Value.GetInt32();
             }
             var mergeRanks = new Dictionary<(string, string), int>();
-            var merges = model.GetProperty("merges");
-            for (int i = 0; i < merges.GetArrayLength(); i++)
+            // One pass with an enumerator: JsonElement's array indexer walks
+            // from the start for arrays of arrays (the ≥ 0.21 pair form), so
+            // merges[i] in a loop is quadratic — minutes for a 247k-merge file.
+            int rank = -1;
+            foreach (var entry in model.GetProperty("merges").EnumerateArray())
             {
+                rank++;
                 // tokenizers ≤ 0.20 writes a merge as one "left right" string;
                 // ≥ 0.21 (Granite's file) writes the pair as a two-element
                 // array. Joining the parts with the separator reproduces the
                 // string form exactly, so both rank identically.
-                var entry = merges[i];
                 string pair;
                 if (entry.ValueKind == JsonValueKind.Array)
                 {
                     if (entry.GetArrayLength() != 2)
                     {
                         throw new TokenizerException(
-                            $"'{path}': merge entry {i} is an array of {entry.GetArrayLength()} parts, expected 2");
+                            $"'{path}': merge entry {rank} is an array of {entry.GetArrayLength()} parts, expected 2");
                     }
                     pair = $"{entry[0].GetString()} {entry[1].GetString()}";
                 }
                 else
                 {
-                    pair = entry.GetString() ?? throw new TokenizerException($"'{path}': null merge entry at {i}");
+                    pair = entry.GetString() ?? throw new TokenizerException($"'{path}': null merge entry at {rank}");
                 }
                 int splitAt = pair.LastIndexOf(' ');
                 if (splitAt <= 0)
                 {
                     throw new TokenizerException($"'{path}': malformed merge '{pair}'");
                 }
-                mergeRanks[(pair[..splitAt], pair[(splitAt + 1)..])] = i;
+                mergeRanks[(pair[..splitAt], pair[(splitAt + 1)..])] = rank;
             }
 
             // Added / special tokens.
@@ -150,9 +153,8 @@ public sealed class HfTokenizer
             var addedByContent = new Dictionary<string, AddedToken>(StringComparer.Ordinal);
             if (root.TryGetProperty("added_tokens", out var added) && added.ValueKind == JsonValueKind.Array)
             {
-                for (int i = 0; i < added.GetArrayLength(); i++)
+                foreach (var entry in added.EnumerateArray())
                 {
-                    var entry = added[i];
                     int id = entry.GetProperty("id").GetInt32();
                     string content = entry.GetProperty("content").GetString() ?? string.Empty;
                     bool special = entry.TryGetProperty("special", out var sp) && sp.GetBoolean();
@@ -253,6 +255,42 @@ public sealed class HfTokenizer
             ids[prefix.Length + i] = body[i];
         }
         suffix.CopyTo(ids, prefix.Length + body.Count);
+        return ids;
+    }
+
+    /// <summary>
+    /// What HF's <c>tokenizer(text, truncation=True, max_length=n)</c> returns:
+    /// the body, truncated from the right so that it and the post-processor's
+    /// special tokens fit in <paramref name="maxLength"/>, then wrapped by the
+    /// single-sequence template when the tokenizer declares one (a ByteLevel
+    /// post-processor, as Qwen's, adds nothing). Reports whether it truncated.
+    /// </summary>
+    public int[] EncodeForModel(string text, int? maxLength, out bool truncated)
+    {
+        var (prefix, suffix) = _singleTemplate ?? (Array.Empty<int>(), Array.Empty<int>());
+        var body = EncodeToIds(text);
+        int keep = body.Count;
+        truncated = false;
+        if (maxLength is { } max)
+        {
+            int room = max - prefix.Length - suffix.Length;
+            if (room < 1)
+            {
+                throw new TokenizerException($"max length {max} leaves no room beside {prefix.Length + suffix.Length} special tokens");
+            }
+            if (keep > room)
+            {
+                keep = room;
+                truncated = true;
+            }
+        }
+        var ids = new int[prefix.Length + keep + suffix.Length];
+        prefix.CopyTo(ids, 0);
+        for (int i = 0; i < keep; i++)
+        {
+            ids[prefix.Length + i] = body[i];
+        }
+        suffix.CopyTo(ids, prefix.Length + keep);
         return ids;
     }
 

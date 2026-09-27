@@ -402,18 +402,21 @@ public static class CommandCatalog
 
         // ── 8. Classify ─────────────────────────────────────────────────────
         new("classify", CatPathways,
-            "NOT IMPLEMENTED — the CLI prints a placeholder and exits 0. Classifier containers "
-            + "can be made with convert-to-classifier and inspected with 'inspect --classifier'.", new[]
+            "Run a sequence-classification head: format the input by the recorded template, pool the last "
+            + "real token, score it and name the label.", new[]
         {
             ContainerParam,
-            new ParamDef("text", "--text premise|hypothesis", ParamKind.Option, EditorKind.Text, Flag: "--text",
-                Help: "Single string split on first | (premise | hypothesis)."),
             new ParamDef("premise", "--premise", ParamKind.Option, EditorKind.Text, Flag: "--premise"),
             new ParamDef("hypothesis", "--hypothesis", ParamKind.Option, EditorKind.Text, Flag: "--hypothesis"),
+            new ParamDef("text", "--text premise|hypothesis", ParamKind.Option, EditorKind.Text, Flag: "--text",
+                Help: "One string split on the first | into premise and hypothesis (a single text when no template is recorded)."),
+            new ParamDef("input", "--input text", ParamKind.Option, EditorKind.MultiLineText, Flag: "--input",
+                Help: "A single text used verbatim, for classifiers without a pair template."),
+            new ParamDef("jsonl", "--jsonl file", ParamKind.Option, EditorKind.File, Flag: "--jsonl",
+                Help: "One {\"premise\",\"hypothesis\"} or {\"text\"} object per line."),
             new ParamDef("format", "--format", ParamKind.Option, EditorKind.Choice, Flag: "--format", DefaultValue: "labels",
-                Choices: new[] { "labels", "json", "jsonl", "csv" },
-                Help: "Intended output format. Currently ignored — the command is a stub, so this "
-                      + "selects nothing until classify is implemented."),
+                Choices: new[] { "labels", "json", "jsonl", "csv" }),
+            new ParamDef("maxTokens", "--max-tokens", ParamKind.Option, EditorKind.Int, Flag: "--max-tokens", DefaultValue: "4096"),
             PatchParam,
         }),
 

@@ -1,6 +1,6 @@
 # Classifier Models in AMQL — sequence-classification ("Jev") support
 
-**Status:** Design proposal
+**Status:** C1–C6 implemented and served (`amql-cli classify`); verified against transformers on `AlexWortega/openjev` `qwen3.5-0.8b-nli-v5` — see §15
 **Author:** AMQL / Ariadne
 **Date:** 2026-09-23
 
@@ -574,3 +574,32 @@ one pooling rule. The design's entire job is to **carry the classifier facts thr
 inspect → export (→ serve) without ever letting the score head, the label table, or the
 pooling rule be silently reshaped into a generator.** The CPU stays the byte-exact reference; an
 unjudged problem type or an absent head refuses by name.
+
+---
+
+## 15. Implementation status (C1–C6)
+
+| Gap | Status | Where |
+|---|---|---|
+| C1 head object kind | `ObjectKind.ClassifierHead`; the planner enforces the ownership contract (a head object ⇔ a `Classifier` surface) | `GraphModel.cs`, `Planner.cs` |
+| C2 score binding | weight **and** `score.bias` when shipped, under the checkpoint's own prefix (`score` / `model.score`) so export rebuilds the exact names; head width checked against the stack | `ArchMapper.BindScoreHead` |
+| C3 last-non-pad pooling | `PoolingSurface.LastNonPad`; served by `ClassifierPooling.Index` (`Σmask − 1`, or the final row when false); other pooling kinds refuse | `SequenceClassifier.cs` |
+| C4 label table / template / problem type / pad | `ClassifierSurface.Labels`, `Template`, `ProblemType`, `ScoreBias`, `PadTokenId`; `classifier.json` mirror; export regenerates `id2label`/`label2id`/`pad_token_id` instead of `LABEL_i` | `Surface.cs`, `ModelToContainer`, `ExportConfig` |
+| C5 ingest lifts and checks the facts | `ReadClassificationFacts`: `NumLabels` from the tensor (the authority); refuses a rank ≠ 2 head, several heads, an `id2label` that does not number rows 0..n−1, a `label2id` that is not its inverse, a mis-shaped bias, an unknown `problem_type`; HF's default problem type when absent; nomic-bert + head refused instead of dropped | `ModelConfig.cs` |
+| C6 `classify` | `amql-cli classify <container> (--premise/--hypothesis \| --text "p\|h" \| --input text \| --jsonl file\|-) [--format labels\|json\|jsonl\|csv] [--max-tokens 4096] [--patch p]`; softmax / per-label sigmoid / identity by `problem_type` | `Classification.cs`, `Program.cs` |
+
+Decisions on §13's open questions: the head binds `score.weight` + optional `score.bias` (openjev ships
+no bias); `--text` splits on the first `|`; multi-label (sigmoid) and regression (identity) are served
+as HF defines them. Inputs are classified one at a time: the backbone is causal, so the pooled row of an
+unpadded input equals the row of the same input inside a right-padded batch — the golden test proves this
+against a padded transformers batch.
+
+**Verification** on `qwen3.5-0.8b-nli-v5` (BF16 weights, both sides in f32): five pairs, labels identical,
+logits within 8e-6 and probabilities within 2e-6 of `OpenJevCrossEncoder.predict`; encode → export →
+encode reproduces identical payloads. Getting there fixed two pre-existing defects in shared code: the
+GatedDeltaNet recurrence predicted `v` from the state *before* its decay (exact at the first token,
+drifting from the second — every Qwen3.5 `generate` was affected), and the tokenizer parsed pair-form
+merges quadratically (183 s → 0.5 s for Qwen's 247k merges). A GatedDeltaNet-only plan now prefills
+layer-major (bit-identical to position-major, ~2.6× faster). On 4 cores: load ~30 s (first use widens
+BF16 → f32), then ~2–4 s per 20–35-token input.
+

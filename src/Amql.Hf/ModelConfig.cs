@@ -42,7 +42,19 @@ public sealed record ClassificationFacts(
     int NumLabels,
     string ProblemType,
     string? Template,
-    bool HasScoreTensor);
+    bool HasScoreTensor)
+{
+    /// <summary>The checkpoint name of the head's weight, e.g. <c>score.weight</c>.</summary>
+    public string WeightTensor { get; init; } = "score.weight";
+
+    /// <summary>The head's bias tensor, when the checkpoint ships one.</summary>
+    public string? BiasTensor { get; init; }
+
+    /// <summary><c>id2label</c> as a list indexed by label id.</summary>
+    public IReadOnlyList<string>? Labels { get; init; }
+
+    public int? PadTokenId { get; init; }
+}
 
 /// <summary>
 /// G1 output: architecture facts lifted from <c>config.json</c> — the
@@ -322,50 +334,132 @@ public static class ModelConfig
         return parsed == 1.0 ? null : parsed;
     }
 
-    /// <summary>Lifts the top-level classifier keys from config.json when a
-    /// <c>ForSequenceClassification</c> checkpoint is detected. Returns null
-    /// when the checkpoint carries no classifier head (ordinary decoder).
-    /// A config that claims a head but has no <c>score.weight</c> in the
-    /// inventory is a defect — refused by name.</summary>
+    /// <summary>The problem types a classifier head can declare — HF's
+    /// <c>problem_type</c> vocabulary. Anything else is refused on ingest rather
+    /// than carried under a name nothing can serve or export faithfully.</summary>
+    public static readonly IReadOnlyList<string> ProblemTypes = new[]
+    {
+        "single_label_classification", "multi_label_classification", "regression",
+    };
+
+    /// <summary>
+    /// Lifts the top-level classifier facts from config.json when a
+    /// <c>ForSequenceClassification</c> checkpoint is detected, and checks
+    /// them against the score tensor, which is the authority. Returns null when
+    /// the checkpoint carries no classifier head (ordinary decoder).
+    /// <para>Refused by name: a classifier architecture with no score tensor; a
+    /// score tensor that is not rank 2; an <c>id2label</c> that does not number
+    /// exactly the tensor's rows 0..n-1; a <c>label2id</c> that is not its
+    /// inverse; a bias of the wrong width; an unknown <c>problem_type</c>.</para>
+    /// </summary>
     public static ClassificationFacts? ReadClassificationFacts(string configPath, HfInventory inventory)
     {
         using var doc = JsonDocument.Parse(File.ReadAllBytes(configPath));
         var root = doc.RootElement;
 
-        // Detect via architectures or the presence of a score head
-        bool isClassifier = false;
-        if (root.TryGetProperty("architectures", out var arch) && arch.ValueKind == JsonValueKind.Array)
-        {
-            isClassifier = arch.EnumerateArray().Any(a =>
-                a.GetString()?.Contains("SequenceClassification", StringComparison.OrdinalIgnoreCase) == true);
-        }
+        bool isClassifier = root.TryGetProperty("architectures", out var arch) && arch.ValueKind == JsonValueKind.Array &&
+                            arch.EnumerateArray().Any(a =>
+                                a.GetString()?.Contains("SequenceClassification", StringComparison.OrdinalIgnoreCase) == true);
 
-        bool hasScore = inventory.CountUnder("model.score.") > 0 ||
-                        inventory.TensorNames.Any(n => n == "score.weight" || n.EndsWith(".score.weight"));
-
-        if (!isClassifier && !hasScore)
+        var scoreNames = inventory.TensorNames
+            .Where(n => n == "score.weight" || n.EndsWith(".score.weight", StringComparison.Ordinal))
+            .ToList();
+        if (!isClassifier && scoreNames.Count == 0)
         {
             return null;
         }
-        if (isClassifier && !hasScore)
+        if (scoreNames.Count == 0)
         {
             throw new ModelConfigException(
-                "config declares a SequenceClassification architecture but no 'model.score.weight' or 'score.weight' tensor is in the inventory");
+                "config declares a SequenceClassification architecture but no 'score.weight' / 'model.score.weight' tensor is in the inventory");
         }
-
-        int numLabels = 0;
-        if (root.TryGetProperty("id2label", out var id2Lbl) && id2Lbl.ValueKind == JsonValueKind.Object)
+        if (scoreNames.Count > 1)
         {
-            numLabels = id2Lbl.EnumerateObject().Count();
+            throw new ModelConfigException(
+                $"the inventory has {scoreNames.Count} score heads ({string.Join(", ", scoreNames)}) — refusing to guess which one classifies");
         }
-        if (numLabels == 0 && hasScore && inventory.TryGet("model.score.weight", out var info))
+
+        string weightName = scoreNames[0];
+        var weight = inventory.Get(weightName);
+        if (weight.Shape.Length != 2)
         {
-            numLabels = (int)info.Shape[0];
+            throw new ModelConfigException($"'{weightName}' has shape [{string.Join("x", weight.Shape)}]; a score head is [num_labels, hidden]");
+        }
+        int numLabels = checked((int)weight.Shape[0]);
+
+        string biasName = weightName[..^"weight".Length] + "bias";
+        bool hasBias = inventory.TryGet(biasName, out var bias);
+        if (hasBias && (bias.Shape.Length != 1 || bias.Shape[0] != numLabels))
+        {
+            throw new ModelConfigException($"'{biasName}' has shape [{string.Join("x", bias.Shape)}]; expected [{numLabels}]");
         }
 
-        string problemType = root.TryGetProperty("problem_type", out var pt) ? pt.GetString() ?? "single_label_classification" : "single_label_classification";
-        string? template = root.TryGetProperty("nli_template", out var tpl) ? tpl.GetString() : null;
+        IReadOnlyList<string>? labels = null;
+        if (root.TryGetProperty("id2label", out var id2Label) && id2Label.ValueKind == JsonValueKind.Object)
+        {
+            var table = new string?[numLabels];
+            foreach (var entry in id2Label.EnumerateObject())
+            {
+                if (!int.TryParse(entry.Name, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out int id) ||
+                    id < 0 || id >= numLabels || table[id] is not null || entry.Value.ValueKind != JsonValueKind.String)
+                {
+                    throw new ModelConfigException(
+                        $"id2label entry '{entry.Name}' is not a unique string label for a row of the [{numLabels}, …] score head");
+                }
+                table[id] = entry.Value.GetString();
+            }
+            if (table.Any(l => l is null))
+            {
+                throw new ModelConfigException(
+                    $"id2label names {table.Count(l => l is not null)} labels but the score head has {numLabels} rows");
+            }
+            labels = table!;
 
-        return new ClassificationFacts(numLabels, problemType, template, hasScore);
+            if (root.TryGetProperty("label2id", out var label2Id) && label2Id.ValueKind == JsonValueKind.Object)
+            {
+                int seen = 0;
+                foreach (var entry in label2Id.EnumerateObject())
+                {
+                    seen++;
+                    if (!entry.Value.TryGetInt32(out int id) || id < 0 || id >= numLabels || labels[id] != entry.Name)
+                    {
+                        throw new ModelConfigException($"label2id maps '{entry.Name}' to {entry.Value} — not the inverse of id2label");
+                    }
+                }
+                if (seen != numLabels)
+                {
+                    throw new ModelConfigException($"label2id has {seen} entries for {numLabels} labels — not the inverse of id2label");
+                }
+            }
+        }
+
+        // HF's own default when the config says nothing: one output is a
+        // regression, several are single-label classes.
+        string problemType = root.TryGetProperty("problem_type", out var pt) && pt.ValueKind == JsonValueKind.String
+            ? pt.GetString()!
+            : numLabels == 1 ? "regression" : "single_label_classification";
+        if (!ProblemTypes.Contains(problemType))
+        {
+            throw new ModelConfigException(
+                $"problem_type '{problemType}' is not one of {string.Join(", ", ProblemTypes)}");
+        }
+
+        string? template = root.TryGetProperty("nli_template", out var tpl) && tpl.ValueKind == JsonValueKind.String
+            ? tpl.GetString()
+            : null;
+
+        int? padTokenId = PadToken(root) ??
+                          (root.TryGetProperty("text_config", out var tc) && tc.ValueKind == JsonValueKind.Object ? PadToken(tc) : null);
+
+        return new ClassificationFacts(numLabels, problemType, template, HasScoreTensor: true)
+        {
+            WeightTensor = weightName,
+            BiasTensor = hasBias ? biasName : null,
+            Labels = labels,
+            PadTokenId = padTokenId,
+        };
+
+        static int? PadToken(JsonElement e) =>
+            e.TryGetProperty("pad_token_id", out var p) && p.TryGetInt32(out int v) ? v : null;
     }
 }

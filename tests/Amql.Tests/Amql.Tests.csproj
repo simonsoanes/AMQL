@@ -36,6 +36,8 @@
     <None Update="torch_state_dict.pt" CopyToOutputDirectory="PreserveNewest" />
     <None Update="torch_noncontiguous.pt" CopyToOutputDirectory="PreserveNewest" />
     <None Update="fixtures\von-tiny\**" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="fixtures\qwen-cls-tiny\**" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="fixtures\gated_delta_golden.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>
