@@ -1,4 +1,6 @@
-# AMQL — VIndex3 Model Container & Graph Database
+# AMQL — AI Model Manipulation Tool
+
+VIndex3 Model Container & Graph Database with transformation and R&D tools
 
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![.NET 10.0](https://img.shields.io/badge/.NET-10.0-purple.svg)](https://dotnet.microsoft.com/download/dotnet)
