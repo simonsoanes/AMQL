@@ -115,6 +115,7 @@ Import and export these checkpoint formats:
 | Gemma 4 | `gemma4_text` | GeGLU activation, QK norms, nested `text_config` |
 | LFM 2.5 | `lfm2` | Short-convolution layers + GQA, SwiGLU MLP |
 | Nomic Embed | `nomic_bert` | Bidirectional encoder, mean pooling |
+| ModernBERT / Von | `modernbert` | Global + sliding bidirectional encoder, GeGLU; Von's `option_marker.pt` scoring head read and written natively (import/export only) |
 | Jev Classifier | `*ForSequenceClassification` | Score head on decoder backbone |
 | Binary/Ternary | any decoder | Via `--quant mxfp4`, `--quant ptq1`, or `--quant pq2` |
 
@@ -301,6 +302,7 @@ multi-million-element matrix is too small to measure downstream. See
 - [Flash-Next Export](docs/export-qwen3.8-flash-next.md) — qwen4-next architecture mapping
 - [Classifier Models](docs/classifier-models-jev.md) — Jev/NLI classification design
 - [Embedding Models](docs/embedding-models-nomic-embed-text.md) — nomic-bert encoder
+- [Decision Models](docs/decision-models-von.md) — Von (ModernBERT option-marker) import/export
 - [Inference Visualiser](docs/inference-visualiser.md) — operator trace format and the map UI
 - [CUDA Backend Plan](docs/CUDA_PLAN.md) — GPU kernel roadmap
 - [MTP Drafter](docs/MTP_DRAFTER.md) — speculative decoding drafter design

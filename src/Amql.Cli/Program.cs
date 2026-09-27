@@ -1189,6 +1189,7 @@ internal static class Program
             Console.WriteLine($"note:       {note}");
         }
         string files = "model.safetensors, config.json" +
+                       (File.Exists(Path.Combine(outDir, Amql.Hf.ModernBert.OptionMarkerFile)) ? $", {Amql.Hf.ModernBert.OptionMarkerFile}" : string.Empty) +
                        (File.Exists(Path.Combine(outDir, "tokenizer.json")) ? ", tokenizer.json" : string.Empty);
         string archLabel = archParam is not null ? $", architecture: {archParam}" : string.Empty;
         Console.WriteLine($"wrote:      {files}  (quantization: {quant}{archLabel})");

@@ -143,7 +143,7 @@ public static class CommandCatalog
         new("encode", CatIngest, "Map + materialise an HF checkpoint into a VINDEX3 container.", new[]
         {
             new ParamDef("modelDir", "model dir", ParamKind.Positional, EditorKind.Directory,
-                Help: "Raw HF checkpoint directory (Qwen3.5, nomic-bert, Jev classifier)."),
+                Help: "Raw HF checkpoint directory (Qwen3.5, nomic-bert, ModernBERT / Von, Jev classifier)."),
             new("out", "--out container dir", ParamKind.Option, EditorKind.Directory, Flag: "--out",
                 Help: "Container directory to write (index.json, system_graph.json, segments/)."),
         }),

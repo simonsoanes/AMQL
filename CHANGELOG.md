@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- **feat:** ModernBERT and the Von decision model ([`wfzyx/von`](https://huggingface.co/wfzyx/von)) import and export — `encode` reads the backbone plus the option-marker scoring head from `option_marker.pt`, `export` writes both back; verified bit-identical (weights and Von's own logits) on the real checkpoint. See `docs/decision-models-von.md`
+- **feat:** `TorchCheckpoint` / `TorchCheckpointWriter` — read and write PyTorch zip checkpoints without Python; the reader only accepts the globals a state dict needs
 - **feat(gui):** "▶ Run and display inference…" in the container explorer (header button, right-click menu, and *Explorer* menu) — opens the run dialog with the loaded container pre-filled and starts a live run in a new inference visualiser
 - **feat:** `amql-cli --progress` (or `AMQL_PROGRESS=1`) — a machine-readable progress/result protocol on stdout: newline-delimited `##amql-progress` and `##amql-result` JSON lines, so front-ends bind progress exactly instead of scraping percentages out of prose
 - **feat:** `amql-cli --verbose` — full stack traces for unexpected errors are now opt-in
@@ -16,6 +18,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- **inference:** planning an encoder container refuses with `UnsupportedOperatorException` naming the encoder stack, so `verify` reports it as not served instead of exiting with an error
+- **hf:** the config reader understands ModernBERT's `hidden_activation`, `norm_eps` and period-style `global_attn_every_n_layers` (previously a GELU encoder would have defaulted to SiLU)
 - **cli:** `change-tensor` collects every argument-validation problem and reports them in one run instead of one error per invocation
 - **cli:** `verify` skips shape-specific operand probes that the container does not have (e.g. the 2-layer `synth-model` demo, a stack without linear attention) instead of failing after integrity passed
 - **cli:** `route` and `path` progress fragments are newline-terminated and flushed under redirected stdout, so a piped consumer sees updates as they happen
