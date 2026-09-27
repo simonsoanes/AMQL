@@ -51,9 +51,9 @@ public sealed partial class RunInferenceDialog : Window
             return;
         }
         if (!int.TryParse(StepsBox.Text.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out int steps)
-            || steps < 1)
+            || steps < -1 || steps == 0)
         {
-            Reject("Steps must be a whole number of at least 1.");
+            Reject("Steps must be a positive whole number, or -1 to run until a stop token.");
             return;
         }
         if (!float.TryParse(TempBox.Text.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out float temp)

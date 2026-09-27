@@ -219,6 +219,11 @@ public static class CommandCatalog
             new ParamDef("topK", "--top-k", ParamKind.Option, EditorKind.Int, Flag: "--top-k", DefaultValue: "0"),
             new ParamDef("topP", "--top-p", ParamKind.Option, EditorKind.Float, Flag: "--top-p", DefaultValue: "0"),
             new ParamDef("seed", "--seed", ParamKind.Option, EditorKind.Int, Flag: "--seed", DefaultValue: "42"),
+            new ParamDef("chat", "--chat", ParamKind.Switch, EditorKind.Choice, Flag: "--chat",
+                DefaultValue: "", Choices: new[] { "", "1" },
+                Help: "Wrap the prompt in the model's chat template (ChatML / Llama 3) before "
+                      + "encoding. Requires a tokenizer with a chat_template.jinja or "
+                      + "tokenizer_config.json."),
             new ParamDef("logits", "--logits K", ParamKind.Option, EditorKind.Int, Flag: "--logits",
                 Help: "Show top-K logits per step (leave empty to hide)."),
             new ParamDef("weights", "--weights", ParamKind.Option, EditorKind.Choice, Flag: "--weights",

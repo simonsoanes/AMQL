@@ -46,7 +46,9 @@ public static class InferenceRunner
         Vindex3Container container, string componentId, int[] tokens,
         int steps, SamplingConfig config, int? showTopK = null,
         WeightPatch? patch = null,
-        GenerateOptions? options = null)
+        GenerateOptions? options = null,
+        IReadOnlySet<int>? stopTokens = null,
+        int? maxContextLength = null)
     {
         using var store = container.CreateOperandStore();
         var plan = Planner.Plan(container, componentId, store);
@@ -120,13 +122,30 @@ public static class InferenceRunner
             }
         }
 
-        var outcomes = new List<StepOutcome>(steps);
-        for (int step = 0; step < steps; step++)
+        int effectiveSteps = steps < 0
+            ? Math.Min(maxContextLength ?? (tokens.Length + 2048), tokens.Length + 8192) - tokens.Length
+            : steps;
+        if (effectiveSteps < 0)
+            effectiveSteps = 0;
+
+        var outcomes = new List<StepOutcome>(Math.Max(effectiveSteps, 0));
+        for (int step = 0; step < effectiveSteps; step++)
         {
             var logits = session.LastLogits;
             int token = config.Temperature <= 0f
                 ? Sampler.ArgMax(logits)
                 : Sampler.Sample(logits, config, rng);
+
+            bool isStop = stopTokens is not null && stopTokens.Contains(token);
+            if (isStop && steps < 0)
+            {
+                outcomes.Add(new StepOutcome(
+                    token,
+                    session.Position,
+                    CandidatesFor(logits, showTopK),
+                    null));
+                break;
+            }
 
             recorder?.BeginStep(session.Position);
 

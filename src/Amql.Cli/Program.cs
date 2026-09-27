@@ -425,6 +425,58 @@ internal static class Program
 
     private static HfTokenizer Tokenizer(string modelDir) => HfTokenizer.FromModelDir(modelDir);
 
+    /// <summary>Reads stop-token ids from generation_config.json (eos_token_id)
+    /// and tokenizer_config.json (eos_token), plus the common end-of-turn
+    /// markers. Mirrors the server's StopTokens.Resolve but stays CLI-local.</summary>
+    private static IReadOnlySet<int> ResolveStopTokens(string dir, HfTokenizer tokenizer)
+    {
+        var ids = new HashSet<int>();
+        string generation = Path.Combine(dir, "generation_config.json");
+        if (File.Exists(generation))
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllBytes(generation));
+            if (doc.RootElement.TryGetProperty("eos_token_id", out var eos))
+            {
+                if (eos.ValueKind == System.Text.Json.JsonValueKind.Number)
+                {
+                    ids.Add(eos.GetInt32());
+                }
+                else if (eos.ValueKind == System.Text.Json.JsonValueKind.Array)
+                {
+                    foreach (var e in eos.EnumerateArray())
+                    {
+                        ids.Add(e.GetInt32());
+                    }
+                }
+            }
+        }
+        string config = Path.Combine(dir, "tokenizer_config.json");
+        if (File.Exists(config))
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllBytes(config));
+            if (doc.RootElement.TryGetProperty("eos_token", out var eos))
+            {
+                string? content = eos.ValueKind == System.Text.Json.JsonValueKind.String ? eos.GetString()
+                    : eos.ValueKind == System.Text.Json.JsonValueKind.Object && eos.TryGetProperty("content", out var c) ? c.GetString()
+                    : null;
+                if (content is not null && tokenizer.AddedTokenId(content) is { } id)
+                {
+                    ids.Add(id);
+                }
+            }
+        }
+        // Always common in the Llama family: the end-of-turn markers these
+        // templates emit.
+        foreach (var marker in new[] { "<|im_end|>", "<|eot_id|>" })
+        {
+            if (tokenizer.AddedTokenId(marker) is { } id)
+            {
+                ids.Add(id);
+            }
+        }
+        return ids;
+    }
+
     // ── route: relationship probing between two tokens ─────────────────────
 
     /// <summary>First token id of a word in its in-context form: the leading
@@ -609,6 +661,19 @@ internal static class Program
         }
 
         int steps = IntOption(args, "--steps", 8);
+
+        int? maxContextLength = null;
+        IReadOnlySet<int>? stopTokens = null;
+        if (steps < 0)
+        {
+            if (tokenizerSource is null)
+            {
+                throw new CliException(
+                    "--steps -1 requires a tokenizer to know which token ids stop generation — "
+                    + "use --tokenizer <checkpoint-dir> with --tokens, or --prompt with --tokenizer");
+            }
+            stopTokens = ResolveStopTokens(tokenizerSource, tokenizer!);
+        }
         var config = new Amql.Inference.SamplingConfig(
             Seed: IntOption(args, "--seed", 42),
             Temperature: FloatOption(args, "--temperature", 0f),
@@ -632,6 +697,16 @@ internal static class Program
         };
 
         using var container = Vindex3Container.Open(containerDir);
+        if (steps < 0 && maxContextLength is null)
+        {
+            var graph = container.Graph;
+            if (graph is not null)
+            {
+                var comp = graph.Component(component);
+                if (comp.Execution?.ContextLength is { } ctx)
+                    maxContextLength = (int)ctx;
+            }
+        }
         var patch = LoadPatch(args, container);
         if (tokenizer is not null)
         {
@@ -707,7 +782,7 @@ internal static class Program
             : null;
 
         var (prefill, steps2) = InferenceRunner.Generate(
-            container, component, tokens, steps, config, showTopK, patch, genOpts);
+            container, component, tokens, steps, config, showTopK, patch, genOpts, stopTokens, maxContextLength);
 
         string prefillText = tokenizer is null ? string.Empty : tokenizer.Decode(prefill);
         string mode = sampling ? "sampled" : "greedy";
@@ -772,7 +847,7 @@ internal static class Program
             var generatedIds = prefill.Concat(steps2.Select(s => s.Token)).ToArray();
             Console.WriteLine($"text:      {tokenizer.Decode(generatedIds)}");
         }
-        Console.WriteLine($"position: {prefill.Length + steps}");
+        Console.WriteLine($"position: {prefill.Length + steps2.Count}");
 
         // Read the trace back rather than trusting the write: it proves the
         // JSON round-trips before anything downstream depends on the format.
@@ -2342,7 +2417,7 @@ internal static class Program
                               [--patch <patch.safetensors>]
               amql-cli generate <container-dir>
                               --prompt "text" --tokenizer <checkpoint-dir>
-                              [--steps 8] [--temperature 0] [--top-k 0] [--top-p 0]
+                              [--steps N|-1] [--temperature 0] [--top-k 0] [--top-p 0]
                               [--seed 42] [--logits K] [--component target]
                               [--patch <patch.safetensors>]
                               [--trace] [--trace-tensors] [--weights f32|bf16|mxfp4]
