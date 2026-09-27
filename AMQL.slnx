@@ -7,6 +7,7 @@
     <Project Path="src/Amql.Merge/Amql.Merge.csproj" />
     <Project Path="src/Amql.Onnx/Amql.Onnx.csproj" />
     <Project Path="src/Amql.Safetensors/Amql.Safetensors.csproj" />
+    <Project Path="src/Amql.Server/Amql.Server.csproj" />
     <Project Path="src/Amql.Vindex3/Amql.Vindex3.csproj" />
     <Project Path="src/Amql.Gui/Amql.Gui.csproj" />
   </Folder>

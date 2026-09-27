@@ -58,7 +58,22 @@ public sealed class DecodeSession
         return _runtime.FinalNorm(new Tensor2D(last, 1, hidden.Cols));
     }
 
-    private Tensor2D RunPrefill(int[] tokens)
+    /// <summary>
+    /// Forward pass returning EVERY position's post-final-norm hidden state
+    /// (T × hidden) — what a pooled embedding (mean over tokens) reads. No
+    /// vocabulary projection is computed.
+    /// </summary>
+    public Tensor2D PrefillHiddenStates(int[] tokens)
+    {
+        var rows = new List<float[]>(tokens.Length);
+        var hidden = RunPrefill(tokens, rows);
+        var all = rows.Count > 0
+            ? new Tensor2D(rows.SelectMany(r => r).ToArray(), rows.Count, hidden.Cols)
+            : hidden;
+        return _runtime.FinalNorm(all);
+    }
+
+    private Tensor2D RunPrefill(int[] tokens, List<float[]>? everyRow = null)
     {
         if (tokens.Length == 0)
         {
@@ -88,6 +103,7 @@ public sealed class DecodeSession
             foreach (var token in tokens)
             {
                 lastHidden = _runtime.StepForward(token);
+                everyRow?.Add(lastHidden.Row(lastHidden.Rows - 1).ToArray());
             }
         }
         else

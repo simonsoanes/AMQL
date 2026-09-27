@@ -48,6 +48,7 @@ public sealed class HfTokenizer
     private readonly HashSet<int> _specialIds;
     private readonly string[] _tokensById;
     private readonly (int[] Prefix, int[] Suffix)? _singleTemplate;
+    private readonly Dictionary<int, AddedToken> _addedById;
 
     private HfTokenizer(
         Dictionary<string, int> vocab,
@@ -60,6 +61,11 @@ public sealed class HfTokenizer
         (int[] Prefix, int[] Suffix)? singleTemplate)
     {
         _singleTemplate = singleTemplate;
+        _addedById = new Dictionary<int, AddedToken>();
+        foreach (var t in addedTokens)
+        {
+            _addedById[t.Id] = t;
+        }
         _vocab = vocab;
         _mergeRanks = mergeRanks;
         _addedByContent = addedByContent;
@@ -510,13 +516,12 @@ public sealed class HfTokenizer
 
     private TokenPiece PieceFor(int id)
     {
-        // Added/special tokens are judged FIRST: they live outside the BPE
-        // vocab and always decode to their content.
-        if (_specialIds.Contains(id))
+        // Added tokens are judged FIRST: they live outside the BPE vocab and
+        // always decode to their content — special or not (ModernBERT's
+        // whitespace runs are non-special added tokens).
+        if (_addedById.TryGetValue(id, out var added))
         {
-            var added = _addedTokens.FirstOrDefault(a => a.Id == id);
-            string content = added?.Content ?? string.Empty;
-            return new TokenPiece(id, content, content, true);
+            return new TokenPiece(id, added.Content, added.Content, added.IsSpecial);
         }
         if (id < 0 || id >= _tokensById.Length || _tokensById[id] is null)
         {
@@ -529,6 +534,46 @@ public sealed class HfTokenizer
 
     private TokenPiece PieceFor(AddedToken added, string content) =>
         new(added.Id, content, content, added.IsSpecial);
+
+    /// <summary>
+    /// The UTF-8 bytes a token sequence stands for, joined before any text
+    /// decoding — what HF's ByteLevel decoder does. Added tokens contribute
+    /// their content (special ones only when <paramref name="skipSpecialTokens"/>
+    /// is false).
+    /// </summary>
+    public byte[] DecodeBytes(IReadOnlyList<int> ids, bool skipSpecialTokens)
+    {
+        var bytes = new List<byte>();
+        foreach (int id in ids)
+        {
+            if (_addedById.TryGetValue(id, out var added))
+            {
+                if (!(added.IsSpecial && skipSpecialTokens))
+                {
+                    bytes.AddRange(Encoding.UTF8.GetBytes(added.Content));
+                }
+                continue;
+            }
+            if (id < 0 || id >= _tokensById.Length || _tokensById[id] is null ||
+                !ByteLevel.TryAppendBytes(_tokensById[id], bytes))
+            {
+                throw new TokenizerException($"cannot decode id {id}");
+            }
+        }
+        return bytes.ToArray();
+    }
+
+    /// <summary>Decodes to text through <see cref="DecodeBytes"/>; invalid
+    /// UTF-8 (a sequence cut mid-character) becomes U+FFFD.</summary>
+    public string DecodeText(IReadOnlyList<int> ids, bool skipSpecialTokens = true) =>
+        Encoding.UTF8.GetString(DecodeBytes(ids, skipSpecialTokens));
+
+    /// <summary>Whether an id is a special added token.</summary>
+    public bool IsSpecial(int id) => _specialIds.Contains(id);
+
+    /// <summary>The id of an added token by its content, if there is one.</summary>
+    public int? AddedTokenId(string content) =>
+        _addedByContent.TryGetValue(content, out var t) ? t.Id : null;
 
     /// <summary>Decodes ids to text: special tokens contribute their
     /// content, byte-level tokens their byte-decoded word.</summary>

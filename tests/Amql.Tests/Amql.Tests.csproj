@@ -25,6 +25,8 @@
     <ProjectReference Include="..\..\src\Amql.Inference\Amql.Inference.csproj" />
     <ProjectReference Include="..\..\src\Amql.Hf\Amql.Hf.csproj" />
     <ProjectReference Include="..\..\src\Amql.Cli\Amql.Cli.csproj" />
+    <ProjectReference Include="..\..\src\Amql.Server\Amql.Server.csproj" />
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
   </ItemGroup>
 
   <ItemGroup>
@@ -38,6 +40,8 @@
     <None Update="fixtures\von-tiny\**" CopyToOutputDirectory="PreserveNewest" />
     <None Update="fixtures\qwen-cls-tiny\**" CopyToOutputDirectory="PreserveNewest" />
     <None Update="fixtures\gated_delta_golden.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="fixtures\qwen-lm-tiny\**" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="fixtures\qwen35_chat_template.jinja" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

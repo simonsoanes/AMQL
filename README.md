@@ -234,6 +234,13 @@ component's per-layer attention policy — `linear_attention` and `softmax` alte
 the object graph (embedding, decoder stack, final norm, output head, vision tower, MTP
 drafter).*
 
+### Server
+
+`amql-server --model <container> [--model …]` serves containers over HTTP: TypeSafe `/v1/decisions` for Von
+decision models, and OpenAI-compatible `/v1/embeddings`, `/v1/chat/completions` and `/v1/responses`
+(streaming included) for embedding and generative containers — each endpoint only where the container can
+serve it. See [Server](docs/server.md).
+
 ### Decisions (Von)
 
 `amql-cli decide <von-container> --request @request.json` answers a TypeSafe `/v1/decisions` request —
