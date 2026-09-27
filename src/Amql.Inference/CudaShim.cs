@@ -257,6 +257,23 @@ public static class CudaShim
         }
     }
 
+    /// <summary>Allocates device memory and copies <paramref name="fp16"/> raw
+    /// FP16 bytes to it. Returns the device pointer (IntPtr.Zero on failure).
+    /// Tracked in the device-weight LRU and freed on shutdown.</summary>
+    public static IntPtr UploadRawF16(string key, byte[] fp16, int rows, int cols)
+    {
+        if (!Enabled || _deviceFailed) return IntPtr.Zero;
+        lock (Lock)
+        {
+            if (_deviceWeights.TryGetValue((key, ""), out var existing)) return existing;
+            nuint bytes = checked((nuint)((long)rows * cols * 2));
+            if (amql_cuda_malloc(out var dev, bytes) != 0) { _deviceFailed = true; return IntPtr.Zero; }
+            if (amql_cuda_host_to_device(dev, fp16, bytes) != 0) { amql_cuda_free(dev); _deviceFailed = true; return IntPtr.Zero; }
+            _deviceWeights[(key, "")] = dev;
+            return dev;
+        }
+    }
+
     /// <summary>Copies bytes host → device; 0 on success.</summary>
     public static int CopyHostToDevice(IntPtr dst, byte[] src, long bytes)
     {

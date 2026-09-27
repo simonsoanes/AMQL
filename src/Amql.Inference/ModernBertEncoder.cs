@@ -124,7 +124,13 @@ public sealed class ModernBertEncoder
             {
                 throw new ContainerException($"{obj}/{name}: expected [{rows}x{cols}], found [{string.Join("x", r.Shape)}]");
             }
-            return new Tensor2D(BitPattern.WidenToF32(r.Dtype, r.Payload), rows, cols);
+            var t = new Tensor2D(BitPattern.WidenToF32(r.Dtype, r.Payload), rows, cols);
+            if (CudaShim.Enabled)
+            {
+                t.DeviceWeightF16 = CudaShim.UploadRawF16(
+                    $"{obj}/{name}", Bf16ToFp16Raw(r.Payload), rows, cols);
+            }
+            return t;
         }
 
         int vocab = surface.Head?.VocabSize ?? throw new ContainerException("encoder declares no vocabulary size");
@@ -169,8 +175,27 @@ public sealed class ModernBertEncoder
             hidden, heads, headDim, inter, vocab, surface.ContextLength ?? long.MaxValue);
     }
 
-    /// <summary><c>1 / θ^(2i/d)</c> in float32, the way the reference's default
-    /// RoPE initialiser computes it.</summary>
+    /// <summary>Converts raw BF16 bytes → FP16 bytes (both 2-byte per element).
+    /// BF16: 1 sign + 8 exponent + 7 mantissa. FP16: 1+5+10. The BF16
+    /// exponent range fits in FP16 without clipping; only the mantissa is
+    /// truncated.</summary>
+    private static byte[] Bf16ToFp16Raw(byte[] bf16)
+    {
+        int n = bf16.Length / 2;
+        var fp16 = new byte[n * 2];
+        for (int i = 0; i < n; i++)
+        {
+            ushort bits = (ushort)(bf16[i * 2] | (bf16[i * 2 + 1] << 8));
+            // BF16 → F32: shift left 16 bits, reinterpret as IEEE 754 single
+            float f = BitConverter.Int32BitsToSingle(bits << 16);
+            // F32 → FP16: round to nearest even (Half ctor then ToUInt16Bits)
+            ushort h = BitConverter.HalfToUInt16Bits((Half)f);
+            fp16[i * 2] = (byte)h;
+            fp16[i * 2 + 1] = (byte)(h >> 8);
+        }
+        return fp16;
+    }
+
     private static float[] InverseFrequencies(double theta, int headDim)
     {
         var inv = new float[headDim / 2];
