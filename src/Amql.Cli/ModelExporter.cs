@@ -49,6 +49,14 @@ public static class ModelExporter
         }
 
         bool isQwen4Next = arch == Qwen4NextLayout.Arch;
+        bool isModernBert = ModernBertLayout.Applies(container);
+        if (isModernBert && (quantizeMxfp4 || quantizeTernary is not null || arch is not null))
+        {
+            // option_marker.pt carries a second copy of the backbone that the
+            // Von SDK loads with strict=True over model.safetensors; a quantised
+            // shard would no longer match it, and neither file could hold both.
+            throw new CliException("a modernbert export is written at its stored precision — --quantize and --arch do not apply");
+        }
 
         var graph = container.Graph
             ?? throw new CliException("container records no system graph — cannot rebuild HF tensor names");
@@ -61,6 +69,10 @@ public static class ModelExporter
         {
             layerTypes = Qwen4NextLayout.BuildLayerTypes(container);
             configJson = Qwen4NextLayout.BuildConfigJson(container, quantizeMxfp4, layerTypes);
+        }
+        else if (isModernBert)
+        {
+            configJson = ModernBertLayout.BuildConfigJson(container);
         }
         else
         {
@@ -83,9 +95,16 @@ public static class ModelExporter
         string? visionId = graph.Components.FirstOrDefault(c => c.Role == ComponentRole.Perception)?.Id;
         var objectPrefixes = new Dictionary<string, string>(StringComparer.Ordinal);
         var work = new List<(string ObjectId, string SegmentPath, SegmentTensor Tensor)>();
+        LogicalObject? optionMarkerHead = null;
         foreach (var obj in graph.Objects.Where(o =>
                      o.Component == primaryId || (visionId is not null && o.Component == visionId)))
         {
+            // Von's scoring head lives in option_marker.pt, not the backbone shard.
+            if (obj.SourceBindings.FirstOrDefault()?.Artifact == ModernBert.OptionMarkerFile)
+            {
+                optionMarkerHead = obj;
+                continue;
+            }
             if (obj.Representations.Count == 0)
             {
                 notes.Add($"object '{obj.Id}': carried only (no materialised tensors) — skipped");
@@ -281,6 +300,13 @@ public static class ModelExporter
         SafetensorsWriter.Write(Path.Combine(outDir, ShardName), payloads, metadata);
         File.WriteAllText(Path.Combine(outDir, "config.json"), configJson);
 
+        if (optionMarkerHead is not null)
+        {
+            int written = WriteOptionMarker(container, store, optionMarkerHead, outDir, patch);
+            notes.Add($"{ModernBert.OptionMarkerFile}: backbone + {written} scorer tensors (loads with torch.load(weights_only=True) " +
+                      "and OptionMarkerModel.load_state_dict(strict=True))");
+        }
+
         var tokenizerPath = Path.Combine(container.Root, "tokenizer.json");
         if (File.Exists(tokenizerPath))
         {
@@ -312,6 +338,50 @@ public static class ModelExporter
             payloads.Count,
             payloads.Sum(p => p.PayloadLength),
             notes);
+    }
+
+    /// <summary>
+    /// Writes Von's <c>option_marker.pt</c>: the whole backbone again under
+    /// <c>encoder.</c> — read back from the shard just written, so the two
+    /// copies are the same bytes by construction, patch included — followed
+    /// by the scoring head under <c>scorer.</c>. Returns the head's tensor count.
+    /// </summary>
+    private static int WriteOptionMarker(Vindex3Container container, OperandStore store, LogicalObject head,
+        string outDir, WeightPatch? patch)
+    {
+        string segmentPath = store.SegmentPathFor(head.Id)
+            ?? throw new CliException($"object '{head.Id}' has no segment on disk — cannot write {ModernBert.OptionMarkerFile}");
+        string prefix = head.SourceBindings[0].TensorPrefix;
+
+        var tensors = new List<TensorPayload>();
+        using (var shard = SafetensorsFile.Open(Path.Combine(outDir, ShardName)))
+        {
+            foreach (string name in shard.TensorNames
+                         .OrderBy(ModernBertLayout.EncoderKeyRank)
+                         .ThenBy(n => n, StringComparer.Ordinal))
+            {
+                var info = shard.GetTensor(name);
+                tensors.Add(new TensorPayload
+                {
+                    Name = ModernBert.EncoderPrefixInPt + name,
+                    Dtype = info.Dtype,
+                    Shape = info.Shape,
+                    Data = shard.ReadBytes(info),
+                });
+            }
+        }
+
+        using (var segment = SegmentFile.Open(Path.Combine(container.Root, segmentPath)))
+        {
+            var order = ModernBert.ScorerTensors.Select(t => t.Name).ToList();
+            foreach (var tensor in segment.Header.Tensors.OrderBy(t => order.IndexOf(t.Name)))
+            {
+                tensors.Add(BuildExportPayload(head.Id, segment, tensor, patch, prefix + "." + tensor.Name));
+            }
+        }
+
+        TorchCheckpointWriter.Write(Path.Combine(outDir, ModernBert.OptionMarkerFile), tensors, archiveName: "option_marker");
+        return tensors.Count(t => t.Name.StartsWith(prefix + ".", StringComparison.Ordinal));
     }
 
     /// <summary>Everything a drafter export wrote.</summary>

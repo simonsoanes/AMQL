@@ -115,6 +115,18 @@ public static class ModelConfig
             {
                 layerTypes.AddRange(types.EnumerateArray().Select(t => t.GetString() ?? string.Empty));
             }
+            if (layerTypes.Count == 0 && text.TryGetProperty("global_attn_every_n_layers", out var every) &&
+                text.TryGetProperty("num_hidden_layers", out var mbLayers))
+            {
+                // Pre-5.x ModernBERT configs carry the alternation as a period
+                // rather than a table: layer i is global when i % n == 0, the
+                // rule ModernBertEncoderLayer applies.
+                int n = every.GetInt32();
+                for (int i = 0; i < mbLayers.GetInt32(); i++)
+                {
+                    layerTypes.Add(i % n == 0 ? "full_attention" : "sliding_attention");
+                }
+            }
             if (layerTypes.Count == 0)
             {
                 // Encoder models (nomic-bert) have no layer_types table; every
@@ -212,7 +224,10 @@ public static class ModelConfig
                 partialRotaryFactor = flatPf.GetDouble();
             }
 
+            // ModernBERT spells it hidden_activation; reading only hidden_act
+            // would silently default a GELU encoder to SiLU.
             string hiddenAct = text.TryGetProperty("hidden_act", out var act) ? act.GetString() ?? "silu"
+                : text.TryGetProperty("hidden_activation", out var hact) ? hact.GetString() ?? "silu"
                 : text.TryGetProperty("activation_function", out var af)
                     ? af.GetString() switch { "swiglu" => "silu", var a => a ?? "silu" }
                     : "silu";
@@ -231,7 +246,9 @@ public static class ModelConfig
                     ? lne.GetDouble()
                     : text.TryGetProperty("layer_norm_epsilon", out var lne2)
                         ? lne2.GetDouble()
-                        : 1e-6;
+                        : text.TryGetProperty("norm_eps", out var ne)
+                            ? ne.GetDouble()
+                            : 1e-6;
 
             return new TextArchitectureFacts(
                 ModelType: text.GetProperty("model_type").GetString() ?? "unknown",

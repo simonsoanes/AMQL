@@ -23,6 +23,13 @@ public static class Planner
         var normSurface = surface.Norm;
 
         var objects = graph.Objects.Where(o => o.Component == componentId).ToList();
+        if (objects.Any(o => o.Kind == ObjectKind.EncoderStack))
+        {
+            // A refusal by name, not a malformed container: encoders (nomic-bert,
+            // ModernBERT/Von) import and export faithfully, they just do not run here.
+            throw new UnsupportedOperatorException(
+                $"component '{componentId}' is a bidirectional encoder_stack — this build's runtime executes causal decoders only");
+        }
         var stack = objects.FirstOrDefault(o => o.Kind == ObjectKind.DecoderStack)
             ?? throw new ContainerException(
                 $"component '{componentId}' owns no decoder_stack object — execution requires one");

@@ -13,7 +13,7 @@ namespace Amql.Hf;
 /// operator) are <em>carried verbatim in the graph</em>, exactly as the
 /// runtime's fail-closed contract demands: recorded, never approximated.
 /// </summary>
-public static class ArchMapper
+public static partial class ArchMapper
 {
     public sealed record EncodeOptions
     {
@@ -24,6 +24,13 @@ public static class ArchMapper
     public static ContainerSpec MapToContainerSpec(string modelId, TextArchitectureFacts facts, HfInventory inventory, EncodeOptions options,
         ClassificationFacts? classification = null)
     {
+        // ModernBERT keeps its layers at the checkpoint root ("layers.N"),
+        // which the text-prefix probe below would reject.
+        if (facts.ModelType == ModernBert.ModelType)
+        {
+            return MapModernBert(modelId, facts, inventory);
+        }
+
         bool isNomicBert = facts.ModelType == "nomic_bert";
         string prefix = DetectTextPrefix(inventory);
         if (facts.LayerTypes.Count != facts.NumLayers)

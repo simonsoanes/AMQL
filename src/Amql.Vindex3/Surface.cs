@@ -272,6 +272,71 @@ public sealed class ClassifierSurface
     public bool ScoreHeadReusesEmbeddingLayout { get; init; }
 }
 
+// ── Bidirectional encoder surface (ModernBERT) ───────────────────────────
+
+/// <summary>
+/// Facts a ModernBERT-style encoder carries beyond the shared attention /
+/// FFN / norm surface. Each one changes the arithmetic, so none may be
+/// defaulted: LayerNorms and projections without bias, a weighted
+/// LayerNorm straight after the embedding lookup, layer 0 skipping its
+/// attention norm (the embedding norm already did that work), and a GeGLU
+/// whose fused <c>Wi</c> emits the activated half first and the gate second.
+/// </summary>
+public sealed class EncoderSurface
+{
+    /// <summary>The HF class this stack came from, e.g. <c>ModernBertModel</c>.</summary>
+    public required string Architecture { get; init; }
+
+    public required bool NormBias { get; init; }
+
+    public required bool MlpBias { get; init; }
+
+    /// <summary>A weighted LayerNorm is applied to the looked-up embeddings.</summary>
+    public required bool EmbeddingNorm { get; init; }
+
+    /// <summary>Layer 0 has no attention pre-norm (an identity in the reference).</summary>
+    public required bool FirstLayerSkipsAttentionNorm { get; init; }
+
+    /// <summary>How the fused FFN input projection splits: <c>input_then_gate</c>
+    /// means <c>act(Wi[:I]·x) * (Wi[I:]·x)</c>.</summary>
+    public required string FusedFfnLayout { get; init; }
+
+    /// <summary>Tokenizer-level ids the config pins (pad/bos/eos/cls/sep),
+    /// carried so an export can restore them.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public IReadOnlyDictionary<string, int>? SpecialTokenIds { get; init; }
+}
+
+/// <summary>
+/// The option-marker scoring head of a Von-style decision model. The
+/// premise and K options are packed into one sequence, each option opened
+/// by a marker token; the encoder's final hidden state at each marker goes
+/// through <c>LayerNorm → Linear(H, S) → GELU → LayerNorm → Linear(S, 1)</c>
+/// to give one logit per option, and a softmax over those is the answer.
+/// It is not a label classifier: the number of outputs is the number of
+/// options in the request, not a fixed label set.
+/// </summary>
+public sealed class OptionMarkerSurface
+{
+    public required int ScorerHiddenSize { get; init; }
+
+    public required double NormEps { get; init; }
+
+    public required Activation Activation { get; init; }
+
+    /// <summary>The token whose final hidden state is scored.</summary>
+    public required string MarkerToken { get; init; }
+
+    /// <summary>Von 1.2+: each option attends only to the premise and itself,
+    /// with position ids restarting after the premise, so its logit cannot
+    /// depend on option order. Weights trained this way must run this way.</summary>
+    public required bool IndependentOptions { get; init; }
+
+    /// <summary>Digit runs are spaced out before tokenisation ("2026" → "2 0 2 6").</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool DigitSplit { get; init; }
+}
+
 // ── The surface proper ─────────────────────────────────────────────────────
 
 /// <summary>
@@ -327,6 +392,12 @@ public sealed class ExecutionSurface
 
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public ClassifierSurface? Classifier { get; init; }
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public EncoderSurface? Encoder { get; init; }
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public OptionMarkerSurface? OptionMarker { get; init; }
 
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public JsonElement? Embedding { get; init; }

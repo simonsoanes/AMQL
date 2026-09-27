@@ -28,6 +28,10 @@ public static class HfAncillaryFiles
         "preprocessor_config.json",
         "video_preprocessor_config.json",
         "processor_config.json",
+        // Von's option-marker calibration: the fitted temperature map, and the
+        // independent_options flag its weights must be run with.
+        "marker_calibration.json",
+        "calibration.json",
     };
 
     /// <summary>Copies whichever of <see cref="Names"/> exist from

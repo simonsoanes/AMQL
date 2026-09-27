@@ -213,13 +213,23 @@ public static class TensorOps
             {
                 return;
             }
-            for (int i = 0; i < m; i++)
+            // Weight rows outer, in cache-sized blocks, activation rows inner:
+            // a many-row GEMM (prefill, an encoder pass) then streams each
+            // weight block from memory once instead of once per activation
+            // row. Every output is still the same single Dot, so the result
+            // is bit-identical to the untiled order.
+            int block = Math.Max(1, (64 * 1024) / (k * sizeof(float)));
+            for (int jb = j0; jb < j1; jb += block)
             {
-                var xRow = x.Data.AsSpan(i * k, k);
-                var cRow = output.AsSpan(i * n, n);
-                for (int j = j0; j < j1; j++)
+                int jEnd = Math.Min(j1, jb + block);
+                for (int i = 0; i < m; i++)
                 {
-                    cRow[j] = Dot(xRow, w.Data.AsSpan(j * k, k));
+                    var xRow = x.Data.AsSpan(i * k, k);
+                    var cRow = output.AsSpan(i * n, n);
+                    for (int j = jb; j < jEnd; j++)
+                    {
+                        cRow[j] = Dot(xRow, w.Data.AsSpan(j * k, k));
+                    }
                 }
             }
         });

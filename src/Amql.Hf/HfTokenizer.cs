@@ -14,8 +14,10 @@ public sealed class TokenizerException : Exception
     public TokenizerException(string message, Exception inner) : base(message, inner) { }
 }
 
-/// <summary>One added (special) token of the tokenizer file.</summary>
-public sealed record AddedToken(int Id, string Content, bool IsSpecial);
+/// <summary>One added (special) token of the tokenizer file.
+/// <c>Lstrip</c>/<c>Rstrip</c> mean the token absorbs the whitespace on that
+/// side of it (ModernBERT's <c>[MASK]</c> is lstrip: "a [MASK]" is "a" + [MASK]).</summary>
+public sealed record AddedToken(int Id, string Content, bool IsSpecial, bool Lstrip = false, bool Rstrip = false);
 
 /// <summary>One encoded piece: the produced id plus its representations —
 /// the byte-level form (the "Ġ"-style vocabulary string) and the decoded
@@ -45,6 +47,7 @@ public sealed class HfTokenizer
     private readonly Regex _splitRegex;
     private readonly HashSet<int> _specialIds;
     private readonly string[] _tokensById;
+    private readonly (int[] Prefix, int[] Suffix)? _singleTemplate;
 
     private HfTokenizer(
         Dictionary<string, int> vocab,
@@ -53,8 +56,10 @@ public sealed class HfTokenizer
         IReadOnlyList<AddedToken> addedTokens,
         Regex splitRegex,
         string[] tokensById,
-        HashSet<int> specialIds)
+        HashSet<int> specialIds,
+        (int[] Prefix, int[] Suffix)? singleTemplate)
     {
+        _singleTemplate = singleTemplate;
         _vocab = vocab;
         _mergeRanks = mergeRanks;
         _addedByContent = addedByContent;
@@ -151,7 +156,9 @@ public sealed class HfTokenizer
                     int id = entry.GetProperty("id").GetInt32();
                     string content = entry.GetProperty("content").GetString() ?? string.Empty;
                     bool special = entry.TryGetProperty("special", out var sp) && sp.GetBoolean();
-                    var token = new AddedToken(id, content, special);
+                    bool lstrip = entry.TryGetProperty("lstrip", out var ls) && ls.GetBoolean();
+                    bool rstrip = entry.TryGetProperty("rstrip", out var rs) && rs.GetBoolean();
+                    var token = new AddedToken(id, content, special, lstrip, rstrip);
                     addedTokens.Add(token);
                     addedByContent[content] = token;
                 }
@@ -190,8 +197,63 @@ public sealed class HfTokenizer
             }
             var specialIds = new HashSet<int>(addedTokens.Where(a => a.IsSpecial).Select(a => a.Id));
 
-            return new HfTokenizer(vocab, mergeRanks, addedByContent, addedTokens, splitRegex, tokensById, specialIds);
+            return new HfTokenizer(vocab, mergeRanks, addedByContent, addedTokens, splitRegex, tokensById, specialIds,
+                ReadSingleTemplate(root, path));
         }
+    }
+
+    /// <summary>Reads a <c>TemplateProcessing</c> post-processor's single-sequence
+    /// template as the special-token ids around <c>$A</c> (BERT-style
+    /// <c>[CLS] $A [SEP]</c>). Other post-processors add nothing to the ids and
+    /// yield no template.</summary>
+    private static (int[] Prefix, int[] Suffix)? ReadSingleTemplate(JsonElement root, string path)
+    {
+        if (!root.TryGetProperty("post_processor", out var post) || post.ValueKind != JsonValueKind.Object ||
+            post.GetProperty("type").GetString() != "TemplateProcessing")
+        {
+            return null;
+        }
+        var prefix = new List<int>();
+        var suffix = new List<int>();
+        bool seenSequence = false;
+        var specials = post.GetProperty("special_tokens");
+        foreach (var item in post.GetProperty("single").EnumerateArray())
+        {
+            if (item.TryGetProperty("Sequence", out _))
+            {
+                seenSequence = true;
+                continue;
+            }
+            string name = item.GetProperty("SpecialToken").GetProperty("id").GetString()!;
+            var ids = specials.GetProperty(name).GetProperty("ids").EnumerateArray().Select(e => e.GetInt32());
+            (seenSequence ? suffix : prefix).AddRange(ids);
+        }
+        if (!seenSequence)
+        {
+            throw new TokenizerException($"'{path}': TemplateProcessing single template has no $A sequence");
+        }
+        return (prefix.ToArray(), suffix.ToArray());
+    }
+
+    /// <summary>Whether the file declares special tokens to wrap a single
+    /// sequence in (see <see cref="EncodeWithSpecialTokens"/>).</summary>
+    public bool HasSingleTemplate => _singleTemplate is not null;
+
+    /// <summary>Encodes and applies the post-processor's single-sequence template —
+    /// what HF's <c>tokenizer(text)</c> returns with <c>add_special_tokens=True</c>.</summary>
+    public int[] EncodeWithSpecialTokens(string text)
+    {
+        var (prefix, suffix) = _singleTemplate
+            ?? throw new TokenizerException("this tokenizer declares no TemplateProcessing post-processor");
+        var body = EncodeToIds(text);
+        var ids = new int[prefix.Length + body.Count + suffix.Length];
+        prefix.CopyTo(ids, 0);
+        for (int i = 0; i < body.Count; i++)
+        {
+            ids[prefix.Length + i] = body[i];
+        }
+        suffix.CopyTo(ids, prefix.Length + body.Count);
+        return ids;
     }
 
     /// <summary>The canonical GPT-2 split regex tokenizers applies under
@@ -257,12 +319,11 @@ public sealed class HfTokenizer
         // Stage 2: added tokens are carved at their start positions
         // (longest content first); the runs between them are regex-split
         // (the configured split, Isolated behavior: matches are the pieces).
-        foreach (var (start, end, isAdded) in Scatter(normalized))
+        foreach (var (start, end, token) in Scatter(normalized))
         {
-            if (isAdded)
+            if (token is not null)
             {
-                string content = normalized[start..end];
-                pieces.Add(PieceFor(_addedByContent[content], content));
+                pieces.Add(PieceFor(token, token.Content));
             }
             else
             {
@@ -281,55 +342,84 @@ public sealed class HfTokenizer
 
     public IReadOnlyList<int> EncodeToIds(string text) => Encode(text).Ids;
 
-    /// <summary>Walks the string once: added-token runs (exact content
-    /// match, longest-first) alternate with plain runs that end where the
-    /// next added token begins.</summary>
-    private static List<(int Start, int End, bool IsAdded)> Scatter(string normalized, IReadOnlyCollection<string> addedContents)
+    /// <summary>
+    /// Walks the string once, carving added tokens leftmost-longest the way
+    /// tokenizers does; the plain runs between them go to the regex split. An
+    /// <c>lstrip</c> token's match may begin on the whitespace before its
+    /// content and an <c>rstrip</c> token's may run over the whitespace after
+    /// it, so that whitespace belongs to the token — and because the longest
+    /// match wins, "  [MASK]" beats a two-space added token that starts at the
+    /// same place (ModernBERT registers such whitespace tokens).
+    /// </summary>
+    private List<(int Start, int End, AddedToken? Token)> Scatter(string text)
     {
-        var runs = new List<(int, int, bool)>();
-        var ordered = addedContents.OrderByDescending(c => c.Length).ToArray();
+        var runs = new List<(int, int, AddedToken?)>();
+        var ordered = _addedTokens.OrderByDescending(t => t.Content.Length).ToArray();
+        int plainStart = 0;
         int i = 0;
-        while (i < normalized.Length)
+        while (i < text.Length)
         {
-            if (TryAddedAt(normalized, i, ordered, out var content))
+            if (MatchAt(text, i, ordered, out var token, out int matchEnd))
             {
-                runs.Add((i, i + content.Length, true));
-                i += content.Length;
+                if (i > plainStart)
+                {
+                    runs.Add((plainStart, i, null));
+                }
+                runs.Add((i, matchEnd, token));
+                i = matchEnd;
+                plainStart = i;
             }
             else
             {
-                int j = i;
-                while (j < normalized.Length && !TryAddedAt(normalized, j, ordered, out _))
-                {
-                    j++;
-                }
-                if (j > i)
-                {
-                    runs.Add((i, j, false));
-                }
-                i = j;
+                i++;
             }
+        }
+        if (text.Length > plainStart)
+        {
+            runs.Add((plainStart, text.Length, null));
         }
         return runs;
-
-        static bool TryAddedAt(string text, int index, string[] ordered, out string content)
-        {
-            foreach (var candidate in ordered)
-            {
-                if (index + candidate.Length <= text.Length &&
-                    string.CompareOrdinal(text, index, candidate, 0, candidate.Length) == 0)
-                {
-                    content = candidate;
-                    return true;
-                }
-            }
-            content = string.Empty;
-            return false;
-        }
     }
 
-    private IEnumerable<(int Start, int End, bool IsAdded)> Scatter(string normalized) =>
-        Scatter(normalized, _addedByContent.Keys);
+    private static bool MatchAt(string text, int index, AddedToken[] ordered, out AddedToken token, out int end)
+    {
+        token = null!;
+        end = -1;
+        foreach (var candidate in ordered)
+        {
+            if (candidate.Content.Length == 0)
+            {
+                continue;
+            }
+            int at = index;
+            if (candidate.Lstrip)
+            {
+                while (at < text.Length && char.IsWhiteSpace(text[at]))
+                {
+                    at++;
+                }
+            }
+            if (at + candidate.Content.Length > text.Length ||
+                string.CompareOrdinal(text, at, candidate.Content, 0, candidate.Content.Length) != 0)
+            {
+                continue;
+            }
+            int e = at + candidate.Content.Length;
+            if (candidate.Rstrip)
+            {
+                while (e < text.Length && char.IsWhiteSpace(text[e]))
+                {
+                    e++;
+                }
+            }
+            if (e > end)
+            {
+                token = candidate;
+                end = e;
+            }
+        }
+        return end > index;
+    }
 
     // ── BPE ────────────────────────────────────────────────────────────────
 
