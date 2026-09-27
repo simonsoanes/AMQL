@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using Amql.Gguf;
 using Amql.Hf;
 using Amql.Inference;
@@ -93,6 +94,7 @@ internal static class Program
                 "prune" => Prune(args[1..]),
                 "fine-tune" => FineTune(args[1..]),
                 "classify" => Classify(args[1..]),
+                "decide" or "decisions" => Decide(args[1..]),
                 "convert-to-classifier" => ConvertToClassifier(args[1..]),
                 "convert-to-embedding" => ConvertToEmbedding(args[1..]),
                 "export-onnx" => ExportOnnx(args[1..]),
@@ -252,6 +254,23 @@ internal static class Program
         // and which it refuses (fail-closed, by name).
         Console.WriteLine("runtime readiness:");
         Console.WriteLine(Census(container));
+        if (ModernBertEncoder.Serves(container))
+        {
+            // Encoders run on their own kernels, not the decoder planner.
+            try
+            {
+                var encoder = ModernBertEncoder.Load(container, store);
+                bool head = container.Graph!.Components[0].Execution?.OptionMarker is not null;
+                Console.WriteLine($"  [served] ModernBERT encoder: {encoder.NumLayers} layers, hidden {encoder.HiddenSize}, " +
+                                  $"{encoder.NumHeads} heads, context {encoder.ContextLength}" +
+                                  (head ? " — option-marker head present: run 'amql-cli decide'" : string.Empty));
+            }
+            catch (UnsupportedOperatorException e)
+            {
+                Console.WriteLine($"  [refused] {e.Message}");
+            }
+            return 0;
+        }
         try
         {
             var plan = Planner.Plan(container, "target", store);
@@ -1928,6 +1947,95 @@ internal static class Program
         return 0;
     }
 
+    // ── decide: TypeSafe /v1/decisions against a Von container ──────────
+
+    /// <summary>
+    /// Answers one decision request in the TypeSafe / OpenJEV shape
+    /// (<c>POST /v1/decisions</c>, <c>/v1/systemone</c>) with a Von container,
+    /// run on the in-process ModernBERT encoder. The request is the API's JSON
+    /// body, given inline, as <c>@file</c>, or as <c>-</c> for stdin; the
+    /// response is the API's body on stdout. <c>--envelope jevai</c> wraps it
+    /// the way jevai.org does (<c>{ code, message, data }</c>), errors included.
+    /// </summary>
+    private static int Decide(string[] args)
+    {
+        var containerDir = Arg(args, 0) ?? throw new CliException(
+            "decide requires a container directory, e.g. amql-cli decide <von-container> --request @request.json");
+        string requestArg = OptionValue(args, "--request") ?? throw new CliException(
+            "decide requires '--request <json | @file | ->' — the /v1/decisions body");
+        string envelope = OptionValue(args, "--envelope") ?? "none";
+        if (envelope is not ("none" or "jevai"))
+        {
+            throw new CliException("--envelope must be 'none' (the OpenJEV / Von body) or 'jevai' ({ code, message, data })");
+        }
+        string attention = OptionValue(args, "--attention") ?? "auto";
+        if (attention is not ("auto" or "independent" or "full"))
+        {
+            throw new CliException("--attention must be 'auto' (what the checkpoint was trained with), 'independent' or 'full'");
+        }
+        bool compact = HasOption(args, "--compact");
+
+        string body = requestArg == "-"
+            ? Console.In.ReadToEnd()
+            : requestArg.StartsWith('@') ? File.ReadAllText(requestArg[1..]) : requestArg;
+
+        var writeOptions = new JsonSerializerOptions
+        {
+            WriteIndented = !compact,
+            Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+        };
+        int Reject(string message)
+        {
+            if (envelope == "jevai")
+            {
+                Console.WriteLine(new JsonObject { ["code"] = 422, ["message"] = message, ["data"] = null }.ToJsonString(writeOptions));
+            }
+            else
+            {
+                Console.Error.WriteLine($"error: invalid request (422): {message}");
+            }
+            return ExitUsage;
+        }
+
+        JsonDocument request;
+        try
+        {
+            request = JsonDocument.Parse(body);
+        }
+        catch (JsonException e)
+        {
+            return Reject($"the request is not valid JSON: {e.Message}");
+        }
+
+        using (request)
+        {
+            using var container = Vindex3Container.Open(containerDir);
+            CliProgress.Phase("load");
+            var engine = VonDecisionEngine.Load(container);
+            if (attention != "auto")
+            {
+                engine.IndependentOptions = attention == "independent";
+            }
+
+            CliProgress.Phase("decide");
+            JsonObject response;
+            try
+            {
+                response = engine.Decide(request.RootElement);
+            }
+            catch (DecisionRequestException e)
+            {
+                return Reject(e.Message);
+            }
+
+            JsonNode output = envelope == "jevai"
+                ? new JsonObject { ["code"] = 0, ["message"] = "ok", ["data"] = response }
+                : response;
+            Console.WriteLine(output.ToJsonString(writeOptions));
+            return 0;
+        }
+    }
+
     // ── convert-to-classifier: generative → classifier container ────────
 
     private static int ConvertToClassifier(string[] args)
@@ -2060,6 +2168,10 @@ internal static class Program
             Commands:
               amql-cli encode <model-dir> --out <container-dir>   map + materialise
               amql-cli verify <container-dir>                     integrity + readiness
+              amql-cli decide <von-container> --request <json | @file | ->
+                              [--envelope none|jevai] [--attention auto|independent|full] [--compact]
+                              answer a TypeSafe /v1/decisions request (choice / score / noul
+                              questions over one state) with a Von decision model, in-process
               amql-cli synth-model <dir>                          write an executable demo checkpoint
               amql-cli tokens --tokenizer <checkpoint-dir> "text"
               amql-cli decode --tokenizer <checkpoint-dir> <id,id,…>

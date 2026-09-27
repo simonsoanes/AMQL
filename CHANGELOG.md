@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- **feat:** `amql-cli decide <container> --request <json | @file | ->` — answers TypeSafe `/v1/decisions` (OpenJEV `/v1/systemone`) requests with a Von container; `--envelope jevai` wraps the response as `{ code, message, data }`, invalid requests exit 2 with the API's 422 message. Answers are identical to the Von 1.2 SDK's on the real weights
+- **feat:** `ModernBertEncoder` / `OptionMarkerScorer` — a ModernBERT encoder written directly in C# (global + sliding bidirectional attention on position ids, RoPE per layer type, GeGLU with exact GELU, Von's order-invariant option mask); `verify` reports such containers as served
+- **feat:** the tokenizer honours `lstrip`/`rstrip` added tokens and `TemplateProcessing` post-processors (`EncodeWithSpecialTokens`)
 - **feat:** ModernBERT and the Von decision model ([`wfzyx/von`](https://huggingface.co/wfzyx/von)) import and export — `encode` reads the backbone plus the option-marker scoring head from `option_marker.pt`, `export` writes both back; verified bit-identical (weights and Von's own logits) on the real checkpoint. See `docs/decision-models-von.md`
 - **feat:** `TorchCheckpoint` / `TorchCheckpointWriter` — read and write PyTorch zip checkpoints without Python; the reader only accepts the globals a state dict needs
 - **feat(gui):** "▶ Run and display inference…" in the container explorer (header button, right-click menu, and *Explorer* menu) — opens the run dialog with the loaded container pre-filled and starts a live run in a new inference visualiser
@@ -18,6 +21,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- **perf:** `TensorOps.MatMulTransposedB` walks weight rows in cache-sized blocks (same arithmetic, so bit-identical results); `BitPattern.WidenToF32` copies an F32 payload once instead of twice
 - **inference:** planning an encoder container refuses with `UnsupportedOperatorException` naming the encoder stack, so `verify` reports it as not served instead of exiting with an error
 - **hf:** the config reader understands ModernBERT's `hidden_activation`, `norm_eps` and period-style `global_attn_every_n_layers` (previously a GELU encoder would have defaulted to SiLU)
 - **cli:** `change-tensor` collects every argument-validation problem and reports them in one run instead of one error per invocation

@@ -283,8 +283,10 @@ public static class BitPattern
                 {
                     throw new SafetensorsException($"F32 payload length {bytes.Length} is not a multiple of 4");
                 }
+                // One copy, not two: reinterpret the bytes instead of staging
+                // them through ToArray() (a 200 MB embedding copied twice).
                 var result = new float[bytes.Length / 4];
-                Buffer.BlockCopy(bytes.ToArray(), 0, result, 0, bytes.Length);
+                System.Runtime.InteropServices.MemoryMarshal.Cast<byte, float>(bytes).CopyTo(result);
                 return result;
             }
             case Dtype.F16:

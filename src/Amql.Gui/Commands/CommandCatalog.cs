@@ -417,6 +417,23 @@ public static class CommandCatalog
             PatchParam,
         }),
 
+        // ── 8b. Decide (Von) ───────────────────────────────────────────────
+        new("decide", CatPathways,
+            "Answer a TypeSafe /v1/decisions request (choice / score / noul questions over one state) "
+            + "with a Von decision-model container, on the in-process ModernBERT encoder.", new[]
+        {
+            ContainerParam,
+            new ParamDef("request", "--request json | @file | -", ParamKind.Option, EditorKind.MultiLineText, Flag: "--request",
+                Help: "The /v1/decisions JSON body: {\"state\": …, \"questions\": {id: {\"type\", \"instructions\", \"criteria\"}}}. "
+                      + "Prefix a path with @ to read it from a file."),
+            new ParamDef("envelope", "--envelope", ParamKind.Option, EditorKind.Choice, Flag: "--envelope", DefaultValue: "none",
+                Choices: new[] { "none", "jevai" },
+                Help: "none: the OpenJEV / Von body { model, answers, usage }. jevai: wrapped as { code, message, data }."),
+            new ParamDef("attention", "--attention", ParamKind.Option, EditorKind.Choice, Flag: "--attention", DefaultValue: "auto",
+                Choices: new[] { "auto", "independent", "full" },
+                Help: "auto uses the mode the checkpoint was trained with (marker_calibration.json)."),
+        }),
+
         // ── 6. MTP Drafter ──────────────────────────────────────────────────
         new("export-mtp", CatMtp, "Emit the MTP drafter as a standalone checkpoint.", new[]
         {

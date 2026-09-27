@@ -7,7 +7,7 @@ Deeper technical reference for the VIndex3 model container format and AMQL's arc
 - [VIndex3 Container Format](vindex3-overview.md) — The VINDEX3 specification: directory structure, `index.json` schema, `system_graph.json` semantic IR, segment file binary format, integrity model, and encoding support.
 - [System Architecture](architecture.md) — Layered design, component responsibilities, data flow diagrams, execution surface, and key design decisions.
 - [Embedding Models — nomic-embed-text-v1.5](embedding-models-nomic-embed-text.md) — Ingesting encoder/embedding checkpoints into VIndex3, exporting an embedding model from any container, and the `embed` CLI command (task prefixes, Matryoshka truncation, mean pooling).
-- [Decision Models — Von](decision-models-von.md) — Importing and exporting the Von option-marker decision model (ModernBERT backbone + `option_marker.pt` scoring head), the PyTorch checkpoint reader/writer it needs, and how the round trip was verified against the real weights.
+- [Decision Models — Von](decision-models-von.md) — Importing, exporting and running the Von option-marker decision model (ModernBERT backbone + `option_marker.pt` scoring head): the PyTorch checkpoint reader/writer, the in-process encoder, `amql-cli decide` for TypeSafe `/v1/decisions` requests, and how each was verified against the real weights.
 - [Classifier Models — Jev sequence-classification](classifier-models-jev.md) — Ingesting classifier/sequence-classification checkpoints (Qwen3_5ForSequenceClassification, openjev-style) into VIndex3, the `score` head + label table + last-non-pad pooling contract, and the `classify` / inspect / export paths.
 
 ## Quick Reference
