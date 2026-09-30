@@ -67,8 +67,8 @@ AMQL/
 │   ├── Amql.Cli/        Amql.Gui/       Amql.Safetensors/
 │   ├── Amql.Vindex3/    Amql.Inference/ Amql.Hf/
 │   ├── Amql.Merge/      Amql.Onnx/      Amql.Gguf/
-├── native/amql_cuda/    # CUDA backend (GEMM, dequant, elementwise)
-├── tests/Amql.Tests/    # ~200 unit & integration tests
+├── native/amql_cuda/    # CUDA backend (GEMM, dequant, elementwise, attention, cuSOLVER)
+├── tests/Amql.Tests/    # 293 unit & integration tests
 └── docs/                # Design docs and architecture reference
 ```
 
@@ -89,6 +89,7 @@ amql-cli import <container> <model> --out <dir> [--container]
 amql-cli merge <containerA> <containerB> --out <dir>
 amql-cli moe-ify <container> --out <dir> --text <corpus> [--experts 8] [--top-k 2]
 amql-cli prune <container> --out <dir> --target-bytes <size> [--approach provenance|corpus|random]
+amql-cli strip <container> --keep Q4_0|BF16|FP4|Q8_0|FP32 [--out <slim-dir>]
 amql-cli fine-tune <container> --data <pairs.tsv> --out <patch> [--lr 1e-4]
 amql-cli create-model --hidden 768 --layers 12 --vocab 32000 --out <dir>
 amql-cli convert-to-classifier <container> --num-labels N --out <dir>
@@ -133,7 +134,11 @@ Three weight working-set modes, selected by `AMQL_WEIGHTS` (or `--weights` on `g
 
 When `AMQL_GPU=1` and the CUDA backend is built (`native/amql_cuda/build-cuda.cmd`),
 MXFP4 packs are dequantised to FP16 on-device and GEMMs run on tensor cores with FP32
-accumulate. Embeddings, norms, and the output head stay f32 in every mode.
+accumulate. Elementwise ops — RMSNorm (auto-dispatched), SiLU, RoPE — and fused
+GQA attention (QKᵀ + causal mask + softmax + PV) also run on-device. KV caches can
+be allocated and appended on-device with zero host round-trips. Embeddings, norms,
+and the output head stay f32 in every mode. A cuSOLVER fp64 Cholesky path accelerates
+merge normal-equation solves.
 
 Tune memory with `AMQL_MEMORY_GB`, `AMQL_F32_CACHE_GB`, and `AMQL_CORES`.
 
@@ -168,6 +173,11 @@ deterministic.
   co-activations. No training, quality gated by perplexity.
 - **`prune`** — Drop whole decoder layers to hit a byte budget. Three ranking approaches:
   provenance (merge history), corpus (residual delta), or random (ablation baseline).
+- **`strip`** — Produce a slim single-encoding copy of any container.
+  Strips every representation that doesn't match `--keep`, yielding a
+  container with `Authority: Slim` that's roughly the size of the equivalent
+  GGUF. The output is a fully self-describing VIndex3 container — `verify`,
+  `generate`, `export`, and `import` work on it directly.
 - **`create-model`** — New container with Xavier-uniform random weights and a
   user-defined architecture. Ready for `fine-tune`.
 - **`convert-to-classifier`** — Add a random score head to a generative model.
@@ -237,9 +247,9 @@ drafter).*
 ### Server
 
 `amql-server --model <container> [--model …]` serves containers over HTTP: TypeSafe `/v1/decisions` for Von
-decision models, and OpenAI-compatible `/v1/embeddings`, `/v1/chat/completions` and `/v1/responses`
-(streaming included) for embedding and generative containers — each endpoint only where the container can
-serve it. See [Server](docs/server.md).
+decision models, and OpenAI-compatible `/v1/embeddings`, `/v1/chat/completions`, `/v1/responses`
+(streaming included), and `/v1/classify` for classifier containers — each endpoint only where the
+container can serve it. See [Server](docs/server.md).
 
 ### Decisions (Von)
 

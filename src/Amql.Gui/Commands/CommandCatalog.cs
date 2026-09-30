@@ -513,6 +513,15 @@ public static class CommandCatalog
             new ParamDef("sample", "--sample", ParamKind.Option, EditorKind.Int, Flag: "--sample", DefaultValue: "8192"),
             new ParamDef("minLayers", "--min-layers", ParamKind.Option, EditorKind.Int, Flag: "--min-layers", DefaultValue: "1"),
         }),
+        new("strip", "2a. Slim Containers", "Keep one encoding, drop the rest — single-precision slim copy.", new[]
+        {
+            ContainerParam,
+            new ParamDef("keep", "--keep encoding", ParamKind.Option, EditorKind.Choice, Flag: "--keep",
+                DefaultValue: "Q4_0", Choices: new[] { "Q4_0", "Q8_0", "FP4", "BF16", "FP32" },
+                Help: "Encoding to keep (all others discarded)."),
+            new ParamDef("out", "--out slim dir", ParamKind.Option, EditorKind.Directory, Flag: "--out",
+                Help: "Output directory (default: <container>-<encoding>)."),
+        }),
     };
 
     public static CommandDef? Find(string name) =>
