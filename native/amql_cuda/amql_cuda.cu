@@ -16,6 +16,7 @@
 
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
+#include <cusolverDn.h>
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
@@ -90,6 +91,7 @@ __global__ void cast_f32_to_f16(const float* __restrict__ src, __half* __restric
 struct GpuContext
 {
     cublasHandle_t cublas;
+    cusolverDnHandle_t cusolver;
     cudaStream_t stream;
     void* scratchA;      // reusable host→device staging for A (grows)
     size_t scratchABytes;
@@ -124,6 +126,14 @@ static int ctx_ensure()
     if (cublasSetStream(gCtx.cublas, gCtx.stream) != CUBLAS_STATUS_SUCCESS)
     {
         return -16;
+    }
+    if (cusolverDnCreate(&gCtx.cusolver) != CUSOLVER_STATUS_SUCCESS)
+    {
+        return -22;
+    }
+    if (cusolverDnSetStream(gCtx.cusolver, gCtx.stream) != CUSOLVER_STATUS_SUCCESS)
+    {
+        return -23;
     }
     // Probe unified memory (Grace-Hopper, integrated GPUs) — on these
     // platforms host↔device cudaMemcpy is a page-table no-op and the GPU
@@ -209,6 +219,7 @@ AMQL_EXPORT void amql_cuda_shutdown(void)
     if (gCtx.scratchAF16) cudaFree(gCtx.scratchAF16);
     cudaStreamDestroy(gCtx.stream);
     cublasDestroy(gCtx.cublas);
+    cusolverDnDestroy(gCtx.cusolver);
     gCtxValid = false;
 }
 
@@ -903,5 +914,605 @@ AMQL_EXPORT int amql_cuda_gram_cross(
 
     cudaFree(bD); cudaFree(aD); cudaFree(gramD); cudaFree(crossD);
     delete[] bT; delete[] aT; delete[] gramStaged; delete[] crossStaged;
+    return 0;
+}
+
+// ── Elementwise kernels (P2) ──────────────────────────────────────────────
+
+// RMSNorm: out[r,c] = in[r,c] * (weight[c] + wOff) / sqrt(mean_sq + eps)
+// One thread per row (cols ≤ 16384 → one block per row with 256 threads
+// doing the reduction), in-place on device memory.
+
+__global__ void rms_norm_f32_kernel(
+    float* __restrict__ x,       // [rows, cols] row-major, in-place
+    const float* __restrict__ w, // [cols] weight
+    float wOff, float eps,
+    int rows, int cols)
+{
+    int row = blockIdx.x;
+    if (row >= rows) return;
+    int tid = threadIdx.x;
+    int stride = blockDim.x;
+    float* rowPtr = x + (long)row * cols;
+
+    // Sum of squares across the row (parallel reduction within the block).
+    __shared__ float sSq[256];
+    float local = 0.f;
+    for (int c = tid; c < cols; c += stride)
+    {
+        float v = rowPtr[c];
+        local += v * v;
+    }
+    sSq[tid] = local;
+    __syncthreads();
+    // Reduce within the block (cols ≤ 16384, so 256 threads is enough).
+    for (int s = 128; s > 0; s >>= 1)
+    {
+        if (tid < s) sSq[tid] += sSq[tid + s];
+        __syncthreads();
+    }
+    float inv = rsqrtf(sSq[0] / (float)cols + eps);
+
+    // Apply weight.
+    for (int c = tid; c < cols; c += stride)
+    {
+        rowPtr[c] = rowPtr[c] * inv * (w[c] + wOff);
+    }
+}
+
+AMQL_EXPORT int amql_cuda_rms_norm_f32(
+    float* x, const float* w, float wOff, float eps,
+    int rows, int cols, int streamOrdinal)
+{
+    if (ctx_ensure() != 0) return -1;
+    if (rows <= 0 || cols <= 0) return 0;
+    cudaStream_t stream = streamOrdinal == 0 ? gCtx.stream : 0;
+
+    int threads = 256;
+    rms_norm_f32_kernel<<<rows, threads, 0, stream>>>(x, w, wOff, eps, rows, cols);
+    return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}
+
+// Host-facing wrapper: copies x to device, runs the kernel there, copies
+// back. Scratch buffers for the staging copies.
+AMQL_EXPORT int amql_cuda_rms_norm_f32_host(
+    float* x, const float* w, float wOff, float eps,
+    int rows, int cols, int streamOrdinal)
+{
+    if (ctx_ensure() != 0) return -1;
+    if (rows <= 0 || cols <= 0) return 0;
+    cudaStream_t stream = streamOrdinal == 0 ? gCtx.stream : 0;
+    long count = (long)rows * cols;
+    size_t xBytes = (size_t)count * 4;
+    size_t wBytes = (size_t)cols * 4;
+
+    if (scratch_reserve(&gCtx.scratchA, &gCtx.scratchABytes, xBytes) != 0) return -2;
+    if (scratch_reserve(&gCtx.scratchC, &gCtx.scratchCBytes, wBytes) != 0) return -3;
+
+    if (cudaMemcpyAsync(gCtx.scratchA, x, xBytes, cudaMemcpyHostToDevice, stream) != cudaSuccess) return -4;
+    if (cudaMemcpyAsync(gCtx.scratchC, w, wBytes, cudaMemcpyHostToDevice, stream) != cudaSuccess) return -5;
+
+    int threads = 256;
+    rms_norm_f32_kernel<<<rows, threads, 0, stream>>>(
+        (float*)gCtx.scratchA, (const float*)gCtx.scratchC, wOff, eps, rows, cols);
+    if (cudaGetLastError() != cudaSuccess) return -6;
+
+    if (cudaMemcpyAsync(x, gCtx.scratchA, xBytes, cudaMemcpyDeviceToHost, stream) != cudaSuccess) return -7;
+    cudaStreamSynchronize(stream);
+    return 0;
+}
+
+// SiLU: out[i] = x[i] / (1 + exp(-x[i])), element-wise in-place on device.
+
+__global__ void silu_f32_kernel(float* __restrict__ x, long count)
+{
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    float v = x[i];
+    x[i] = v / (1.f + expf(-v));
+}
+
+AMQL_EXPORT int amql_cuda_silu_f32(float* x, int rows, int cols, int streamOrdinal)
+{
+    if (ctx_ensure() != 0) return -1;
+    if (rows <= 0 || cols <= 0) return 0;
+    cudaStream_t stream = streamOrdinal == 0 ? gCtx.stream : 0;
+    long count = (long)rows * cols;
+    int threads = 256;
+    int blocks = (int)((count + threads - 1) / threads);
+    silu_f32_kernel<<<blocks, threads, 0, stream>>>(x, count);
+    return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}
+
+AMQL_EXPORT int amql_cuda_silu_f32_host(
+    float* x, int rows, int cols, int streamOrdinal)
+{
+    if (ctx_ensure() != 0) return -1;
+    if (rows <= 0 || cols <= 0) return 0;
+    cudaStream_t stream = streamOrdinal == 0 ? gCtx.stream : 0;
+    long count = (long)rows * cols;
+    size_t bytes = (size_t)count * 4;
+
+    if (scratch_reserve(&gCtx.scratchA, &gCtx.scratchABytes, bytes) != 0) return -2;
+    if (cudaMemcpyAsync(gCtx.scratchA, x, bytes, cudaMemcpyHostToDevice, stream) != cudaSuccess) return -3;
+
+    int threads = 256;
+    int blocks = (int)((count + threads - 1) / threads);
+    silu_f32_kernel<<<blocks, threads, 0, stream>>>((float*)gCtx.scratchA, count);
+    if (cudaGetLastError() != cudaSuccess) return -4;
+
+    if (cudaMemcpyAsync(x, gCtx.scratchA, bytes, cudaMemcpyDeviceToHost, stream) != cudaSuccess) return -5;
+    cudaStreamSynchronize(stream);
+    return 0;
+}
+
+// RoPE: apply rotary position embedding to a [rows, heads * headDim] tensor,
+// in-place on device.  Rotary pairs are (i, i + rotaryWidth/2) for i <
+// pairCount within each head, where rotaryWidth ≤ headDim.
+
+__global__ void rope_f32_kernel(
+    float* __restrict__ x,   // [rows, heads * headDim] row-major, in-place
+    const float* __restrict__ invFreq, // [pairCount] precomputed 1/theta^(2i/rotaryWidth)
+    const int* __restrict__ positions, // [rows] absolute positions
+    int rows, int heads, int headDim, int pairCount)
+{
+    int elem = (int)((long)blockIdx.x * blockDim.x + threadIdx.x);
+    long total = (long)rows * heads * headDim;
+    if (elem >= total) return;
+
+    int col = elem % (heads * headDim);
+    int row = elem / (heads * headDim);
+    int h = col / headDim;
+    int d = col % headDim;
+
+    // Only the first rotaryWidth dims are rotated; the rest are pass-through.
+    if (d >= pairCount * 2) return;
+
+    int pair = d < pairCount ? d : d - pairCount;
+    int otherOff = d < pairCount ? pairCount : -pairCount;
+    int otherIdx = (int)((long)row * heads * headDim + (long)h * headDim + d + otherOff);
+
+    float angle = (float)positions[row] * invFreq[pair];
+    float c = cosf(angle);
+    float s = sinf(angle);
+    float v1 = x[elem];
+    float v2 = x[otherIdx];
+    if (d < pairCount)
+    {
+        x[elem] = v1 * c - v2 * s;
+    }
+    else
+    {
+        x[elem] = v1 * s + v2 * c;
+    }
+}
+
+AMQL_EXPORT int amql_cuda_rope_f32(
+    float* x, const float* invFreq, const int* positions,
+    int rows, int heads, int headDim, int pairCount, int streamOrdinal)
+{
+    if (ctx_ensure() != 0) return -1;
+    if (rows <= 0 || heads <= 0 || headDim <= 0) return 0;
+    cudaStream_t stream = streamOrdinal == 0 ? gCtx.stream : 0;
+
+    long total = (long)rows * heads * headDim;
+    int threads = 256;
+    int blocks = (int)((total + threads - 1) / threads);
+    rope_f32_kernel<<<blocks, threads, 0, stream>>>(
+        x, invFreq, positions, rows, heads, headDim, pairCount);
+    return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}
+
+AMQL_EXPORT int amql_cuda_rope_f32_host(
+    float* x, const float* invFreq, const int* positions,
+    int rows, int heads, int headDim, int pairCount, int streamOrdinal)
+{
+    if (ctx_ensure() != 0) return -1;
+    if (rows <= 0 || heads <= 0 || headDim <= 0) return 0;
+    cudaStream_t stream = streamOrdinal == 0 ? gCtx.stream : 0;
+
+    long total = (long)rows * heads * headDim;
+    size_t xBytes = (size_t)total * 4;
+    size_t freqBytes = (size_t)pairCount * 4;
+    size_t posBytes = (size_t)rows * 4;
+
+    if (scratch_reserve(&gCtx.scratchA, &gCtx.scratchABytes, xBytes) != 0) return -2;
+    if (scratch_reserve(&gCtx.scratchC, &gCtx.scratchCBytes, freqBytes + posBytes) != 0) return -3;
+
+    float* dFreq = (float*)gCtx.scratchC;
+    int* dPos = (int*)(dFreq + pairCount);
+
+    if (cudaMemcpyAsync(gCtx.scratchA, x, xBytes, cudaMemcpyHostToDevice, stream) != cudaSuccess) return -4;
+    if (cudaMemcpyAsync((void*)dFreq, invFreq, freqBytes, cudaMemcpyHostToDevice, stream) != cudaSuccess) return -5;
+    if (cudaMemcpyAsync((void*)dPos, positions, posBytes, cudaMemcpyHostToDevice, stream) != cudaSuccess) return -6;
+
+    int threads = 256;
+    int blocks = (int)((total + threads - 1) / threads);
+    rope_f32_kernel<<<blocks, threads, 0, stream>>>(
+        (float*)gCtx.scratchA, dFreq, dPos, rows, heads, headDim, pairCount);
+    if (cudaGetLastError() != cudaSuccess) return -7;
+
+    if (cudaMemcpyAsync(x, gCtx.scratchA, xBytes, cudaMemcpyDeviceToHost, stream) != cudaSuccess) return -8;
+    cudaStreamSynchronize(stream);
+    return 0;
+}
+
+// Embedding gather: out[r,c] = table[ids[r], c].  The full embedding table
+// is copied to the device, ids are uploaded, rows are gathered, and the
+// result is copied back.  Small-op only — the table upload dominates for
+// large vocabularies.  P7 keeps the table resident.
+
+__global__ void gather_rows_f32_kernel(
+    const float* __restrict__ table, // [vocab, hidden] row-major
+    const int* __restrict__ ids,     // [rows]
+    float* __restrict__ out,         // [rows, hidden] row-major
+    int rows, int hidden)
+{
+    int col = (int)((long)blockIdx.x * blockDim.x + threadIdx.x);
+    if (col >= hidden) return;
+    for (int r = 0; r < rows; r++)
+    {
+        int id = ids[r];
+        out[(long)r * hidden + col] = table[(long)id * hidden + col];
+    }
+}
+
+AMQL_EXPORT int amql_cuda_gather_rows_f32_host(
+    const float* table, int vocab, const int* ids, float* out,
+    int rows, int hidden, int streamOrdinal)
+{
+    if (ctx_ensure() != 0) return -1;
+    if (rows <= 0 || hidden <= 0) return 0;
+    cudaStream_t stream = streamOrdinal == 0 ? gCtx.stream : 0;
+
+    size_t tableBytes = (size_t)vocab * hidden * 4;
+    size_t idBytes = (size_t)rows * 4;
+    size_t outBytes = (size_t)rows * hidden * 4;
+
+    if (scratch_reserve(&gCtx.scratchA, &gCtx.scratchABytes, tableBytes) != 0) return -2;
+    if (scratch_reserve(&gCtx.scratchC, &gCtx.scratchCBytes, outBytes) != 0) return -3;
+
+    // Copy table to scratchA, ids to scratchPack, output will go to scratchC.
+    if (scratch_reserve(&gCtx.scratchPack, &gCtx.scratchPackBytes, idBytes) != 0) return -4;
+
+    if (cudaMemcpyAsync(gCtx.scratchA, table, tableBytes, cudaMemcpyHostToDevice, stream) != cudaSuccess) return -5;
+    if (cudaMemcpyAsync(gCtx.scratchPack, ids, idBytes, cudaMemcpyHostToDevice, stream) != cudaSuccess) return -6;
+
+    int threads = 256;
+    int blocks = (hidden + threads - 1) / threads;
+    gather_rows_f32_kernel<<<blocks, threads, 0, stream>>>(
+        (const float*)gCtx.scratchA, (const int*)gCtx.scratchPack,
+        (float*)gCtx.scratchC, rows, hidden);
+    if (cudaGetLastError() != cudaSuccess) return -7;
+
+    if (cudaMemcpyAsync(out, gCtx.scratchC, outBytes, cudaMemcpyDeviceToHost, stream) != cudaSuccess) return -8;
+    cudaStreamSynchronize(stream);
+    return 0;
+}
+
+// ── P3: Softmax attention + KV on device ──────────────────────────────────
+
+// Fused GQA attention: QK^T + causal mask + window + sinks + softcap +
+// softmax + PV.  One thread block per (query position, query head) pair.
+// Uses shared memory for the score row and separate block-level reductions.
+//
+// Q: [seqQ, numQHeads * headDim] row-major
+// K: [seqKV, numKvHeads * headDim] row-major
+// V: [seqKV, numKvHeads * headDim] row-major
+// out: [seqQ, numQHeads * headDim] row-major
+// sinks: [numQHeads] per-head additive bias (nullptr → no sinks)
+//
+// GQA: q_head → kv_head = q_head * numKvHeads / numQHeads.
+
+__global__ void attention_gqa_f32_kernel(
+    const float* __restrict__ Q,
+    const float* __restrict__ K,
+    const float* __restrict__ V,
+    float* __restrict__ out,
+    int seqQ, int seqKV,
+    int numQHeads, int numKvHeads, int headDim,
+    float scoreScale, float softCap, int window,
+    const float* __restrict__ sinks,
+    const int* __restrict__ qPos,
+    const int* __restrict__ kvPos)
+{
+    // sData layout: [0..seqKV-1] = scores, [seqKV..seqKV+1] = max/exp
+    extern __shared__ float sData[];
+
+    int qi = blockIdx.x;
+    int qh = blockIdx.y;
+    if (qi >= seqQ || qh >= numQHeads) return;
+
+    float* scores = sData;
+    __shared__ float sRed[256]; // blockDim.x-sized reduction workspace
+
+    int kvh = qh * numKvHeads / numQHeads;
+    int tid = threadIdx.x;
+    int stride = blockDim.x;
+
+    // 1. ── QK^T ──
+    const float* qPtr = Q + (long)qi * numQHeads * headDim + (long)qh * headDim;
+
+    float myMax = -INFINITY;
+    int qp = qPos[qi];
+
+    for (int j = tid; j < seqKV; j += stride)
+    {
+        int kp = kvPos[j];
+        if (kp > qp) { scores[j] = -INFINITY; continue; }
+        if (window > 0 && qp - kp >= window) { scores[j] = -INFINITY; continue; }
+
+        const float* kPtr = K + (long)j * numKvHeads * headDim + (long)kvh * headDim;
+        float dot = 0.f;
+        for (int d = 0; d < headDim; d++)
+            dot += qPtr[d] * kPtr[d];
+        float s = dot * scoreScale;
+        if (softCap > 0.f && !isinf(s))
+            s = tanhf(s / softCap) * softCap;
+        if (sinks && kp == 0)
+            s += sinks[qh];
+        scores[j] = s;
+        if (s > myMax) myMax = s;
+    }
+
+    // 2. ── softmax ──
+    // Block-wide max reduction.
+    sRed[tid] = myMax;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1)
+    {
+        if (tid < s && sRed[tid + s] > sRed[tid])
+            sRed[tid] = sRed[tid + s];
+        __syncthreads();
+    }
+    float maxScore = sRed[0];
+
+    float mySum = 0.f;
+    if (!isinf(maxScore))
+    {
+        for (int j = tid; j < seqKV; j += stride)
+        {
+            if (isinf(scores[j])) { scores[j] = 0.f; continue; }
+            scores[j] = expf(scores[j] - maxScore);
+            mySum += scores[j];
+        }
+    }
+    else
+    {
+        for (int j = tid; j < seqKV; j += stride)
+            scores[j] = 0.f;
+    }
+
+    // Block-wide sum reduction.
+    sRed[tid] = mySum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1)
+    {
+        if (tid < s) sRed[tid] += sRed[tid + s];
+        __syncthreads();
+    }
+    float sumExp = sRed[0];
+    float invSum = (sumExp > 0.f) ? (1.f / sumExp) : 0.f;
+
+    // Normalise scores in-place.
+    for (int j = tid; j < seqKV; j += stride)
+        scores[j] *= invSum;
+    __syncthreads();
+
+    // 3. ── PV ──
+    float* outPtr = out + (long)qi * numQHeads * headDim + (long)qh * headDim;
+    for (int d = tid; d < headDim; d += stride)
+    {
+        float acc = 0.f;
+        for (int j = 0; j < seqKV; j++)
+        {
+            float w = scores[j];
+            if (w == 0.f) continue;
+            acc += w * V[(long)j * numKvHeads * headDim + (long)kvh * headDim + d];
+        }
+        outPtr[d] = acc;
+    }
+}
+
+// Host staging wrapper: copies Q, K, V, positions to device, runs the
+// fused kernel, copies output back.
+AMQL_EXPORT int amql_cuda_attention_gqa_f32_host(
+    const float* q, int seqQ,
+    const float* kCache, int seqKV,
+    const float* vCache,
+    float* output,
+    int numQHeads, int numKvHeads, int headDim,
+    float scoreScale, float softCap, int window,
+    const float* sinks,
+    const int* qPositions,
+    const int* kvPositions,
+    int streamOrdinal)
+{
+    if (ctx_ensure() != 0) return -1;
+    if (seqQ <= 0 || seqKV <= 0 || numQHeads <= 0 || headDim <= 0) return 0;
+    cudaStream_t stream = streamOrdinal == 0 ? gCtx.stream : 0;
+
+    size_t qBytes    = (size_t)seqQ * numQHeads * headDim * 4;
+    size_t kvBytes   = (size_t)seqKV * numKvHeads * headDim * 4;
+    size_t outBytes  = (size_t)seqQ * numQHeads * headDim * 4;
+    size_t posBytes  = (size_t)(seqQ + seqKV) * 4;
+    size_t sinkBytes = sinks ? (size_t)numQHeads * 4 : 0;
+
+    // ScratchA: Q + output
+    if (scratch_reserve(&gCtx.scratchA, &gCtx.scratchABytes, qBytes) != 0) return -2;
+    // ScratchC: K + V
+    if (scratch_reserve(&gCtx.scratchC, &gCtx.scratchCBytes, kvBytes * 2) != 0) return -3;
+    // ScratchPack: positions + sinks
+    if (scratch_reserve(&gCtx.scratchPack, &gCtx.scratchPackBytes, posBytes + sinkBytes) != 0) return -4;
+
+    float* dQ  = (float*)gCtx.scratchA;
+    float* dK  = (float*)gCtx.scratchC;
+    float* dV  = dK + (long)seqKV * numKvHeads * headDim;
+    int*   dPos = (int*)  gCtx.scratchPack;
+    int*   dKvPos = dPos + seqQ;
+    float* dSinks = sinks ? (float*)(dKvPos + seqKV) : nullptr;
+
+    if (cudaMemcpyAsync(dQ, q, qBytes, cudaMemcpyHostToDevice, stream) != cudaSuccess) return -5;
+    if (cudaMemcpyAsync(dK, kCache, kvBytes, cudaMemcpyHostToDevice, stream) != cudaSuccess) return -6;
+    if (cudaMemcpyAsync(dV, vCache, kvBytes, cudaMemcpyHostToDevice, stream) != cudaSuccess) return -7;
+    if (cudaMemcpyAsync(dPos, qPositions, (size_t)seqQ * 4, cudaMemcpyHostToDevice, stream) != cudaSuccess) return -8;
+    if (cudaMemcpyAsync(dKvPos, kvPositions, (size_t)seqKV * 4, cudaMemcpyHostToDevice, stream) != cudaSuccess) return -9;
+    if (sinks && cudaMemcpyAsync(dSinks, sinks, sinkBytes, cudaMemcpyHostToDevice, stream) != cudaSuccess) return -10;
+
+    int blockThreads = 256;
+    dim3 grid(seqQ, numQHeads);
+    size_t shmBytes = (size_t)seqKV * sizeof(float) + sizeof(float); // scores + max/exp
+
+    attention_gqa_f32_kernel<<<grid, blockThreads, shmBytes, stream>>>(
+        dQ, dK, dV, dQ, seqQ, seqKV, numQHeads, numKvHeads, headDim,
+        scoreScale, softCap, window, dSinks, dPos, dKvPos);
+    if (cudaGetLastError() != cudaSuccess) return -11;
+
+    if (cudaMemcpyAsync(output, dQ, outBytes, cudaMemcpyDeviceToHost, stream) != cudaSuccess) return -12;
+    cudaStreamSynchronize(stream);
+    return 0;
+}
+
+// ── Device KV cache management ────────────────────────────────────────────
+
+// Append new rows to a device ring buffer.
+// newRows: [seqQ, numKvHeads * headDim] row-major
+// cache:   [maxSeq, numKvHeads * headDim] pre-allocated
+// Returns 0 on success, negative on error.  The kernel is a plain copy;
+// no synchronisation — caller owns the ring position.
+__global__ void copy_contig_f32_kernel(
+    const float* __restrict__ src,
+    float* __restrict__ dst,
+    long count)
+{
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) dst[i] = src[i];
+}
+
+AMQL_EXPORT int amql_cuda_kv_append_f32(
+    const float* newRows, int seqQ,
+    float* cache, int maxSeq,
+    int numKvHeads, int headDim, int writePos,
+    int streamOrdinal)
+{
+    if (ctx_ensure() != 0) return -1;
+    if (seqQ <= 0) return 0;
+    cudaStream_t stream = streamOrdinal == 0 ? gCtx.stream : 0;
+
+    long kvStride = (long)numKvHeads * headDim;
+    long total = (long)seqQ * kvStride;
+    if (writePos + seqQ > maxSeq) return -2; // ring overflow
+
+    int threads = 256;
+    int blocks = (int)((total + threads - 1) / threads);
+    copy_contig_f32_kernel<<<blocks, threads, 0, stream>>>(
+        newRows, cache + (long)writePos * kvStride, total);
+    return cudaGetLastError() == cudaSuccess ? 0 : -3;
+}
+
+// Allocate a device KV cache buffer.  amql_cuda_free_kv_cache to free.
+AMQL_EXPORT int amql_cuda_alloc_kv_cache(float** ptr, int maxSeq, int numKvHeads, int headDim)
+{
+    if (ctx_ensure() != 0) return -1;
+    size_t bytes = (size_t)maxSeq * numKvHeads * headDim * 4;
+    cudaError_t e = cudaMalloc((void**)ptr, bytes);
+    return e == cudaSuccess ? 0 : -2;
+}
+
+// Free a device KV cache buffer allocated by amql_cuda_alloc_kv_cache.
+AMQL_EXPORT int amql_cuda_free_kv_cache(float* ptr)
+{
+    if (!ptr) return 0;
+    cudaError_t e = cudaFree(ptr);
+    return e == cudaSuccess ? 0 : -1;
+}
+
+// Read a contiguous slice of a device KV cache back to host.
+// Reads rows [startRow, startRow+numRows) from cache into host buffer.
+AMQL_EXPORT int amql_cuda_kv_read_f32(
+    const float* cache, int startRow, int numRows,
+    float* host, int numKvHeads, int headDim,
+    int streamOrdinal)
+{
+    if (ctx_ensure() != 0) return -1;
+    if (numRows <= 0) return 0;
+    cudaStream_t stream = streamOrdinal == 0 ? gCtx.stream : 0;
+
+    long kvStride = (long)numKvHeads * headDim;
+    size_t bytes = (size_t)numRows * kvStride * 4;
+    if (cudaMemcpyAsync(host, cache + (long)startRow * kvStride, bytes,
+            cudaMemcpyDeviceToHost, stream) != cudaSuccess) return -2;
+    cudaStreamSynchronize(stream);
+    return 0;
+}
+
+// ── P6: cuSOLVER Cholesky + triangular solve ─────────────────────────────
+
+// Solves AX = B where A is symmetric positive-definite [n × n], B is
+// [n × nrhs] (both column-major).  Uses cusolverDnDpotrf + cusolverDnDpotrs.
+// On success, B is overwritten with the solution X.  fp64 matches the
+// managed Cholesky path exactly.
+
+AMQL_EXPORT int amql_cuda_cholesky_solve_f64(
+    double* A, int n,    // A[n*n] column-major, overwritten with Cholesky factor
+    double* B, int nrhs, // B[n*nrhs] column-major, overwritten with solution
+    int streamOrdinal)
+{
+    if (ctx_ensure() != 0) return -1;
+    if (n <= 0 || nrhs <= 0) return 0;
+    cudaStream_t stream = streamOrdinal == 0 ? gCtx.stream : 0;
+
+    size_t aBytes = (size_t)n * n * sizeof(double);
+    size_t bBytes = (size_t)n * nrhs * sizeof(double);
+
+    double *dA = nullptr, *dB = nullptr;
+    if (cudaMalloc(&dA, aBytes) != cudaSuccess) return -2;
+    if (cudaMalloc(&dB, bBytes) != cudaSuccess) { cudaFree(dA); return -3; }
+
+    if (cudaMemcpyAsync(dA, A, aBytes, cudaMemcpyHostToDevice, stream) != cudaSuccess)
+        { cudaFree(dA); cudaFree(dB); return -4; }
+    if (cudaMemcpyAsync(dB, B, bBytes, cudaMemcpyHostToDevice, stream) != cudaSuccess)
+        { cudaFree(dA); cudaFree(dB); return -5; }
+
+    int workspaceSize = 0;
+    if (cusolverDnDpotrf_bufferSize(gCtx.cusolver, CUBLAS_FILL_MODE_LOWER, n, dA, n,
+            &workspaceSize) != CUSOLVER_STATUS_SUCCESS)
+        { cudaFree(dA); cudaFree(dB); return -6; }
+
+    double* dWorkspace = nullptr;
+    if (cudaMalloc((void**)&dWorkspace, (size_t)workspaceSize) != cudaSuccess)
+        { cudaFree(dA); cudaFree(dB); return -7; }
+
+    int* dInfo = nullptr;
+    if (cudaMalloc(&dInfo, sizeof(int)) != cudaSuccess)
+        { cudaFree(dA); cudaFree(dB); cudaFree((void*)dWorkspace); return -8; }
+
+    if (cusolverDnDpotrf(gCtx.cusolver, CUBLAS_FILL_MODE_LOWER, n, dA, n,
+            dWorkspace, workspaceSize, dInfo) != CUSOLVER_STATUS_SUCCESS)
+        { cudaFree(dA); cudaFree(dB); cudaFree((void*)dWorkspace); cudaFree(dInfo); return -9; }
+
+    int info = 0;
+    if (cudaMemcpyAsync(&info, dInfo, sizeof(int), cudaMemcpyDeviceToHost, stream) != cudaSuccess)
+        { cudaFree(dA); cudaFree(dB); cudaFree((void*)dWorkspace); cudaFree(dInfo); return -10; }
+    cudaStreamSynchronize(stream);
+    if (info != 0)
+        { cudaFree(dA); cudaFree(dB); cudaFree((void*)dWorkspace); cudaFree(dInfo); return info; }
+
+    if (cusolverDnDpotrs(gCtx.cusolver, CUBLAS_FILL_MODE_LOWER, n, nrhs, dA, n,
+            dB, n, dInfo) != CUSOLVER_STATUS_SUCCESS)
+        { cudaFree(dA); cudaFree(dB); cudaFree((void*)dWorkspace); cudaFree(dInfo); return -11; }
+
+    if (cudaMemcpyAsync(&info, dInfo, sizeof(int), cudaMemcpyDeviceToHost, stream) != cudaSuccess)
+        { cudaFree(dA); cudaFree(dB); cudaFree((void*)dWorkspace); cudaFree(dInfo); return -12; }
+    cudaStreamSynchronize(stream);
+    if (info != 0)
+        { cudaFree(dA); cudaFree(dB); cudaFree((void*)dWorkspace); cudaFree(dInfo); return info; }
+
+    if (cudaMemcpyAsync(B, dB, bBytes, cudaMemcpyDeviceToHost, stream) != cudaSuccess)
+        { cudaFree(dA); cudaFree(dB); cudaFree((void*)dWorkspace); cudaFree(dInfo); return -13; }
+    cudaStreamSynchronize(stream);
+
+    cudaFree(dA); cudaFree(dB); cudaFree((void*)dWorkspace);
+    cudaFree(dInfo);
     return 0;
 }

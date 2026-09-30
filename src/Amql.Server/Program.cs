@@ -33,6 +33,7 @@ for (int i = 0; i < args.Length; i++)
                 Serves each container on the endpoints it can answer:
                   Von decision model          POST /v1/decisions, /v1/systemone, /api/v1/decisions (jevai envelope)
                   embedding container         POST /v1/embeddings
+                  classifier container        POST /v1/classify
                   generative decoder + chat   POST /v1/chat/completions, /v1/responses (stream or not)
                   all                         GET  /v1/models, /health
                 The API key may also come from AMQL_API_KEY; without one, requests are not authenticated.

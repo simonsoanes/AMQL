@@ -37,11 +37,34 @@ public static class Norms
     public static void ApplyInPlace(Tensor2D x, NormType kind, double eps,
         ReadOnlySpan<float> weight, float weightOffset)
     {
+        // GPU path for RMSNorm — the dominant norm in every model family.
+        if (kind == NormType.RmsNorm && CudaShim.Enabled)
+        {
+            var buf = _normWeightBufEnsure(weight.Length);
+            weight.CopyTo(buf);
+            if (CudaShim.TryRmsNorm(x.Data, buf, weightOffset, eps, x.Rows, x.Cols))
+            {
+                return;
+            }
+        }
         for (int r = 0; r < x.Rows; r++)
         {
             var row = x.Row(r);
             ApplyRow(row, kind, eps, weight, weightOffset);
         }
+    }
+
+    [ThreadStatic]
+    private static float[]? _normWeightBuf;
+
+    private static float[] _normWeightBufEnsure(int len)
+    {
+        var buf = _normWeightBuf;
+        if (buf is null || buf.Length < len)
+        {
+            _normWeightBuf = buf = new float[len];
+        }
+        return buf;
     }
 
     /// <summary>Normalises a row of length n in place, weight applied

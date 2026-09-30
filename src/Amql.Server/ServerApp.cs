@@ -106,6 +106,7 @@ public static class ServerApp
         app.MapPost("/v1/systemone", (Delegate)((HttpContext ctx) => Decisions(ctx, models, envelope: false)));
         app.MapPost("/api/v1/decisions", (Delegate)((HttpContext ctx) => Decisions(ctx, models, envelope: true)));
         app.MapPost("/v1/embeddings", (Delegate)((HttpContext ctx) => Embeddings(ctx, models)));
+        app.MapPost("/v1/classify", (Delegate)((HttpContext ctx) => Classify(ctx, models)));
         app.MapPost("/v1/chat/completions", (HttpContext ctx) => ChatCompletions(ctx, models, settings));
         app.MapPost("/v1/responses", (HttpContext ctx) => Responses(ctx, models, settings));
         return app;
@@ -125,6 +126,10 @@ public static class ServerApp
         {
             yield return "chat.completions";
             yield return "responses";
+        }
+        if (c.HasFlag(Capability.Classification))
+        {
+            yield return "classification";
         }
     }
 
@@ -302,6 +307,81 @@ public static class ServerApp
             default:
                 throw new ApiException(400, "'input' must be a string, an array of strings, or token arrays", param: "input");
         }
+    }
+
+    // ── classify ─────────────────────────────────────────────────────────
+
+    private static async Task<IResult> Classify(HttpContext ctx, IReadOnlyList<ModelHost> models)
+    {
+        using var doc = await ReadBody(ctx);
+        var body = doc.RootElement;
+        var model = Route(models, body, Capability.Classification);
+
+        if (!body.TryGetProperty("input", out var input))
+        {
+            throw new ApiException(400, "'input' is required", param: "input");
+        }
+        string format = body.TryGetProperty("format", out var f) && f.ValueKind == JsonValueKind.String ? f.GetString()! : "json";
+
+        bool isBatch = input.ValueKind == JsonValueKind.Array &&
+                       input.GetArrayLength() > 0 && input[0].ValueKind == JsonValueKind.Object;
+        var inputs = isBatch
+            ? input.EnumerateArray().Select(ParseClassificationInput).ToList()
+            : new List<ClassificationInput> { ParseClassificationInput(input) };
+
+        var results = await Locked(model, ctx.RequestAborted, () => inputs.Select(model.Classifier!.Classify).ToList());
+
+        if (format == "labels")
+        {
+            return Results.Json(results.Select(r => (JsonNode?)JsonValue.Create(model.Classifier!.LabelLine(r))!).ToArray(), Json);
+        }
+        if (format == "csv")
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine(string.Join(",", model.Classifier!.Labels));
+            foreach (var r in results)
+            {
+                sb.AppendLine(string.Join(",", r["scores"]!.AsObject().Select(kv => kv.Value!.GetValue<double>().ToString("R"))));
+            }
+            return Results.Text(sb.ToString(), "text/csv");
+        }
+        if (format == "jsonl")
+        {
+            var sb = new StringBuilder();
+            foreach (var r in results)
+            {
+                sb.AppendLine(r.ToJsonString(Json));
+            }
+            return Results.Text(sb.ToString(), "application/x-jsonlines");
+        }
+        // Default: json — a single object for one input, an array for many.
+        if (results.Count == 1)
+        {
+            return Results.Json(results[0], Json);
+        }
+        return Results.Json(results, Json);
+    }
+
+    private static ClassificationInput ParseClassificationInput(JsonElement e)
+    {
+        if (e.ValueKind == JsonValueKind.String)
+        {
+            return ClassificationInput.Single(e.GetString()!);
+        }
+        if (e.ValueKind != JsonValueKind.Object)
+        {
+            throw new ApiException(400, "'input' must be a string, an object with premise/hypothesis, or an array of them", param: "input");
+        }
+        if (e.TryGetProperty("premise", out var p) && p.ValueKind == JsonValueKind.String &&
+            e.TryGetProperty("hypothesis", out var h) && h.ValueKind == JsonValueKind.String)
+        {
+            return ClassificationInput.Pair(p.GetString()!, h.GetString()!);
+        }
+        if (e.TryGetProperty("text", out var t) && t.ValueKind == JsonValueKind.String)
+        {
+            return ClassificationInput.Single(t.GetString()!);
+        }
+        throw new ApiException(400, "an input object needs 'text' or both 'premise' and 'hypothesis'", param: "input");
     }
 
     // ── chat completions ─────────────────────────────────────────────────

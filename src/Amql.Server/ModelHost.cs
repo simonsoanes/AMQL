@@ -17,6 +17,7 @@ public enum Capability
     Decisions = 1,
     Chat = 2,
     Embeddings = 4,
+    Classification = 8,
 }
 
 /// <summary>
@@ -38,13 +39,14 @@ public sealed class ModelHost : IDisposable
     public VonDecisionEngine? Decisions { get; }
     public TextGenerator? Generator { get; }
     public Embedder? Embedder { get; }
+    public ClassificationService? Classifier { get; }
 
     /// <summary>Why a capability a container looked like it might have was
     /// not offered — reported at startup instead of failing a request later.</summary>
     public IReadOnlyList<string> Notes { get; }
 
     private ModelHost(string id, string path, Vindex3Container container, OperandStore? store, VonDecisionEngine? decisions,
-        TextGenerator? generator, Embedder? embedder, List<string> notes)
+        TextGenerator? generator, Embedder? embedder, ClassificationService? classifier, List<string> notes)
     {
         Id = id;
         Path = path;
@@ -53,10 +55,12 @@ public sealed class ModelHost : IDisposable
         Decisions = decisions;
         Generator = generator;
         Embedder = embedder;
+        Classifier = classifier;
         Notes = notes;
         Capabilities = (decisions is null ? Capability.None : Capability.Decisions) |
                        (generator is null ? Capability.None : Capability.Chat) |
-                       (embedder is null ? Capability.None : Capability.Embeddings);
+                       (embedder is null ? Capability.None : Capability.Embeddings) |
+                       (classifier is null ? Capability.None : Capability.Classification);
         Created = new DateTimeOffset(Directory.GetCreationTimeUtc(path)).ToUnixTimeSeconds();
     }
 
@@ -76,22 +80,38 @@ public sealed class ModelHost : IDisposable
                 if (surface?.OptionMarker is null)
                 {
                     notes.Add("ModernBERT encoder without an option-marker head: no endpoint serves a bare encoder");
-                    return new ModelHost(id, path, container, null, null, null, null, notes);
+                    return new ModelHost(id, path, container, null, null, null, null, null, notes);
                 }
-                return new ModelHost(id, path, container, null, VonDecisionEngine.Load(container), null, null, notes);
+                return new ModelHost(id, path, container, null, VonDecisionEngine.Load(container), null, null, null, notes);
             }
 
             if (surface?.Classifier is not null)
             {
-                notes.Add("sequence classifier: served by 'amql-cli classify', not by an OpenAI endpoint");
-                return new ModelHost(id, path, container, null, null, null, null, notes);
+                string tokenizerPathCls = System.IO.Path.Combine(path, "tokenizer.json");
+                if (!File.Exists(tokenizerPathCls))
+                {
+                    notes.Add("no tokenizer.json: classification endpoint needs the container's own tokenizer");
+                    return new ModelHost(id, path, container, null, null, null, null, null, notes);
+                }
+                var storeCls = container.CreateOperandStore();
+                try
+                {
+                    var classifier = ClassificationService.Load(container, storeCls);
+                    return new ModelHost(id, path, container, storeCls, null, null, null, classifier, notes);
+                }
+                catch (Exception e)
+                {
+                    storeCls.Dispose();
+                    notes.Add($"classifier could not be loaded: {e.Message}");
+                    return new ModelHost(id, path, container, null, null, null, null, null, notes);
+                }
             }
 
             string tokenizerPath = System.IO.Path.Combine(path, "tokenizer.json");
             if (!File.Exists(tokenizerPath))
             {
                 notes.Add("no tokenizer.json: text endpoints need the container's own tokenizer");
-                return new ModelHost(id, path, container, null, null, null, null, notes);
+                return new ModelHost(id, path, container, null, null, null, null, null, notes);
             }
             var tokenizer = HfTokenizer.FromTokenizerFile(tokenizerPath);
             var store = container.CreateOperandStore();
@@ -104,26 +124,26 @@ public sealed class ModelHost : IDisposable
             {
                 store.Dispose();
                 notes.Add($"the runtime does not serve this stack: {e.Message}");
-                return new ModelHost(id, path, container, null, null, null, null, notes);
+                return new ModelHost(id, path, container, null, null, null, null, null, notes);
             }
 
             if (surface?.Embedding is { } embedding)
             {
                 var embedder = new Embedder(new DecodeSession(plan, store), tokenizer, EmbeddingPooling.From(embedding),
                     (int)(surface.ContextLength ?? int.MaxValue));
-                return new ModelHost(id, path, container, store, null, null, embedder, notes);
+                return new ModelHost(id, path, container, store, null, null, embedder, null, notes);
             }
 
             if (plan.Output is null)
             {
                 notes.Add("the plan has no output head, so it cannot generate");
-                return new ModelHost(id, path, container, store, null, null, null, notes);
+                return new ModelHost(id, path, container, store, null, null, null, null, notes);
             }
             string? template = ChatTemplate.Load(path);
             if (template is null)
             {
                 notes.Add("no chat template (chat_template.jinja / tokenizer_config.json): chat endpoints need one");
-                return new ModelHost(id, path, container, store, null, null, null, notes);
+                return new ModelHost(id, path, container, store, null, null, null, null, notes);
             }
             try
             {
@@ -132,11 +152,11 @@ public sealed class ModelHost : IDisposable
             catch (ChatTemplateException e)
             {
                 notes.Add($"chat template not rendered by this build: {e.Message}");
-                return new ModelHost(id, path, container, store, null, null, null, notes);
+                return new ModelHost(id, path, container, store, null, null, null, null, notes);
             }
             var generator = new TextGenerator(new DecodeSession(plan, store), tokenizer, template,
                 StopTokens.Resolve(path, tokenizer, template), (int)(surface?.ContextLength ?? int.MaxValue));
-            return new ModelHost(id, path, container, store, null, generator, null, notes);
+            return new ModelHost(id, path, container, store, null, generator, null, null, notes);
         }
         catch
         {

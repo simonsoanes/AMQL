@@ -268,13 +268,42 @@ public sealed class GenericRuntime
         _lastCapture = AttentionTrace is not null
             ? new List<(int Head, float[] Weights)>(attn.NumQHeads)
             : null;
-        var output = AttentionKernel.Execute(
+
+        Tensor2D output;
+        // GPU attention path — fused QK^T + causal softmax + PV on device.
+        // Only for non-trivial prefills (≥ 8 query tokens) when the weights
+        // are already on the device.  Single-token decode is too small for
+        // the GPU launch overhead.
+        if (CudaShim.Enabled && _lastCapture is null &&
+            q.Rows >= 8 &&
+            _weights.AnyDeviceWeight)
+        {
+            var softCap = attn.LogitSoftcapping ?? 0f;
+            var window = attn.Window is { } wv ? checked((int)wv) : 0;
+            var gpuOut = new float[q.Rows * attn.QDim];
+            if (CudaShim.TryAttentionGqa(
+                    q.Data, q.Rows,
+                    kMat.Data, kvSeq,
+                    vMat.Data,
+                    gpuOut,
+                    attn.NumQHeads, attn.NumKvHeads, attn.HeadDim,
+                    (float)attn.ScoreScale, softCap, window,
+                    null,
+                    queryPositions, kvPositions))
+            {
+                output = new Tensor2D(gpuOut, q.Rows, attn.QDim);
+                goto attentionDone;
+            }
+        }
+        output = AttentionKernel.Execute(
             q, kMat, vMat,
             attn.NumQHeads, attn.NumKvHeads, attn.HeadDim,
             attn.ScoreScale, attn.LogitSoftcapping, null,
             attn.Window is { } windowValue ? checked((int)windowValue) : null,
             queryPositions, kvPositions,
             _lastCapture);
+
+        attentionDone:
 
         if (AttentionTrace is { } trace && _lastCapture is { Count: > 0 })
         {

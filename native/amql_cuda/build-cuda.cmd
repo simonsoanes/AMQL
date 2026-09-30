@@ -68,7 +68,7 @@ echo [amql-cuda] compiling amql_cuda.cu -arch=%CUDA_ARCH% ...
     --shared ^
     -o bin\amql_cuda.dll ^
     amql_cuda.cu ^
-    -lcublasLt -lcublas -lcudart
+    -lcublasLt -lcublas -lcusolver -lcudart
 if errorlevel 1 (
     echo [amql-cuda] nvcc build FAILED for -arch=%CUDA_ARCH%.
     exit /b 1

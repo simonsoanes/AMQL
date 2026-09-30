@@ -66,6 +66,10 @@ public sealed class WeightLoader
 
     public WeightWorkingSet WorkingSet => _workingSet;
 
+    /// <summary>True when at least one weight tensor has been uploaded to
+    /// the device via the CUDA path — gates GPU-only ops like attention.</summary>
+    public bool AnyDeviceWeight { get; private set; }
+
     /// <summary>When set, every tensor load reports its (objectId, tensorName),
     /// shape, and whether it was already cached (hit). The generate command's
     /// <c>--trace-tensors</c> flag wires it.</summary>
@@ -194,6 +198,7 @@ public sealed class WeightLoader
                 CudaShim.TryGetDeviceWeight(operand.ObjectId, operand.TensorName, out var ptr, out _);
                 matrix.DeviceWeightF16 = ptr;
             }
+            AnyDeviceWeight = matrix.DeviceWeightF16 != IntPtr.Zero;
         }
         return matrix;
     }
@@ -228,6 +233,7 @@ public sealed class WeightLoader
         var matrix = new Tensor2D(dequant, rows, cols);
         matrix.DeviceWeightF16 = CudaShim.UploadWeightF16(
             operand.ObjectId, operand.TensorName, _packs[key].Packed, _packs[key].BlockScales, rows, cols);
+        AnyDeviceWeight = matrix.DeviceWeightF16 != IntPtr.Zero;
         return matrix;
     }
 

@@ -565,4 +565,172 @@ public static class CudaShim
     [DllImport("amql_cuda")]
     private static extern int amql_cuda_gram_cross(
         float[] a, float[] b, double[] gram, double[] cross, int n, int d, int blockRows, int streamOrdinal);
+
+    // ── Elementwise ops (P2) ────────────────────────────────────────────────
+
+    /// <summary>RMSNorm on the GPU: copies x and weight to device, runs the
+    /// kernel there, copies x back. Returns true on success (x modified
+    /// in-place). Falls back to managed on failure.</summary>
+    public static bool TryRmsNorm(float[] x, float[] weight, float weightOffset, double eps, int rows, int cols)
+    {
+        if (!Enabled || _deviceFailed) return false;
+        int code = amql_cuda_rms_norm_f32_host(x, weight, weightOffset, (float)eps, rows, cols, 0);
+        LastNativeError = code;
+        if (code != 0) { _deviceFailed = true; return false; }
+        return true;
+    }
+
+    /// <summary>SiLU activation on the GPU, in-place. Returns true on success.</summary>
+    public static bool TrySilu(float[] x, int rows, int cols)
+    {
+        if (!Enabled || _deviceFailed) return false;
+        int code = amql_cuda_silu_f32_host(x, rows, cols, 0);
+        LastNativeError = code;
+        if (code != 0) { _deviceFailed = true; return false; }
+        return true;
+    }
+
+    /// <summary>RoPE on the GPU, in-place. Returns true on success.</summary>
+    public static bool TryRope(float[] x, float[] invFreq, int[] positions, int rows, int heads, int headDim, int pairCount)
+    {
+        if (!Enabled || _deviceFailed) return false;
+        int code = amql_cuda_rope_f32_host(x, invFreq, positions, rows, heads, headDim, pairCount, 0);
+        LastNativeError = code;
+        if (code != 0) { _deviceFailed = true; return false; }
+        return true;
+    }
+
+    /// <summary>Embedding gather on the GPU. Returns true on success.</summary>
+    public static bool TryGatherRows(float[] table, int vocab, int[] ids, float[] result, int rows, int hidden)
+    {
+        if (!Enabled || _deviceFailed) return false;
+        int code = amql_cuda_gather_rows_f32_host(table, vocab, ids, result, rows, hidden, 0);
+        LastNativeError = code;
+        if (code != 0) { _deviceFailed = true; return false; }
+        return true;
+    }
+
+    [DllImport("amql_cuda")]
+    private static extern int amql_cuda_rms_norm_f32_host(
+        float[] x, float[] w, float wOff, float eps, int rows, int cols, int streamOrdinal);
+
+    [DllImport("amql_cuda")]
+    private static extern int amql_cuda_silu_f32_host(
+        float[] x, int rows, int cols, int streamOrdinal);
+
+    [DllImport("amql_cuda")]
+    private static extern int amql_cuda_rope_f32_host(
+        float[] x, float[] invFreq, int[] positions, int rows, int heads, int headDim, int pairCount, int streamOrdinal);
+
+    [DllImport("amql_cuda")]
+    private static extern int amql_cuda_gather_rows_f32_host(
+        float[] table, int vocab, int[] ids, float[] result, int rows, int hidden, int streamOrdinal);
+
+    // ── Attention + KV cache (P3) ───────────────────────────────────────────
+
+    /// <summary>Fused GQA attention on the GPU.  Returns true on success
+    /// (output written).  Falls back to managed on failure.</summary>
+    public static bool TryAttentionGqa(
+        float[] q, int seqQ,
+        float[] kCache, int seqKV,
+        float[] vCache,
+        float[] output,
+        int numQHeads, int numKvHeads, int headDim,
+        float scoreScale, float softCap, int window,
+        float[]? sinks,
+        int[] qPositions, int[] kvPositions)
+    {
+        if (!Enabled || _deviceFailed) return false;
+        int code = amql_cuda_attention_gqa_f32_host(
+            q, seqQ, kCache, seqKV, vCache, output,
+            numQHeads, numKvHeads, headDim,
+            scoreScale, softCap, window,
+            sinks ?? Array.Empty<float>(),
+            qPositions, kvPositions, 0);
+        LastNativeError = code;
+        if (code != 0) { _deviceFailed = true; return false; }
+        return true;
+    }
+
+    [DllImport("amql_cuda")]
+    private static extern int amql_cuda_attention_gqa_f32_host(
+        float[] q, int seqQ,
+        float[] kCache, int seqKV,
+        float[] vCache,
+        float[] output,
+        int numQHeads, int numKvHeads, int headDim,
+        float scoreScale, float softCap, int window,
+        float[] sinks,
+        int[] qPositions, int[] kvPositions,
+        int streamOrdinal);
+
+    // ── Device KV cache (P3) ────────────────────────────────────────────────
+
+    /// <summary>Allocate a device-side KV cache buffer for one layer.
+    /// Returns the device pointer (IntPtr), or IntPtr.Zero on failure.</summary>
+    public static IntPtr AllocateKvCache(int maxSeq, int numKvHeads, int headDim)
+    {
+        if (!Enabled || _deviceFailed) return IntPtr.Zero;
+        int code = amql_cuda_alloc_kv_cache(out IntPtr ptr, maxSeq, numKvHeads, headDim);
+        LastNativeError = code;
+        if (code != 0) { _deviceFailed = true; return IntPtr.Zero; }
+        return ptr;
+    }
+
+    /// <summary>Free a device-side KV cache buffer.</summary>
+    public static void FreeKvCache(IntPtr ptr)
+    {
+        if (ptr == IntPtr.Zero) return;
+        amql_cuda_free_kv_cache(ptr);
+    }
+
+    /// <summary>Append new KV rows to a device-side cache.  Returns true
+    /// on success (data on device, no host readback).</summary>
+    public static bool TryKvAppend(float[] newRows, int seqQ, IntPtr cache, int maxSeq,
+        int numKvHeads, int headDim, int writePos)
+    {
+        if (!Enabled || _deviceFailed) return false;
+        int code = amql_cuda_kv_append_f32(newRows, seqQ, cache, maxSeq, numKvHeads, headDim, writePos, 0);
+        LastNativeError = code;
+        if (code != 0) { _deviceFailed = true; return false; }
+        return true;
+    }
+
+    /// <summary>Read KV cache rows from device to host.  Returns true on success.</summary>
+    public static bool TryKvRead(IntPtr cache, int startRow, int numRows,
+        float[] host, int numKvHeads, int headDim)
+    {
+        if (!Enabled || _deviceFailed) return false;
+        int code = amql_cuda_kv_read_f32(cache, startRow, numRows, host, numKvHeads, headDim, 0);
+        LastNativeError = code;
+        if (code != 0) { _deviceFailed = true; return false; }
+        return true;
+    }
+
+    [DllImport("amql_cuda")]
+    private static extern int amql_cuda_alloc_kv_cache(out IntPtr ptr, int maxSeq, int numKvHeads, int headDim);
+
+    [DllImport("amql_cuda")]
+    private static extern int amql_cuda_free_kv_cache(IntPtr ptr);
+
+    [DllImport("amql_cuda")]
+    private static extern int amql_cuda_kv_append_f32(
+        float[] newRows, int seqQ, IntPtr cache, int maxSeq,
+        int numKvHeads, int headDim, int writePos, int streamOrdinal);
+
+    [DllImport("amql_cuda")]
+    private static extern int amql_cuda_kv_read_f32(
+        IntPtr cache, int startRow, int numRows, float[] host,
+        int numKvHeads, int headDim, int streamOrdinal);
+
+    // ── Merge: cuSOLVER Cholesky + solve (P6) ──────────────────────────────
+
+    /// <summary>cuSOLVER fp64 Cholesky factorisation + triangular solve.
+    /// A[n*n] column-major, B[n*nrhs] column-major. A is overwritten with
+    /// the Cholesky factor; B is overwritten with the solution X. Returns
+    /// 0 on success, positive value if the matrix is singular, negative
+    /// on device error.</summary>
+    [DllImport("amql_cuda")]
+    public static extern int amql_cuda_cholesky_solve_f64(
+        double[] A, int n, double[] B, int nrhs, int streamOrdinal);
 }

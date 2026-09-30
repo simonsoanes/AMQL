@@ -139,4 +139,15 @@ public static class MergeGpu
         return CudaShim.TryGemmTransposedBF32WithMap(
             otherRows, m, otherCount, d, d, out aligned, blockRows: 8192);
     }
+
+    /// <summary>cuSOLVER fp64 Cholesky factorisation + triangular solve
+    /// for the normal-equation solve (the 11 min/fit bottleneck from 2026‑09‑18).
+    /// A is overwritten with the Cholesky factor; B is overwritten with
+    /// the solution X.  Returns true on success (B holds the solution).</summary>
+    public static bool TryCholeskySolve(double[] a, int n, double[] b, int nrhs)
+    {
+        if (!Enabled) return false;
+        int code = CudaShim.amql_cuda_cholesky_solve_f64(a, n, b, nrhs, 0);
+        return code == 0;
+    }
 }
