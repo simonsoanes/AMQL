@@ -98,6 +98,7 @@ amql-cli export-onnx <container> --out <model.onnx>
 amql-cli classify <container> --premise "A" --hypothesis "B"
 amql-cli layers <container>
 amql-cli to-gguf <checkpoint-dir> --out <file.gguf>
+amql-cli from-gguf <file.gguf> --out <container-dir>
 amql-cli export --list-architectures
 ```
 

@@ -84,6 +84,7 @@ internal static class Program
                 "save-lora" => SaveLora(args[1..]),
                 "export" => Export(args[1..]),
                 "to-gguf" => ToGguf(args[1..]),
+                "from-gguf" => FromGguf(args[1..]),
                 "export-mtp" => ExportMtp(args[1..]),
                 "generate-mtp" => GenerateMtp(args[1..]),
                 "collect-mtp" => CollectMtp(args[1..]),
@@ -1396,6 +1397,51 @@ internal static class Program
         return 0;
     }
 
+    // ── from-gguf ──────────────────────────────────────────────────────────
+
+    private static int FromGguf(string[] args)
+    {
+        var ggufFile = Arg(args, 0) ?? throw new CliException("from-gguf requires a .gguf file");
+        string outDir = OptionValue(args, "--out") ?? throw new CliException("from-gguf requires '--out <container-dir>'");
+
+        if (!File.Exists(ggufFile))
+            throw new CliException($"GGUF file '{ggufFile}' not found");
+
+        Console.WriteLine($"importing '{Path.GetFileName(ggufFile)}' into container '{outDir}'");
+        CliProgress.Phase("from-gguf");
+
+        // Step 1: GGUF → temporary HF checkpoint.
+        string parent = Path.GetDirectoryName(Path.GetFullPath(outDir))
+            ?? Directory.GetCurrentDirectory();
+        string tempCheckpoint = Path.Combine(parent, $".amql-from-gguf-{Guid.NewGuid():N}");
+        Console.WriteLine($"dequantising to temporary checkpoint at {tempCheckpoint}");
+
+        HfCheckpointFromGguf.Convert(ggufFile, tempCheckpoint);
+
+        // Step 2: HF checkpoint → VINDEX3 container.
+        var report = ModelToContainer.Encode(tempCheckpoint, outDir);
+
+        // Clean up the temporary checkpoint.
+        try
+        {
+            Directory.Delete(tempCheckpoint, recursive: true);
+        }
+        catch (IOException)
+        {
+            Console.WriteLine($"warning: could not remove the temporary checkpoint at {tempCheckpoint}");
+        }
+
+        CliProgress.Complete($"{report.Tensors} tensors");
+
+        Console.WriteLine();
+        Console.WriteLine($"model:        {report.ModelId}");
+        Console.WriteLine($"encoding:     {report.Encoding}");
+        Console.WriteLine($"tensors:      {report.Tensors}");
+        Console.WriteLine($"payload:      {FormatBytes(report.PayloadBytes)}");
+        Console.WriteLine("done. run 'amql-cli verify <container-dir>' for integrity.");
+        return 0;
+    }
+
     // ── layers: describe the per-layer policy table and tensors ──────────
 
     private static int Layers(string[] args)
@@ -2477,6 +2523,7 @@ internal static class Program
                               [--arch qwen4-next]
               amql-cli to-gguf <checkpoint-dir|container-dir> --out <file.gguf> [--force]
                     [--quant none|f16|q4_0|mxfp4|mxfp4_moe|ptq1|pq2]
+              amql-cli from-gguf <file.gguf> --out <container-dir>   import GGUF into container
               amql-cli export-mtp <container-dir> --out <drafter-dir>
               amql-cli generate-mtp <container-dir> --out <out>
                               [--text <corpus.txt>] [--sample 4096] [--fit]

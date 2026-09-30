@@ -377,6 +377,12 @@ public static class CommandCatalog
                       + "Norms, embeddings, the output head, "
                       + "routers and 1-D tensors stay full precision in every mode."),
         }),
+        new("from-gguf", CatIngest, "Import a GGUF file into a VINDEX3 container.", new[]
+        {
+            new ParamDef("ggufFile", ".gguf file", ParamKind.Positional, EditorKind.File,
+                Help: "GGUF v3 file to import (Qwen3.5-family architectures)."),
+            OutDirParam with { Label = "--out container dir", Help = "Container directory to write." },
+        }),
         new("export-onnx", CatExport, "Export a container as an ONNX model (.onnx).", new[]
         {
             ContainerParam,
