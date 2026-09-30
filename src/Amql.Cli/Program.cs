@@ -99,6 +99,7 @@ internal static class Program
                 "convert-to-embedding" => ConvertToEmbedding(args[1..]),
                 "export-onnx" => ExportOnnx(args[1..]),
                 "create-model" => CreateModel(args[1..]),
+                "strip" => Strip(args[1..]),
                 _ => throw new CliException($"unknown command '{args[0]}'"),
             };
         }
@@ -1884,6 +1885,37 @@ internal static class Program
         return 0;
     }
 
+    // ── strip ──────────────────────────────────────────────────────────────
+
+    private static int Strip(string[] args)
+    {
+        var containerDir = Arg(args, 0) ?? throw new CliException("strip requires a container directory");
+        string? keep = OptionValue(args, "--keep");
+        if (keep is null)
+            throw new CliException("strip requires '--keep <encoding>' (e.g. --keep Q4_0)");
+        string? outDir = OptionValue(args, "--out");
+
+        if (outDir is null)
+        {
+            // Default: sibling directory name-mangled with the encoding.
+            var parent = Path.GetDirectoryName(containerDir.TrimEnd('\\', '/'))
+                         ?? Path.GetPathRoot(containerDir.TrimEnd('\\', '/')) ?? ".";
+            var name = Path.GetFileName(containerDir.TrimEnd('\\', '/'));
+            outDir = Path.Combine(parent, $"{name}-{keep}");
+        }
+
+        Console.WriteLine($"stripping '{containerDir}' → '{outDir}' (keep {keep})");
+        CliProgress.Phase("strip");
+        ContainerStripper.Strip(containerDir, outDir, keep);
+        CliProgress.Complete($"kept {keep}");
+
+        Console.WriteLine();
+        Console.WriteLine($"output:    {outDir}");
+        Console.WriteLine($"encoding:  {keep}");
+        Console.WriteLine("done. run 'amql-cli verify <dir>' to confirm integrity.");
+        return 0;
+    }
+
     /// <summary>Byte size from user spelling: a bare count or with an
     /// IEC/SI suffix (case-insensitive), e.g. <c>2GiB</c>, <c>512MiB</c>,
     /// <c>1.5GB</c>, <c>800KB</c>, <c>10B</c>.</summary>
@@ -2395,6 +2427,8 @@ internal static class Program
 
             Commands:
               amql-cli encode <model-dir> --out <container-dir>   map + materialise
+                              [--dtype Q4_0|Q8_0|FP4|BF16|FP32]   single-encoding slim import
+              amql-cli strip <container-dir> --keep <encoding> [--out <slim-dir>]   slim copy
               amql-cli verify <container-dir>                     integrity + readiness
               amql-cli classify <classifier-container>
                               (--premise "…" --hypothesis "…" | --text "premise|hypothesis"

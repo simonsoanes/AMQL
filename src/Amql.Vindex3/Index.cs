@@ -72,6 +72,10 @@ public enum ContainerAuthority
 {
     Canonical,
     Derived,
+    /// <summary>Single-encoding subset of what a full import would hold.
+    /// Structure validation accepts fewer segments; verify checks only the
+    /// stored encoding.</summary>
+    Slim,
 }
 
 /// <summary>
