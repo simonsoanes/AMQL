@@ -48,6 +48,7 @@ public static class HfCheckpointFromGguf
         public bool HasMoe;
         public int Experts, TopK, ExpertIntermediate;
         public int LinearKeyHeads, LinearKeyHeadDim, LinearValueHeads, LinearValueHeadDim, LinearConvKernel;
+        public bool HasLinearLayers;
     }
 
     private static ModelFacts ReadFacts(GgufReader gguf)
@@ -71,18 +72,27 @@ public static class HfCheckpointFromGguf
         if (TryF32(gguf, $"{arch}.rope.partial_rotary_factor") is { } prf)
             f.PartialRotaryFactor = prf;
 
-        // Layer types.
-        int softmaxCount = TryI32(gguf, $"{arch}.attention.layer_count_full") ?? f.NumLayers;
-        int linearCount = TryI32(gguf, $"{arch}.attention.layer_count_recurrent") ?? 0;
-        int fullInterval = TryI32(gguf, $"{arch}.attention.full_attention_interval") ?? 1;
-        if (fullInterval < 1) fullInterval = 1;
-
-        // Build per-layer pattern.
+        // Detect layer types from the tensor name table: if a layer has
+        // attn_qkv.weight, it's linear_attention; if attn_q.weight, full.
+        f.LayerTypes.Clear();
         for (int i = 0; i < f.NumLayers; i++)
+            f.LayerTypes.Add("full_attention");
+
+        foreach (var t in gguf.Tensors)
         {
-            int mod = (i + 1) % (fullInterval + 1);
-            bool linear = mod == 0;
-            f.LayerTypes.Add(linear ? "linear_attention" : "full_attention");
+            if (!t.Name.StartsWith("blk.", StringComparison.Ordinal)) continue;
+            string rest = t.Name[4..];
+            int dot = rest.IndexOf('.');
+            if (dot < 0) continue;
+            if (!int.TryParse(rest[..dot], out int layer)) continue;
+            string tail = rest[(dot + 1)..];
+            if (tail.StartsWith("attn_qkv", StringComparison.Ordinal)
+                || tail.StartsWith("attn_gate", StringComparison.Ordinal)
+                || tail.StartsWith("ssm_", StringComparison.Ordinal))
+            {
+                f.LayerTypes[layer] = "linear_attention";
+                f.HasLinearLayers = true;
+            }
         }
 
         // MoE.
@@ -105,11 +115,21 @@ public static class HfCheckpointFromGguf
         return f;
     }
 
-    private static int GetI32(GgufReader gguf, string key) =>
-        (int)gguf.Get(key).AsInt64();
+    private static int GetI32(GgufReader gguf, string key)
+    {
+        var v = gguf.Get(key);
+        if (v.Kind == GgufValueType.Uint32 || v.Kind == GgufValueType.Int32)
+            return (int)v.AsInt32();
+        return (int)v.AsInt64();
+    }
 
-    private static int? TryI32(GgufReader gguf, string key) =>
-        gguf.TryGet(key, out var v) ? (int?)v.AsInt64() : null;
+    private static int? TryI32(GgufReader gguf, string key)
+    {
+        if (!gguf.TryGet(key, out var v)) return null;
+        if (v.Kind == GgufValueType.Uint32 || v.Kind == GgufValueType.Int32)
+            return (int)v.AsInt32();
+        return (int)v.AsInt64();
+    }
 
     private static float? TryF32(GgufReader gguf, string key) =>
         gguf.TryGet(key, out var v) ? v.AsFloat() : null;
@@ -142,13 +162,23 @@ public static class HfCheckpointFromGguf
             ["torch_dtype"] = "float32",
         };
 
-        if (f.LinearKeyHeads > 0)
+        if (f.LinearKeyHeads > 0 || f.HasLinearLayers)
         {
-            config["linear_num_key_heads"] = f.LinearKeyHeads;
-            config["linear_key_head_dim"] = f.LinearKeyHeadDim > 0 ? f.LinearKeyHeadDim : f.HeadDim;
-            config["linear_num_value_heads"] = f.LinearValueHeads;
-            config["linear_value_head_dim"] = f.LinearValueHeadDim > 0 ? f.LinearValueHeadDim : f.HeadDim;
-            config["linear_conv_kernel_dim"] = f.LinearConvKernel;
+            // The GGUF metadata may not carry the separate linear-attention
+            // head dimensions.  Use the architecture-level defaults that
+            // match real Qwen3.5 configs: key heads match KV heads, value
+            // heads default to 2, both at headDim (or 128 if headDim < 128).
+            int lkHeads = f.LinearKeyHeads > 0 ? f.LinearKeyHeads : f.NumKvHeads;
+            int lkHeadDim = f.LinearKeyHeadDim > 0 ? f.LinearKeyHeadDim
+                : (f.HeadDim >= 128 ? f.HeadDim : 128);
+            int lvHeads = f.LinearValueHeads > 0 ? f.LinearValueHeads : Math.Min(2, f.NumKvHeads);
+            int lvHeadDim = f.LinearValueHeadDim > 0 ? f.LinearValueHeadDim : lkHeadDim;
+            int lcKernel = f.LinearConvKernel > 0 ? f.LinearConvKernel : 4;
+            config["linear_num_key_heads"] = lkHeads;
+            config["linear_key_head_dim"] = lkHeadDim;
+            config["linear_num_value_heads"] = lvHeads;
+            config["linear_value_head_dim"] = lvHeadDim;
+            config["linear_conv_kernel_dim"] = lcKernel;
         }
 
         if (f.HasMoe)
@@ -173,13 +203,12 @@ public static class HfCheckpointFromGguf
             ["version"] = "1.0",
         };
 
+        string modelType = "BPE";
         if (gguf.TryGet("tokenizer.ggml.model", out var tm))
         {
-            string model = tm.AsString();
-            tokenizer["model"] = new Dictionary<string, object>
-            {
-                ["type"] = model == "gpt2" ? "BPE" : model,
-            };
+            string m = tm.AsString();
+            if (m == "gpt2") modelType = "BPE";
+            else modelType = m;
         }
 
         // Build the vocab from GGUF tokenizer arrays.
@@ -194,8 +223,9 @@ public static class HfCheckpointFromGguf
             }
         }
 
-        tokenizer["model"] = new Dictionary<string, object>
+        var modelObj = new Dictionary<string, object>
         {
+            ["type"] = modelType,
             ["vocab"] = vocab,
             ["merges"] = Array.Empty<object>(),
         };
@@ -207,8 +237,10 @@ public static class HfCheckpointFromGguf
             var (_, mergeItems) = mergesArr.AsArray();
             foreach (var item in mergeItems)
                 merges.Add((string)item);
-            ((Dictionary<string, object>)tokenizer["model"])["merges"] = merges;
+            modelObj["merges"] = merges;
         }
+
+        tokenizer["model"] = modelObj;
 
         // Special tokens.
         var added = new List<object>();
@@ -278,6 +310,16 @@ public static class HfCheckpointFromGguf
 
         var headerJson = JsonSerializer.Serialize(header);
         byte[] headerBytes = System.Text.Encoding.UTF8.GetBytes(headerJson);
+        // Safetensors convention: JSON header must be space-padded to a
+        // multiple of 8 bytes. The header-length field is the padded length.
+        int pad = (8 - headerBytes.Length % 8) % 8;
+        if (pad > 0)
+        {
+            var padded = new byte[headerBytes.Length + pad];
+            Array.Copy(headerBytes, padded, headerBytes.Length);
+            for (int i = 0; i < pad; i++) padded[headerBytes.Length + i] = (byte)' ';
+            headerBytes = padded;
+        }
         long headerLen = headerBytes.Length;
 
         using var fs = new FileStream(Path.Combine(dir, "model.safetensors"), FileMode.Create, FileAccess.Write, FileShare.None);
@@ -326,10 +368,14 @@ public static class HfCheckpointFromGguf
             string tail = rest[(dot + 1)..];
             string b = $"model.language_model.layers.{layer}.";
 
-            string kind = layer < facts.LayerTypes.Count ? facts.LayerTypes[layer] : "full_attention";
-            bool linear = kind.Contains("linear", StringComparison.OrdinalIgnoreCase);
+            // Detect layer type from the tensor name itself: linear layers
+            // have attn_qkv / ssm_* tensors; full-attention layers have
+            // attn_q / attn_k / attn_v.
+            bool looksLinear = tail.StartsWith("attn_qkv", StringComparison.Ordinal)
+                            || tail.StartsWith("attn_gate", StringComparison.Ordinal)
+                            || tail.StartsWith("ssm_", StringComparison.Ordinal);
 
-            if (linear) return MapLinearTensor(b, tail);
+            if (looksLinear) return MapLinearTensor(b, tail);
             else return MapFullTensor(b, tail);
         }
 
@@ -342,6 +388,8 @@ public static class HfCheckpointFromGguf
         "attn_q.weight" => prefix + "self_attn.q_proj.weight",
         "attn_k.weight" => prefix + "self_attn.k_proj.weight",
         "attn_v.weight" => prefix + "self_attn.v_proj.weight",
+        "attn_q_norm.weight" => prefix + "self_attn.q_norm.weight",
+        "attn_k_norm.weight" => prefix + "self_attn.k_norm.weight",
         "attn_output.weight" => prefix + "self_attn.o_proj.weight",
         "ffn_norm.weight" or "post_attention_norm.weight" => prefix + "post_attention_layernorm.weight",
         "ffn_gate.weight" => prefix + "mlp.gate_proj.weight",
