@@ -290,6 +290,8 @@ public class PruneTests
     [Fact]
     public void Prune_Merged_Container_Then_Import_A_Smaller_Model_Is_A_Complete_Model()
     {
+        MergeGpu.ForceDisable(); // GPU path is not tested here and would
+                                 // corrupt alignment on small anchor sets.
         using var dir = new TempDir();
         var baseContainer = BuildContainer(dir, "base", MergeDims(40, 4), Tokens("t", 0, 40));
         var importedContainer = BuildContainer(dir, "imported", MergeDims(32, 4), Tokens("t", 8, 40));

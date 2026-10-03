@@ -23,19 +23,16 @@ public class MergeGpuTests
 
     private static bool GpuAvailable()
     {
-        string previousGpu = Environment.GetEnvironmentVariable("AMQL_GPU") ?? "";
-        string previousMerge = Environment.GetEnvironmentVariable("AMQL_MERGE_GPU") ?? "";
+        bool prevForce = MergeGpu.Enabled;
         try
         {
-            Environment.SetEnvironmentVariable("AMQL_GPU", "1");
-            Environment.SetEnvironmentVariable("AMQL_MERGE_GPU", "1");
+            MergeGpu.ForceEnable();
             CudaShim.Reset();
             return MergeGpu.Enabled;
         }
         finally
         {
-            Environment.SetEnvironmentVariable("AMQL_GPU", previousGpu);
-            Environment.SetEnvironmentVariable("AMQL_MERGE_GPU", previousMerge);
+            MergeGpu.Reset();
             CudaShim.Reset();
         }
     }
@@ -44,25 +41,20 @@ public class MergeGpuTests
     /// disabled) and on the GPU path (enabled), returning both results.</summary>
     private static (T Cpu, T Gpu) RunBoth<T>(Func<T> action)
     {
-        string previousGpu = Environment.GetEnvironmentVariable("AMQL_GPU") ?? "";
-        string previousMerge = Environment.GetEnvironmentVariable("AMQL_MERGE_GPU") ?? "";
         try
         {
-            Environment.SetEnvironmentVariable("AMQL_GPU", "0");
-            Environment.SetEnvironmentVariable("AMQL_MERGE_GPU", "0");
+            MergeGpu.ForceDisable();
             CudaShim.Reset();
             T cpu = action();
 
-            Environment.SetEnvironmentVariable("AMQL_GPU", "1");
-            Environment.SetEnvironmentVariable("AMQL_MERGE_GPU", "1");
+            MergeGpu.ForceEnable();
             CudaShim.Reset();
             T gpu = action();
             return (cpu, gpu);
         }
         finally
         {
-            Environment.SetEnvironmentVariable("AMQL_GPU", previousGpu);
-            Environment.SetEnvironmentVariable("AMQL_MERGE_GPU", previousMerge);
+            MergeGpu.Reset();
             CudaShim.Reset();
         }
     }
@@ -113,12 +105,9 @@ public class MergeGpuTests
         // Gram/Cross, and the solve is sanity-checked for finiteness only.
         var (cpuGram, cpuCross) = CpuGramCross(rows.A, rows.B, n, d);
 
-        string previousGpu = Environment.GetEnvironmentVariable("AMQL_GPU") ?? "";
-        string previousMerge = Environment.GetEnvironmentVariable("AMQL_MERGE_GPU") ?? "";
         try
         {
-            Environment.SetEnvironmentVariable("AMQL_GPU", "1");
-            Environment.SetEnvironmentVariable("AMQL_MERGE_GPU", "1");
+            MergeGpu.ForceEnable();
             CudaShim.Reset();
             Assert.True(MergeGpu.TryGramCross(rows.A, rows.B, n, d, out var gpuGram, out var gpuCross),
                 $"TryGramCross failed with native code {CudaShim.LastNativeError}");
@@ -127,8 +116,7 @@ public class MergeGpuTests
         }
         finally
         {
-            Environment.SetEnvironmentVariable("AMQL_GPU", previousGpu);
-            Environment.SetEnvironmentVariable("AMQL_MERGE_GPU", previousMerge);
+            MergeGpu.Reset();
             CudaShim.Reset();
         }
     }

@@ -46,6 +46,12 @@ public static class MergeGpu
         _forceMode = false;
     }
 
+    /// <summary>Resets forced mode to auto (respect <c>AMQL_MERGE_GPU</c>).</summary>
+    public static void Reset()
+    {
+        _forceMode = null;
+    }
+
     /// <summary>Whether the merge should route its hot loops to CUDA:
     /// explicitly requested by <c>AMQL_MERGE_GPU</c> (1/on/true) AND the
     /// device/native shim is actually usable.</summary>
