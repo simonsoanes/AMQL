@@ -6,9 +6,14 @@ using Amql.Vindex3;
 namespace Amql.Cli;
 
 /// <summary>A sampled generation step: the produced token plus (optionally)
-/// the top-k candidate window with probabilities.</summary>
+/// the top-k candidate window with probabilities and statistical outputs.</summary>
 public sealed record StepOutcome(int Token, int Position, IReadOnlyList<Candidate>? Candidates,
-    IReadOnlyList<LayerTraceLine>? Trace);
+    IReadOnlyList<LayerTraceLine>? Trace)
+{
+    /// <summary>Per-token logprobs, entropy, and top-K with log-probabilities.
+    /// Populated when <c>--logprobs K</c> is active.</summary>
+    public LogprobsResult? Logprobs { get; init; }
+}
 
 public sealed record LayerTraceLine(int Layer, float ResidualNorm, float DeltaNorm);
 
@@ -45,6 +50,7 @@ public static class InferenceRunner
     public static (int[] Prefill, List<StepOutcome> Steps) Generate(
         Vindex3Container container, string componentId, int[] tokens,
         int steps, SamplingConfig config, int? showTopK = null,
+        int? logprobsTopK = null,
         WeightPatch? patch = null,
         GenerateOptions? options = null,
         IReadOnlySet<int>? stopTokens = null,
@@ -132,9 +138,20 @@ public static class InferenceRunner
         for (int step = 0; step < effectiveSteps; step++)
         {
             var logits = session.LastLogits;
-            int token = config.Temperature <= 0f
-                ? Sampler.ArgMax(logits)
-                : Sampler.Sample(logits, config, rng);
+            int token;
+            LogprobsResult? stepLogprobs = null;
+
+            if (logprobsTopK is { } lpTk && lpTk > 0)
+            {
+                (token, stepLogprobs) = Sampler.SampleWithLogprobs(
+                    logits, config, rng, lpTk);
+            }
+            else
+            {
+                token = config.Temperature <= 0f
+                    ? Sampler.ArgMax(logits)
+                    : Sampler.Sample(logits, config, rng);
+            }
 
             bool isStop = stopTokens is not null && stopTokens.Contains(token);
             if (isStop && steps < 0)
@@ -143,7 +160,10 @@ public static class InferenceRunner
                     token,
                     session.Position,
                     CandidatesFor(logits, showTopK),
-                    null));
+                    null)
+                {
+                    Logprobs = stepLogprobs,
+                });
                 break;
             }
 
@@ -178,16 +198,22 @@ public static class InferenceRunner
                     }
                     attention.Clear();
                 }
+                float producedEntropy = SoftmaxEntropy(produced);
+                float producedMargin = topK.Count >= 2
+                    ? topK[0].Probability - topK[1].Probability
+                    : topK.Count == 1 ? topK[0].Probability : 0f;
                 recorder.EndStep(token, options?.TokenText?.Invoke(token), topK,
-                    SoftmaxEntropy(produced),
-                    topK.Count >= 2 ? topK[0].Probability - topK[1].Probability : topK[0].Probability);
+                    producedEntropy, producedMargin);
             }
 
             outcomes.Add(new StepOutcome(
                 token,
                 session.Position,
                 CandidatesFor(logits, showTopK),
-                trace));
+                trace)
+            {
+                Logprobs = stepLogprobs,
+            });
         }
 
         // Detach before attribution. CausalTracer replays the whole context

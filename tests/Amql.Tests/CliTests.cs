@@ -156,4 +156,75 @@ public class CliTests
         var logits = session.Prefill(new[] { 1, 2 });
         Assert.Equal(Sampler.ArgMax(logits), report.Top[0].Token);
     }
+
+    [Fact]
+    public void Generate_With_Logprobs_Populates_StepOutcome()
+    {
+        using var dir = new TempDir();
+        var containerPath = WriteSynthContainer(dir);
+        var cfg = new SamplingConfig(Seed: 42, Temperature: 1.0f);
+        using var container = Vindex3Container.Open(containerPath);
+        var (_, steps) = InferenceRunner.Generate(
+            container, "target", new[] { 1, 2 }, 5, cfg, logprobsTopK: 3);
+        Assert.All(steps, s => Assert.NotNull(s.Logprobs));
+        Assert.All(steps, s =>
+        {
+            Assert.InRange(s.Logprobs!.Entropy, 0f, float.PositiveInfinity);
+            Assert.InRange(s.Logprobs.TokenLogprob, float.NegativeInfinity, 0f);
+            Assert.InRange(s.Logprobs.Top1Margin, 0f, 1f);
+            Assert.NotEmpty(s.Logprobs.TopLogprobs);
+            Assert.True(s.Logprobs.TopLogprobs.Count <= 3);
+            // The selected token must appear in the top-K with its logprob.
+            Assert.Contains(s.Logprobs.TopLogprobs,
+                t => t.Token == s.Token && Math.Abs(t.Logprob - s.Logprobs.TokenLogprob) < 1e-4f);
+        });
+    }
+
+    [Fact]
+    public void Generate_Without_Logprobs_Keeps_Null()
+    {
+        using var dir = new TempDir();
+        var containerPath = WriteSynthContainer(dir);
+        var cfg = new SamplingConfig(Seed: 42, Temperature: 1.0f);
+        using var container = Vindex3Container.Open(containerPath);
+        var (_, steps) = InferenceRunner.Generate(
+            container, "target", new[] { 1, 2 }, 5, cfg);
+        Assert.All(steps, s => Assert.Null(s.Logprobs));
+    }
+
+    [Fact]
+    public void Generate_Logprobs_Greedy_Has_Zero_Logprob()
+    {
+        using var dir = new TempDir();
+        var containerPath = WriteSynthContainer(dir);
+        var cfg = new SamplingConfig(Seed: 42, Temperature: 0f);
+        using var container = Vindex3Container.Open(containerPath);
+        var (_, steps) = InferenceRunner.Generate(
+            container, "target", new[] { 1, 2 }, 4, cfg, logprobsTopK: 5);
+        Assert.All(steps, s =>
+        {
+            Assert.NotNull(s.Logprobs);
+            // Greedy: selected token is certain → logprob 0.
+            Assert.Equal(0f, s.Logprobs!.TokenLogprob);
+            // Entropy still computed from softmax over raw logits.
+            Assert.True(s.Logprobs.Entropy >= 0f);
+        });
+    }
+
+    [Fact]
+    public void Generate_Logprobs_Deterministic_For_Same_Seed()
+    {
+        using var dir = new TempDir();
+        var containerPath = WriteSynthContainer(dir);
+        var cfg = new SamplingConfig(Seed: 99, Temperature: 1.0f, TopK: 0, TopP: 0f);
+        using var c1 = Vindex3Container.Open(containerPath);
+        var (_, steps1) = InferenceRunner.Generate(
+            c1, "target", new[] { 1 }, 6, cfg, logprobsTopK: 4);
+        using var c2 = Vindex3Container.Open(containerPath);
+        var (_, steps2) = InferenceRunner.Generate(
+            c2, "target", new[] { 1 }, 6, cfg, logprobsTopK: 4);
+        Assert.Equal(
+            steps1.Select(s => (s.Token, s.Logprobs!.TokenLogprob, s.Logprobs.Entropy)),
+            steps2.Select(s => (s.Token, s.Logprobs!.TokenLogprob, s.Logprobs.Entropy)));
+    }
 }

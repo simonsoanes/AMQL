@@ -3,6 +3,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Threading.Channels;
 using Amql.Cli;
+using Amql.Hf;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
@@ -391,7 +392,7 @@ public static class ServerApp
         using var doc = await ReadBody(ctx);
         var body = doc.RootElement;
         var model = Route(models, body, Capability.Chat);
-        RefuseUnsupported(body, "tools", "functions", "logprobs", "top_logprobs", "audio", "prediction");
+        RefuseUnsupported(body, "tools", "functions", "audio", "prediction");
         if (body.TryGetProperty("n", out var n) && n.ValueKind == JsonValueKind.Number && n.GetInt32() != 1)
         {
             throw new ApiException(400, "only n=1 is supported", param: "n");
@@ -408,6 +409,24 @@ public static class ServerApp
         var messages = msgs.EnumerateArray().Select((m, i) => ChatMessageFrom(m, $"messages[{i}]")).ToList();
         int maxTokens = IntField(body, "max_completion_tokens") ?? IntField(body, "max_tokens") ?? settings.DefaultMaxTokens;
         var p = Sampling(body, maxTokens);
+
+        // logprobs: accepts both { "logprobs": true } and { "logprobs": true, "top_logprobs": K }.
+        int? logprobsTopK = null;
+        if (body.TryGetProperty("logprobs", out var lp))
+        {
+            if (lp.ValueKind is JsonValueKind.True)
+            {
+                logprobsTopK = body.TryGetProperty("top_logprobs", out var tlp) &&
+                               tlp.ValueKind == JsonValueKind.Number
+                    ? Math.Clamp(tlp.GetInt32(), 1, 20)
+                    : 5;
+            }
+            else if (lp.ValueKind == JsonValueKind.Number)
+            {
+                logprobsTopK = Math.Clamp(lp.GetInt32(), 1, 20);
+            }
+        }
+
         bool thinking = body.TryGetProperty("chat_template_kwargs", out var kw) && kw.ValueKind == JsonValueKind.Object &&
                         kw.TryGetProperty("enable_thinking", out var et) && et.ValueKind == JsonValueKind.True;
         int[] prompt = Prompt(model, messages, thinking);
@@ -418,7 +437,8 @@ public static class ServerApp
 
         if (!stream)
         {
-            var result = await Locked(model, ctx.RequestAborted, () => Run(model, prompt, p, null, ctx.RequestAborted));
+            var result = await Locked(model, ctx.RequestAborted,
+                () => Run(model, prompt, p, null, ctx.RequestAborted, logprobsTopK));
             await ctx.Response.WriteAsJsonAsync(new JsonObject
             {
                 ["id"] = id,
@@ -429,7 +449,7 @@ public static class ServerApp
                 {
                     ["index"] = 0,
                     ["message"] = new JsonObject { ["role"] = "assistant", ["content"] = result.Text, ["refusal"] = null },
-                    ["logprobs"] = null,
+                    ["logprobs"] = ChatLogprobsJson(result, model.Generator!.Tokenizer),
                     ["finish_reason"] = result.FinishReason,
                 }),
                 ["usage"] = ChatUsage(result),
@@ -450,7 +470,7 @@ public static class ServerApp
                 ["index"] = 0, ["delta"] = delta, ["logprobs"] = null, ["finish_reason"] = finish,
             }),
         };
-        await StreamSse(ctx, model, prompt, p,
+        await StreamSse(ctx, model, prompt, p, logprobsTopK,
             start: w => w(null, Chunk(new JsonObject { ["role"] = "assistant", ["content"] = "" }, null)),
             delta: (w, text) => w(null, Chunk(new JsonObject { ["content"] = text }, null)),
             finish: (w, result) =>
@@ -571,7 +591,7 @@ public static class ServerApp
 
         if (!stream)
         {
-            var result = await Locked(model, ctx.RequestAborted, () => Run(model, prompt, p, null, ctx.RequestAborted));
+            var result = await Locked(model, ctx.RequestAborted, () => Run(model, prompt, p, null, ctx.RequestAborted, null));
             await ctx.Response.WriteAsJsonAsync(Response(StatusOf(result), result), Json);
             return;
         }
@@ -584,7 +604,7 @@ public static class ServerApp
             return fields;
         }
         var text = new StringBuilder();
-        await StreamSse(ctx, model, prompt, p,
+        await StreamSse(ctx, model, prompt, p, null,
             start: w =>
             {
                 w("response.created", Event("response.created", new JsonObject { ["response"] = Response("in_progress", null) }));
@@ -643,11 +663,12 @@ public static class ServerApp
         }
     }
 
-    private static GenerationResult Run(ModelHost model, int[] prompt, GenerationParams p, Action<string>? onDelta, CancellationToken cancel)
+    private static GenerationResult Run(ModelHost model, int[] prompt, GenerationParams p,
+        Action<string>? onDelta, CancellationToken cancel, int? logprobsTopK = null)
     {
         try
         {
-            return model.Generator!.Generate(prompt, p, onDelta, cancel);
+            return model.Generator!.Generate(prompt, p, onDelta, cancel, logprobsTopK);
         }
         catch (ArgumentException e)
         {
@@ -663,6 +684,7 @@ public static class ServerApp
     /// </summary>
     private static async Task StreamSse(
         HttpContext ctx, ModelHost model, int[] prompt, GenerationParams p,
+        int? logprobsTopK,
         Action<Action<string?, JsonObject>> start,
         Action<Action<string?, JsonObject>, string> delta,
         Action<Action<string?, JsonObject>, GenerationResult> finish,
@@ -678,7 +700,7 @@ public static class ServerApp
             try
             {
                 start(Write);
-                var result = model.Generator!.Generate(prompt, p, d => delta(Write, d), ctx.RequestAborted);
+                var result = model.Generator!.Generate(prompt, p, d => delta(Write, d), ctx.RequestAborted, logprobsTopK);
                 finish(Write, result);
                 if (done)
                 {
@@ -793,6 +815,56 @@ public static class ServerApp
             sb.Append(text.GetString());
         }
         return new ChatMessage(r, sb.ToString());
+    }
+
+    /// <summary>Builds the OpenAI-format <c>logprobs</c> object from the
+    /// generation result's per-token statistics. Returns null (JSON null)
+    /// when no logprobs were requested.</summary>
+    private static JsonNode? ChatLogprobsJson(GenerationResult result, HfTokenizer tokenizer)
+    {
+        if (result.Logprobs is not { Count: > 0 })
+        {
+            return null;
+        }
+        var content = new JsonArray();
+        foreach (var lp in result.Logprobs)
+        {
+            var topArray = new JsonArray();
+            foreach (var tlp in lp.TopLogprobs)
+            {
+                string? tokenText = tokenizer.TokenInfo(tlp.Token).DecodedText;
+                var bytesArray = new JsonArray();
+                if (tokenText is not null)
+                {
+                    foreach (byte b in Encoding.UTF8.GetBytes(tokenText))
+                        bytesArray.Add(b);
+                }
+                topArray.Add(new JsonObject
+                {
+                    ["token"] = tokenText ?? $"<{tlp.Token}>",
+                    ["logprob"] = float.IsNegativeInfinity(tlp.Logprob) ? -9999.0f : tlp.Logprob,
+                    ["bytes"] = bytesArray,
+                });
+            }
+            // The selected token is always TopLogprobs[0] since it has the
+            // highest probability among the sampled distribution.
+            var first = lp.TopLogprobs[0];
+            string? firstText = tokenizer.TokenInfo(first.Token).DecodedText;
+            var firstBytes = new JsonArray();
+            if (firstText is not null)
+            {
+                foreach (byte b in Encoding.UTF8.GetBytes(firstText))
+                    firstBytes.Add(b);
+            }
+            content.Add(new JsonObject
+            {
+                ["token"] = firstText ?? $"<{first.Token}>",
+                ["logprob"] = float.IsNegativeInfinity(lp.TokenLogprob) ? -9999.0f : lp.TokenLogprob,
+                ["bytes"] = firstBytes,
+                ["top_logprobs"] = topArray,
+            });
+        }
+        return new JsonObject { ["content"] = content };
     }
 
     private static void RefuseUnsupported(JsonElement body, params string[] fields)

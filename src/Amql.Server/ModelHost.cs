@@ -249,6 +249,15 @@ public sealed record GenerationResult(string Text, string FinishReason, int Prom
 {
     /// <summary>The generated token ids (stop token excluded).</summary>
     public IReadOnlyList<int> Tokens { get; init; } = Array.Empty<int>();
+
+    /// <summary>Per-token logprobs for the completion, when requested.</summary>
+    public IReadOnlyList<LogprobsResult>? Logprobs { get; init; }
+
+    /// <summary>Perplexity over the completion tokens (exp of mean NLL).</summary>
+    public float? Perplexity { get; init; }
+
+    /// <summary>Mean Shannon entropy (nats) over the completion tokens.</summary>
+    public float? MeanEntropy { get; init; }
 }
 
 /// <summary>
@@ -288,7 +297,8 @@ public sealed class TextGenerator
         _session.Reset();
     }
 
-    public GenerationResult Generate(int[] prompt, GenerationParams p, Action<string>? onDelta, CancellationToken cancel)
+    public GenerationResult Generate(int[] prompt, GenerationParams p, Action<string>? onDelta,
+        CancellationToken cancel, int? logprobsTopK = null)
     {
         if (prompt.Length == 0)
         {
@@ -306,13 +316,27 @@ public sealed class TextGenerator
         var logits = _session.Prefill(prompt);
 
         var generated = new List<int>();
+        var logprobsList = logprobsTopK is { } lpTk && lpTk > 0
+            ? new List<LogprobsResult>()
+            : null;
         string emitted = string.Empty;
         string finish = "length";
         int holdBack = p.Stop.Count == 0 ? 0 : p.Stop.Max(s => s.Length) - 1;
 
         while (generated.Count < budget && !cancel.IsCancellationRequested)
         {
-            int token = Sampler.Sample(logits, config, rng);
+            int token;
+            LogprobsResult? stepLp = null;
+
+            if (logprobsTopK is { } lpTk2 && lpTk2 > 0)
+            {
+                (token, stepLp) = Sampler.SampleWithLogprobs(logits, config, rng, lpTk2);
+                logprobsList!.Add(stepLp!);
+            }
+            else
+            {
+                token = Sampler.Sample(logits, config, rng);
+            }
             if (_stopTokens.Contains(token))
             {
                 finish = "stop";
@@ -327,7 +351,7 @@ public sealed class TextGenerator
                 Emit(text[..stopAt]);
                 finish = "stop";
                 emitted = text[..stopAt];
-                return new GenerationResult(emitted, finish, prompt.Length, generated.Count) { Tokens = generated };
+                return BuildResult(emitted, finish, prompt.Length, generated, logprobsList);
             }
             // Hold back a trailing partial character, and enough text that a
             // stop string straddling the next token is never half-sent.
@@ -347,10 +371,7 @@ public sealed class TextGenerator
 
         string final = Tokenizer.DecodeText(generated);
         Emit(final);
-        return new GenerationResult(final, cancel.IsCancellationRequested ? "cancelled" : finish, prompt.Length, generated.Count)
-        {
-            Tokens = generated,
-        };
+        return BuildResult(final, cancel.IsCancellationRequested ? "cancelled" : finish, prompt.Length, generated, logprobsList);
 
         void Emit(string upTo)
         {
@@ -374,6 +395,26 @@ public sealed class TextGenerator
             }
         }
         return best;
+    }
+
+    private static GenerationResult BuildResult(string text, string finish, int promptTokens,
+        List<int> generated, List<LogprobsResult>? logprobsList)
+    {
+        float? perplexity = null;
+        float? meanEntropy = null;
+        if (logprobsList is { Count: > 0 })
+        {
+            double nllSum = logprobsList.Sum(lp => -(double)lp.TokenLogprob);
+            perplexity = (float)Math.Exp(nllSum / logprobsList.Count);
+            meanEntropy = logprobsList.Average(lp => lp.Entropy);
+        }
+        return new GenerationResult(text, finish, promptTokens, generated.Count)
+        {
+            Tokens = generated,
+            Logprobs = logprobsList,
+            Perplexity = perplexity,
+            MeanEntropy = meanEntropy,
+        };
     }
 }
 

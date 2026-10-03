@@ -278,9 +278,9 @@ public class PatchTests
         using var container = Vindex3Container.Open(containerPath);
         var config = new SamplingConfig(Seed: 42);
         var (_, steps1) = InferenceRunner.Generate(
-            container, "target", new[] { 1, 4, 2 }, 3, config, showTopK: 4, patch);
+            container, "target", new[] { 1, 4, 2 }, 3, config, showTopK: 4, patch: patch);
         var (_, steps2) = InferenceRunner.Generate(
-            container, "target", new[] { 1, 4, 2 }, 3, config, showTopK: 4, patch);
+            container, "target", new[] { 1, 4, 2 }, 3, config, showTopK: 4, patch: patch);
 
         Assert.Equal(steps1.Select(s => s.Token), steps2.Select(s => s.Token));
         Assert.All(steps1, s => Assert.NotNull(s.Candidates));

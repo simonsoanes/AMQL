@@ -683,6 +683,12 @@ internal static class Program
             TopP: FloatOption(args, "--top-p", 0f));
         string component = OptionValue(args, "--component") ?? "target";
         int? showTopK = IntOptionOrNull(args, "--logits");
+        int? logprobsTopK = IntOptionOrNull(args, "--logprobs");
+        if (HasOption(args, "--logprobs") && logprobsTopK is null)
+        {
+            logprobsTopK = 5; // bare --logprobs defaults to top 5
+        }
+        bool uncertainty = HasOption(args, "--uncertainty");
         bool sampling = config.Temperature > 0f || config.TopK > 0 || config.TopP > 0;
         bool trace = HasOption(args, "--trace");
         bool traceTensors = HasOption(args, "--trace-tensors");
@@ -784,7 +790,7 @@ internal static class Program
             : null;
 
         var (prefill, steps2) = InferenceRunner.Generate(
-            container, component, tokens, steps, config, showTopK, patch, genOpts, stopTokens, maxContextLength);
+            container, component, tokens, steps, config, showTopK, logprobsTopK, patch, genOpts, stopTokens, maxContextLength);
 
         string prefillText = tokenizer is null ? string.Empty : tokenizer.Decode(prefill);
         string mode = sampling ? "sampled" : "greedy";
@@ -803,6 +809,10 @@ internal static class Program
                 Console.Write("   " + string.Join("  ",
                     candidates.Select(c => $"{c.Token} {c.Logit:0.####}({c.Probability * 100:0.###}%)")));
             }
+            if (outcome.Logprobs is { } lp)
+            {
+                Console.Write($"   [logprob {lp.TokenLogprob:0.####}  entropy {lp.Entropy:0.##}  margin {lp.Top1Margin:0.###}]");
+            }
             Console.WriteLine();
 
             if (outcome.Trace is { } traceLines && traceLines.Count > 0)
@@ -812,6 +822,19 @@ internal static class Program
                 {
                     Console.WriteLine($"     L{t.Layer}: residual |h|={t.ResidualNorm:F2}  Δ={t.DeltaNorm:F4}");
                 }
+            }
+        }
+
+        if (uncertainty && steps2.Count > 0)
+        {
+            var lpSteps = steps2.Where(s => s.Logprobs is not null).ToList();
+            if (lpSteps.Count > 0)
+            {
+                float meanEntropy = lpSteps.Average(s => s.Logprobs!.Entropy);
+                float meanMargin = lpSteps.Average(s => s.Logprobs!.Top1Margin);
+                double nllSum = lpSteps.Sum(s => -(double)s.Logprobs!.TokenLogprob);
+                float perplexity = (float)Math.Exp(nllSum / lpSteps.Count);
+                Console.WriteLine($"  perplexity {perplexity:0.##}  mean entropy {meanEntropy:0.##} nats  mean margin {meanMargin:0.###}");
             }
         }
 
@@ -2498,7 +2521,7 @@ internal static class Program
               amql-cli generate <container-dir>
                               --prompt "text" --tokenizer <checkpoint-dir>
                               [--steps N|-1] [--temperature 0] [--top-k 0] [--top-p 0]
-                              [--seed 42] [--logits K] [--component target]
+                              [--seed 42] [--logits K] [--logprobs [K]] [--uncertainty] [--component target]
                               [--patch <patch.safetensors>]
                               [--trace] [--trace-tensors] [--weights f32|bf16|mxfp4]
                               [--trace-json <trace.json>]
