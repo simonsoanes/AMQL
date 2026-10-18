@@ -88,7 +88,7 @@ amql-cli export <container> --out <dir> [--patch <file>] [--quant mxfp4|ptq1|pq2
 amql-cli import <container> <model> --out <dir> [--container]
 amql-cli merge <containerA> <containerB> --out <dir>
 amql-cli moe-ify <container> --out <dir> --text <corpus> [--experts 8] [--top-k 2]
-amql-cli prune <container> --out <dir> --target-bytes <size> [--approach provenance|corpus|random]
+amql-cli prune <container> --out <dir> --target-bytes <size> [--approach provenance|corpus|random|star-elastic] [--text <corpus.txt>]
 amql-cli strip <container> --keep Q4_0|BF16|FP4|Q8_0|FP32 [--out <slim-dir>]
 amql-cli fine-tune <container> --data <pairs.tsv> --out <patch> [--lr 1e-4]
 amql-cli create-model --hidden 768 --layers 12 --vocab 32000 --out <dir>
@@ -172,8 +172,13 @@ deterministic.
 - **`import`** — Merge a second model into an existing container.
 - **`moe-ify`** — Turn a dense model into a routed Mixture of Experts by clustering FFN
   co-activations. No training, quality gated by perplexity.
-- **`prune`** — Drop whole decoder layers to hit a byte budget. Three ranking approaches:
-  provenance (merge history), corpus (residual delta), or random (ablation baseline).
+- **`prune`** — Shrink a container to a byte budget. Two pruners share the command:
+  **layer drop** (`provenance` / `corpus` / `random`) removes whole decoder layers, and
+  **`star-elastic`** does structured *width* pruning — it ranks the FFN intermediate
+  channels by activation magnitude (`Σ|x·W_upᵀ|`, the Star Elastic importance score) on
+  one forward pass over `--text`, then slices gate/up/down to the top channels on every
+  dense layer (homogeneous width). No elastic training, so quality is gated, not
+  recovered — see `docs/star-elastic-pruning.md`.
 - **`strip`** — Produce a slim single-encoding copy of any container.
   Strips every representation that doesn't match `--keep`, yielding a
   container with `Authority: Slim` that's roughly the size of the equivalent

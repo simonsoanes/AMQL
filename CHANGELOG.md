@@ -22,6 +22,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **feat:** `amql-cli --verbose` — full stack traces for unexpected errors are now opt-in
 - **feat:** `to-gguf --force` overwrites an existing output file (idempotent re-runs)
 - **docs:** the exit-code table is documented in `amql-cli help`: 0 success, 1 a legitimate negative result (`path` found nothing within budget, `verify` integrity failed), 2 usage/runtime error
+- **feat:** `prune --approach star-elastic` — structured FFN-channel width pruning (Star Elastic's zero-shot importance estimation + nested slice): ranks the intermediate channels by activation magnitude `Σ|x·W_upᵀ|` on one forward pass over `--text`, slices the gate/up rows and down columns to the top channels on every dense layer, and writes a smaller complete container under the same exact byte budget + fail-closed floor as layer prune. No elastic training (autograd/distillation is out of scope), so quality is gated, not recovered. See docs/star-elastic-pruning.md
 
 ### Changed
 

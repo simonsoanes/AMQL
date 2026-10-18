@@ -1912,7 +1912,9 @@ internal static class Program
             "provenance" => PruneApproach.Provenance,
             "corpus" => PruneApproach.Corpus,
             "random" => PruneApproach.Random,
-            _ => throw new CliException($"unknown pruning approach '{approachRaw}' — use provenance, corpus, or random"),
+            "star-elastic" => PruneApproach.StarElastic,
+            _ => throw new CliException(
+                $"unknown pruning approach '{approachRaw}' — use provenance, corpus, random, or star-elastic"),
         };
         int seed = IntOption(args, "--seed", 42);
         int sample = IntOption(args, "--sample", 8192);
@@ -1928,6 +1930,31 @@ internal static class Program
             {
                 throw new CliException($"cannot read corpus '{textPath}': {e.Message}");
             }
+        }
+
+        if (approach == PruneApproach.StarElastic)
+        {
+            int minIntermediate = IntOption(args, "--min-intermediate", 1);
+            var seReport = StarElasticPruner.Prune(containerDir, outDir, new StarElasticOptions(
+                TargetBytes: targetBytes,
+                CorpusText: text,
+                SampleCap: sample,
+                MinIntermediate: minIntermediate));
+
+            Console.WriteLine($"pruned:    {seReport.OutDir}");
+            Console.WriteLine($"model:     {seReport.Model}");
+            Console.WriteLine("approach:  star-elastic");
+            Console.WriteLine($"ffn width: {seReport.OriginalIntermediate} → {seReport.KeptIntermediate} channels  " +
+                              $"({seReport.DenseLayers} dense layer(s))");
+            Console.WriteLine($"bytes:     {FormatBytes(seReport.OriginalBytes)} → {FormatBytes(seReport.FinalBytes)}  " +
+                              $"(target {FormatBytes(seReport.TargetBytes)}, saved {FormatBytes(seReport.OriginalBytes - seReport.FinalBytes)})");
+            foreach (var note in seReport.Notes)
+            {
+                Console.WriteLine($"note:      {note}");
+            }
+            Console.WriteLine("the pruned container is a complete model — verify and export it as usual:");
+            Console.WriteLine($"  amql-cli verify {outDir}");
+            return 0;
         }
 
         var report = LayerPruner.Prune(containerDir, outDir, new PruneOptions(
@@ -2563,8 +2590,9 @@ internal static class Program
                               [--experts 8] [--top-k 2] [--sample 4096] [--eval 1024]
                               [--policy softmax|renormalise]
               amql-cli prune <container-dir> --out <pruned-dir> --target-bytes <size>
-                              [--approach provenance|corpus|random] [--seed 42]
+                              [--approach provenance|corpus|random|star-elastic] [--seed 42]
                               [--text <corpus.txt>] [--sample 8192] [--min-layers 1]
+                              [--min-intermediate 1]
               amql-cli fine-tune <container-dir> --data <pairs.tsv>
                               --out <patch.safetensors>
                               [--tokenizer <checkpoint-dir>] [--component target]
@@ -2681,6 +2709,18 @@ internal static class Program
             budget (never below --min-layers), verifies the exact rebuilt
             sizes before writing, and refuses when the target is below
             the floor.
+            "star-elastic" is structured WIDTH pruning instead of layer
+            dropping: one forward pass over --text ranks the FFN
+            intermediate channels by activation magnitude (Σ|x·W_upᵀ|,
+            the Star Elastic importance score), then slices the gate/up
+            rows and down columns to keep the top channels on every dense
+            FFN layer (homogeneous width) until the container is under
+            --target-bytes, never below --min-intermediate. It produces a
+            plain smaller model — no elastic training/distillation, so
+            quality is gated rather than recovered; see
+            docs/star-elastic-pruning.md. Requires --text and a BPE
+            tokenizer beside the container. Attention-head and MoE-expert
+            slicing are designed but not built yet.
             fine-tune runs supervised fine-tuning via teacher-forced
             output-head adaptation. The --data file is a TSV of
             prompt<TAB>completion lines; the model runs forward on each

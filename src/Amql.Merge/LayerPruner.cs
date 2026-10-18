@@ -22,6 +22,13 @@ public enum PruneApproach
 
     /// <summary>Seeded uniform random layer order — the ablation baseline.</summary>
     Random,
+
+    /// <summary>Star-Elastic structured <em>width</em> pruning: rank the
+    /// FFN intermediate channels by activation magnitude on one forward
+    /// pass over a corpus, then slice the gate/up/down projections to the
+    /// most important channels (homogeneous width) to hit the byte budget.
+    /// See <see cref="StarElasticPruner"/> and docs/star-elastic-pruning.md.</summary>
+    StarElastic,
 }
 
 /// <summary>Prune inputs: the byte budget for the whole output container,
