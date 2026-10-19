@@ -305,6 +305,8 @@ public sealed class GenericRuntime
 
         attentionDone:
 
+        AttentionContextCapture?.Invoke(layer, output);
+
         if (AttentionTrace is { } trace && _lastCapture is { Count: > 0 })
         {
             foreach (var (head, weights) in _lastCapture)
@@ -822,6 +824,12 @@ public sealed class GenericRuntime
     /// layer as the layer runs — the MoE-ification sampler's activation
     /// seam (see <c>amql-cli moe-ify</c>).</summary>
     public Action<int, Tensor2D>? FfnInputCapture { get; set; }
+
+    /// <summary>When set, each softmax-attention layer's per-head context
+    /// output (rows × QDim, contiguous per-head <c>HeadDim</c> blocks, before
+    /// the output gate and <c>o_proj</c>) is handed out as the layer runs —
+    /// the Star-Elastic head-pruning importance seam.</summary>
+    public Action<int, Tensor2D>? AttentionContextCapture { get; set; }
 
     /// <summary>When set, every layer's attention-output and FFN-output
     /// L2 norms are reported per step for diagnostic tracing

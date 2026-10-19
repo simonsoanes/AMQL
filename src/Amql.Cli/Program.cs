@@ -1946,6 +1946,11 @@ internal static class Program
             Console.WriteLine("approach:  star-elastic");
             Console.WriteLine($"ffn width: {seReport.OriginalIntermediate} → {seReport.KeptIntermediate} channels  " +
                               $"({seReport.DenseLayers} dense layer(s))");
+            if (seReport.OriginalNumKvHeads > 0)
+            {
+                Console.WriteLine($"attention: {seReport.OriginalNumKvHeads} → {seReport.KeptNumKvHeads} KV groups  " +
+                                  $"({seReport.OriginalNumQHeads} → {seReport.KeptNumQHeads} Q heads)");
+            }
             Console.WriteLine($"bytes:     {FormatBytes(seReport.OriginalBytes)} → {FormatBytes(seReport.FinalBytes)}  " +
                               $"(target {FormatBytes(seReport.TargetBytes)}, saved {FormatBytes(seReport.OriginalBytes - seReport.FinalBytes)})");
             foreach (var note in seReport.Notes)
@@ -2711,16 +2716,17 @@ internal static class Program
             the floor.
             "star-elastic" is structured WIDTH pruning instead of layer
             dropping: one forward pass over --text ranks the FFN
-            intermediate channels by activation magnitude (Σ|x·W_upᵀ|,
-            the Star Elastic importance score), then slices the gate/up
-            rows and down columns to keep the top channels on every dense
-            FFN layer (homogeneous width) until the container is under
-            --target-bytes, never below --min-intermediate. It produces a
-            plain smaller model — no elastic training/distillation, so
-            quality is gated rather than recovered; see
-            docs/star-elastic-pruning.md. Requires --text and a BPE
-            tokenizer beside the container. Attention-head and MoE-expert
-            slicing are designed but not built yet.
+            intermediate channels (Σ|x·W_upᵀ|) and, when the model has
+            softmax attention, the KV-head groups (Σ‖head context‖₂, the
+            Star Elastic importance scores), then slices the gate/up rows,
+            down columns, and q/k/v/o head blocks to drop the least
+            important units across both axes jointly until the container
+            is under --target-bytes — FFN never below --min-intermediate,
+            heads never below one KV group. It produces a plain smaller
+            model — no elastic training/distillation, so quality is gated
+            rather than recovered; see docs/star-elastic-pruning.md.
+            Requires --text and a BPE tokenizer beside the container.
+            MoE-expert slicing is designed but not built yet.
             fine-tune runs supervised fine-tuning via teacher-forced
             output-head adaptation. The --data file is a TSV of
             prompt<TAB>completion lines; the model runs forward on each

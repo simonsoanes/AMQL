@@ -159,7 +159,9 @@ public class StarElasticPruneTests
         var doc = JsonDocument.Parse(File.ReadAllBytes(Path.Combine(outDir, "index.json")));
         var prune = doc.RootElement.GetProperty("prune");
         Assert.Equal("star-elastic", prune.GetProperty("approach").GetString());
-        Assert.Equal("ffn_channels", prune.GetProperty("axis").GetString());
+        string[] axis = prune.GetProperty("axis").EnumerateArray().Select(a => a.GetString()!).ToArray();
+        Assert.Contains("ffn_channels", axis);
+        Assert.Contains("attention_heads", axis);
         Assert.Equal(report.KeptIntermediate, prune.GetProperty("to_intermediate").GetInt32());
     }
 
@@ -312,5 +314,183 @@ public class StarElasticPruneTests
             () => StarElasticPruner.Prune(routed, Path.Combine(dir.Path, "p"),
                 new StarElasticOptions(TargetBytes: 1024, CorpusText: "abcde")));
         Assert.Contains("dense FFN layer", e.Message);
+    }
+
+    // ── attention-head pruning (GQA) ──────────────────────────────────────
+
+    /// <summary>4 Q heads / 2 KV heads (groupSize 2), HeadDim 4 — enough for
+    /// one droppable KV group.</summary>
+    private static Dims GqaDims() =>
+        new(Vocab: 9, Hidden: 32, Layers: 2, Intermediate: 64, NumQHeads: 4, NumKvHeads: 2, HeadDim: 4);
+
+    [Fact]
+    public void StarElastic_Prunes_Attention_Heads_And_Produces_A_Valid_Model()
+    {
+        using var dir = new TempDir();
+        var container = BuildContainer(dir, "se", GqaDims(), Tokens5);
+        long input = DirBytes(container);
+
+        // MinIntermediate = intermediate isolates the head axis: every FFN
+        // channel is kept and the budget is absorbed by dropping KV groups.
+        var report = StarElasticPruner.Prune(container, Path.Combine(dir.Path, "p"),
+            new StarElasticOptions(TargetBytes: input - 1, CorpusText: "abcdeabcde", MinIntermediate: 64));
+
+        Assert.Equal(64, report.KeptIntermediate);
+        Assert.Equal(2, report.OriginalNumKvHeads);
+        Assert.Equal(4, report.OriginalNumQHeads);
+        Assert.Equal(1, report.KeptNumKvHeads);
+        Assert.Equal(2, report.KeptNumQHeads);
+        Assert.True(report.FinalBytes <= input - 1, $"final {report.FinalBytes} exceeds target");
+
+        using var pruned = Vindex3Container.Open(Path.Combine(dir.Path, "p"));
+        Assert.True(pruned.VerifyIntegrity().Ok);
+        using var store = pruned.CreateOperandStore();
+        var plan = Planner.Plan(pruned, "target", store);
+        foreach (var lp in plan.Layers)
+        {
+            Assert.Equal(1, lp.Attention!.NumKvHeads);
+            Assert.Equal(2, lp.Attention!.NumQHeads);
+        }
+        // q [2 heads × HeadDim 4, hidden] = [8, 32]; k/v [1 head × 4, 32]; o [32, 8]
+        Assert.Equal("8x32", Shape(store, "0.self_attn.q_proj.weight"));
+        Assert.Equal("4x32", Shape(store, "0.self_attn.k_proj.weight"));
+        Assert.Equal("4x32", Shape(store, "0.self_attn.v_proj.weight"));
+        Assert.Equal("32x8", Shape(store, "0.self_attn.o_proj.weight"));
+    }
+
+    [Fact]
+    public void StarElastic_Head_Slice_And_Ranking_Match_An_Independent_Oracle()
+    {
+        using var dir = new TempDir();
+        var container = BuildContainer(dir, "se", GqaDims(), Tokens5);
+        long input = DirBytes(container);
+
+        var report = StarElasticPruner.Prune(container, Path.Combine(dir.Path, "p"),
+            new StarElasticOptions(TargetBytes: input - 1, CorpusText: "abcdeabcde", MinIntermediate: 64));
+
+        Assert.Equal(1, report.KeptNumKvHeads);
+        int keptGroup = report.KeptKvHeads.Single();
+        int[] keptQ = report.KeptQHeads.ToArray();
+        Assert.Equal(new[] { 2 * keptGroup, 2 * keptGroup + 1 }, keptQ);
+
+        // 1. The kept group is the independently-scored top-1 KV group.
+        int topGroup = IndependentTopGroup(container, topN: 1)[0];
+        Assert.Equal(keptGroup, topGroup);
+
+        // 2. The slice is byte-exact: pruned q/k/v/o equal the original
+        //    float-level head-block gather at the kept heads (independent of
+        //    the pruner's byte-granular gather).
+        using (var orig = Vindex3Container.Open(container))
+        using (var pruned = Vindex3Container.Open(Path.Combine(dir.Path, "p")))
+        {
+            foreach (var l in new[] { 0, 1 })
+            {
+                Assert.Equal(
+                    HeadBlockRows(Widen(orig, $"{l}.self_attn.q_proj.weight"), 32, keptQ, headDim: 4, outputGate: false),
+                    Widen(pruned, $"{l}.self_attn.q_proj.weight"));
+                Assert.Equal(
+                    HeadBlockRows(Widen(orig, $"{l}.self_attn.k_proj.weight"), 32, new[] { keptGroup }, headDim: 4, outputGate: false),
+                    Widen(pruned, $"{l}.self_attn.k_proj.weight"));
+                Assert.Equal(
+                    HeadBlockRows(Widen(orig, $"{l}.self_attn.v_proj.weight"), 32, new[] { keptGroup }, headDim: 4, outputGate: false),
+                    Widen(pruned, $"{l}.self_attn.v_proj.weight"));
+                Assert.Equal(
+                    HeadBlockCols(Widen(orig, $"{l}.self_attn.o_proj.weight"), 32, 16, keptQ, headDim: 4),
+                    Widen(pruned, $"{l}.self_attn.o_proj.weight"));
+            }
+        }
+    }
+
+    [Fact]
+    public void StarElastic_Joint_Allocation_Drops_Both_Axes()
+    {
+        using var dir = new TempDir();
+        var container = BuildContainer(dir, "se", GqaDims(), Tokens5);
+        long input = DirBytes(container);
+
+        // Channel-only savings = 63 channels × 768 B = 48,384 B; one KV group
+        // saves 6,144 B. 50,000 forces both axes while staying reachable.
+        var report = StarElasticPruner.Prune(container, Path.Combine(dir.Path, "p"),
+            new StarElasticOptions(TargetBytes: input - 50_000, CorpusText: "abcdeabcde"));
+
+        Assert.True(report.KeptIntermediate < 64, "expected some FFN channels to be dropped");
+        Assert.Equal(1, report.KeptNumKvHeads);
+        Assert.Equal(2, report.KeptNumQHeads);
+        Assert.True(report.FinalBytes <= input - 50_000);
+
+        using var pruned = Vindex3Container.Open(Path.Combine(dir.Path, "p"));
+        Assert.True(pruned.VerifyIntegrity().Ok);
+        using var store = pruned.CreateOperandStore();
+        var plan = Planner.Plan(pruned, "target", store);
+        Assert.Equal(1, plan.Layers[0].Attention!.NumKvHeads);
+        Assert.Equal(report.KeptIntermediate, plan.Layers[0].Ffn!.Dense!.IntermediateSize);
+    }
+
+    // ── head test helpers ─────────────────────────────────────────────────
+
+    private static string Shape(OperandStore store, string name)
+    {
+        var r = store.Resolve("target.decoder_stack", name);
+        return string.Join("x", r.Shape);
+    }
+
+    private static float[] HeadBlockRows(float[] src, int cols, int[] keptHeads, int headDim, bool outputGate)
+    {
+        int blockRows = outputGate ? 2 * headDim : headDim;
+        var dst = new float[keptHeads.Length * blockRows * cols];
+        for (int i = 0; i < keptHeads.Length; i++)
+        {
+            Array.Copy(src, keptHeads[i] * blockRows * cols, dst, i * blockRows * cols, blockRows * cols);
+        }
+        return dst;
+    }
+
+    private static float[] HeadBlockCols(float[] src, int rows, int cols, int[] keptHeads, int headDim)
+    {
+        var dst = new float[rows * keptHeads.Length * headDim];
+        for (int r = 0; r < rows; r++)
+        {
+            for (int i = 0; i < keptHeads.Length; i++)
+            {
+                Array.Copy(src, r * cols + keptHeads[i] * headDim, dst, (r * keptHeads.Length + i) * headDim, headDim);
+            }
+        }
+        return dst;
+    }
+
+    private static int[] IndependentTopGroup(string containerDir, int topN)
+    {
+        using var c = Vindex3Container.Open(containerDir);
+        using var store = c.CreateOperandStore();
+        var plan = Planner.Plan(c, "target", store);
+        var attn0 = plan.Layers[0].Attention!;
+        int numQ = attn0.NumQHeads, numKv = attn0.NumKvHeads, headDim = attn0.HeadDim;
+        int groupSize = numQ / numKv;
+        var groupScore = new double[numKv];
+        var rt = new GenericRuntime(plan, store);
+        rt.AttentionContextCapture = (layer, output) =>
+        {
+            for (int r = 0; r < output.Rows; r++)
+            {
+                int off = r * output.Cols;
+                for (int h = 0; h < numQ; h++)
+                {
+                    double n = 0;
+                    for (int d = 0; d < headDim; d++)
+                    {
+                        float x = output.Data[off + h * headDim + d];
+                        n += (double)x * x;
+                    }
+                    groupScore[h / groupSize] += Math.Sqrt(n);
+                }
+            }
+        };
+        foreach (var token in Amql.Hf.HfTokenizer.FromModelDir(c.Root).EncodeToIds("abcdeabcde"))
+        {
+            rt.StepForward(token);
+        }
+        return Enumerable.Range(0, numKv)
+            .OrderByDescending(g => groupScore[g]).ThenBy(g => g)
+            .Take(topN).OrderBy(g => g).ToArray();
     }
 }

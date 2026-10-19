@@ -1,14 +1,15 @@
 # Star-Elastic Pruning
 
-Status: **Phase 1 built** (FFN channels, `prune --approach star-elastic`). Phases 2–3 and the
-no-grad recovery refit are designed below but **not built yet**.
+Status: **Phases 1–2 built** (FFN channels + softmax attention heads,
+`prune --approach star-elastic`). Phase 3 (MoE experts) and the no-grad recovery
+refit are designed below but **not built yet**.
 
 ## Purpose
 
 Add a `prune --approach star-elastic` mode that shrinks a container by *structured
-width pruning* — slicing the model's **FFN intermediate dimension** (and later its
-softmax attention heads and MoE experts) to the most important channels, ranked by
-**activation-based importance scores** from a single forward pass over a corpus.
+width pruning* — slicing the model's **FFN intermediate dimension** and **softmax
+attention heads** (and later its MoE experts) to the most important units, ranked
+by **activation-based importance scores** from a single forward pass over a corpus.
 
 This is the zero-shot core of [Star Elastic](https://arxiv.org/abs/2605.07182)
 (its stages 1 + 2: importance estimation + nested slicing). AMQL has no autograd, so
@@ -44,11 +45,19 @@ Weight shape convention (HF `nn.Linear`): projections are `[out, in]`, so
 
 - gate/up `[intermediate, hidden]` — slicing a channel = dropping a **row**;
 - down `[hidden, intermediate]` — slicing a channel = dropping a **column**.
+- q/k/v `[heads·headDim (q: ×2 with output gate), hidden]` — slicing a head = dropping
+  its contiguous `headDim` (q: `2·headDim`) **row block**; o `[hidden, heads·headDim]`
+  — dropping a head = dropping its `headDim` **column block**.
 
 `FfnSurface.IntermediateSize`, `AttentionSurface.NumQHeads/NumKvHeads`, and
 `MoeSurface.Experts` are each a **single** value, so AMQL's slice is **homogeneous**:
 the same kept channels/heads/experts on every layer. (The paper supports
 per-layer-heterogeneous FFN; AMQL's surface does not.)
+
+Head pruning drops whole **KV groups** (one KV head + its `NumQHeads/NumKvHeads`
+Q heads), so the uniform GQA grouping — `kvHead = qHead / (NumQHeads/NumKvHeads)` —
+stays intact and `NumQHeads : NumKvHeads` is preserved. MHA (`NumKvHeads ==
+NumQHeads`) degrades to per-head; MQA (`NumKvHeads == 1`) has no droppable group.
 
 ## The importance formulas (as implemented)
 
@@ -60,8 +69,10 @@ the sum is over the sampled positions:
   where `hf` is the normed pre-FFN input. (The paper scores the `up` branch
   `X·W_upᵀ`; `gate` shares the channel index, so gate/up/down are all sliced by the
   same kept set.)
-- **Attention heads** (*Phase 2*) — `F_h = Σ_t ‖Attn(XW_q^h, XW_k^h, XW_v^h)‖₂`,
-  the per-head context-vector norm before `o_proj`.
+- **Attention heads** — `F_h = Σ_t ‖Attn(XW_q^h, XW_k^h, XW_v^h)‖₂`, the per-head
+  context-vector norm before `o_proj`, captured through the new
+  `GenericRuntime.AttentionContextCapture` seam. Per-Q-head scores are summed
+  into each KV group.
 - **MoE experts** (*Phase 3*) — REAP: `S_e = mean_{x active-e} g_e(x)·‖f_e(x)‖₂`.
 
 Scores are aggregated across layers into one global ranking (homogeneous slice).
@@ -72,20 +83,28 @@ single-output `prune` does not.
 
 ## Budget model
 
-Same shape as `LayerPruner`: `--target-bytes` is the whole-output budget. Let
-`inter` be the original FFN intermediate, `K` the kept width. Removing one channel
-from one dense layer frees `3·hidden·elemSize` bytes (one gate row + one up row +
-one down column). The pruner scans `K = inter … 1`, estimates each candidate's exact
-output size (rebuilt stack header + payload, index, graph — with the token-map and
-every other file byte-copied), and commits the largest `K` that fits. Below the
-floor it fails closed, like the layer pruner.
+Same shape as `LayerPruner`: `--target-bytes` is the whole-output budget, honoured
+with an exact rebuilt-size estimate and a fail-closed floor. The two axes are pruned
+**jointly**:
+
+1. Each axis's raw scores are normalised by its own maximum, mapping every unit —
+   a channel and a KV group alike — to `[0,1]` "importance relative to its
+   siblings". (The paper nests per-axis and never ranks cross-axis, so this
+   comparable scale is AMQL's design choice.)
+2. Units are merged **least-important-first** (ties: channels before heads, then
+   index) and dropped one at a time — FFN channels down to `--min-intermediate`,
+   heads down to one KV group — until the estimated output fits.
+3. Removing one channel from one dense layer frees `3·hidden·elemSize` bytes; one
+   KV group frees `(2 + 2·groupSize)·headDim·hidden·elemSize`. Size is recomputed
+   exactly at each step (rebuilt stack header + payload, index, graph; the
+   token-map and every other file are byte-copied).
 
 ## Phasing
 
 | Phase | Axis | Status |
 |-------|------|--------|
 | 1 | FFN channels (homogeneous intermediate width) | **built** |
-| 2 | Softmax attention heads (homogeneous head count, GQA-aware) | designed, not built |
+| 2 | Softmax attention heads (homogeneous head count, GQA-aware) | **built** |
 | 3 | MoE experts (opt-in `--slice-moe`, REAP ranking) | designed, not built |
 | — | No-grad recovery refit (`down_proj` least-squares on calibration activations) | future work |
 

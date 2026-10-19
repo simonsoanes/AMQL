@@ -7,15 +7,15 @@ using Amql.Vindex3;
 namespace Amql.Merge;
 
 /// <summary>Star-Elastic prune inputs: the whole-output byte budget, the
-/// calibration corpus, and the FFN-channel controls.</summary>
+/// calibration corpus, and the FFN-channel floor.</summary>
 public sealed record StarElasticOptions(
     long TargetBytes,
     string? CorpusText = null,
     int SampleCap = 8192,
     int MinIntermediate = 1);
 
-/// <summary>Outcome of one star-elastic prune: the sizes, the FFN-channel
-/// counts, and the ranking/edge notes.</summary>
+/// <summary>Outcome of one star-elastic prune: whole-output sizes, the
+/// FFN-channel and attention-head counts, and the ranking/edge notes.</summary>
 public sealed record StarElasticReport(
     string OutDir,
     string Model,
@@ -27,31 +27,82 @@ public sealed record StarElasticReport(
     int Layers,
     int DenseLayers,
     /// <summary>The kept FFN channel indices, in original order — the same
-    /// set on every dense layer (homogeneous width).</summary>
+    /// set on every dense FFN layer (homogeneous width).</summary>
     IReadOnlyList<int> KeptChannels,
+    int OriginalNumQHeads,
+    int KeptNumQHeads,
+    int OriginalNumKvHeads,
+    int KeptNumKvHeads,
+    /// <summary>The kept Q-head indices and KV-head indices, in original
+    /// order — the same set on every softmax-attention layer. Empty when the
+    /// model has no softmax attention.</summary>
+    IReadOnlyList<int> KeptQHeads,
+    IReadOnlyList<int> KeptKvHeads,
     IReadOnlyList<string> Notes);
 
 /// <summary>
 /// Star-Elastic structured <em>width</em> pruning — the zero-shot core of
-/// the Star Elastic paper (importance estimation + nested slicing), the
-/// FFN-channel axis. One forward pass over a calibration corpus ranks the
-/// FFN intermediate channels by their activation magnitude
-/// (<c>F_j = Σ_layers Σ_t |(hf · W_upᵀ)[t,j]|</c>); the pruner then keeps the
-/// top-K channels — the same K and the same indices on <em>every</em> dense
-/// FFN layer, because AMQL's <see cref="FfnSurface.IntermediateSize"/> is a
-/// single homogeneous value — and slices gate/up rows and down columns to
-/// produce a smaller, complete, planable container.
+/// the Star Elastic paper (importance estimation + nested slicing). One
+/// forward pass over a calibration corpus ranks two axes by activation
+/// magnitude:
+/// <list type="bullet">
+/// <item>FFN channels — <c>F_j = Σ_layers Σ_t |(hf · W_upᵀ)[t,j]|</c>;</item>
+/// <item>attention heads — <c>F_h = Σ_layers Σ_t ‖Attn(XW_q^h, XW_k^h, XW_v^h)‖₂</c>,
+/// aggregated to a KV head and its <c>NumQHeads/NumKvHeads</c> group so the
+/// uniform GQA grouping stays intact.</item>
+/// </list>
+/// The axes are pruned <em>jointly</em> under <c>--target-bytes</c>: each
+/// unit's raw score is normalised by its axis maximum (so a channel and a
+/// KV group are both mapped to [0,1] "importance relative to its siblings"),
+/// the units are merged least-important-first, and the pruner drops the
+/// smallest least-important prefix that fits the budget — channels down to
+/// <c>--min-intermediate</c>, heads down to one KV group.
 ///
-/// The output is a plain smaller model (kept channels restored to their
-/// original index order — no permutation). The byte budget is honored with
-/// an exact estimate and a fail-closed floor, exactly like
+/// Every axis is sliced to the same indices on every layer it applies to
+/// (AMQL's surface is homogeneous), and kept units are restored to their
+/// original index order — a plain smaller model, no permutation. The byte
+/// budget is honoured with an exact estimate and a fail-closed floor, like
 /// <see cref="LayerPruner"/>. This is stages 1+2 of the paper; the elastic
-/// training (stage 3) that recovers accuracy is out of scope here — see
+/// training (stage 3) that recovers accuracy is out of scope — see
 /// docs/star-elastic-pruning.md.
 /// </summary>
 public static class StarElasticPruner
 {
     private const string IndexFile = "index.json";
+
+    private sealed class SlicedFfn
+    {
+        public SegmentTensor? Gate;
+        public required SegmentTensor Up;
+        public required SegmentTensor Down;
+    }
+
+    private sealed class SlicedAttn
+    {
+        public required SegmentTensor Q;
+        public required SegmentTensor K;
+        public required SegmentTensor V;
+        public required SegmentTensor O;
+        public required bool OutputGate;
+    }
+
+    private sealed class HeadSliceInfo
+    {
+        public required int NumQHeads;
+        public required int NumKvHeads;
+        public required int HeadDim;
+        public required Dictionary<int, SlicedAttn> Layers;
+    }
+
+    private sealed class SliceContext
+    {
+        public required List<SegmentTensor> Carried;
+        public required Dictionary<int, SlicedFfn> Ffn;
+        public HeadSliceInfo? Head;
+        public required int TensorCount;
+    }
+
+    private sealed record SegmentEstimate(long SegmentBytes, long PayloadBytes);
 
     public static StarElasticReport Prune(string containerDir, string outDir, StarElasticOptions options)
     {
@@ -83,7 +134,7 @@ public static class StarElasticPruner
         }
         int intermediate = ffn.IntermediateSize;
         int hidden = component.HiddenSize;
-        if (intermediate <= options.MinIntermediate)
+        if (intermediate < options.MinIntermediate)
         {
             throw new MergeException(
                 $"cannot keep {options.MinIntermediate} FFN channels of a {intermediate}-channel FFN");
@@ -96,7 +147,7 @@ public static class StarElasticPruner
             throw new MergeException("the corpus encodes to zero tokens — nothing to score");
         }
 
-        // ── plan + activation-based ranking (one forward pass) ────────────
+        // ── plan ──────────────────────────────────────────────────────────
         using var store = container.CreateOperandStore();
         ComponentOpPlan plan;
         try
@@ -122,7 +173,30 @@ public static class StarElasticPruner
                 "supported yet (MoE expert slicing is a later phase)");
         }
 
-        double[] score = new double[intermediate];
+        // Homogeneous attention geometry from the first softmax layer.
+        bool hasSoftmax = false;
+        int numQHeads = 0, numKvHeads = 0, headDim = 0;
+        foreach (var lp in plan.Layers)
+        {
+            if (lp.Attention is { } a)
+            {
+                numQHeads = a.NumQHeads;
+                numKvHeads = a.NumKvHeads;
+                headDim = a.HeadDim;
+                hasSoftmax = true;
+                break;
+            }
+        }
+        if (hasSoftmax && (numQHeads <= 0 || numKvHeads <= 0 || numQHeads % numKvHeads != 0))
+        {
+            throw new MergeException(
+                $"degenerate attention geometry: num_q_heads={numQHeads}, num_kv_heads={numKvHeads}");
+        }
+        int groupSize = hasSoftmax ? numQHeads / numKvHeads : 0;
+
+        // ── one forward pass scores both axes ─────────────────────────────
+        double[] channelScore = new double[intermediate];
+        double[] headScore = hasSoftmax ? new double[numQHeads] : Array.Empty<double>();
         var runtime = new GenericRuntime(plan, store);
         runtime.FfnInputCapture = (layer, hf) =>
         {
@@ -135,20 +209,55 @@ public static class StarElasticPruner
                     int off = r * intermediate;
                     for (int j = 0; j < intermediate; j++)
                     {
-                        score[j] += Math.Abs(hu.Data[off + j]);
+                        channelScore[j] += Math.Abs(hu.Data[off + j]);
                     }
                 }
             }
         };
+        if (hasSoftmax)
+        {
+            runtime.AttentionContextCapture = (layer, output) =>
+            {
+                if (plan.Layers[layer].Attention is null)
+                {
+                    return;
+                }
+                for (int r = 0; r < output.Rows; r++)
+                {
+                    int off = r * output.Cols;
+                    for (int h = 0; h < numQHeads; h++)
+                    {
+                        double n = 0;
+                        for (int d = 0; d < headDim; d++)
+                        {
+                            float x = output.Data[off + h * headDim + d];
+                            n += (double)x * x;
+                        }
+                        headScore[h] += Math.Sqrt(n);
+                    }
+                }
+            };
+        }
         foreach (var token in tokens)
         {
             runtime.StepForward(token);
         }
 
-        int[] ranked = Enumerable.Range(0, intermediate)
-            .OrderByDescending(j => score[j])
-            .ThenBy(j => j)
-            .ToArray();
+        double[] groupScore = new double[hasSoftmax ? numKvHeads : 0];
+        if (hasSoftmax)
+        {
+            for (int h = 0; h < numQHeads; h++)
+            {
+                groupScore[h / groupSize] += headScore[h];
+            }
+        }
+
+        int[] channelDesc = Enumerable.Range(0, intermediate)
+            .OrderByDescending(j => channelScore[j]).ThenBy(j => j).ToArray();
+        int[] groupDesc = hasSoftmax
+            ? Enumerable.Range(0, numKvHeads)
+                .OrderByDescending(g => groupScore[g]).ThenBy(g => g).ToArray()
+            : Array.Empty<int>();
 
         // ── classify stack tensors: slice targets vs carried ─────────────
         var stackObj = graph.Objects.First(o => o.Component == component.Id && o.Kind == ObjectKind.DecoderStack);
@@ -164,8 +273,8 @@ public static class StarElasticPruner
         }
         var byName = sourceTensors.ToDictionary(t => t.Name, StringComparer.Ordinal);
 
-        var sliced = new Dictionary<int, SlicedFfn>();
         var slicedNames = new HashSet<string>(StringComparer.Ordinal);
+        var slicedFfn = new Dictionary<int, SlicedFfn>();
         bool gated = false;
         for (int l = 0; l < plan.Layers.Count; l++)
         {
@@ -179,12 +288,7 @@ public static class StarElasticPruner
             var down = Lookup(byName, dense.Down.TensorName, stackSegmentPath);
             foreach (var t in new[] { gate, up, down })
             {
-                if (t is not null && t.Dtype is not ("F32" or "F16" or "BF16"))
-                {
-                    throw new MergeException(
-                        $"tensor '{t.Name}' is stored as '{t.Dtype}' — star-elastic width pruning slices at byte " +
-                        "granularity and needs a flat F32/F16/BF16 stack; re-encode with '--strip --keep F32' first");
-                }
+                RequireFlat(t, stackSegmentPath);
             }
             if (gate is not null)
             {
@@ -193,10 +297,54 @@ public static class StarElasticPruner
             }
             slicedNames.Add(up.Name);
             slicedNames.Add(down.Name);
-            sliced[l] = new SlicedFfn { Gate = gate, Up = up, Down = down };
+            slicedFfn[l] = new SlicedFfn { Gate = gate, Up = up, Down = down };
         }
+
+        HeadSliceInfo? headInfo = null;
+        if (hasSoftmax)
+        {
+            var attnSurface = surface.Attention
+                ?? throw new MergeException("the plan serves softmax attention but the surface declares no attention facts");
+            var attnLayers = new Dictionary<int, SlicedAttn>();
+            for (int l = 0; l < plan.Layers.Count; l++)
+            {
+                if (plan.Layers[l].Attention is not { } attn)
+                {
+                    continue;
+                }
+                var q = Lookup(byName, attn.QProj.TensorName, stackSegmentPath);
+                var k = Lookup(byName, attn.KProj.TensorName, stackSegmentPath);
+                var v = Lookup(byName, attn.VProj.TensorName, stackSegmentPath);
+                var o = Lookup(byName, attn.OProj.TensorName, stackSegmentPath);
+                foreach (var t in new[] { q, k, v, o })
+                {
+                    RequireFlat(t, stackSegmentPath);
+                }
+                slicedNames.Add(q.Name);
+                slicedNames.Add(k.Name);
+                slicedNames.Add(v.Name);
+                slicedNames.Add(o.Name);
+                attnLayers[l] = new SlicedAttn { Q = q, K = k, V = v, O = o, OutputGate = attn.OutputGate };
+            }
+            headInfo = new HeadSliceInfo
+            {
+                NumQHeads = attnSurface.NumQHeads,
+                NumKvHeads = attnSurface.NumKvHeads,
+                HeadDim = attnSurface.HeadDim,
+                Layers = attnLayers,
+            };
+        }
+
         var carried = sourceTensors.Where(t => !slicedNames.Contains(t.Name)).ToList();
-        int tensorCount = carried.Count + sliced.Count * (gated ? 3 : 2);
+        int ffnTensorCount = slicedFfn.Count * (gated ? 3 : 2);
+        int headTensorCount = headInfo is null ? 0 : headInfo.Layers.Count * 4;
+        var ctx = new SliceContext
+        {
+            Carried = carried,
+            Ffn = slicedFfn,
+            Head = headInfo,
+            TensorCount = carried.Count + ffnTensorCount + headTensorCount,
+        };
 
         // ── baseline byte census ──────────────────────────────────────────
         long inputTotal = DirectorySize(containerDir);
@@ -209,46 +357,104 @@ public static class StarElasticPruner
             - new FileInfo(indexPath).Length
             - new FileInfo(graphPath).Length;
 
-        // ── scan K = intermediate … MinIntermediate for the largest fit ──
-        long floor = -1;
-        for (int keptInter = intermediate; keptInter >= options.MinIntermediate; keptInter--)
+        // ── joint allocation: drop the least-important prefix until it fits ─
+        double cMax = channelScore.Max();
+        double gMax = hasSoftmax ? groupScore.Max() : 0.0;
+        int maxDropChannels = intermediate - options.MinIntermediate;
+        int maxDropGroups = hasSoftmax ? numKvHeads - 1 : 0;
+
+        var units = new List<(bool IsGroup, int Index, double Norm)>(
+            maxDropChannels + maxDropGroups);
+        foreach (var j in Enumerable.Range(0, intermediate)
+                     .OrderBy(j => channelScore[j]).ThenBy(j => j).Take(maxDropChannels))
         {
-            int[] kept = ranked.Take(keptInter).OrderBy(j => j).ToArray();
-            var estimate = MeasureStack(stackRepId, carried, sliced, keptInter);
+            units.Add((false, j, cMax > 0 ? channelScore[j] / cMax : 0.0));
+        }
+        foreach (var g in Enumerable.Range(0, numKvHeads)
+                     .OrderBy(g => groupScore[g]).ThenBy(g => g).Take(maxDropGroups))
+        {
+            units.Add((true, g, gMax > 0 ? groupScore[g] / gMax : 0.0));
+        }
+        units.Sort((a, b) =>
+        {
+            int c = a.Norm.CompareTo(b.Norm);
+            if (c != 0)
+            {
+                return c;
+            }
+            c = (a.IsGroup ? 1 : 0).CompareTo(b.IsGroup ? 1 : 0);
+            if (c != 0)
+            {
+                return c;
+            }
+            return a.Index.CompareTo(b.Index);
+        });
+
+        long floorBytes = -1;
+        int droppedChannels = 0, droppedGroups = 0;
+        for (int m = 0; ; m++)
+        {
+            int keptInter = intermediate - droppedChannels;
+            int keptKv = hasSoftmax ? numKvHeads - droppedGroups : 0;
+
+            var estimate = MeasureStack(stackRepId, ctx, keptInter, keptKv);
             var newFfn = RebuildFfn(ffn, keptInter);
-            var newSurface = RebuildSurface(surface, newFfn);
+            var newAttn = hasSoftmax
+                ? RebuildAttention(surface.Attention!, keptKv * groupSize, keptKv)
+                : surface.Attention;
+            var newSurface = RebuildSurface(surface, newFfn, newAttn);
             var newGraph = BuildGraph(graph, component, newSurface);
             long graphLen = JsonSerializer.SerializeToUtf8Bytes(newGraph, ViJson.Options).Length;
             var indexEstimate = BuildIndex(
-                container.Index, stackEntry, stackRepId, keptInter, intermediate, options,
-                tensorCount, estimate.PayloadBytes,
+                container.Index, stackEntry, stackRepId, keptInter, intermediate,
+                hasSoftmax ? numQHeads : 0, keptKv * groupSize,
+                hasSoftmax ? numKvHeads : 0, keptKv,
+                options, ctx.TensorCount, estimate.PayloadBytes,
                 payloadSha: new string('0', 64), segmentSha: new string('0', 64));
             long indexLen = JsonSerializer.SerializeToUtf8Bytes(indexEstimate, ViJson.Options).Length;
-            long estimatedTotal = copiedBytes + estimate.SegmentBytes + indexLen + graphLen;
-            if (estimatedTotal > options.TargetBytes)
-            {
-                floor = Math.Max(floor, estimatedTotal);
-                continue;
-            }
+            long total = copiedBytes + estimate.SegmentBytes + indexLen + graphLen;
 
-            var report = Commit(
-                container, outDir, graph, component, surface, ffn, stackRepId, stackEntry,
-                carried, sliced, kept, keptInter, intermediate, options, copiedBytes, inputTotal,
-                gated, drafterPresent, tokens.Length);
-            if (report is not null)
+            if (total <= options.TargetBytes)
             {
-                return report;
+                int[] keptChannels = channelDesc.Take(keptInter).OrderBy(j => j).ToArray();
+                int[] keptKvGroups = hasSoftmax ? groupDesc.Take(keptKv).OrderBy(g => g).ToArray() : Array.Empty<int>();
+                int[] keptQHeads = hasSoftmax
+                    ? keptKvGroups.SelectMany(g => Enumerable.Range(g * groupSize, groupSize)).ToArray()
+                    : Array.Empty<int>();
+
+                var report = Commit(
+                    container, outDir, graph, component, surface, ffn, stackRepId, stackEntry, ctx,
+                    keptChannels, keptKvGroups, keptQHeads, keptInter, keptKv, intermediate,
+                    hasSoftmax ? numQHeads : 0, hasSoftmax ? numKvHeads : 0,
+                    options, copiedBytes, inputTotal, gated, headInfo is not null, drafterPresent, tokens.Length);
+                if (report is not null)
+                {
+                    return report;
+                }
             }
-            floor = Math.Max(floor, estimatedTotal);
+            floorBytes = total;
+
+            if (m >= units.Count)
+            {
+                break;
+            }
+            if (units[m].IsGroup)
+            {
+                droppedGroups++;
+            }
+            else
+            {
+                droppedChannels++;
+            }
         }
 
         throw new MergeException(
-            $"cannot reach target-bytes '{FormatBytes(options.TargetBytes)}': " +
-            $"at --min-intermediate {options.MinIntermediate} the floor is {FormatBytes(floor)} " +
-            $"(from {intermediate} FFN channels down to {options.MinIntermediate})");
+            $"cannot reach target-bytes '{FormatBytes(options.TargetBytes)}': the floor is {FormatBytes(floorBytes)} " +
+            $"(FFN {intermediate}→{options.MinIntermediate} channels" +
+            (hasSoftmax && numKvHeads > 1 ? $", attention {numKvHeads}→1 KV groups" : "") + ")");
     }
 
-    // ── ranking / scoring ─────────────────────────────────────────────────
+    // ── ranking / tokenization ────────────────────────────────────────────
 
     private static int[] Tokenize(string containerRoot, string? corpusText, int sampleCap)
     {
@@ -270,14 +476,7 @@ public static class StarElasticPruner
         return ids.Take(cap).ToArray();
     }
 
-    // ── container / tensor helpers ────────────────────────────────────────
-
-    private sealed class SlicedFfn
-    {
-        public SegmentTensor? Gate;
-        public required SegmentTensor Up;
-        public required SegmentTensor Down;
-    }
+    // ── slice helpers ─────────────────────────────────────────────────────
 
     private static SegmentTensor Lookup(Dictionary<string, SegmentTensor> byName, string name, string segmentPath)
     {
@@ -290,9 +489,19 @@ public static class StarElasticPruner
 
     private static int Elem(SegmentTensor tensor) => DtypeExtensions.FromLabel(tensor.Dtype).ElementSize();
 
-    /// <summary>sliced-byte helpers (same byte-granular row/column gather as
-    /// moe-ify): rows keep a channel for gate/up (<c>[I, H]</c>), columns for
-    /// down (<c>[H, I]</c>).</summary>
+    private static void RequireFlat(SegmentTensor? tensor, string segmentPath)
+    {
+        if (tensor is not null && tensor.Dtype is not ("F32" or "F16" or "BF16"))
+        {
+            throw new MergeException(
+                $"tensor '{tensor.Name}' is stored as '{tensor.Dtype}' — star-elastic width pruning slices at byte " +
+                $"granularity and needs a flat F32/F16/BF16 stack (segment '{segmentPath}'); re-encode with " +
+                "'--strip --keep F32' first");
+        }
+    }
+
+    /// <summary>FFN channel gather: rows keep a channel for gate/up
+    /// (<c>[I, H]</c>), columns for down (<c>[H, I]</c>).</summary>
     private static byte[] GatherRows(byte[] source, int width, int elem, int[] units)
     {
         var result = new byte[units.Length * width * elem];
@@ -318,30 +527,95 @@ public static class StarElasticPruner
         return result;
     }
 
-    private sealed record SegmentEstimate(long SegmentBytes, long PayloadBytes);
-
-    /// <summary>Exact serialised size of the rebuilt stack segment at a
-    /// given kept width, without reading any payload: the header JSON is
-    /// serialised exactly as <see cref="SegmentWriter.Write"/> would (sorted
-    /// names, 16-byte padding) and payload lengths are summed from the slice
-    /// geometry.</summary>
-    private static SegmentEstimate MeasureStack(
-        string repId, List<SegmentTensor> carried, Dictionary<int, SlicedFfn> sliced, int keptInter)
+    /// <summary>Head-block row gather: each kept head owns <paramref name="blockRows"/>
+    /// contiguous rows of <paramref name="width"/> elements (q/k/v: <c>[heads·blockRows, hidden]</c>).</summary>
+    private static byte[] GatherHeadRows(byte[] source, int hidden, int elem, int[] keptHeads, int blockRows)
     {
-        var desc = new List<(string Name, string Dtype, long[] Shape, long Len)>(carried.Count + sliced.Count * 3);
-        foreach (var t in carried)
+        int blockBytes = blockRows * hidden * elem;
+        var result = new byte[keptHeads.Length * blockBytes];
+        for (int i = 0; i < keptHeads.Length; i++)
+        {
+            Buffer.BlockCopy(source, keptHeads[i] * blockBytes, result, i * blockBytes, blockBytes);
+        }
+        return result;
+    }
+
+    /// <summary>Head-block column gather: each kept Q head owns <paramref name="headDim"/>
+    /// contiguous columns (o: <c>[hidden, heads·headDim]</c>).</summary>
+    private static byte[] GatherHeadCols(byte[] source, int hidden, int srcCols, int elem, int[] keptHeads, int headDim)
+    {
+        var result = new byte[hidden * keptHeads.Length * headDim * elem];
+        for (int r = 0; r < hidden; r++)
+        {
+            for (int i = 0; i < keptHeads.Length; i++)
+            {
+                Buffer.BlockCopy(
+                    source, (r * srcCols + keptHeads[i] * headDim) * elem,
+                    result, (r * keptHeads.Length * headDim + i * headDim) * elem,
+                    headDim * elem);
+            }
+        }
+        return result;
+    }
+
+    // ── shape/length geometry (shared by estimate and commit) ─────────────
+
+    private static (long[] Shape, long Len) FfnTensor(SegmentTensor t, int keptInter, int hidden, bool isDown) =>
+        isDown
+            ? (new long[] { hidden, keptInter }, (long)hidden * keptInter * Elem(t))
+            : (new long[] { keptInter, hidden }, (long)keptInter * hidden * Elem(t));
+
+    private static (long[] Shape, long Len) QTensor(SegmentTensor q, int hidden, int headDim, int keptQCount, bool outputGate)
+    {
+        int blockRows = outputGate ? 2 * headDim : headDim;
+        return (new long[] { (long)keptQCount * blockRows, hidden }, (long)keptQCount * blockRows * hidden * Elem(q));
+    }
+
+    private static (long[] Shape, long Len) KvTensor(SegmentTensor k, int hidden, int headDim, int keptKvCount) =>
+        (new long[] { (long)keptKvCount * headDim, hidden }, (long)keptKvCount * headDim * hidden * Elem(k));
+
+    private static (long[] Shape, long Len) OTensor(SegmentTensor o, int hidden, int headDim, int keptQCount) =>
+        (new long[] { hidden, (long)keptQCount * headDim }, (long)hidden * keptQCount * headDim * Elem(o));
+
+    // ── exact stack-size estimate ─────────────────────────────────────────
+
+    private static SegmentEstimate MeasureStack(string repId, SliceContext ctx, int keptInter, int keptKv)
+    {
+        int keptQCount = ctx.Head is { } h ? keptKv * (h.NumQHeads / h.NumKvHeads) : 0;
+        var desc = new List<(string Name, string Dtype, long[] Shape, long Len)>(
+            ctx.Carried.Count + ctx.Ffn.Count * 3 + (ctx.Head?.Layers.Count * 4 ?? 0));
+
+        foreach (var t in ctx.Carried)
         {
             desc.Add((t.Name, t.Dtype, t.Shape, t.Len));
         }
-        foreach (var sf in sliced.Values)
+        foreach (var sf in ctx.Ffn.Values)
         {
             int hidden = (int)sf.Up.Shape[1];
             if (sf.Gate is { } gate)
             {
-                desc.Add((gate.Name, gate.Dtype, new long[] { keptInter, hidden }, (long)keptInter * hidden * Elem(gate)));
+                var g = FfnTensor(gate, keptInter, hidden, isDown: false);
+                desc.Add((gate.Name, gate.Dtype, g.Shape, g.Len));
             }
-            desc.Add((sf.Up.Name, sf.Up.Dtype, new long[] { keptInter, hidden }, (long)keptInter * hidden * Elem(sf.Up)));
-            desc.Add((sf.Down.Name, sf.Down.Dtype, new long[] { hidden, keptInter }, (long)hidden * keptInter * Elem(sf.Down)));
+            var u = FfnTensor(sf.Up, keptInter, hidden, isDown: false);
+            desc.Add((sf.Up.Name, sf.Up.Dtype, u.Shape, u.Len));
+            var d = FfnTensor(sf.Down, keptInter, hidden, isDown: true);
+            desc.Add((sf.Down.Name, sf.Down.Dtype, d.Shape, d.Len));
+        }
+        if (ctx.Head is { } head)
+        {
+            foreach (var sa in head.Layers.Values)
+            {
+                int hidden = (int)sa.O.Shape[0];
+                var q = QTensor(sa.Q, hidden, head.HeadDim, keptQCount, sa.OutputGate);
+                var k = KvTensor(sa.K, hidden, head.HeadDim, keptKv);
+                var v = KvTensor(sa.V, hidden, head.HeadDim, keptKv);
+                var o = OTensor(sa.O, hidden, head.HeadDim, keptQCount);
+                desc.Add((sa.Q.Name, sa.Q.Dtype, q.Shape, q.Len));
+                desc.Add((sa.K.Name, sa.K.Dtype, k.Shape, k.Len));
+                desc.Add((sa.V.Name, sa.V.Dtype, v.Shape, v.Len));
+                desc.Add((sa.O.Name, sa.O.Dtype, o.Shape, o.Len));
+            }
         }
         desc.Sort((a, b) => StringComparer.Ordinal.Compare(a.Name, b.Name));
 
@@ -387,6 +661,8 @@ public static class StarElasticPruner
             payload);
     }
 
+    // ── surface / graph / index rebuilders ────────────────────────────────
+
     private static FfnSurface RebuildFfn(FfnSurface source, int keptIntermediate) => new()
     {
         IntermediateSize = keptIntermediate,
@@ -396,10 +672,26 @@ public static class StarElasticPruner
         Moe = source.Moe,
     };
 
-    private static ExecutionSurface RebuildSurface(ExecutionSurface source, FfnSurface newFfn) => new()
+    private static AttentionSurface RebuildAttention(AttentionSurface source, int keptQHeads, int keptKvHeads) => new()
+    {
+        NumQHeads = keptQHeads,
+        NumKvHeads = keptKvHeads,
+        HeadDim = source.HeadDim,
+        QueryScale = source.QueryScale,
+        ScoreScale = source.ScoreScale,
+        LogitSoftcapping = source.LogitSoftcapping,
+        QkNormScope = source.QkNormScope,
+        QkNormWeightOffset = source.QkNormWeightOffset,
+        ParameterFreeQkNorm = source.ParameterFreeQkNorm,
+        OutputGate = source.OutputGate,
+        Sinks = source.Sinks,
+        AttentionBias = source.AttentionBias,
+    };
+
+    private static ExecutionSurface RebuildSurface(ExecutionSurface source, FfnSurface newFfn, AttentionSurface? newAttn) => new()
     {
         ContextLength = source.ContextLength,
-        Attention = source.Attention,
+        Attention = newAttn,
         Ffn = newFfn,
         Norm = source.Norm,
         Head = source.Head,
@@ -451,6 +743,10 @@ public static class StarElasticPruner
         string stackRepId,
         int keptIntermediate,
         int originalIntermediate,
+        int keptQHeads,
+        int originalQHeads,
+        int keptKvHeads,
+        int originalKvHeads,
         StarElasticOptions options,
         int tensorCount,
         long payloadBytes,
@@ -460,19 +756,22 @@ public static class StarElasticPruner
         var reps = new Dictionary<string, RepresentationEntry>(StringComparer.Ordinal);
         foreach (var (repId, entry) in source.Representations)
         {
-            reps[repId] = repId == stackRepId
-                ? new RepresentationEntry
-                {
-                    Object = entry.Object,
-                    Encoding = entry.Encoding,
-                    Segment = entry.Segment,
-                    TensorCount = tensorCount,
-                    PayloadBytes = payloadBytes,
-                    PayloadSha256 = payloadSha,
-                    SegmentSha256 = segmentSha,
-                    CompiledFrom = entry.CompiledFrom,
-                }
-                : entry;
+            if (repId != stackRepId)
+            {
+                reps[repId] = entry;
+                continue;
+            }
+            reps[repId] = new RepresentationEntry
+            {
+                Object = entry.Object,
+                Encoding = entry.Encoding,
+                Segment = entry.Segment,
+                TensorCount = tensorCount,
+                PayloadBytes = payloadBytes,
+                PayloadSha256 = payloadSha,
+                SegmentSha256 = segmentSha,
+                CompiledFrom = entry.CompiledFrom,
+            };
         }
 
         var extra = source.Extra is null
@@ -481,9 +780,13 @@ public static class StarElasticPruner
         extra["prune"] = JsonSerializer.SerializeToElement(new
         {
             Approach = "star-elastic",
-            Axis = "ffn_channels",
+            Axis = new[] { "ffn_channels", "attention_heads" },
             FromIntermediate = originalIntermediate,
             ToIntermediate = keptIntermediate,
+            FromNumQHeads = originalQHeads,
+            ToNumQHeads = keptQHeads,
+            FromNumKvHeads = originalKvHeads,
+            ToNumKvHeads = keptKvHeads,
             TargetBytes = options.TargetBytes,
         }, ViJson.Options);
 
@@ -518,15 +821,20 @@ public static class StarElasticPruner
         FfnSurface ffn,
         string stackRepId,
         RepresentationEntry stackEntry,
-        List<SegmentTensor> carried,
-        Dictionary<int, SlicedFfn> sliced,
-        int[] kept,
+        SliceContext ctx,
+        int[] keptChannels,
+        int[] keptKvGroups,
+        int[] keptQHeads,
         int keptIntermediate,
+        int keptKv,
         int originalIntermediate,
+        int originalQHeads,
+        int originalKvHeads,
         StarElasticOptions options,
         long copiedBytes,
         long inputTotal,
         bool gated,
+        bool headPruned,
         bool drafterPresent,
         int sampledTokens)
     {
@@ -534,11 +842,10 @@ public static class StarElasticPruner
         {
             Directory.CreateDirectory(outDir);
 
-            // ── rebuilt stack segment (sliced FFN + verbatim carried) ───
-            var named = new List<NamedTensorData>(carried.Count + sliced.Count * 3);
+            var named = new List<NamedTensorData>(ctx.TensorCount);
             using (var sourceSegment = SegmentFile.Open(Path.Combine(container.Root, stackEntry.Segment)))
             {
-                foreach (var tensor in carried)
+                foreach (var tensor in ctx.Carried)
                 {
                     named.Add(new NamedTensorData
                     {
@@ -548,7 +855,7 @@ public static class StarElasticPruner
                         Data = sourceSegment.ReadBytes(tensor.Name),
                     });
                 }
-                foreach (var sf in sliced.Values)
+                foreach (var sf in ctx.Ffn.Values)
                 {
                     int hidden = (int)sf.Up.Shape[1];
                     if (sf.Gate is { } gate)
@@ -558,7 +865,7 @@ public static class StarElasticPruner
                             Name = gate.Name,
                             Dtype = DtypeExtensions.FromLabel(gate.Dtype),
                             Shape = new long[] { keptIntermediate, hidden },
-                            Data = GatherRows(sourceSegment.ReadBytes(gate.Name), hidden, Elem(gate), kept),
+                            Data = GatherRows(sourceSegment.ReadBytes(gate.Name), hidden, Elem(gate), keptChannels),
                         });
                     }
                     named.Add(new NamedTensorData
@@ -566,7 +873,7 @@ public static class StarElasticPruner
                         Name = sf.Up.Name,
                         Dtype = DtypeExtensions.FromLabel(sf.Up.Dtype),
                         Shape = new long[] { keptIntermediate, hidden },
-                        Data = GatherRows(sourceSegment.ReadBytes(sf.Up.Name), hidden, Elem(sf.Up), kept),
+                        Data = GatherRows(sourceSegment.ReadBytes(sf.Up.Name), hidden, Elem(sf.Up), keptChannels),
                     });
                     named.Add(new NamedTensorData
                     {
@@ -574,8 +881,45 @@ public static class StarElasticPruner
                         Dtype = DtypeExtensions.FromLabel(sf.Down.Dtype),
                         Shape = new long[] { hidden, keptIntermediate },
                         Data = GatherCols(sourceSegment.ReadBytes(sf.Down.Name),
-                            (int)sf.Down.Shape[1], hidden, Elem(sf.Down), kept),
+                            (int)sf.Down.Shape[1], hidden, Elem(sf.Down), keptChannels),
                     });
+                }
+                if (ctx.Head is { } head)
+                {
+                    foreach (var sa in head.Layers.Values)
+                    {
+                        int hidden = (int)sa.O.Shape[0];
+                        int srcCols = (int)sa.O.Shape[1];
+                        int blockRows = sa.OutputGate ? 2 * head.HeadDim : head.HeadDim;
+                        named.Add(new NamedTensorData
+                        {
+                            Name = sa.Q.Name,
+                            Dtype = DtypeExtensions.FromLabel(sa.Q.Dtype),
+                            Shape = new long[] { (long)keptQHeads.Length * blockRows, hidden },
+                            Data = GatherHeadRows(sourceSegment.ReadBytes(sa.Q.Name), hidden, Elem(sa.Q), keptQHeads, blockRows),
+                        });
+                        named.Add(new NamedTensorData
+                        {
+                            Name = sa.K.Name,
+                            Dtype = DtypeExtensions.FromLabel(sa.K.Dtype),
+                            Shape = new long[] { (long)keptKvGroups.Length * head.HeadDim, hidden },
+                            Data = GatherHeadRows(sourceSegment.ReadBytes(sa.K.Name), hidden, Elem(sa.K), keptKvGroups, head.HeadDim),
+                        });
+                        named.Add(new NamedTensorData
+                        {
+                            Name = sa.V.Name,
+                            Dtype = DtypeExtensions.FromLabel(sa.V.Dtype),
+                            Shape = new long[] { (long)keptKvGroups.Length * head.HeadDim, hidden },
+                            Data = GatherHeadRows(sourceSegment.ReadBytes(sa.V.Name), hidden, Elem(sa.V), keptKvGroups, head.HeadDim),
+                        });
+                        named.Add(new NamedTensorData
+                        {
+                            Name = sa.O.Name,
+                            Dtype = DtypeExtensions.FromLabel(sa.O.Dtype),
+                            Shape = new long[] { hidden, (long)keptQHeads.Length * head.HeadDim },
+                            Data = GatherHeadCols(sourceSegment.ReadBytes(sa.O.Name), hidden, srcCols, Elem(sa.O), keptQHeads, head.HeadDim),
+                        });
+                    }
                 }
             }
 
@@ -583,21 +927,23 @@ public static class StarElasticPruner
             Directory.CreateDirectory(stackDir);
             var stackWrite = SegmentWriter.Write(Path.Combine(outDir, stackEntry.Segment), stackRepId, named);
 
-            // ── rebuilt metadata ────────────────────────────────────────
             var newFfn = RebuildFfn(ffn, keptIntermediate);
-            var newSurface = RebuildSurface(surface, newFfn);
+            var newAttn = headPruned
+                ? RebuildAttention(surface.Attention!, keptQHeads.Length, keptKvGroups.Length)
+                : surface.Attention;
+            var newSurface = RebuildSurface(surface, newFfn, newAttn);
             var newGraph = BuildGraph(graph, component, newSurface);
             File.WriteAllBytes(Path.Combine(outDir, container.Index.SystemGraph!),
                 JsonSerializer.SerializeToUtf8Bytes(newGraph, ViJson.Options));
 
             var newIndex = BuildIndex(
-                container.Index, stackEntry, stackRepId, keptIntermediate, originalIntermediate, options,
-                named.Count, stackWrite.PayloadBytes,
+                container.Index, stackEntry, stackRepId, keptIntermediate, originalIntermediate,
+                keptQHeads.Length, originalQHeads, keptKvGroups.Length, originalKvHeads,
+                options, named.Count, stackWrite.PayloadBytes,
                 stackWrite.PayloadSha256Hex, stackWrite.SegmentSha256Hex);
             File.WriteAllBytes(Path.Combine(outDir, IndexFile),
                 JsonSerializer.SerializeToUtf8Bytes(newIndex, ViJson.Options));
 
-            // ── exact total before copying anything else ────────────────
             long exactTotal = copiedBytes
                 + new FileInfo(Path.Combine(outDir, stackEntry.Segment)).Length
                 + new FileInfo(Path.Combine(outDir, IndexFile)).Length
@@ -624,15 +970,22 @@ public static class StarElasticPruner
 
             var notes = new List<string>
             {
-                $"ranked {originalIntermediate} FFN channels by Σ|x·W_upᵀ| over {sampledTokens} sampled positions",
+                $"ranked {originalIntermediate} FFN channels by Σ|x·W_upᵀ| and" +
+                (headPruned ? $" {originalKvHeads} KV-head groups by Σ‖head context‖₂" : " no softmax heads") +
+                $" over {sampledTokens} sampled positions",
                 gated
                     ? "gated FFN — gate/up rows and down columns sliced to the same kept channels"
                     : "dense FFN — up rows and down columns sliced to the same kept channels",
-                "homogeneous width — the same channels are kept in every dense layer (AMQL's surface is per-model, not per-layer)",
+                "homogeneous width — the same channels/heads are kept in every layer (AMQL's surface is per-model, not per-layer)",
             };
-            if (keptIntermediate == originalIntermediate)
+            if (headPruned)
             {
-                notes.Add("already within the budget — no channels dropped, the stack was re-encoded unchanged");
+                notes.Add($"attention heads — {originalKvHeads} → {keptKvGroups.Length} KV groups " +
+                          $"({originalQHeads} → {keptQHeads.Length} Q heads)");
+            }
+            if (keptIntermediate == originalIntermediate && (!headPruned || keptKvGroups.Length == originalKvHeads))
+            {
+                notes.Add("already within the budget — nothing dropped, the stack was re-encoded unchanged");
             }
             if (drafterPresent)
             {
@@ -649,8 +1002,14 @@ public static class StarElasticPruner
                 OriginalIntermediate: originalIntermediate,
                 KeptIntermediate: keptIntermediate,
                 Layers: component.NumLayers,
-                DenseLayers: sliced.Count,
-                KeptChannels: kept,
+                DenseLayers: ctx.Ffn.Count,
+                KeptChannels: keptChannels,
+                OriginalNumQHeads: originalQHeads,
+                KeptNumQHeads: keptQHeads.Length,
+                OriginalNumKvHeads: originalKvHeads,
+                KeptNumKvHeads: keptKvGroups.Length,
+                KeptQHeads: keptQHeads,
+                KeptKvHeads: keptKvGroups,
                 Notes: notes);
         }
         catch
