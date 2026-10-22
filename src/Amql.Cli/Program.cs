@@ -27,6 +27,11 @@ internal static class Program
             PrintHelp();
             return args.Length == 0 ? ExitUsage : ExitOk;
         }
+        if (args[0] is "--version" or "-V")
+        {
+            PrintVersion();
+            return ExitOk;
+        }
 
         // Parse global --cpu / --gpu before any command runs so the probe
         // honours the forced mode on the very first CudaShim.Enabled read.
@@ -2517,6 +2522,12 @@ internal static class Program
 
     // ── plumbing ───────────────────────────────────────────────────────────
 
+    private static void PrintVersion()
+    {
+        Console.WriteLine("amql-cli v0.x");
+        Console.WriteLine("Copyright © 2026 Simon Soanes");
+    }
+
     private static void PrintHelp()
     {
         Console.WriteLine("""
@@ -2525,6 +2536,7 @@ internal static class Program
 
             USAGE:
               amql-cli [--cpu | --gpu] [--progress] [--verbose] <command> [args]
+              amql-cli --version | -V
 
             Commands:
               amql-cli encode <model-dir> --out <container-dir>   map + materialise
@@ -2773,6 +2785,7 @@ internal static class Program
             '##amql-progress ' for phase/done/total/percent updates and
             '##amql-result ' for the command's terminal outcome, so a
             front-end can bind progress exactly instead of scraping text.
+            --version (or -V) prints the version and copyright.
             --verbose prints full stack traces for unexpected errors;
             without it a failure is one 'error: …' line on stderr.
 

@@ -829,7 +829,8 @@ public partial class MainWindow : Window
             "store all parameters plus run status, progress and output tails.\n\n" +
             "The GUI drives amql-cli as a child process for transforms, and references the " +
             "Vindex3, Safetensors and Inference libraries directly for container inspection in " +
-            "the Explorer and for the inference visualiser's trace model.",
+            "the Explorer and for the inference visualiser's trace model.\n\n" +
+            "Copyright © 2026 Simon Soanes",
             "About AMQL Studio", MessageBoxButton.OK, MessageBoxImage.Information);
     }
 
