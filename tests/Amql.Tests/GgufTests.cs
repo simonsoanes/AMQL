@@ -689,4 +689,23 @@ public class GgufTests
         SafetensorsWriter.Write(Path.Combine(dir, "model.safetensors"), tensors,
             new Dictionary<string, string> { ["format"] = "pt", ["model"] = "synth-qwen35moe" });
     }
+
+    [Theory]
+    [InlineData(GgufType.TQ1_0, 256, 54)]
+    [InlineData(GgufType.TQ2_0, 256, 66)]
+    [InlineData(GgufType.Q1_0, 128, 18)]
+    [InlineData(GgufType.Q2_0, 64, 18)]
+    [InlineData(GgufType.Q6_K, 256, 210)]
+    [InlineData(GgufType.IQ2_S, 256, 82)]
+    [InlineData(GgufType.IQ1_M, 256, 56)]
+    [InlineData(GgufType.Nvfp4, 64, 36)]
+    public void Every_Block_Type_Sizes_One_Block(GgufType type, int elements, long bytes)
+    {
+        // IsBlockQuantized named TQ1_0/TQ2_0/Q1_0/Q2_0 but DataBytes had no
+        // size for them and threw; the table now covers every block type.
+        Assert.True(GgufTypeSizing.IsBlockQuantized(type));
+        Assert.Equal(elements, GgufTypeSizing.BlockElements(type));
+        Assert.Equal(bytes, GgufTypeSizing.DataBytes(type, elements));
+        Assert.Equal(3 * bytes, GgufTypeSizing.DataBytes(type, 3L * elements));
+    }
 }

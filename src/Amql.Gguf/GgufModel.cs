@@ -79,46 +79,58 @@ public static class GgufTypeSizing
         return DataBytes(type, elements);
     }
 
-    /// <summary>Bytes occupied by the payload of that many values.</summary>
-    public static long DataBytes(GgufType type, long elements) => type switch
+    /// <summary>(elements, bytes) per block of every block-packed ggml type,
+    /// as ggml-common.h lays them out.</summary>
+    private static readonly Dictionary<GgufType, (int Elements, int Bytes)> Blocks = new()
     {
-        // Q4_0: 18 bytes per 32-element block (2-byte F16 scale + 16 nibble bytes)
-        GgufType.Q4_0 => ((elements + 31) / 32) * 18,
-        // Q8_0: 34 bytes per 32-element block (2-byte F16 scale + 32 int8)
-        GgufType.Q8_0 => ((elements + 31) / 32) * 34,
-        // MXFP4: 17 bytes per 32-element block (1-byte E8M0 scale + 16 nibbles)
-        GgufType.Mxfp4 => ((elements + 31) / 32) * 17,
-        // NVFP4: 36 bytes per 64-element block (4 UE4M3 sub-block scales + 32 nibbles)
-        GgufType.Nvfp4 => ((elements + 63) / 64) * 36,
-        // Bonsai ternary: 128-element blocks, FP16 scale then packed trits
-        GgufType.Pq2_0 => ((elements + 127) / 128) * 34,
-        GgufType.Ptq1_0 => ((elements + 127) / 128) * 28,
-        // Q4_K: 144 bytes per 256-element super-block
-        GgufType.Q4_K => ((elements + 255) / 256) * 144,
-        _ => checked(elements * ElementSize(type)),
+        [GgufType.Q4_0] = (32, 18),
+        [GgufType.Q4_1] = (32, 20),
+        [GgufType.Q5_0] = (32, 22),
+        [GgufType.Q5_1] = (32, 24),
+        [GgufType.Q8_0] = (32, 34),
+        [GgufType.Q2_K] = (256, 84),
+        [GgufType.Q3_K] = (256, 110),
+        [GgufType.Q4_K] = (256, 144),
+        [GgufType.Q5_K] = (256, 176),
+        [GgufType.Q6_K] = (256, 210),
+        [GgufType.IQ2_XXS] = (256, 66),
+        [GgufType.IQ2_XS] = (256, 74),
+        [GgufType.IQ2_S] = (256, 82),
+        [GgufType.IQ3_XXS] = (256, 98),
+        [GgufType.IQ3_S] = (256, 110),
+        [GgufType.IQ1_S] = (256, 50),
+        [GgufType.IQ1_M] = (256, 56),
+        [GgufType.IQ4_NL] = (32, 18),
+        [GgufType.IQ4_XS] = (256, 136),
+        [GgufType.TQ1_0] = (256, 54),
+        [GgufType.TQ2_0] = (256, 66),
+        // MXFP4: 1-byte E8M0 scale + 16 nibbles per 32.
+        [GgufType.Mxfp4] = (32, 17),
+        // NVFP4: 4 UE4M3 sub-block scales + 32 nibbles per 64.
+        [GgufType.Nvfp4] = (64, 36),
+        [GgufType.Q1_0] = (128, 18),
+        [GgufType.Q2_0] = (64, 18),
+        // Bonsai ternary: 128-element blocks, FP16 scale then packed trits.
+        [GgufType.Pq2_0] = (128, 34),
+        [GgufType.Ptq1_0] = (128, 28),
     };
+
+    /// <summary>Bytes occupied by the payload of that many values.</summary>
+    public static long DataBytes(GgufType type, long elements) =>
+        Blocks.TryGetValue(type, out var block)
+            ? (elements + block.Elements - 1) / block.Elements * block.Bytes
+            : checked(elements * ElementSize(type));
 
     /// <summary>True for the block-packed types, whose payload size is a
     /// function of the block count rather than the element count.</summary>
-    public static bool IsBlockQuantized(GgufType type) => type switch
-    {
-        GgufType.Q4_0 or GgufType.Q8_0 or GgufType.Mxfp4 or GgufType.Nvfp4
-            or GgufType.Q4_K or GgufType.TQ1_0 or GgufType.TQ2_0
-            or GgufType.Q1_0 or GgufType.Q2_0
-            or GgufType.Pq2_0 or GgufType.Ptq1_0 => true,
-        _ => false,
-    };
+    public static bool IsBlockQuantized(GgufType type) => Blocks.ContainsKey(type);
 
     /// <summary>Elements per scale block for a block-quantized type, which is
     /// what an eligibility check has to divide by — Q4_0 and friends block at
-    /// 32, the Bonsai ternary packings at 128.</summary>
-    public static int BlockElements(GgufType type) => type switch
-    {
-        GgufType.Pq2_0 or GgufType.Ptq1_0 => 128,
-        GgufType.Nvfp4 => 64,
-        GgufType.Q4_K => 256,
-        _ => 32,
-    };
+    /// 32, the K-quants and most IQ types at 256, the Bonsai ternary packings
+    /// at 128.</summary>
+    public static int BlockElements(GgufType type) =>
+        Blocks.TryGetValue(type, out var block) ? block.Elements : 32;
 
     /// <summary>Bytes per value, for the plain dtypes only.</summary>
     public static int ElementSize(GgufType type) => type switch
