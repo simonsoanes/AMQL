@@ -228,13 +228,16 @@ public static class Lfm3Gguf
         _ => throw new GgufException($"unknown quantization '{quantization}'"),
     };
 
-    private static uint FileType(List<Entry> plan)
+    internal static uint FileType(List<Entry> plan)
     {
-        // The dominant weight type names the file, as llama-quantize does.
-        var dominant = plan.Where(e => e.Shape.Length == 2 && e.Type != GgufType.F32)
+        // The dominant weight type names the file, as llama-quantize does
+        // (expert banks are 3-D, so the weight is the full element count);
+        // a file with no weight below F32 is ALL_F32 (0).
+        var dominant = plan.Where(e => e.Shape.Length >= 2 && e.Type != GgufType.F32)
             .GroupBy(e => e.Type)
-            .OrderByDescending(g => g.Sum(e => e.Shape[0] * e.Shape[1]))
-            .First().Key;
+            .OrderByDescending(g => g.Sum(e => e.Shape.Aggregate(1L, (a, b) => a * b)))
+            .Select(g => (GgufType?)g.Key)
+            .FirstOrDefault();
         return dominant switch
         {
             GgufType.F16 => 1,
@@ -298,10 +301,11 @@ public static class Lfm3Gguf
     // ── tokenizer ───────────────────────────────────────────────────────
 
     /// <summary>The BPE vocabulary as llama.cpp's converter writes it for
-    /// LFM: ids the tokenizer does not define become <c>[PADn]</c> (UNUSED),
+    /// LFM (and, with <paramref name="pre"/> <c>qwen2</c>, for Qwen): ids the tokenizer does not define become <c>[PADn]</c> (UNUSED),
     /// added tokens are CONTROL when special or when they look special
     /// (<c>&lt;|…|&gt;</c>), USER_DEFINED otherwise.</summary>
-    private static void WriteTokenizer(GgufWriter writer, string checkpointDir, int vocab, JsonElement text, JsonElement root)
+    internal static void WriteTokenizer(GgufWriter writer, string checkpointDir, int vocab, JsonElement text, JsonElement root,
+        string pre = "lfm2")
     {
         string path = Path.Combine(checkpointDir, "tokenizer.json");
         if (!File.Exists(path))
@@ -352,7 +356,7 @@ public static class Lfm3Gguf
         }
 
         writer.Kv("tokenizer.ggml.model", GgufValue.String("gpt2"));
-        writer.Kv("tokenizer.ggml.pre", GgufValue.String("lfm2"));
+        writer.Kv("tokenizer.ggml.pre", GgufValue.String(pre));
         writer.Kv("tokenizer.ggml.tokens", GgufValue.StringArray(tokens!));
         writer.Kv("tokenizer.ggml.token_type", GgufValue.Int32Array(types));
         writer.Kv("tokenizer.ggml.merges", GgufValue.StringArray(merges));

@@ -298,7 +298,8 @@ public sealed class GenericRuntime
                     attn.NumQHeads, attn.NumKvHeads, attn.HeadDim,
                     (float)attn.ScoreScale, softCap, window,
                     null,
-                    queryPositions, kvPositions))
+                    attn.Causal ? queryPositions : MaskPositionsSeeingAll(q.Rows, kvPositions),
+                    kvPositions))
             {
                 output = new Tensor2D(gpuOut, q.Rows, attn.QDim);
                 goto attentionDone;
@@ -310,7 +311,8 @@ public sealed class GenericRuntime
             attn.ScoreScale, attn.LogitSoftcapping, null,
             attn.Window is { } windowValue ? checked((int)windowValue) : null,
             queryPositions, kvPositions,
-            _lastCapture);
+            _lastCapture,
+            attn.Causal);
 
         attentionDone:
 
@@ -765,6 +767,18 @@ public sealed class GenericRuntime
 
     private static float Sigmoid(float x) => 1f / (1f + MathF.Exp(-x));
 
+    /// <summary>The device kernel takes positions for its causal mask only (rope
+    /// is already applied): a query placed at the last key position masks
+    /// nothing, which is bidirectional attention without a second kernel. The
+    /// planner refuses a window over a bidirectional stack, so the window test
+    /// these positions also feed never fires.</summary>
+    private static int[] MaskPositionsSeeingAll(int queries, int[] kvPositions)
+    {
+        var positions = new int[queries];
+        Array.Fill(positions, kvPositions.Length == 0 ? 0 : kvPositions.Max());
+        return positions;
+    }
+
     private void AppendRows(int layer, Tensor2D k, Tensor2D v)
     {
         for (int r = 0; r < k.Rows; r++)
@@ -781,6 +795,13 @@ public sealed class GenericRuntime
     /// recurrent state.</summary>
     public Tensor2D StepForward(int token)
     {
+        if (_plan.Diffusion is not null)
+        {
+            // A cached prefix is only valid when later tokens cannot change
+            // earlier rows; in a bidirectional stack every new token does.
+            throw new UnsupportedOperatorException(
+                "step decoding is causal-only — a masked diffusion model generates with MaskedDiffusionSampler");
+        }
         int position = SessionPosition;
         var hidden = Embed(new[] { token });
         var queryPositions = new[] { position };

@@ -64,6 +64,21 @@ public static class Planner
             ?? throw new ContainerException(
                 $"component '{componentId}': a decoder stack implies an ffn surface (required primitive: ffn)");
 
+        // The diffusion surface and the bidirectional mask come together: the
+        // objective reads logits that only a full-span stack produces, and a
+        // bidirectional decoder has no generation procedure without one.
+        if ((surface.Diffusion is not null) != attnSurface.Bidirectional)
+        {
+            throw new ContainerException(attnSurface.Bidirectional
+                ? $"component '{componentId}': a bidirectional decoder stack declares no diffusion objective"
+                : $"component '{componentId}': a masked diffusion surface over a causal attention surface");
+        }
+        if (surface.Diffusion is { Objective: not "masked_diffusion" } other)
+        {
+            throw new UnsupportedOperatorException(
+                $"component '{componentId}': diffusion objective '{other.Objective}' has no managed implementation");
+        }
+
         bool prePost = normSurface.Placement == NormPlacement.PrePost;
         bool sandwich = normSurface.Placement == NormPlacement.Sandwich;
         if (normSurface.Post is null)
@@ -87,6 +102,9 @@ public static class Planner
             FinalNorm = BindNorm(store, finalNormObj.Id, "weight", normSurface.FinalNorm, component.HiddenSize),
             Output = BuildOutput(store, embedObj, headObj, surface, component.HiddenSize),
             ResidualScale = surface.ResidualScale ?? 1.0,
+            Diffusion = surface.Diffusion is { } diffusion
+                ? new MaskedDiffusionOp { MaskTokenId = diffusion.MaskTokenId }
+                : null,
         };
     }
 
@@ -194,6 +212,11 @@ public static class Planner
             throw new UnsupportedOperatorException(
                 $"layer {layer}: the persisted attention surface declares learned sinks with no managed implementation");
         }
+        if (attnSurface.Bidirectional && policy.Window is not null)
+        {
+            throw new UnsupportedOperatorException(
+                $"layer {layer}: a sliding window over bidirectional attention has no managed implementation");
+        }
 
         bool perHeadGate = attnSurface.OutputGate is { ValueKind: System.Text.Json.JsonValueKind.Object } gateFacts &&
                            gateFacts.TryGetProperty("per_head_gate", out var phg) && phg.ValueKind == System.Text.Json.JsonValueKind.True;
@@ -213,6 +236,7 @@ public static class Planner
             ScoreScale = attnSurface.ScoreScale,
             LogitSoftcapping = attnSurface.LogitSoftcapping,
             Window = policy.Window,
+            Causal = !attnSurface.Bidirectional,
             Position = policy.Position,
             VFromK = policy.VFromK,
             OutputGate = attnSurface.OutputGate is not null && !perHeadGate,

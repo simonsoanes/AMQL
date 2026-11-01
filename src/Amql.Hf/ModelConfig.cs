@@ -104,6 +104,16 @@ public sealed record TextArchitectureFacts(
     /// projector and media token facts), carried verbatim so a multimodal
     /// export can be rebuilt; null for a plain text config.</summary>
     public JsonElement? WrapperConfig { get; init; }
+
+    /// <summary>The first <c>architectures</c> entry, e.g. <c>A2DQwen3LMHeadModel</c>.</summary>
+    public string? Architecture { get; init; }
+
+    /// <summary>The remote-code class map (<c>auto_map</c>), verbatim.</summary>
+    public JsonElement? AutoMap { get; init; }
+
+    /// <summary>The id of the tokenizer's <c>mask_token</c>, resolved through the
+    /// checkpoint's tokenizer files; null when it declares none.</summary>
+    public int? MaskTokenId { get; init; }
 }
 
 /// <summary>G1 reader: <c>config.json</c> → <see cref="TextArchitectureFacts"/>.</summary>
@@ -182,7 +192,7 @@ public static class ModelConfig
 
             JsonElement rope = text.TryGetProperty("rope_parameters", out var rp) && rp.ValueKind == JsonValueKind.Object
                 ? rp.Clone()
-                : JsonDocument.Parse("{\"rope_type\":\"default\"}").RootElement.Clone();
+                : LegacyRopeParameters(text);
 
             LinearAttentionFacts? linear = null;
             if (text.TryGetProperty("linear_conv_kernel_dim", out var ck) &&
@@ -319,8 +329,99 @@ public static class ModelConfig
                 UseSandwichNorm = text.TryGetProperty("use_sandwich_norm", out var sn) && sn.ValueKind == JsonValueKind.True,
                 WrapperModelType = wrapped && root.TryGetProperty("model_type", out var wmt) ? wmt.GetString() : null,
                 WrapperConfig = wrapped ? WithoutTextConfig(root) : null,
+                Architecture = root.TryGetProperty("architectures", out var archs) &&
+                               archs.ValueKind == JsonValueKind.Array && archs.GetArrayLength() > 0
+                    ? archs[0].GetString()
+                    : null,
+                AutoMap = root.TryGetProperty("auto_map", out var autoMap) && autoMap.ValueKind == JsonValueKind.Object
+                    ? autoMap.Clone()
+                    : null,
+                MaskTokenId = ResolveMaskTokenId(root, Path.GetDirectoryName(Path.GetFullPath(configPath))!),
             };
         }
+    }
+
+    /// <summary>The mask token's id. The token itself is named in
+    /// <c>tokenizer_config.json</c> (or a <c>tokenizer_config</c> block inside
+    /// config.json); its id comes from <c>added_tokens.json</c> or the
+    /// <c>added_tokens</c> list of <c>tokenizer.json</c>.</summary>
+    private static int? ResolveMaskTokenId(JsonElement root, string dir)
+    {
+        static string? MaskName(JsonElement obj) =>
+            obj.TryGetProperty("mask_token", out var m)
+                ? m.ValueKind switch
+                {
+                    JsonValueKind.String => m.GetString(),
+                    JsonValueKind.Object when m.TryGetProperty("content", out var c) => c.GetString(),
+                    _ => null,
+                }
+                : null;
+
+        string? name = root.TryGetProperty("tokenizer_config", out var embedded) && embedded.ValueKind == JsonValueKind.Object
+            ? MaskName(embedded)
+            : null;
+        string tokenizerConfig = Path.Combine(dir, "tokenizer_config.json");
+        if (name is null && File.Exists(tokenizerConfig))
+        {
+            using var tc = JsonDocument.Parse(File.ReadAllBytes(tokenizerConfig));
+            name = MaskName(tc.RootElement);
+        }
+        if (name is null)
+        {
+            return null;
+        }
+
+        string added = Path.Combine(dir, "added_tokens.json");
+        if (File.Exists(added))
+        {
+            using var at = JsonDocument.Parse(File.ReadAllBytes(added));
+            if (at.RootElement.TryGetProperty(name, out var id))
+            {
+                return id.GetInt32();
+            }
+        }
+        string tokenizer = Path.Combine(dir, "tokenizer.json");
+        if (File.Exists(tokenizer))
+        {
+            using var tj = JsonDocument.Parse(File.ReadAllBytes(tokenizer));
+            if (tj.RootElement.TryGetProperty("added_tokens", out var list) && list.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var t in list.EnumerateArray())
+                {
+                    if (t.TryGetProperty("content", out var c) && c.GetString() == name)
+                    {
+                        return t.GetProperty("id").GetInt32();
+                    }
+                }
+            }
+        }
+        // Encoders (ModernBERT's [MASK]) keep theirs in the base vocabulary, not
+        // the added tokens; only a family that needs the id refuses without it.
+        return null;
+    }
+
+    /// <summary>Configs written before transformers grouped the rope facts
+    /// into <c>rope_parameters</c> carry <c>rope_theta</c> at the top level and
+    /// any scaling in <c>rope_scaling</c> (whose kind is spelled <c>type</c> or
+    /// <c>rope_type</c>). Both are folded into the grouped shape, so a
+    /// Qwen3/Qwen2/Llama checkpoint in the old layout keeps its theta rather
+    /// than reading as the 10 000 default.</summary>
+    private static JsonElement LegacyRopeParameters(JsonElement text)
+    {
+        var node = new System.Text.Json.Nodes.JsonObject();
+        if (text.TryGetProperty("rope_scaling", out var scaling) && scaling.ValueKind == JsonValueKind.Object)
+        {
+            foreach (var p in scaling.EnumerateObject())
+            {
+                node[p.Name == "type" ? "rope_type" : p.Name] = System.Text.Json.Nodes.JsonNode.Parse(p.Value.GetRawText());
+            }
+        }
+        node["rope_type"] ??= "default";
+        if (text.TryGetProperty("rope_theta", out var theta) && theta.ValueKind == JsonValueKind.Number)
+        {
+            node["rope_theta"] = theta.GetDouble();
+        }
+        return JsonDocument.Parse(node.ToJsonString()).RootElement.Clone();
     }
 
     private static JsonElement WithoutTextConfig(JsonElement root)

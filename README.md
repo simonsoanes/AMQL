@@ -119,6 +119,7 @@ Import and export these checkpoint formats:
 | Gemma 4 | `gemma4_text` | GeGLU activation, QK norms, nested `text_config` |
 | LFM 2.5 | `lfm2` | Short-convolution layers + GQA, SwiGLU MLP |
 | LFM3 / LFM3-VL | `lfm3` | Gated short conv (width 7) + full and sliding-window GQA, per-head output gate, sandwich norms, zero-tail partial rope; `to-gguf` writes llama.cpp's `lfm3` arch |
+| Masked diffusion (dLLM A2D) | `a2d-qwen3` | Qwen3 with bidirectional attention, MDLM objective; `generate` runs the block-wise low-confidence unmasking sampler; `to-gguf` writes llama.cpp's `rnd1` arch (dense FFN as one expert) for `llama-diffusion-cli` |
 | Nomic Embed | `nomic_bert` | Bidirectional encoder, mean pooling |
 | ModernBERT / Von | `modernbert` | Global + sliding bidirectional encoder, GeGLU; Von's `option_marker.pt` scoring head read and written natively, and run in-process by `decide` |
 | Jev Classifier | `*ForSequenceClassification` | Score head on decoder backbone |

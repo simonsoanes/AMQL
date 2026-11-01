@@ -36,6 +36,9 @@
     <None Update="golden_qwen35_forward.json" CopyToOutputDirectory="PreserveNewest" />
     <None Update="golden_qwen35_1tok.json" CopyToOutputDirectory="PreserveNewest" />
     <None Update="golden_lfm3_synth.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="golden_a2d_qwen3_synth.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="golden_a2d_qwen3_sample.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="fixtures\golden_mdlm_real.json" CopyToOutputDirectory="PreserveNewest" />
     <None Update="torch_state_dict.pt" CopyToOutputDirectory="PreserveNewest" />
     <None Update="torch_noncontiguous.pt" CopyToOutputDirectory="PreserveNewest" />
     <None Update="fixtures\von-tiny\**" CopyToOutputDirectory="PreserveNewest" />

@@ -18,7 +18,7 @@ namespace Amql.Cli;
 ///   amql-cli encode &lt;model-dir&gt; --out &lt;container-dir&gt;
 ///   amql-cli verify &lt;container-dir&gt;
 /// </summary>
-internal static class Program
+internal static partial class Program
 {
     private static int Main(string[] args)
     {
@@ -331,9 +331,16 @@ internal static class Program
             Console.WriteLine($"wrote an executable 4-layer LFM3-shaped checkpoint (conv, full, conv, sliding) to '{dir}'");
             return 0;
         }
+        if (family == Amql.Hf.SyntheticA2dQwen3Checkpoint.Family)
+        {
+            Amql.Hf.SyntheticA2dQwen3Checkpoint.Write(dir);
+            Console.WriteLine($"wrote an executable 2-layer A2D-Qwen3 masked diffusion checkpoint to '{dir}' " +
+                              $"(mask token {Amql.Hf.SyntheticA2dQwen3Checkpoint.MaskTokenId})");
+            return 0;
+        }
         if (family != "qwen3_5")
         {
-            throw new CliException($"synth-model --family '{family}' — expected qwen3_5 or lfm3");
+            throw new CliException($"synth-model --family '{family}' — expected qwen3_5, lfm3 or a2d-qwen3");
         }
         Amql.Hf.SyntheticCheckpoint.Write(dir);
         Console.WriteLine($"wrote an executable 2-layer Qwen3.5-shaped demo checkpoint to '{dir}'\n" +
@@ -643,6 +650,10 @@ internal static class Program
     private static int Generate(string[] args)
     {
         var containerDir = Arg(args, 0) ?? throw new CliException("generate requires a container directory");
+        if (IsDiffusionContainer(containerDir, OptionValue(args, "--component") ?? "target"))
+        {
+            return GenerateDiffusion(containerDir, args, OptionValue(args, "--component") ?? "target");
+        }
         string? prompt = OptionValue(args, "--prompt");
         bool useChat = HasOption(args, "--chat");
 
@@ -1405,6 +1416,10 @@ internal static class Program
         {
             return ToGgufLfm3(args, checkpointDir, outFile, quantization);
         }
+        if (A2dQwen3Gguf.Applies(checkpointDir))
+        {
+            return ToGgufLfm3(args, checkpointDir, outFile, quantization, masked: true);
+        }
         if (quantization == "f16")
         {
             // 'f16' is the user-facing alias for "do not quantize".
@@ -1441,8 +1456,10 @@ internal static class Program
     }
 
     /// <summary>LFM3 has its own writer (llama.cpp's <c>lfm3</c> arch):
-    /// conv/attention layer table, sliding-window pattern and zero-tail rope.</summary>
-    private static int ToGgufLfm3(string[] args, string checkpointDir, string outFile, string quantization)
+    /// conv/attention layer table, sliding-window pattern and zero-tail rope.
+    /// The A2D-Qwen3 masked diffusion writer (<c>rnd1</c>) shares the CLI
+    /// surface and the same --quant modes.</summary>
+    private static int ToGgufLfm3(string[] args, string checkpointDir, string outFile, string quantization, bool masked = false)
     {
         if (File.Exists(outFile))
         {
@@ -1452,7 +1469,9 @@ internal static class Program
             }
             File.Delete(outFile);
         }
-        var report = Lfm3Gguf.Convert(checkpointDir, outFile, quantization);
+        var report = masked
+            ? A2dQwen3Gguf.Convert(checkpointDir, outFile, quantization)
+            : Lfm3Gguf.Convert(checkpointDir, outFile, quantization);
         Console.WriteLine($"converted: {report.OutputPath}");
         Console.WriteLine($"arch:       {report.Architecture}");
         Console.WriteLine($"tensors:    {report.TensorsWritten}  ({FormatBytes(report.OutputBytes)})");
@@ -2611,6 +2630,10 @@ internal static class Program
                               [--attribute-source <row>] [--attribute-layers <end>]
                               [--logit-lens] [--trace-attention]
                               [--trace-stream <trace.jsonl>]
+                            masked diffusion containers (a2d-qwen3) take instead:
+                              [--chat] [--think] [--gen 128] [--steps <gen>] [--block 32]
+                              [--remasking low_confidence|random] [--temperature 0]
+                              [--seed 42] [--show-steps] [--no-early-stop] [--weights f32|bf16|mxfp4]
               amql-cli inspect-token <container-dir> <token>
                               [--tokens ctx,ids] [--neighbors 5] [--logits K]
                               [--tokenizer <checkpoint-dir>] [--component target]
@@ -2628,6 +2651,7 @@ internal static class Program
                               [--arch qwen4-next]
               amql-cli to-gguf <checkpoint-dir|container-dir> --out <file.gguf> [--force]
                     [--quant none|f16|q4_0|mxfp4|mxfp4_moe|ptq1|pq2]
+                    a2d-qwen3 (masked diffusion) writes llama.cpp's rnd1 arch — run with llama-diffusion-cli
               amql-cli from-gguf <file.gguf> --out <container-dir>   import GGUF into container
               amql-cli export-mtp <container-dir> --out <drafter-dir>
               amql-cli generate-mtp <container-dir> --out <out>

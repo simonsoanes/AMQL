@@ -52,6 +52,7 @@ public static partial class ArchMapper
         // sections, scaled families) is carried verbatim as unresolved and
         // refused by the planner naming the kind.
         bool isLfm3 = facts.ModelType == "lfm3";
+        DiffusionSurface? diffusion = JudgeDiffusion(facts);
         PositionPolicy position = isLfm3 ? PositionPolicy.None : JudgePosition(facts);
         var policies = new List<AttentionLayerPolicy>(facts.NumLayers);
         for (int l = 0; l < facts.NumLayers; l++)
@@ -123,6 +124,7 @@ public static partial class ArchMapper
                     : HasPerHeadGate(inventory)
                         ? JsonSerializer.SerializeToElement(new { per_head_gate = true }, ViJson.Options)
                         : null,
+                Bidirectional = diffusion is not null,
             },
             Ffn = new FfnSurface
             {
@@ -192,6 +194,7 @@ public static partial class ArchMapper
                     PadTokenId = classification.PadTokenId,
                 }
                 : null,
+            Diffusion = diffusion,
         };
 
         // ── canonical encoding: judged from the stored dtype, never
@@ -492,6 +495,42 @@ public static partial class ArchMapper
     /// other families this build maps default to plain RMS(x)·w.</summary>
     private static float NormWeightOffsetFor(string modelType) =>
         modelType is "qwen3_5_text" or "qwen3_5" ? 1.0f : 0f;
+
+    /// <summary>dLLM's A2D ("autoregressive to diffusion") checkpoints are the
+    /// base family's weights and config under <c>a2d-&lt;family&gt;</c>, with the
+    /// causal mask replaced by a padding-only one and MDLM training on top.
+    /// Only the Qwen3 conversion is judged: the published modeling code for it
+    /// changes nothing but the mask, and its logits are read unshifted. Any other
+    /// <c>a2d-*</c> refuses rather than run as its causal base.</summary>
+    private static DiffusionSurface? JudgeDiffusion(TextArchitectureFacts facts)
+    {
+        if (!facts.ModelType.StartsWith("a2d-", StringComparison.Ordinal))
+        {
+            return null;
+        }
+        if (facts.ModelType != "a2d-qwen3")
+        {
+            throw new ModelConfigException(
+                $"model_type '{facts.ModelType}' is an A2D diffusion conversion this build has not judged (only a2d-qwen3)");
+        }
+        if (facts.MaskTokenId is not { } mask)
+        {
+            throw new ModelConfigException(
+                "a2d-qwen3 is a masked diffusion model but the checkpoint's tokenizer declares no mask_token with an id");
+        }
+        if (facts.SlidingWindow is not null && facts.LayerTypes.Any(t => t != "full_attention"))
+        {
+            throw new ModelConfigException("a2d-qwen3 with sliding-window layers is not judged");
+        }
+        return new DiffusionSurface
+        {
+            Objective = "masked_diffusion",
+            MaskTokenId = mask,
+            ModelType = facts.ModelType,
+            Architecture = facts.Architecture ?? "A2DQwen3LMHeadModel",
+            AutoMap = facts.AutoMap,
+        };
+    }
 
     /// <summary>Whether the attention layers carry LFM3's per-head output
     /// gate (<c>self_attn.gate_proj</c>, [heads, hidden]).</summary>

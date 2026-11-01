@@ -993,6 +993,24 @@ internal static class ExportConfig
             config["rope_parameters"] = rope;
         }
 
+        // A masked diffusion checkpoint loads through its own remote-code
+        // class (auto_map → modeling_*.py, carried as an ancillary file); its
+        // config subclasses the transformers release it was saved with, which
+        // reads the old top-level rope_theta rather than rope_parameters.
+        if (surface.Diffusion is { } diffusion)
+        {
+            config["architectures"] = new JsonArray(JsonValue.Create(diffusion.Architecture)!);
+            config["model_type"] = diffusion.ModelType;
+            if (diffusion.AutoMap is { } autoMap)
+            {
+                config["auto_map"] = JsonNode.Parse(autoMap.GetRawText());
+            }
+            if (policies[0].Position is PositionRope plainRope)
+            {
+                config["rope_theta"] = plainRope.Theta;
+            }
+        }
+
         if (quantizeMxfp4)
         {
             config["quantization_config"] = new JsonObject

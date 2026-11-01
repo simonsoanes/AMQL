@@ -105,6 +105,40 @@ public sealed class AttentionSurface
 
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public bool? AttentionBias { get; init; }
+
+    /// <summary>Every position attends to every other — no causal mask. A
+    /// masked diffusion LM converted from a causal checkpoint keeps the same
+    /// weights and changes only this, so it must be recorded: run causally,
+    /// the same tensors give a different (and wrong) distribution.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool Bidirectional { get; init; }
+}
+
+// ── Masked diffusion surface ─────────────────────────────────────────────
+
+/// <summary>
+/// A masked diffusion language model (MDLM): generation starts from a run of
+/// mask tokens and unmasks them over several full-sequence passes, instead of
+/// appending one token per pass. Logits at position i predict the token AT i
+/// (no next-token shift). The HF identity is carried so export can restore the
+/// custom class the checkpoint loads through.
+/// </summary>
+public sealed class DiffusionSurface
+{
+    /// <summary><c>masked_diffusion</c> is the only objective judged.</summary>
+    public required string Objective { get; init; }
+
+    public required int MaskTokenId { get; init; }
+
+    /// <summary>The checkpoint's <c>model_type</c>, e.g. <c>a2d-qwen3</c>.</summary>
+    public required string ModelType { get; init; }
+
+    /// <summary>The checkpoint's <c>architectures</c> entry.</summary>
+    public required string Architecture { get; init; }
+
+    /// <summary>The checkpoint's <c>auto_map</c> (remote-code class map), verbatim.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public JsonElement? AutoMap { get; init; }
 }
 
 // ── FFN surface ────────────────────────────────────────────────────────────
@@ -421,4 +455,7 @@ public sealed class ExecutionSurface
 
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public JsonElement? Embedding { get; init; }
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public DiffusionSurface? Diffusion { get; init; }
 }

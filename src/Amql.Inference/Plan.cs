@@ -51,6 +51,10 @@ public sealed class AttentionOp
     /// <summary>Sliding window in positions; null means full span.</summary>
     public long? Window { get; init; }
 
+    /// <summary>False for a bidirectional stack (masked diffusion): every
+    /// query sees every key, before and after it.</summary>
+    public bool Causal { get; init; } = true;
+
     /// <summary>Position policy resolved from the per-layer table.</summary>
     public required PositionPolicy Position { get; init; }
 
@@ -241,5 +245,15 @@ public sealed class ComponentOpPlan
     /// join). 1.0 is the plain add every other family uses.</summary>
     public double ResidualScale { get; init; } = 1.0;
 
+    /// <summary>Set for a masked diffusion LM: the stack is bidirectional and
+    /// generation unmasks <see cref="MaskedDiffusionOp.MaskTokenId"/> runs
+    /// rather than stepping one token at a time.</summary>
+    public MaskedDiffusionOp? Diffusion { get; init; }
+
     public int HiddenSize => FinalNorm.Width;
+}
+
+public sealed class MaskedDiffusionOp
+{
+    public required int MaskTokenId { get; init; }
 }

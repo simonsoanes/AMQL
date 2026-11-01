@@ -130,7 +130,7 @@ public static class Rope
 /// (<c>tanh(scores/cap)·cap</c>), optional per-head sinks added to
 /// position-0 scores, and an optional sliding window (rows outside the
 /// window are masked to −∞ before softmax — never evicted, masked).
-/// Causal by construction.
+/// Causal unless the caller says otherwise (a bidirectional stack).
 /// </summary>
 public static class AttentionKernel
 {
@@ -183,7 +183,8 @@ public static class AttentionKernel
         int? window,
         int[] queryPositions,
         int[] kvPositions,
-        List<(int Head, float[] Weights)>? lastRowCapture = null)
+        List<(int Head, float[] Weights)>? lastRowCapture = null,
+        bool causal = true)
     {
         int seq = q.Rows;
         int kvSeq = k.Rows;
@@ -208,7 +209,7 @@ public static class AttentionKernel
                 for (int j = 0; j < kvSeq; j++)
                 {
                     int s = qPos - kvPositions[j];
-                    if (s < 0)
+                    if (s < 0 && causal)
                     {
                         break; // keys are position-ordered; past the window nothing is valid
                     }
