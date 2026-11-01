@@ -50,6 +50,10 @@ public static class ModelExporter
 
         bool isQwen4Next = arch == Qwen4NextLayout.Arch;
         bool isModernBert = ModernBertLayout.Applies(container);
+        bool isLfm3 = Lfm3Layout.Applies(container);
+        // Without a materialised tower an LFM3 export is a plain
+        // Lfm3ForCausalLM, which keeps its decoder under "model." directly.
+        bool lfm3TextOnly = isLfm3 && Lfm3Layout.Wrapper(container) is null;
         if (isModernBert && (quantizeMxfp4 || quantizeTernary is not null || arch is not null))
         {
             // option_marker.pt carries a second copy of the backbone that the
@@ -73,6 +77,11 @@ public static class ModelExporter
         else if (isModernBert)
         {
             configJson = ModernBertLayout.BuildConfigJson(container);
+        }
+        else if (isLfm3)
+        {
+            using var configStore = container.CreateOperandStore();
+            configJson = Lfm3Layout.BuildConfigJson(container, configStore);
         }
         else
         {
@@ -134,6 +143,7 @@ public static class ModelExporter
                     {
                         hfName = Qwen4NextLayout.RemapTensorName(obj.Id, hfName);
                     }
+                    hfName = Lfm3Layout.RemapTensorName(hfName, lfm3TextOnly);
                     if (names.TryGetValue(hfName, out var other))
                     {
                         throw new CliException(
@@ -169,6 +179,7 @@ public static class ModelExporter
             {
                 hfName = Qwen4NextLayout.RemapTensorName(item.ObjectId, hfName);
             }
+            hfName = Lfm3Layout.RemapTensorName(hfName, lfm3TextOnly);
             bool quantizing = (quantizeMxfp4 || quantizeTernary is not null) &&
                 ShouldQuantize(item.ObjectId, item.Tensor.Name, item.Tensor.Shape);
 

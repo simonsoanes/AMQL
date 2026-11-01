@@ -51,11 +51,22 @@ public static partial class ArchMapper
         // PositionRope; every other rope fact (partial factor, MRoPE
         // sections, scaled families) is carried verbatim as unresolved and
         // refused by the planner naming the kind.
-        PositionPolicy position = JudgePosition(facts);
+        bool isLfm3 = facts.ModelType == "lfm3";
+        PositionPolicy position = isLfm3 ? PositionPolicy.None : JudgePosition(facts);
         var policies = new List<AttentionLayerPolicy>(facts.NumLayers);
         for (int l = 0; l < facts.NumLayers; l++)
         {
             bool linear = facts.LayerTypes[l] == "linear_attention";
+            bool sliding = facts.LayerTypes[l] == "sliding_attention";
+            if (sliding && !isLfm3)
+            {
+                throw new ModelConfigException(
+                    $"layer {l}: layer_type 'sliding_attention' is judged for lfm3 only (model_type '{facts.ModelType}')");
+            }
+            if (sliding && facts.SlidingWindow is null)
+            {
+                throw new ModelConfigException($"layer {l}: 'sliding_attention' declared but the config carries no sliding_window");
+            }
             HeadGeometry geometry = linear && facts.LinearAttention is { } lin
                 ? new HeadGeometry { HeadDim = lin.KeyHeadDim, NumKvHeads = lin.KeyHeads }
                 : new HeadGeometry { HeadDim = facts.HeadDim, NumKvHeads = facts.NumKvHeads };
@@ -63,14 +74,15 @@ public static partial class ArchMapper
             {
                 Operator = facts.LayerTypes[l] switch
                 {
-                    "full_attention" => LayerOperators.Softmax,
+                    "full_attention" or "sliding_attention" => LayerOperators.Softmax,
                     "linear_attention" => LayerOperators.LinearAttention,
                     "conv" => LayerOperators.Conv,
                     var other => throw new ModelConfigException(
                         $"layer {l}: layer_type '{other}' has no judged operator mapping"),
                 },
-                Span = AttentionSpan.Full,
-                Position = position,
+                Span = sliding ? AttentionSpan.Sliding : AttentionSpan.Full,
+                Window = sliding ? facts.SlidingWindow : null,
+                Position = isLfm3 ? JudgeLfm3Position(facts, facts.LayerTypes[l]) : position,
                 Geometry = geometry,
             });
         }
@@ -103,9 +115,14 @@ public static partial class ArchMapper
                 QkNormScope = QkNormScope.PerHead,
                 QkNormWeightOffset = NormWeightOffsetFor(facts.ModelType),
                 AttentionBias = facts.AttentionBias,
+                // LFM3 gates each head's output by sigmoid(gate_proj·x), one
+                // scalar per head — a different operator from Qwen3.5's
+                // elementwise gate folded into q_proj.
                 OutputGate = facts.AttentionOutputGate
                     ? JsonSerializer.SerializeToElement(new { attn_output_gate = true }, ViJson.Options)
-                    : null,
+                    : HasPerHeadGate(inventory)
+                        ? JsonSerializer.SerializeToElement(new { per_head_gate = true }, ViJson.Options)
+                        : null,
             },
             Ffn = new FfnSurface
             {
@@ -127,7 +144,7 @@ public static partial class ArchMapper
                 Pre = normSpec,
                 Post = normSpec,
                 FinalNorm = normSpec,
-                Placement = NormPlacement.PreOnly,
+                Placement = facts.UseSandwichNorm ? NormPlacement.Sandwich : NormPlacement.PreOnly,
             },
             Head = new HeadSurface
             {
@@ -196,7 +213,10 @@ public static partial class ArchMapper
         {
             TextObject("target.embedding", ObjectKind.Embedding, prefix, "embed_tokens", encoding),
             TextObject("target.decoder_stack", ObjectKind.DecoderStack, prefix, "layers", encoding),
-            TextObject("target.final_norm", ObjectKind.FinalNorm, prefix, "norm", encoding),
+            // LFM2/LFM3 name the final norm "embedding_norm"; the binding has
+            // to carry the real stem or export rebuilds a name nothing loads.
+            TextObject("target.final_norm", ObjectKind.FinalNorm, prefix,
+                inventory.TryGet($"{prefix}.embedding_norm.weight", out _) ? "embedding_norm" : "norm", encoding),
             new()
             {
                 Id = "target.output_head",
@@ -268,11 +288,14 @@ public static partial class ArchMapper
         // ── vision tower prefix detection ────────────────────────────────────
         // Qwen uses "model.visual.", LFM2.5-VL (SigLIP2) uses
         // "model.vision_tower.vision_model.". Detect which exists.
+        // LFM3-VL keeps its own tower directly under "model.vision_tower.".
         string visionPrefix = inventory.CountUnder("model.visual.") > 0
             ? "model.visual"
             : inventory.CountUnder("model.vision_tower.vision_model.") > 0
                 ? "model.vision_tower.vision_model"
-                : "model.visual"; // fallback
+                : inventory.CountUnder("model.vision_tower.") > 0
+                    ? "model.vision_tower"
+                    : "model.visual"; // fallback
 
         if (options.IncludeVision)
         {
@@ -310,8 +333,13 @@ public static partial class ArchMapper
                 SourceArtifact = visionPrefix,
                 NumLayers = facts.Vision?.NumLayers ?? 12,
                 HiddenSize = facts.Vision?.HiddenSize ?? 768,
-                Perception = JsonSerializer.SerializeToElement(
-                    new { modality = "image", transform = new { kind = "encoder" } }, ViJson.Options),
+                // The wrapper config (vision tower, projector, media tokens)
+                // rides along verbatim so a multimodal export can rebuild it.
+                Perception = facts.WrapperConfig is { } wrapper
+                    ? JsonSerializer.SerializeToElement(
+                        new { modality = "image", transform = new { kind = "encoder" }, hf_wrapper = wrapper }, ViJson.Options)
+                    : JsonSerializer.SerializeToElement(
+                        new { modality = "image", transform = new { kind = "encoder" } }, ViJson.Options),
             });
         }
 
@@ -464,6 +492,38 @@ public static partial class ArchMapper
     /// other families this build maps default to plain RMS(x)·w.</summary>
     private static float NormWeightOffsetFor(string modelType) =>
         modelType is "qwen3_5_text" or "qwen3_5" ? 1.0f : 0f;
+
+    /// <summary>Whether the attention layers carry LFM3's per-head output
+    /// gate (<c>self_attn.gate_proj</c>, [heads, hidden]).</summary>
+    private static bool HasPerHeadGate(HfInventory inventory) =>
+        inventory.TensorNames.Any(n => n.EndsWith(".self_attn.gate_proj.weight", StringComparison.Ordinal));
+
+    /// <summary>LFM3 keys its rope facts by layer type. The full-attention
+    /// layers use the zero-tail partial rotary (the progression of the full
+    /// head dim, trailing frequencies zeroed); a factor of 1 is plain rope.</summary>
+    private static PositionPolicy JudgeLfm3Position(TextArchitectureFacts facts, string layerType)
+    {
+        if (layerType == "conv")
+        {
+            return PositionPolicy.None;
+        }
+        var rope = facts.RopeParameters;
+        if (rope.ValueKind != JsonValueKind.Object || !rope.TryGetProperty(layerType, out var p) ||
+            p.ValueKind != JsonValueKind.Object)
+        {
+            throw new ModelConfigException($"lfm3: rope_parameters carries no '{layerType}' entry");
+        }
+        string ropeType = p.TryGetProperty("rope_type", out var rt) ? rt.GetString() ?? "default" : "default";
+        if (ropeType != "default")
+        {
+            return new PositionUnresolved { Kind = $"rope_scaling({ropeType})", Payload = p.Clone() };
+        }
+        double theta = p.TryGetProperty("rope_theta", out var t) ? t.GetDouble() : 10_000.0;
+        double factor = p.TryGetProperty("partial_rotary_factor", out var f) ? f.GetDouble() : 1.0;
+        return factor < 1.0
+            ? new PositionZeroTailRope { Theta = theta, RotaryFactor = factor }
+            : PositionPolicy.CreateRope(theta);
+    }
 
     /// <summary>Judges whether the persisted rope facts are the served plain
     /// default rotary (PositionRope) or must be carried unresolved. The

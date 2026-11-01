@@ -91,8 +91,9 @@ public sealed class DecodeSession
         // plan whose only state is theirs runs layer-major like a softmax
         // plan: the projections become real GEMMs instead of one matrix-vector
         // product per token. Verified bit-identical to position-major on
-        // Qwen3.5. Other stateful operators keep the position-major path.
-        bool layerMajor = _runtime.Plan.Layers.All(l => l.Conv is null);
+        // Qwen3.5. The LFM gated short conv likewise convolves a whole
+        // sequence against its carried history, so every plan runs layer-major.
+        bool layerMajor = true;
         if (!layerMajor)
         {
             // Position-major: one token through every layer at a time, so

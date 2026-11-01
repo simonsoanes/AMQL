@@ -1266,6 +1266,10 @@ __global__ void attention_gqa_f32_kernel(
         __syncthreads();
     }
     float maxScore = sRed[0];
+    // Every thread must have read the max before sRed is reused for the sum
+    // below — without this barrier thread 0 can overwrite sRed[0] with its
+    // partial sum while a slower warp is still reading the max.
+    __syncthreads();
 
     float mySum = 0.f;
     if (!isinf(maxScore))

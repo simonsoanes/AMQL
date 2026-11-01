@@ -29,6 +29,9 @@ public static class Rope
         {
             case PositionNone:
                 return;
+            case PositionZeroTailRope zeroTail:
+                ApplyZeroTail(x, numHeads, headDim, zeroTail, positions);
+                return;
             case PositionRope rope:
                 rotaryWidth = headDim;
                 theta = rope.Theta;
@@ -67,6 +70,47 @@ public static class Rope
                 {
                     int a = rowStart + head + i;
                     int b = a + pairCount;
+                    double angle = position * invFreq[i];
+                    double cos = Math.Cos(angle);
+                    double sin = Math.Sin(angle);
+                    double x1 = x.Data[a];
+                    double x2 = x.Data[b];
+                    x.Data[a] = (float)(x1 * cos - x2 * sin);
+                    x.Data[b] = (float)(x1 * sin + x2 * cos);
+                }
+            }
+        }
+    }
+
+    /// <summary>LFM3's zero-tail partial rotary: pairs (i, i + head_dim/2)
+    /// with <c>inv_freq[i] = theta^(-2i/head_dim)</c> for the first
+    /// <c>RotatedPairs</c> pairs; the remaining pairs have frequency zero and
+    /// pass through unrotated.</summary>
+    private static void ApplyZeroTail(Tensor2D x, int numHeads, int headDim,
+        PositionZeroTailRope policy, ReadOnlySpan<int> positions)
+    {
+        int half = headDim / 2;
+        int rotated = policy.RotatedPairs(headDim);
+        if (rotated > half)
+        {
+            throw new ArgumentException($"zero-tail rope rotates {rotated} pairs but head dim {headDim} has {half}");
+        }
+        var invFreq = new double[rotated];
+        for (int i = 0; i < rotated; i++)
+        {
+            invFreq[i] = 1.0 / Math.Pow(policy.Theta, 2.0 * i / headDim);
+        }
+        for (int r = 0; r < x.Rows; r++)
+        {
+            double position = positions[r];
+            int rowStart = r * x.Cols;
+            for (int h = 0; h < numHeads; h++)
+            {
+                int head = rowStart + h * headDim;
+                for (int i = 0; i < rotated; i++)
+                {
+                    int a = head + i;
+                    int b = a + half;
                     double angle = position * invFreq[i];
                     double cos = Math.Cos(angle);
                     double sin = Math.Sin(angle);

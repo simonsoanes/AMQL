@@ -118,6 +118,7 @@ Import and export these checkpoint formats:
 | Qwen Flash-Next | `qwen4_exp_text` | `--arch qwen4-next` export with HC placeholders |
 | Gemma 4 | `gemma4_text` | GeGLU activation, QK norms, nested `text_config` |
 | LFM 2.5 | `lfm2` | Short-convolution layers + GQA, SwiGLU MLP |
+| LFM3 / LFM3-VL | `lfm3` | Gated short conv (width 7) + full and sliding-window GQA, per-head output gate, sandwich norms, zero-tail partial rope; `to-gguf` writes llama.cpp's `lfm3` arch |
 | Nomic Embed | `nomic_bert` | Bidirectional encoder, mean pooling |
 | ModernBERT / Von | `modernbert` | Global + sliding bidirectional encoder, GeGLU; Von's `option_marker.pt` scoring head read and written natively, and run in-process by `decide` |
 | Jev Classifier | `*ForSequenceClassification` | Score head on decoder backbone |

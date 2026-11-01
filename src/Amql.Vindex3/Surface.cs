@@ -36,6 +36,11 @@ public enum NormPlacement
 {
     PreOnly,
     PrePost,
+
+    /// <summary>LFM3's sandwich: a pre norm into each sub-block and a post
+    /// norm on each sub-block's output before its residual add
+    /// (operator_norm / post_operator_norm, ffn_norm / post_ffn_norm).</summary>
+    Sandwich,
 }
 
 public sealed class NormSurface

@@ -87,7 +87,24 @@ public sealed record TextArchitectureFacts(
     double? AttentionMultiplier,
     double? EmbeddingMultiplier,
     double? ResidualMultiplier,
-    double? LogitsScaling);
+    double? LogitsScaling)
+{
+    /// <summary>Window (in positions) of the <c>sliding_attention</c> layers.</summary>
+    public long? SlidingWindow { get; init; }
+
+    /// <summary>LFM3's <c>use_sandwich_norm</c>: a post norm on each
+    /// sub-block's output before the residual add.</summary>
+    public bool UseSandwichNorm { get; init; }
+
+    /// <summary>The wrapper config's own <c>model_type</c> (e.g. <c>lfm3_vl</c>)
+    /// when the text stack sits in <c>text_config</c>.</summary>
+    public string? WrapperModelType { get; init; }
+
+    /// <summary>The wrapper config minus its <c>text_config</c> (vision tower,
+    /// projector and media token facts), carried verbatim so a multimodal
+    /// export can be rebuilt; null for a plain text config.</summary>
+    public JsonElement? WrapperConfig { get; init; }
+}
 
 /// <summary>G1 reader: <c>config.json</c> → <see cref="TextArchitectureFacts"/>.</summary>
 public static class ModelConfig
@@ -118,9 +135,8 @@ public static class ModelConfig
 
             // Unwrap a multimodal wrapper: the text stack always lives in
             // text_config; a plain text config IS the text config.
-            JsonElement text = root.TryGetProperty("text_config", out var nested) && nested.ValueKind == JsonValueKind.Object
-                ? nested
-                : root;
+            bool wrapped = root.TryGetProperty("text_config", out var nested) && nested.ValueKind == JsonValueKind.Object;
+            JsonElement text = wrapped ? nested : root;
 
             var layerTypes = new List<string>();
             if (text.TryGetProperty("layer_types", out var types) && types.ValueKind == JsonValueKind.Array)
@@ -295,8 +311,23 @@ public static class ModelConfig
                 AttentionMultiplier: OptionalDouble(text, "attention_multiplier"),
                 EmbeddingMultiplier: OptionalDouble(text, "embedding_multiplier"),
                 ResidualMultiplier: OptionalDouble(text, "residual_multiplier"),
-                LogitsScaling: OptionalDouble(text, "logits_scaling"));
+                LogitsScaling: OptionalDouble(text, "logits_scaling"))
+            {
+                SlidingWindow = text.TryGetProperty("sliding_window", out var sw) && sw.ValueKind == JsonValueKind.Number
+                    ? sw.GetInt64()
+                    : null,
+                UseSandwichNorm = text.TryGetProperty("use_sandwich_norm", out var sn) && sn.ValueKind == JsonValueKind.True,
+                WrapperModelType = wrapped && root.TryGetProperty("model_type", out var wmt) ? wmt.GetString() : null,
+                WrapperConfig = wrapped ? WithoutTextConfig(root) : null,
+            };
         }
+    }
+
+    private static JsonElement WithoutTextConfig(JsonElement root)
+    {
+        var node = System.Text.Json.Nodes.JsonNode.Parse(root.GetRawText())!.AsObject();
+        node.Remove("text_config");
+        return JsonDocument.Parse(node.ToJsonString()).RootElement.Clone();
     }
 
     private static int Int(JsonElement obj, string name, bool required = true)

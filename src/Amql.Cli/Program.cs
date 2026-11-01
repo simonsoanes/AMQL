@@ -324,6 +324,17 @@ internal static class Program
     private static int SynthModel(string[] args)
     {
         var dir = Arg(args, 0) ?? throw new CliException("synth-model requires an output directory");
+        string family = OptionValue(args, "--family") ?? "qwen3_5";
+        if (family == Amql.Hf.SyntheticLfm3Checkpoint.Family)
+        {
+            Amql.Hf.SyntheticLfm3Checkpoint.Write(dir);
+            Console.WriteLine($"wrote an executable 4-layer LFM3-shaped checkpoint (conv, full, conv, sliding) to '{dir}'");
+            return 0;
+        }
+        if (family != "qwen3_5")
+        {
+            throw new CliException($"synth-model --family '{family}' — expected qwen3_5 or lfm3");
+        }
         Amql.Hf.SyntheticCheckpoint.Write(dir);
         Console.WriteLine($"wrote an executable 2-layer Qwen3.5-shaped demo checkpoint to '{dir}'\n" +
                           "encode it:  amql-cli encode <dir> --out <container>\n" +
@@ -1390,6 +1401,10 @@ internal static class Program
     private static int ToGgufFromCheckpoint(string[] args, string checkpointDir, string outFile)
     {
         string quantization = OptionValue(args, "--quant") ?? "none";
+        if (Lfm3Gguf.Applies(checkpointDir))
+        {
+            return ToGgufLfm3(args, checkpointDir, outFile, quantization);
+        }
         if (quantization == "f16")
         {
             // 'f16' is the user-facing alias for "do not quantize".
@@ -1422,6 +1437,29 @@ internal static class Program
             Console.WriteLine($"note:       {note}");
         }
         Console.WriteLine("load it with llama.cpp / LM Studio, e.g. 'llama-cli -m <file.gguf> -p \"hello\"' — validate the hybrid arch on the target build");
+        return 0;
+    }
+
+    /// <summary>LFM3 has its own writer (llama.cpp's <c>lfm3</c> arch):
+    /// conv/attention layer table, sliding-window pattern and zero-tail rope.</summary>
+    private static int ToGgufLfm3(string[] args, string checkpointDir, string outFile, string quantization)
+    {
+        if (File.Exists(outFile))
+        {
+            if (!HasOption(args, "--force"))
+            {
+                throw new CliException($"output '{outFile}' already exists — pass --force to overwrite");
+            }
+            File.Delete(outFile);
+        }
+        var report = Lfm3Gguf.Convert(checkpointDir, outFile, quantization);
+        Console.WriteLine($"converted: {report.OutputPath}");
+        Console.WriteLine($"arch:       {report.Architecture}");
+        Console.WriteLine($"tensors:    {report.TensorsWritten}  ({FormatBytes(report.OutputBytes)})");
+        foreach (var note in report.Notes)
+        {
+            Console.WriteLine($"note:       {note}");
+        }
         return 0;
     }
 
@@ -2552,7 +2590,7 @@ internal static class Program
                               [--envelope none|jevai] [--attention auto|independent|full] [--compact]
                               answer a TypeSafe /v1/decisions request (choice / score / noul
                               questions over one state) with a Von decision model, in-process
-              amql-cli synth-model <dir>                          write an executable demo checkpoint
+              amql-cli synth-model <dir> [--family qwen3_5|lfm3]  write an executable demo checkpoint
               amql-cli tokens --tokenizer <checkpoint-dir> "text"
               amql-cli decode --tokenizer <checkpoint-dir> <id,id,…>
               amql-cli route <container-dir> <A> <B> --tokenizer <checkpoint-dir>

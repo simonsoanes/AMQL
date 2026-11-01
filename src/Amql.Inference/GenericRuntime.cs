@@ -89,27 +89,36 @@ public sealed class GenericRuntime
         }
 
         // Token mixer dispatch.
+        Tensor2D mixerOut;
         if (layerPlan.LinearAttention is { } linear)
         {
             long t = TraceStart;
-            var mixerOut = RunLinearAttention(h, layer, linear);
+            mixerOut = RunLinearAttention(h, layer, linear);
             Report(layer, "linear_attn", null, mixerOut, t);
-            AddResidualInPlace(x, mixerOut);
         }
         else if (layerPlan.Conv is { } conv)
         {
             long t = TraceStart;
-            var mixerOut = RunConv(h, layer, conv);
+            mixerOut = RunConv(h, layer, conv);
             Report(layer, "conv", null, mixerOut, t);
-            AddResidualInPlace(x, mixerOut);
         }
         else
         {
             long t = TraceStart;
-            var mixerOut = RunSoftmaxAttention(h, layer, layerPlan, queryPositions, kvPositions, appendKv);
+            mixerOut = RunSoftmaxAttention(h, layer, layerPlan, queryPositions, kvPositions, appendKv);
             Report(layer, "softmax_attn", null, mixerOut, t);
-            AddResidualInPlace(x, mixerOut);
         }
+
+        // Post-mixer norm (four-norm / sandwich placement) applies to the
+        // mixer output before the residual add, whichever operator ran.
+        if (layerPlan.PostAttentionNorm is { } postAttnNorm)
+        {
+            var postAttnW = _weights.Vector(postAttnNorm.Weight, hidden);
+            long tn = TraceStart;
+            Norms.ApplyInPlace(mixerOut, postAttnNorm.Kind, postAttnNorm.Eps, postAttnW, postAttnNorm.WeightOffset);
+            Report(layer, "post_attn_norm", postAttnNorm.Weight, mixerOut, tn);
+        }
+        AddResidualInPlace(x, mixerOut);
 
         // Pre-FFN norm.
         Tensor2D hf = x;
@@ -327,16 +336,27 @@ public sealed class GenericRuntime
 
         Report(layer, "attn_context", null, output, 0);
 
+        // Per-head output gate (LFM3): each head's context × sigmoid(gate_proj·h).
+        if (attn.HeadGate is { } headGateRef)
+        {
+            var headGate = TensorOps.MatMulTransposedB(h, _weights.Matrix(headGateRef, attn.NumQHeads, hidden));
+            Report(layer, "attn_head_gate", headGateRef, headGate, 0);
+            for (int r = 0; r < output.Rows; r++)
+            {
+                for (int head = 0; head < attn.NumQHeads; head++)
+                {
+                    float g = Sigmoid(headGate.Data[r * attn.NumQHeads + head]);
+                    int start = r * attn.QDim + head * attn.HeadDim;
+                    for (int d = 0; d < attn.HeadDim; d++)
+                    {
+                        output.Data[start + d] *= g;
+                    }
+                }
+            }
+        }
+
         var o = TensorOps.MatMulTransposedB(output, _weights.Matrix(attn.OProj, hidden, attn.QDim));
         Report(layer, "attn_output", attn.OProj, o, 0);
-
-        // Post-attention norm (four-norm placement) applies to the mixer
-        // output before the residual add.
-        if (layerPlan.PostAttentionNorm is { } postAttnNorm)
-        {
-            var postAttnW = _weights.Vector(postAttnNorm.Weight, hidden);
-            Norms.ApplyInPlace(o, postAttnNorm.Kind, postAttnNorm.Eps, postAttnW, postAttnNorm.WeightOffset);
-        }
         return o;
     }
 
@@ -466,6 +486,7 @@ public sealed class GenericRuntime
     public void ResetSession()
     {
         _linearStates.Clear();
+        _convStates.Clear();
         SessionPosition = 0;
         if (_patches.Count > 0)
         {
@@ -656,26 +677,17 @@ public sealed class GenericRuntime
                 });
     }
 
-    // ── conv layer (LFM2.5 short-convolution) ───────────────────────────
+    // ── conv layer (LFM2/LFM3 gated short convolution) ──────────────────
 
-    private readonly Dictionary<int, ConvState> _convStates = new();
+    /// <summary>Per conv layer: the last (kernel-1) rows of B⊙x, oldest
+    /// first, zero before the session's first token.</summary>
+    private readonly Dictionary<int, float[]> _convStates = new();
 
-    private sealed class ConvState
-    {
-        public readonly float[] Buffer; // [kernel-1, convDim] sliding window
-        public int FillCount;
-        public ConvState(int kernel, int convDim)
-        {
-            Buffer = new float[(kernel - 1) * convDim];
-            FillCount = 0;
-        }
-    }
-
-    private ConvState ConvStateFor(int layer, ConvOp op)
+    private float[] ConvStateFor(int layer, ConvOp op)
     {
         if (!_convStates.TryGetValue(layer, out var state))
         {
-            state = new ConvState(op.KernelSize, op.ConvDim);
+            state = new float[(op.KernelSize - 1) * op.ConvDim];
             _convStates[layer] = state;
         }
         return state;
@@ -685,76 +697,70 @@ public sealed class GenericRuntime
     {
         int seqLen = h.Rows;
         int hidden = op.HiddenSize;
-        int convDim = op.ConvDim;
+        int d = op.ConvDim;
         int kernel = op.KernelSize;
 
-        // Input projection: hidden → conv_dim
-        var inProj = _weights.Matrix(op.InProj, convDim, hidden);
-        var projected = TensorOps.MatMulTransposedB(h, inProj); // [seqLen, convDim]
+        // in_proj → (B, C, x), each d wide, in that order along the row.
+        var bcx = TensorOps.MatMulTransposedB(h, _weights.Matrix(op.InProj, 3 * d, hidden));
+        Report(layer, "conv_in", op.InProj, bcx, 0);
 
-        // Get or create conv state
-        var state = ConvStateFor(layer, op);
-
-        // Depthwise causal conv1d with SiLU
-        var convWeight = _weights.Matrix(op.ConvWeight, convDim, kernel); // [convDim, kernel]
-        float[]? convBias = op.ConvBias is { } biasRef
-            ? _weights.Vector(biasRef, convDim)
-            : null;
-
-        var convOut = new float[seqLen * convDim];
-        for (int t = 0; t < seqLen; t++)
+        var bx = new float[seqLen * d];
+        for (int r = 0; r < seqLen; r++)
         {
-            for (int c = 0; c < convDim; c++)
+            int row = r * 3 * d;
+            for (int c = 0; c < d; c++)
             {
-                float sum = convBias?[c] ?? 0f;
-                for (int k = 0; k < kernel; k++)
+                bx[r * d + c] = bcx.Data[row + c] * bcx.Data[row + 2 * d + c];
+            }
+        }
+
+        // Depthwise causal conv over B⊙x, no activation: out[t] =
+        // Σ_j w[c, j]·in[t - (K-1) + j], positions before the batch read the
+        // carried history (row i of the history is position i - (K-1)).
+        var history = ConvStateFor(layer, op);
+        var w = _weights.Vector(op.ConvWeight, d * kernel);
+        float[]? bias = op.ConvBias is { } biasRef ? _weights.Vector(biasRef, d) : null;
+        var y = new float[seqLen * d];
+        Parallel.For(0, seqLen, r =>
+        {
+            int row = r * 3 * d;
+            for (int c = 0; c < d; c++)
+            {
+                float sum = bias?[c] ?? 0f;
+                for (int j = 0; j < kernel; j++)
                 {
-                    // Causal: only look at positions <= t
-                    int pos = t - (kernel - 1 - k);
-                    float inputVal;
-                    if (pos < 0)
-                    {
-                        // Use conv state buffer (padding from previous sequence)
-                        int stateIdx = (kernel - 1 + pos) * convDim + c;
-                        inputVal = stateIdx >= 0 && stateIdx < state.Buffer.Length
-                            ? state.Buffer[stateIdx]
-                            : 0f;
-                    }
-                    else if (pos < state.FillCount)
-                    {
-                        // From state buffer (prefill history)
-                        int stateIdx = pos * convDim + c;
-                        inputVal = stateIdx < state.Buffer.Length ? state.Buffer[stateIdx] : 0f;
-                    }
-                    else
-                    {
-                        // From current batch
-                        int batchIdx = (pos - state.FillCount) * convDim + c;
-                        inputVal = batchIdx < projected.Data.Length ? projected.Data[batchIdx] : 0f;
-                    }
-                    sum += inputVal * convWeight.Data[c * kernel + k];
+                    int pos = r - (kernel - 1) + j;
+                    float v = pos >= 0 ? bx[pos * d + c] : history[(pos + kernel - 1) * d + c];
+                    sum += w[c * kernel + j] * v;
                 }
-                // SiLU activation
-                convOut[t * convDim + c] = sum * Sigmoid(sum);
+                // Output gate C.
+                y[r * d + c] = bcx.Data[row + d + c] * sum;
             }
-        }
+        });
 
-        // Update conv state with the last (kernel-1) positions
-        int newFill = Math.Min(state.FillCount + seqLen, kernel - 1);
-        for (int i = 0; i < kernel - 1; i++)
+        // Advance the history to the last (K-1) rows of [history; B⊙x].
+        int keep = kernel - 1;
+        var next = new float[keep * d];
+        for (int i = 0; i < keep; i++)
         {
-            int srcPos = seqLen - (kernel - 1) + i;
-            if (srcPos >= 0)
+            int pos = seqLen - keep + i; // position relative to this batch
+            if (pos >= 0)
             {
-                Array.Copy(projected.Data, srcPos * convDim, state.Buffer, i * convDim, convDim);
+                Array.Copy(bx, pos * d, next, i * d, d);
+            }
+            else
+            {
+                Array.Copy(history, (pos + keep) * d, next, i * d, d);
             }
         }
-        state.FillCount = newFill;
+        _convStates[layer] = next;
 
-        // Output projection: conv_dim → hidden
-        var convTensor = new Tensor2D(convOut, seqLen, convDim);
-        var outProj = _weights.Matrix(op.OutProj, hidden, convDim);
-        return TensorOps.MatMulTransposedB(convTensor, outProj);
+        var gated = new Tensor2D(y, seqLen, d);
+        Report(layer, "conv_gated", op.ConvWeight, gated, 0);
+        var outProj = _weights.Matrix(op.OutProj, hidden, d);
+        var result = TensorOps.MatMulTransposedB(gated, outProj);
+        Report(layer, "conv_out", op.OutProj, result, 0);
+        return result;
     }
 
     private static float Sigmoid(float x) => 1f / (1f + MathF.Exp(-x));

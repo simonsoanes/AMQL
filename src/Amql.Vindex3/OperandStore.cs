@@ -54,6 +54,19 @@ public sealed class OperandStore : IDisposable
         return null;
     }
 
+    /// <summary>A tensor's shape from its segment header alone — no payload read.</summary>
+    public long[] ShapeOf(string objectId, string tensorName)
+    {
+        ThrowIfDisposed();
+        var representationId = _container.CanonicalRepresentationId(objectId);
+        if (!_container.Index.Representations.TryGetValue(representationId, out var entry))
+        {
+            throw new ContainerException(
+                $"object '{objectId}' has no representation entry '{representationId}' in index.representations");
+        }
+        return OpenSegment(entry.Segment).GetTensor(tensorName).Shape;
+    }
+
     public OperandResolution Resolve(string objectId, string tensorName)
     {
         ThrowIfDisposed();

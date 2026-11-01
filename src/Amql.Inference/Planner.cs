@@ -65,6 +65,7 @@ public static class Planner
                 $"component '{componentId}': a decoder stack implies an ffn surface (required primitive: ffn)");
 
         bool prePost = normSurface.Placement == NormPlacement.PrePost;
+        bool sandwich = normSurface.Placement == NormPlacement.Sandwich;
         if (normSurface.Post is null)
         {
             throw new ContainerException(
@@ -75,7 +76,7 @@ public static class Planner
         var layers = new List<LayerPlan>(component.NumLayers);
         for (int l = 0; l < component.NumLayers; l++)
         {
-            layers.Add(BuildLayer(store, stack.Id, l, policies[l], surface, ffnSurface, normSurface, prePost, component.HiddenSize));
+            layers.Add(BuildLayer(store, stack.Id, l, policies[l], surface, ffnSurface, normSurface, prePost, sandwich, component.HiddenSize));
         }
 
         return new ComponentOpPlan
@@ -98,6 +99,7 @@ public static class Planner
         FfnSurface ffnSurface,
         NormSurface normSurface,
         bool prePost,
+        bool sandwich,
         int hiddenSize)
     {
         bool linear = policy.Operator == LayerOperators.LinearAttention;
@@ -136,7 +138,19 @@ public static class Planner
         NormOp? postAttention = null;
         NormOp? preFfn;
         NormOp? postFfn = null;
-        if (prePost)
+        if (sandwich)
+        {
+            // LFM3: operator_norm → mixer → post_operator_norm → +residual,
+            // ffn_norm → FFN → post_ffn_norm → +residual.
+            string postOpName = $"{layer}.post_operator_norm.weight";
+            string postFfnName = $"{layer}.post_ffn_norm.weight";
+            Require(store, stackId, postOpName, layer, "post-operator norm");
+            Require(store, stackId, postFfnName, layer, "post-ffn norm");
+            postAttention = BindNorm(store, stackId, postOpName, normSurface.Post!, hiddenSize);
+            preFfn = BindNorm(store, stackId, postAttnName, normSurface.Post!, hiddenSize);
+            postFfn = BindNorm(store, stackId, postFfnName, normSurface.Post!, hiddenSize);
+        }
+        else if (prePost)
         {
             Require(store, stackId, postAttnName, layer, "post-attention norm");
             postAttention = BindNorm(store, stackId, postAttnName, normSurface.Post!, hiddenSize);
@@ -181,6 +195,16 @@ public static class Planner
                 $"layer {layer}: the persisted attention surface declares learned sinks with no managed implementation");
         }
 
+        bool perHeadGate = attnSurface.OutputGate is { ValueKind: System.Text.Json.JsonValueKind.Object } gateFacts &&
+                           gateFacts.TryGetProperty("per_head_gate", out var phg) && phg.ValueKind == System.Text.Json.JsonValueKind.True;
+        OperandRef? headGate = null;
+        if (perHeadGate)
+        {
+            string gateName = $"{layer}.self_attn.gate_proj.weight";
+            Require(store, stackId, gateName, layer, "per-head output gate (gate_proj)");
+            headGate = new OperandRef(stackId, gateName);
+        }
+
         var op = new AttentionOp
         {
             NumQHeads = attnSurface.NumQHeads,
@@ -191,7 +215,8 @@ public static class Planner
             Window = policy.Window,
             Position = policy.Position,
             VFromK = policy.VFromK,
-            OutputGate = attnSurface.OutputGate is not null,
+            OutputGate = attnSurface.OutputGate is not null && !perHeadGate,
+            HeadGate = headGate,
             QkNormScope = attnSurface.QkNormScope,
             QkNormWeightOffset = attnSurface.QkNormWeightOffset,
             ParameterFreeQkNorm = attnSurface.ParameterFreeQkNorm,
@@ -312,10 +337,7 @@ public static class Planner
         OperandStore store, string stackId, int layer,
         ExecutionSurface surface, int hiddenSize)
     {
-        // LFM2.5 uses conv_kernel=4 (short causal convolution)
-        int convKernel = 4;
-
-        // LFM2.5 conv tensor names: conv.in_proj, conv.conv, conv.out_proj
+        // LFM2/LFM3 conv tensor names: conv.in_proj, conv.conv, conv.out_proj
         string inProjName = $"{layer}.conv.in_proj.weight";
         string convWeightName = $"{layer}.conv.conv.weight";
         string convBiasName = $"{layer}.conv.conv.bias";
@@ -337,8 +359,22 @@ public static class Planner
             // Bias not present — that's OK
         }
 
-        // Conv dim = hidden size (depthwise conv preserves dimensionality)
+        // Depthwise conv over hidden channels; the kernel width (LFM2: 3,
+        // LFM3: 7) is the weight's last dim, [hidden, 1, K] or [hidden, K].
         int convDim = hiddenSize;
+        var convShape = store.ShapeOf(stackId, convWeightName);
+        int convKernel = checked((int)convShape[^1]);
+        if (convShape[0] != convDim)
+        {
+            throw new ContainerException(
+                $"layer {layer}: conv weight has {convShape[0]} channels, hidden size is {convDim}");
+        }
+        var inShape = store.ShapeOf(stackId, inProjName);
+        if (inShape[0] != 3L * convDim)
+        {
+            throw new ContainerException(
+                $"layer {layer}: conv in_proj has {inShape[0]} rows — the gated short conv needs 3×hidden (B, C, x)");
+        }
 
         return new ConvOp
         {

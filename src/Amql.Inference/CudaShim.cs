@@ -645,7 +645,11 @@ public static class CudaShim
             q, seqQ, kCache, seqKV, vCache, output,
             numQHeads, numKvHeads, headDim,
             scoreScale, softCap, window,
-            sinks ?? Array.Empty<float>(),
+            // null marshals as a null pointer, which the kernel reads as "no
+            // sinks". An empty array marshals as a valid pointer to nothing:
+            // the native side then copies numQHeads floats of garbage and adds
+            // them to every head's position-0 score.
+            sinks,
             qPositions, kvPositions, 0);
         LastNativeError = code;
         if (code != 0) { _deviceFailed = true; return false; }
@@ -660,7 +664,7 @@ public static class CudaShim
         float[] output,
         int numQHeads, int numKvHeads, int headDim,
         float scoreScale, float softCap, int window,
-        float[] sinks,
+        float[]? sinks,
         int[] qPositions, int[] kvPositions,
         int streamOrdinal);
 

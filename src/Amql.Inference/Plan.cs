@@ -61,6 +61,11 @@ public sealed class AttentionOp
     /// elementwise — <c>o_proj(attn_out ⊙ sigmoid(gate))</c>.</summary>
     public bool OutputGate { get; init; }
 
+    /// <summary>LFM3's per-head output gate: <c>gate_proj</c> [heads, hidden]
+    /// on the mixer input, each head's context scaled by
+    /// <c>sigmoid(gate_proj·x)[head]</c> before <c>o_proj</c>.</summary>
+    public OperandRef? HeadGate { get; init; }
+
     public QkNormScope QkNormScope { get; init; } = QkNormScope.PerHead;
     public float QkNormWeightOffset { get; init; }
     public ParameterFreeQkNorm ParameterFreeQkNorm { get; init; } = new();
@@ -160,10 +165,10 @@ public sealed class LinearAttentionOp
 }
 
 /// <summary>
-/// LFM2.5-style short-convolution block: a depthwise causal conv1d with
-/// SiLU gating, flanked by input/output projections. The conv state is a
-/// sliding window of the last (kernel-1) inputs — stateful like linear
-/// attention, but simpler (no recurrence, no gating network).
+/// LFM2/LFM3 gated short convolution: <c>in_proj</c> [3·hidden, hidden]
+/// yields (B, C, x); the depthwise causal conv runs over <c>B ⊙ x</c> with no
+/// activation, its output is gated by <c>C</c>, then <c>out_proj</c>. The
+/// conv state is the last (kernel-1) rows of <c>B ⊙ x</c>.
 /// </summary>
 public sealed class ConvOp
 {

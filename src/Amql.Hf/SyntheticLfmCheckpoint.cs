@@ -80,9 +80,10 @@ public static class SyntheticLfmCheckpoint
         string l0 = "model.layers.0.";
         int qDim = NumQHeads * HeadDim;
         tensors[$"{l0}operator_norm.weight"] = (new long[] { Hidden }, Ones(Hidden));
-        tensors[$"{l0}conv.in_proj.weight"] = (new long[] { qDim, Hidden }, Matrix(rng, qDim, Hidden));
+        // The gated short conv: in_proj yields (B, C, x), three hidden-wide blocks.
+        tensors[$"{l0}conv.in_proj.weight"] = (new long[] { 3 * Hidden, Hidden }, Matrix(rng, 3 * Hidden, Hidden));
         tensors[$"{l0}conv.conv.weight"] = (new long[] { Hidden, 1, ConvKernel }, Matrix(rng, Hidden * ConvKernel, 1));
-        tensors[$"{l0}conv.out_proj.weight"] = (new long[] { qDim, Hidden }, Matrix(rng, qDim, Hidden));
+        tensors[$"{l0}conv.out_proj.weight"] = (new long[] { Hidden, Hidden }, Matrix(rng, Hidden, Hidden));
         tensors[$"{l0}ffn_norm.weight"] = (new long[] { Hidden }, Ones(Hidden));
         tensors[$"{l0}feed_forward.w1.weight"] = (new long[] { Intermediate, Hidden }, Matrix(rng, Intermediate, Hidden));
         tensors[$"{l0}feed_forward.w3.weight"] = (new long[] { Intermediate, Hidden }, Matrix(rng, Intermediate, Hidden));

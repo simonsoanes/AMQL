@@ -51,6 +51,23 @@ public sealed class PositionPartialRope : PositionPolicy
     public int RotaryWidth(int headDim) => Math.Max(2, (int)(headDim * RotaryFactor));
 }
 
+/// <summary>
+/// LFM3's "zero-tail" partial rotary: the frequency progression is that of
+/// the FULL head dim (<c>inv_freq[i] = theta^(-2i/head_dim)</c>), the first
+/// <c>head_dim × RotaryFactor / 2</c> frequencies are kept and the rest are
+/// zero. Pairs stay (i, i + head_dim/2) — unlike <see cref="PositionPartialRope"/>,
+/// which shrinks the rotary window and re-derives the progression over it.
+/// Serialised as <c>{"kind":"zero_tail_rope","theta":…,"rotary_factor":0.5}</c>.
+/// </summary>
+public sealed class PositionZeroTailRope : PositionPolicy
+{
+    public double Theta { get; init; } = 10_000.0;
+    public double RotaryFactor { get; init; } = 1.0;
+
+    /// <summary>Rotated frequency pairs per head (the rest are identity).</summary>
+    public int RotatedPairs(int headDim) => (int)(RotaryFactor * headDim) / 2;
+}
+
 /// <summary>A position policy this build has not judged. The payload is
 /// kept verbatim so the fact is never silently lost; planning refuses it.</summary>
 public sealed class PositionUnresolved : PositionPolicy
@@ -84,6 +101,14 @@ public sealed class PositionPolicyConverter : JsonConverter<PositionPolicy>
                     ? rf.GetDouble()
                     : throw new JsonException("partial_rope requires 'rotary_factor'");
                 return new PositionPartialRope { Theta = partialTheta, RotaryFactor = factor };
+            case "zero_tail_rope":
+                return new PositionZeroTailRope
+                {
+                    Theta = root.GetProperty("theta").GetDouble(),
+                    RotaryFactor = root.TryGetProperty("rotary_factor", out var zf)
+                        ? zf.GetDouble()
+                        : throw new JsonException("zero_tail_rope requires 'rotary_factor'"),
+                };
             default:
                 // Unknown/pending variant — carry verbatim, refuse at plan time.
                 return new PositionUnresolved { Kind = kind, Payload = root.Clone() };
@@ -110,6 +135,13 @@ public sealed class PositionPolicyConverter : JsonConverter<PositionPolicy>
                 writer.WriteString("kind", "partial_rope");
                 writer.WriteNumber("theta", partial.Theta);
                 writer.WriteNumber("rotary_factor", partial.RotaryFactor);
+                writer.WriteEndObject();
+                break;
+            case PositionZeroTailRope zeroTail:
+                writer.WriteStartObject();
+                writer.WriteString("kind", "zero_tail_rope");
+                writer.WriteNumber("theta", zeroTail.Theta);
+                writer.WriteNumber("rotary_factor", zeroTail.RotaryFactor);
                 writer.WriteEndObject();
                 break;
             case PositionUnresolved unresolved:
