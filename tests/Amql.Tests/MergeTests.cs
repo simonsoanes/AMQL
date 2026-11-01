@@ -671,4 +671,43 @@ public class MergeTests
         var component = container.Graph!.Components.First(c => c.Role == ComponentRole.PrimaryText);
         Assert.Equal(12, component.Execution!.Head!.VocabSize);
     }
+
+    [Fact]
+    public void LeastSquares_Fit_Recovers_A_NonSymmetric_Map()
+    {
+        // a_i = M·b_i exactly: the fit must return M itself (row-major), the
+        // orientation ApplyMap and ResidualL2 consume — not Mᵀ.
+        const int d = 6, n = 200;
+        var rng = new Random(3);
+        var m = new float[d * d];
+        for (int i = 0; i < m.Length; i++)
+        {
+            m[i] = (float)(rng.NextDouble() * 2 - 1);
+        }
+        var a = new float[n * d];
+        var b = new float[n * d];
+        for (int k = 0; k < n; k++)
+        {
+            for (int c = 0; c < d; c++)
+            {
+                b[k * d + c] = (float)(rng.NextDouble() * 2 - 1);
+            }
+            for (int r = 0; r < d; r++)
+            {
+                double sum = 0;
+                for (int c = 0; c < d; c++)
+                {
+                    sum += m[r * d + c] * b[k * d + c];
+                }
+                a[k * d + r] = (float)sum;
+            }
+        }
+        var fitted = LeastSquares.Fit(a, b, n, d, ridgeRel: 1e-9);
+        for (int i = 0; i < m.Length; i++)
+        {
+            Assert.Equal(m[i], fitted[i], 3);
+        }
+        Assert.True(LeastSquares.ResidualL2(a, b, n, d, fitted) < 1e-4);
+    }
+
 }

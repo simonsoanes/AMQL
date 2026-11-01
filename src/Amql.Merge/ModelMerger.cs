@@ -551,6 +551,7 @@ public static class ModelMerger
         var merged = new float[outputRows * width];
         var entries = mapping.Entries;
         var agreement = new double[mapping.Count]; // NaN where not a shared token
+        Array.Fill(agreement, double.NaN);
 
         // Rows the mapping does not cover are the scaffold's trailing
         // vocabulary padding: the embedding table is typically padded to a
@@ -792,7 +793,16 @@ public static class ModelMerger
             provenance[tensor.Name] = new TensorProvenance(scaffold.Model, "copied");
         }
 
-        var grown = otherTensors.Where(t => !provenance.ContainsKey(t.Name)).ToList();
+        // Grafting only makes sense within one architecture (a smaller sibling
+        // contributing a tensor kind the scaffold lacks). Across families the
+        // other stack's tensors belong to operators the scaffold does not run
+        // — Qwen3.5's GatedDeltaNet inside an LFM3 stack would be dead weight
+        // with names no exporter knows — so the scaffold's stack is copied as
+        // is and the other stack stays preserved under segments/source/.
+        bool sameFamily = string.Equals(scaffold.Index.Family, other.Index.Family, StringComparison.Ordinal);
+        var grown = sameFamily
+            ? otherTensors.Where(t => !provenance.ContainsKey(t.Name)).ToList()
+            : new List<SegmentTensor>();
         if (grown.Count == 0)
         {
             return new StackPlan(scaffold.Model, scaffold.Layers, scaffold.StackEncoding,
@@ -865,6 +875,11 @@ public static class ModelMerger
         if (from.Length != to.Length)
         {
             throw new MergeException("cannot grow a tensor across rank");
+        }
+        if (from.Zip(to).Any(p => p.First > p.Second))
+        {
+            throw new MergeException(
+                $"cannot grow [{string.Join("x", from)}] to [{string.Join("x", to)}] — a target dim is smaller");
         }
         int elemSize = dtype.ElementSize();
         long toElements = 1;

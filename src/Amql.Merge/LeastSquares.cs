@@ -97,10 +97,15 @@ public static class LeastSquares
             },
             local =>
             {
-                for (int k = 0; k < d * d; k++)
+                // localFinally runs concurrently on the workers that finish
+                // together; unlocked, their += race and lose partials.
+                lock (totalGram)
                 {
-                    totalGram[k] += local.Gram[k];
-                    totalCross[k] += local.Cross[k];
+                    for (int k = 0; k < d * d; k++)
+                    {
+                        totalGram[k] += local.Gram[k];
+                        totalCross[k] += local.Cross[k];
+                    }
                 }
             });
         var g = totalGram;
@@ -137,10 +142,15 @@ public static class LeastSquares
         SolveLower(chol, x, cross, d, d);
         SolveUpperTranspose(chol, x, d, d);
 
+        // X is Mᵀ; every consumer (ApplyMap, ResidualL2, the GPU map GEMM)
+        // computes M·b with M row-major, so transpose on the way out.
         var result = new float[d * d];
-        for (int i = 0; i < d * d; i++)
+        for (int r = 0; r < d; r++)
         {
-            result[i] = (float)x[i];
+            for (int c = 0; c < d; c++)
+            {
+                result[r * d + c] = (float)x[c * d + r];
+            }
         }
         return result;
     }
