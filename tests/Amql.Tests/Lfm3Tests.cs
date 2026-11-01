@@ -173,6 +173,27 @@ public class Lfm3Tests
     }
 
     [Fact]
+    public void MoeIfy_Reads_The_Lfm_Feed_Forward_Names()
+    {
+        // moe-ify used to hard-code Qwen's mlp.{gate,up,down}_proj; LFM names
+        // its FFN feed_forward.w1/w3/w2. The dense names now come from the plan.
+        using var dir = new TempDir();
+        var containerDir = EncodeSynthetic(dir);
+        var outDir = Path.Combine(dir.Path, "moe");
+        var report = Amql.Merge.MoeIfy.Transform(containerDir, outDir,
+            clusterTokens: new[] { 3, 17, 250, 4, 99, 128 }, evalTokens: new[] { 7, 7, 42, 200 },
+            experts: 2, topK: 1);
+        Assert.Equal(SyntheticLfm3Checkpoint.Intermediate / 2, report.ExpertIntermediateSize);
+
+        using var moe = Vindex3Container.Open(outDir);
+        using var store = moe.CreateOperandStore();
+        var plan = Planner.Plan(moe, "target", store);
+        Assert.All(plan.Layers, l => Assert.NotNull(l.Ffn!.Routed));
+        Assert.False(store.ContainsTensor("target.decoder_stack", "0.feed_forward.w1.weight"));
+        Assert.True(store.ContainsTensor("target.decoder_stack", "0.mlp.experts.1.down_proj.weight"));
+    }
+
+    [Fact]
     public void Gguf_Writes_The_Lfm3_Layer_Table_And_Rope_Mask()
     {
         using var dir = new TempDir();

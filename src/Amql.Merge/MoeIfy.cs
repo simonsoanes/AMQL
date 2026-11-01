@@ -121,6 +121,16 @@ public static class MoeIfy
             container.CanonicalRepresentationId(stackId)].Encoding;
         var stackSegmentPath = container.Index.Representations[
             container.CanonicalRepresentationId(stackId)].Segment;
+        // The dense projections' names come from the plan, so any family's
+        // spelling (Qwen's mlp.*_proj, LFM's feed_forward.w1/w3/w2) works.
+        var denseNames = new HashSet<string>(StringComparer.Ordinal);
+        for (int l = 0; l < layers; l++)
+        {
+            var dense = plan.Layers[l].Ffn!.Dense!;
+            denseNames.Add(dense.Gate!.TensorName);
+            denseNames.Add(dense.Up.TensorName);
+            denseNames.Add(dense.Down.TensorName);
+        }
         var rebuilt = new List<NamedTensorData>();
         using (var sourceSegment = SegmentFile.Open(Path.Combine(container.Root, stackSegmentPath)))
         {
@@ -128,9 +138,7 @@ public static class MoeIfy
             {
                 // The dense FFN projections leave the stack; everything
                 // else (attention, norms, linear-attention tensors) stays.
-                bool isDenseProjection = tensor.Name.EndsWith(".mlp.gate_proj.weight") ||
-                                         tensor.Name.EndsWith(".mlp.up_proj.weight") ||
-                                         tensor.Name.EndsWith(".mlp.down_proj.weight");
+                bool isDenseProjection = denseNames.Contains(tensor.Name);
                 if (!isDenseProjection)
                 {
                     rebuilt.Add(new NamedTensorData
@@ -147,9 +155,10 @@ public static class MoeIfy
         for (int l = 0; l < layers; l++)
         {
             string layerStem = $"{l}.mlp";
-            var gateInfo = Resolve(store, stackId, $"{layerStem}.gate_proj.weight");
-            var upInfo = Resolve(store, stackId, $"{layerStem}.up_proj.weight");
-            var downInfo = Resolve(store, stackId, $"{layerStem}.down_proj.weight");
+            var dense = plan.Layers[l].Ffn!.Dense!;
+            var gateInfo = Resolve(store, stackId, dense.Gate!.TensorName);
+            var upInfo = Resolve(store, stackId, dense.Up.TensorName);
+            var downInfo = Resolve(store, stackId, dense.Down.TensorName);
             int elem = gateInfo.Dtype.ElementSize();
 
             var partition = partitions[l];
