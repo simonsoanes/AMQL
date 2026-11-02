@@ -229,6 +229,59 @@ public class Lfm3Tests
     }
 
     [Fact]
+    public void Recipe_First_Match_Wins_And_Unknown_Types_Refuse()
+    {
+        var recipe = QuantRecipe.Parse("""
+            # comment
+            token_embd\.weight      q4_k
+            blk\.(0|1)\.ffn_.*      iq2_s   # early layers
+            blk\.\d+\.ffn_down\..* q5_k
+            *                       q6_k
+            """);
+        Assert.Equal(GgufType.Q4_K, recipe.TypeFor("token_embd.weight"));
+        Assert.Equal(GgufType.IQ2_S, recipe.TypeFor("blk.1.ffn_down.weight"));
+        Assert.Equal(GgufType.Q5_K, recipe.TypeFor("blk.7.ffn_down.weight"));
+        Assert.Equal(GgufType.Q6_K, recipe.TypeFor("blk.7.attn_q.weight"));
+        // Anchored: a pattern never matches a substring of a longer name.
+        Assert.Equal(GgufType.Q6_K, recipe.TypeFor("xtoken_embd.weight"));
+        Assert.Throws<GgufException>(() => QuantRecipe.Parse("blk.* q3_x"));
+        Assert.Throws<GgufException>(() => QuantRecipe.Parse("just-one-field"));
+    }
+
+    [Fact]
+    public void Recipe_Conversion_Uses_Ggml_Quantizers_When_Available()
+    {
+        // Needs a llama.cpp ggml-base library (AMQL_GGML); skipped without one.
+        if (Environment.GetEnvironmentVariable("AMQL_GGML") is not { Length: > 0 })
+        {
+            return;
+        }
+        using var dir = new TempDir();
+        var ckpt = Path.Combine(dir.Path, "ckpt");
+        SyntheticLfm3Checkpoint.Write(ckpt);
+        var vocab = Enumerable.Range(0, SyntheticLfm3Checkpoint.Vocab).ToDictionary(i => $"t{i}", i => i);
+        File.WriteAllText(Path.Combine(ckpt, "tokenizer.json"), JsonSerializer.Serialize(new
+        {
+            model = new { type = "BPE", vocab, merges = Array.Empty<string>() },
+            added_tokens = Array.Empty<object>(),
+        }));
+        // Rows of 64 and 96 cannot hold a 256-element K/IQ block — they fall back
+        // to BF16; Q8_0 / Q4_0 (32-element blocks) apply.
+        var recipe = QuantRecipe.Parse("""
+            blk\.\d+\.ffn_down\.weight q4_0
+            blk\.\d+\.ffn_.*           q4_k
+            *                          q8_0
+            """);
+        var outFile = Path.Combine(dir.Path, "mixed.gguf");
+        Lfm3Gguf.Convert(ckpt, outFile, recipe, importance: null);
+        using var gguf = GgufReader.Open(outFile);
+        Assert.Equal(GgufType.Q4_0, gguf.GetTensor("blk.0.ffn_down.weight").Type);
+        Assert.Equal(GgufType.BF16, gguf.GetTensor("blk.0.ffn_gate.weight").Type);
+        Assert.Equal(GgufType.Q8_0, gguf.GetTensor("blk.1.attn_q.weight").Type);
+        Assert.Equal(GgufType.F32, gguf.GetTensor("blk.0.attn_norm.weight").Type);
+    }
+
+    [Fact]
     public void ZeroTail_Rope_Rotates_Only_The_Leading_Pairs_With_Full_Dim_Frequencies()
     {
         const int headDim = 8;

@@ -101,6 +101,7 @@ internal static partial class Program
                 "fine-tune" => FineTune(args[1..]),
                 "bake-predicate" => BakePredicate(args[1..]),
                 "classify" => Classify(args[1..]),
+                "tool-eval" => ToolEval.Run(args[1..], OptionValue, HasOption),
                 "decide" or "decisions" => Decide(args[1..]),
                 "convert-to-classifier" => ConvertToClassifier(args[1..]),
                 "convert-to-embedding" => ConvertToEmbedding(args[1..]),
@@ -1459,7 +1460,7 @@ internal static partial class Program
     /// <summary>LFM3 has its own writer (llama.cpp's <c>lfm3</c> arch):
     /// conv/attention layer table, sliding-window pattern and zero-tail rope.
     /// The A2D-Qwen3 masked diffusion writer (<c>rnd1</c>) shares the CLI
-    /// surface and the same --quant modes.</summary>
+    /// surface: the same --quant modes and --recipe/--imatrix.</summary>
     private static int ToGgufLfm3(string[] args, string checkpointDir, string outFile, string quantization, bool masked = false)
     {
         if (File.Exists(outFile))
@@ -1470,9 +1471,27 @@ internal static partial class Program
             }
             File.Delete(outFile);
         }
-        var report = masked
-            ? A2dQwen3Gguf.Convert(checkpointDir, outFile, quantization)
-            : Lfm3Gguf.Convert(checkpointDir, outFile, quantization);
+        GgufConversion report;
+        if (OptionValue(args, "--recipe") is { } recipePath)
+        {
+            // Variable quantization: per-tensor types from the recipe, ggml's
+            // own quantizers for the K/IQ families, an optional imatrix.
+            if (OptionValue(args, "--ggml") is { } ggml)
+            {
+                GgmlNative.EnsureLoaded(ggml);
+            }
+            var recipe = QuantRecipe.Parse(File.ReadAllText(recipePath), Path.GetFileName(recipePath));
+            var importance = OptionValue(args, "--imatrix") is { } imatrixPath ? ImportanceMatrix.Load(imatrixPath) : null;
+            report = masked
+                ? A2dQwen3Gguf.Convert(checkpointDir, outFile, recipe, importance)
+                : Lfm3Gguf.Convert(checkpointDir, outFile, recipe, importance);
+        }
+        else
+        {
+            report = masked
+                ? A2dQwen3Gguf.Convert(checkpointDir, outFile, quantization)
+                : Lfm3Gguf.Convert(checkpointDir, outFile, quantization);
+        }
         Console.WriteLine($"converted: {report.OutputPath}");
         Console.WriteLine($"arch:       {report.Architecture}");
         Console.WriteLine($"tensors:    {report.TensorsWritten}  ({FormatBytes(report.OutputBytes)})");
@@ -1884,7 +1903,17 @@ internal static partial class Program
         string outDir = OptionValue(args, "--out") ?? throw new CliException("import requires '--out <merged-dir>'");
         bool importedIsContainer = HasOption(args, "--container");
 
-        var report = ModelMerger.Import(containerDir, imported, outDir, importedIsContainer);
+        var mergeOptions = new ModelMerger.MergeOptions(
+            Blend: OptionValue(args, "--blend") is { } blend
+                ? double.Parse(blend, System.Globalization.CultureInfo.InvariantCulture)
+                : 0.5,
+            BaseVocabOnly: (OptionValue(args, "--vocab") ?? "union") switch
+            {
+                "union" => false,
+                "base" => true,
+                var other => throw new CliException($"--vocab '{other}' — expected union or base"),
+            });
+        var report = ModelMerger.Import(containerDir, imported, outDir, importedIsContainer, mergeOptions);
 
         Console.WriteLine($"imported:   {report.ImportedModel} into {report.BaseModel}");
         Console.WriteLine($"result:     {report.ResultModel}");
@@ -2652,6 +2681,7 @@ internal static partial class Program
                               [--arch qwen4-next]
               amql-cli to-gguf <checkpoint-dir|container-dir> --out <file.gguf> [--force]
                     [--quant none|f16|q4_0|mxfp4|mxfp4_moe|ptq1|pq2]
+                    [--recipe <types.txt> [--imatrix <imatrix.gguf>] [--ggml <ggml-base dir>]]   lfm3, a2d-qwen3: per-tensor types
                     a2d-qwen3 (masked diffusion) writes llama.cpp's rnd1 arch — run with llama-diffusion-cli
               amql-cli from-gguf <file.gguf> --out <container-dir>   import GGUF into container
               amql-cli export-mtp <container-dir> --out <drafter-dir>

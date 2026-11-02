@@ -53,6 +53,28 @@ public static class Lfm3Gguf
         return Convert(checkpointDir, outFile, entry => DefaultType(entry, quantization), quantization);
     }
 
+    /// <summary>Variable quantization: each quantisable weight takes the type
+    /// of the first matching recipe rule (unmatched weights stay BF16);
+    /// norms, the conv kernel and the rope mask stay F32. Types AMQL does not
+    /// encode itself go through ggml's quantizer (<see cref="GgmlNative"/>),
+    /// weighted by <paramref name="importance"/> when given.</summary>
+    public static GgufConversion Convert(string checkpointDir, string outFile, QuantRecipe recipe, ImportanceMatrix? importance)
+    {
+        _importance = importance;
+        try
+        {
+            return Convert(checkpointDir, outFile, entry => recipe.TypeFor(entry.Name) ?? GgufType.BF16,
+                $"recipe {recipe.Source}" + (importance is null ? "" : $", imatrix of {importance.Count} tensors"));
+        }
+        finally
+        {
+            _importance = null;
+        }
+    }
+
+    [ThreadStatic]
+    private static ImportanceMatrix? _importance;
+
     /// <summary>The converter proper, with the per-tensor type decided by
     /// <paramref name="typeFor"/> (given the GGUF name and logical shape of
     /// every quantisable 2-D weight).</summary>
@@ -98,7 +120,13 @@ public static class Lfm3Gguf
         {
             var info = shards.Info(hf);
             var shape = info.Shape;
-            plan.Add(new Entry(gguf, shape, typeFor((gguf, shape)), hf, null));
+            var type = typeFor((gguf, shape));
+            // A row narrower than the type's block cannot be packed; keep it exact.
+            if (GgufTypeSizing.IsBlockQuantized(type) && shape[^1] % GgufTypeSizing.BlockElements(type) != 0)
+            {
+                type = GgufType.BF16;
+            }
+            plan.Add(new Entry(gguf, shape, type, hf, null));
         }
         void Norm(string hf, string gguf) =>
             plan.Add(new Entry(gguf, shards.Info(hf).Shape, GgufType.F32, hf, null));
@@ -192,7 +220,7 @@ public static class Lfm3Gguf
             var entry = plan[i];
             writer.SeekTensor(i);
             byte[] payload = entry.Values is { } values
-                ? Encode(entry.Type, values, (int)entry.Shape[^1])
+                ? Encode(entry.Type, values, (int)entry.Shape[^1], null)
                 : EncodeSource(shards, entry);
             writer.Data.Write(payload);
             writer.FinishTensor(i);
@@ -245,16 +273,28 @@ public static class Lfm3Gguf
             GgufType.Q8_0 => 7,
             GgufType.BF16 => 32,
             GgufType.Mxfp4 => 38,
+            GgufType.Q4_K => 15,
+            GgufType.Q6_K => 18,
+            GgufType.IQ2_XXS => 19,
+            GgufType.IQ2_XS => 20,
+            GgufType.IQ2_S => 28,
+            GgufType.IQ1_S => 24,
+            GgufType.IQ1_M => 31,
+            GgufType.Q2_K => 10,
+            GgufType.IQ3_XXS => 23,
+            GgufType.IQ4_XS => 30,
             _ => 0,
         };
     }
 
-    internal static byte[] Encode(GgufType type, float[] values, int cols) => type switch
+    internal static byte[] Encode(GgufType type, float[] values, int cols, float[]? importance) => type switch
     {
         GgufType.F32 => ToBytes(values),
         GgufType.F16 => ToF16(values),
         GgufType.BF16 => ToBf16(values),
-        _ => GgmlQuant.Encode(type, values, cols),
+        // AMQL's own encoders where it has them and no importance applies.
+        GgufType.Mxfp4 or GgufType.Q8_0 when importance is null => GgmlQuant.Encode(type, values, cols),
+        _ => GgmlNative.Quantize(type, values, cols, importance),
     };
 
     private static byte[] EncodeSource(ShardSet shards, Entry entry)
@@ -264,7 +304,8 @@ public static class Lfm3Gguf
         {
             return shards.ReadBytes(entry.Source!); // verbatim, no widening
         }
-        return Encode(entry.Type, shards.ReadFloats(entry.Source!), (int)entry.Shape[^1]);
+        var importance = entry.Shape.Length == 2 ? _importance?.For(entry.GgufName) : null;
+        return Encode(entry.Type, shards.ReadFloats(entry.Source!), (int)entry.Shape[^1], importance);
     }
 
     private static byte[] ToBytes(float[] values)

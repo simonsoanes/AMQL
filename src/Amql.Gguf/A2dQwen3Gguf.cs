@@ -49,8 +49,12 @@ public static class A2dQwen3Gguf
         }, quantization);
     }
 
+    public static GgufConversion Convert(string checkpointDir, string outFile, QuantRecipe recipe, ImportanceMatrix? importance) =>
+        Convert(checkpointDir, outFile, t => recipe.TypeFor(t.Name) ?? GgufType.BF16,
+            $"recipe {recipe.Source}" + (importance is null ? "" : $", imatrix of {importance.Count} tensors"), importance);
+
     private static GgufConversion Convert(string checkpointDir, string outFile,
-        Func<(string Name, long[] Shape), GgufType> typeFor, string label)
+        Func<(string Name, long[] Shape), GgufType> typeFor, string label, ImportanceMatrix? importance = null)
     {
         using var configDoc = JsonDocument.Parse(File.ReadAllText(Path.Combine(checkpointDir, "config.json")));
         var root = configDoc.RootElement;
@@ -155,7 +159,7 @@ public static class A2dQwen3Gguf
             byte[] payload;
             if (entry.Values is { } values)
             {
-                payload = Lfm3Gguf.Encode(entry.Type, values, (int)entry.Shape[^1]);
+                payload = Lfm3Gguf.Encode(entry.Type, values, (int)entry.Shape[^1], null);
             }
             else if (entry.Type == GgufType.BF16 && shards.Info(entry.Source!).Dtype == Amql.Safetensors.Dtype.BF16)
             {
@@ -163,7 +167,8 @@ public static class A2dQwen3Gguf
             }
             else
             {
-                payload = Lfm3Gguf.Encode(entry.Type, shards.ReadFloats(entry.Source!), (int)entry.Shape[^1]);
+                var imp = entry.Shape.Length >= 2 ? importance?.For(entry.GgufName) : null;
+                payload = Lfm3Gguf.Encode(entry.Type, shards.ReadFloats(entry.Source!), (int)entry.Shape[^1], imp);
             }
             writer.Data.Write(payload);
             writer.FinishTensor(i);

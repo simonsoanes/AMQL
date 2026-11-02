@@ -73,12 +73,26 @@ public static class ModelMerger
 
     private const string PreservedRoot = "segments/source";
 
+    /// <summary>How strongly the merge moves the scaffold: <c>Blend</c> is the
+    /// imported row's weight in an agreeing shared token (0.5 = the even
+    /// blend; small values nudge the scaffold rather than replace half of
+    /// it). <c>BaseVocabOnly</c> keeps the base model's vocabulary — no
+    /// imported-only rows are appended, so the token interface (and a tied
+    /// output head's softmax) keeps its size; valid when the base scaffolds.</summary>
+    public sealed record MergeOptions(double Blend = 0.5, bool BaseVocabOnly = false);
+
     public static MergeReport Import(
         string baseContainerDir,
         string importedPath,
         string outDir,
-        bool importedIsContainer)
+        bool importedIsContainer,
+        MergeOptions? options = null)
     {
+        options ??= new MergeOptions();
+        if (options.Blend is < 0 or > 1)
+        {
+            throw new MergeException($"--blend {options.Blend} is outside [0, 1]");
+        }
         if (Directory.Exists(outDir))
         {
             throw new MergeException($"merge output '{outDir}' already exists");
@@ -100,6 +114,19 @@ public static class ModelMerger
         // ── Tokenization mapping layer ────────────────────────────────────
         var mapping = TokenMapping.Build(
             baseView.Vocab, importedView.Vocab, baseView.Model, importedView.Model);
+        if (options.BaseVocabOnly)
+        {
+            // Base ids come first in the mapping; dropping the appended
+            // imported-only entries leaves exactly the base vocabulary.
+            mapping = new TokenMapping
+            {
+                BaseModel = mapping.BaseModel,
+                ImportedModel = mapping.ImportedModel,
+                BaseVocab = mapping.BaseVocab,
+                ImportedVocab = mapping.ImportedVocab,
+                Entries = mapping.Entries.Where(e => e.Kind != TokenMergeKind.AlignedNew).ToList(),
+            };
+        }
         if (mapping.BlendedCount == 0)
         {
             throw new MergeException(
@@ -115,6 +142,12 @@ public static class ModelMerger
             : baseView;
         var other = ReferenceEquals(scaffold, baseView) ? importedView : baseView;
         bool scaffoldIsImported = ReferenceEquals(scaffold, importedView);
+        if (options.BaseVocabOnly && scaffoldIsImported)
+        {
+            throw new MergeException(
+                $"--vocab base keeps the base vocabulary, but '{importedView.Model}' scaffolds the merge (it is larger) — " +
+                "swap the base and imported models");
+        }
         int width = Math.Max(baseView.Width, importedView.Width);
         int layers = Math.Max(baseView.Layers, importedView.Layers);
         var mergedDtype = scaffold.Embedding.DtypeEnum;
@@ -163,7 +196,7 @@ public static class ModelMerger
         }
         var embeddingMerge = MergeTable(
             scaffoldEmbedRows, otherEmbedRows, mapping, scaffoldIsImported, embeddingAlignment, width, mergedDtype,
-            mergedVocab);
+            mergedVocab, options.Blend);
         Phase($"merged embedding rows (mean agreement {embeddingMerge.MeanAgreement:0.000}, " +
               $"{embeddingMerge.ShareAboveThreshold * 100:0.0}% above threshold)");
         notes.Add(AgreementNote(embeddingMerge, scaffold.Model));
@@ -181,7 +214,7 @@ public static class ModelMerger
                 scaffoldHeadRows, otherHeadRows, mapping, scaffoldIsImported, width, AgreementThreshold);
             var headMerge = MergeTable(
                 scaffoldHeadRows, otherHeadRows, mapping, scaffoldIsImported, headAlignment, width, headDtype.Value,
-                mergedVocab);
+                mergedVocab, options.Blend);
             headChunks = headMerge.Chunks;
             notes.Add(AgreementNote(headMerge, scaffold.Model, "head"));
             Phase("merged output head rows");
@@ -545,8 +578,10 @@ public static class ModelMerger
         Alignment alignment,
         int width,
         Dtype mergedDtype,
-        int outputRows)
+        int outputRows,
+        double blend)
     {
+        float wOther = (float)blend, wScaffold = 1f - wOther;
         var m = alignment.Map;
         var merged = new float[outputRows * width];
         var entries = mapping.Entries;
@@ -609,7 +644,7 @@ public static class ModelMerger
                     {
                         for (int k = 0; k < width; k++)
                         {
-                            merged[dest + k] = 0.5f * (scaffoldRows[s * width + k] + merged[dest + k]);
+                            merged[dest + k] = wScaffold * scaffoldRows[s * width + k] + wOther * merged[dest + k];
                         }
                         RestoreEnergy(merged, dest, scaffoldRows, s * width, width);
                     }
