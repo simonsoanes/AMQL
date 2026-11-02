@@ -337,6 +337,23 @@ public static class CommandCatalog
             new ParamDef("lr", "--lr", ParamKind.Option, EditorKind.Float, Flag: "--lr", DefaultValue: "1e-4"),
             new ParamDef("epochs", "--epochs", ParamKind.Option, EditorKind.Int, Flag: "--epochs", DefaultValue: "1"),
         }),
+        new("bake-predicate", CatTraining, "Write a rule the model reads in context into its weights → weight patch.", new[]
+        {
+            ContainerParam,
+            new ParamDef("predicate", "--predicate", ParamKind.Option, EditorKind.MultiLineText, Flag: "--predicate",
+                Help: "The rule, as you would put it in a system prompt. The model interprets it itself."),
+            new ParamDef("out", "--out patch", ParamKind.Option, EditorKind.File, Flag: "--out"),
+            new ParamDef("prompts", "--prompts file", ParamKind.Option, EditorKind.File, Flag: "--prompts",
+                Help: "Probe user turns, one per line. Omit to let the model write its own."),
+            new ParamDef("selfProbes", "--self-probes", ParamKind.Option, EditorKind.Int, Flag: "--self-probes", DefaultValue: "8"),
+            new ParamDef("layers", "--layers", ParamKind.Option, EditorKind.Text, Flag: "--layers",
+                Help: "Comma-separated layers to edit. Omit for evenly spaced middle layers."),
+            new ParamDef("ridge", "--ridge", ParamKind.Option, EditorKind.Float, Flag: "--ridge", DefaultValue: "1e-2",
+                Help: "Larger keeps the change smaller; smaller follows the predicated model more tightly."),
+            new ParamDef("maxTokens", "--max-tokens", ParamKind.Option, EditorKind.Int, Flag: "--max-tokens", DefaultValue: "48"),
+            TokenizerParam,
+            ComponentParam,
+        }),
 
         // ── 5. Export & Conversion ──────────────────────────────────────────
         new("export", CatExport, "Materialise an HF checkpoint from the container.", new[]

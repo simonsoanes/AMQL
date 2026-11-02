@@ -99,6 +99,7 @@ internal static partial class Program
                 "moe-ify" => MoeIfy(args[1..]),
                 "prune" => Prune(args[1..]),
                 "fine-tune" => FineTune(args[1..]),
+                "bake-predicate" => BakePredicate(args[1..]),
                 "classify" => Classify(args[1..]),
                 "decide" or "decisions" => Decide(args[1..]),
                 "convert-to-classifier" => ConvertToClassifier(args[1..]),
@@ -2676,6 +2677,12 @@ internal static partial class Program
                               --out <patch.safetensors>
                               [--tokenizer <checkpoint-dir>] [--component target]
                               [--lr 1e-4] [--epochs 1]
+              amql-cli bake-predicate <container-dir> --predicate "<rule>"
+                              --out <patch.safetensors>
+                              [--prompts <file>] [--self-probes 8] [--layers 6,9,12]
+                              [--layer-count 4] [--ridge 1e-2] [--max-tokens 48]
+                              [--samples 3] [--raw] [--tokenizer <checkpoint-dir>]
+                              [--component target]
               amql-cli help
 
             Example:
@@ -2814,6 +2821,22 @@ internal static partial class Program
             also adjusted. The learning rate and epochs are optional;
             papers typically use lr ∈ [1e-5, 1e-4] for LoRA-style
             fine-tuning.
+            bake-predicate writes a rule into the weights. The model is
+            given --predicate as its system message (or as a preamble with
+            --raw / no chat template) and answers each probe prompt itself
+            — its own reading of the rule is the target. Then, layer by
+            layer (shallow to deep), the FFN down-projection update is
+            solved in closed form so the model WITHOUT the predicate
+            reproduces the hidden states it had WITH it, at every
+            position of those answers: the minimum-norm ridge solution
+            ΔWᵀ = Kᵀ(KKᵀ + λI)⁻¹T, keys K the FFN activations, targets T
+            each layer's share of the remaining residual gap. No
+            gradients. Probes come from --prompts (one user turn per
+            line) or, by default, the model writes --self-probes of its
+            own for the rule, mixed with a few generic turns. The report
+            gives KL(with-rule ‖ without) and top-1 agreement before and
+            after, plus sample answers. The output is a standard weight
+            patch (one tensor per layer) for --patch / export --patch.
             generate-mtp boots an MTP drafter for a dense model that has
             none: the trunk is a copy of the model's last full-attention
             layer, the drafter/final norms copy the final norm, the fc

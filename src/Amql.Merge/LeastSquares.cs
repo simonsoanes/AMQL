@@ -265,6 +265,121 @@ public static class LeastSquares
         return w;
     }
 
+    /// <summary>
+    /// Minimum-norm ridge update: the ΔW ∈ R^{dOut × dIn} minimising
+    /// Σ‖t_i − ΔW·k_i‖² + λ‖ΔW‖²_F, solved in the SAMPLE space —
+    /// ΔWᵀ = Kᵀ(KKᵀ + λI)⁻¹T — so the system is n×n rather than dIn×dIn.
+    /// That is the cheap side when the keys are FFN activations (dIn in the
+    /// thousands) and the samples a few hundred aligned positions, and the
+    /// solution is the smallest weight change that hits the targets: it
+    /// lies in the span of the keys, so inputs orthogonal to every key are
+    /// untouched. Returns the update and, per sample, how much of the
+    /// target it closes.
+    /// </summary>
+    /// <param name="t">Targets, row-major n×dOut.</param>
+    /// <param name="k">Keys, row-major n×dIn.</param>
+    /// <returns>ΔW row-major dOut×dIn, and the fraction of ‖T‖² the fit
+    /// removes (1 = exact, 0 = nothing).</returns>
+    public static (float[] Delta, double Explained) FitMinimumNormUpdate(
+        float[] t, float[] k, int n, int dOut, int dIn, double ridgeRel = 1e-2)
+    {
+        if (n <= 0)
+        {
+            throw new MergeException("no samples to fit the weight update");
+        }
+        if (t.Length != n * dOut || k.Length != n * dIn)
+        {
+            throw new MergeException($"update samples do not match (n={n}, in={dIn}, out={dOut})");
+        }
+
+        // G = KKᵀ (n×n), rows independent.
+        var gram = new double[n * n];
+        Parallel.For(0, n, new ParallelOptions { MaxDegreeOfParallelism = ComputeBudget.Cores }, i =>
+        {
+            var ki = k.AsSpan(i * dIn, dIn);
+            for (int j = 0; j <= i; j++)
+            {
+                double dot = TensorOps.Dot(ki, k.AsSpan(j * dIn, dIn));
+                gram[i * n + j] = dot;
+                gram[j * n + i] = dot;
+            }
+        });
+
+        double trace = 0;
+        for (int i = 0; i < n; i++)
+        {
+            trace += gram[i * n + i];
+        }
+        double ridge = ridgeRel * (trace / n) + 1e-8;
+        var system = (double[])gram.Clone();
+        for (int i = 0; i < n; i++)
+        {
+            system[i * n + i] += ridge;
+        }
+
+        // X = (G + λI)⁻¹ T  (n×dOut)
+        var rhs = new double[n * dOut];
+        for (int i = 0; i < rhs.Length; i++)
+        {
+            rhs[i] = t[i];
+        }
+        var chol = Cholesky(system, n);
+        var x = new double[n * dOut];
+        SolveLower(chol, x, rhs, n, dOut);
+        SolveUpperTranspose(chol, x, n, dOut);
+
+        // ΔW[o, j] = Σ_i X[i, o] · K[i, j]
+        var delta = new float[dOut * dIn];
+        Parallel.For(0, dOut, new ParallelOptions { MaxDegreeOfParallelism = ComputeBudget.Cores }, o =>
+        {
+            var acc = new double[dIn];
+            for (int i = 0; i < n; i++)
+            {
+                double xo = x[i * dOut + o];
+                if (xo == 0)
+                {
+                    continue;
+                }
+                int kRow = i * dIn;
+                for (int j = 0; j < dIn; j++)
+                {
+                    acc[j] += xo * k[kRow + j];
+                }
+            }
+            for (int j = 0; j < dIn; j++)
+            {
+                delta[o * dIn + j] = (float)acc[j];
+            }
+        });
+
+        // The fitted targets are K·ΔWᵀ = G·X; report how much of ‖T‖² they
+        // remove.
+        var totals = new double[n];
+        var lefts = new double[n];
+        Parallel.For(0, n, new ParallelOptions { MaxDegreeOfParallelism = ComputeBudget.Cores }, i =>
+        {
+            var fitted = new double[dOut];
+            for (int j = 0; j < n; j++)
+            {
+                double g = gram[i * n + j];
+                int xRow = j * dOut;
+                for (int o = 0; o < dOut; o++)
+                {
+                    fitted[o] += g * x[xRow + o];
+                }
+            }
+            for (int o = 0; o < dOut; o++)
+            {
+                double target = t[i * dOut + o];
+                double diff = target - fitted[o];
+                totals[i] += target * target;
+                lefts[i] += diff * diff;
+            }
+        });
+        double total = totals.Sum(), left = lefts.Sum();
+        return (delta, total > 0 ? 1.0 - left / total : 1.0);
+    }
+
     private static double[] Cholesky(double[] a, int d)
     {
         var l = new double[d * d];

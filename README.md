@@ -91,6 +91,7 @@ amql-cli moe-ify <container> --out <dir> --text <corpus> [--experts 8] [--top-k 
 amql-cli prune <container> --out <dir> --target-bytes <size> [--approach provenance|corpus|random|star-elastic] [--text <corpus.txt>]
 amql-cli strip <container> --keep Q4_0|BF16|FP4|Q8_0|FP32 [--out <slim-dir>]
 amql-cli fine-tune <container> --data <pairs.tsv> --out <patch> [--lr 1e-4]
+amql-cli bake-predicate <container> --predicate "<rule>" --out <patch> [--prompts <file>] [--layers 6,9,12]
 amql-cli create-model --hidden 768 --layers 12 --vocab 32000 --out <dir>
 amql-cli convert-to-classifier <container> --num-labels N --out <dir>
 amql-cli convert-to-embedding <container> --out <dir>
@@ -165,6 +166,14 @@ apply deltas at load time. `save-lora` factors a patch's 2-D deltas into a LoRA 
 pair, the model forward-passes the prompt, teacher-forces each completion token, and
 accumulates per-token head deltas — no autograd, no gradient infrastructure, fully
 deterministic.
+
+`bake-predicate` writes a rule into the weights — "always reply in French", "you are
+a pirate", a fact the model should take as given. The model reads the predicate in
+context (as its system message) and answers a set of probe prompts, which it can write
+for itself; then the FFN down-projections of a few middle layers are solved in closed
+form (minimum-norm ridge, layer by layer) so the model *without* the predicate
+reproduces its hidden states *with* it. The output is an ordinary weight patch, and the
+run reports KL and top-1 agreement against the predicated model before and after.
 
 ### Model Merging & Transformation
 
