@@ -48,4 +48,12 @@
     <None Update="fixtures\qwen35_chat_template.jinja" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
+  <!-- The locally built CUDA backend (native/amql_cuda, gitignored), so the
+       "gpu" collection runs on the device where one is present instead of
+       skipping. Absent on CPU-only machines; those tests then fall back. -->
+  <ItemGroup Condition="Exists('..\..\native\amql_cuda\bin\amql_cuda.dll')">
+    <None Include="..\..\native\amql_cuda\bin\amql_cuda.dll" Link="amql_cuda.dll"
+          CopyToOutputDirectory="PreserveNewest" Visible="false" />
+  </ItemGroup>
+
 </Project>

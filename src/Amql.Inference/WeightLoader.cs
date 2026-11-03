@@ -188,7 +188,11 @@ public sealed class WeightLoader
         if (CudaShim.Enabled)
         {
             string deviceKey = $"{operand.ObjectId}/{operand.TensorName}";
-            if (!CudaShim.TryGetDeviceWeight(operand.ObjectId, operand.TensorName, out _, out _))
+            if (PatchedDeviceKey(operand) is { } patchedKey)
+            {
+                matrix.DeviceWeightF16 = CudaShim.UploadRawF16(patchedKey, BitPattern.F32ToFp16Bytes(widened), rows, cols);
+            }
+            else if (!CudaShim.TryGetDeviceWeight(operand.ObjectId, operand.TensorName, out _, out _))
             {
                 var fp16 = BitPattern.F32ToFp16Bytes(widened);
                 matrix.DeviceWeightF16 = CudaShim.UploadRawF16(deviceKey, fp16, rows, cols);
@@ -223,16 +227,21 @@ public sealed class WeightLoader
                     $"operand '{operand.ObjectId}/{operand.TensorName}' resolves to shape " +
                     $"[{string.Join(",", resolution.Shape)}] — expected [{rows} x {cols}]");
             }
-            var values = resolution.Values;
-            ApplyPatch(operand, values);
-            _packs[key] = Mxfp4.Quantize(values, rows, cols);
+            // The pack holds the base weight only: a patch delta is usually
+            // far below FP4 resolution and would be lost in the codec, so it
+            // is added at full precision to each dequantised view instead.
+            _packs[key] = Mxfp4.Quantize(resolution.Values, rows, cols);
         }
 
         var dequant = Mxfp4.Dequant(_packs[key].Packed, _packs[key].BlockScales, rows, cols);
-        ApplyPatch(operand, dequant); // re-apply deltas on the dequantised view
+        ApplyPatch(operand, dequant);
         var matrix = new Tensor2D(dequant, rows, cols);
-        matrix.DeviceWeightF16 = CudaShim.UploadWeightF16(
-            operand.ObjectId, operand.TensorName, _packs[key].Packed, _packs[key].BlockScales, rows, cols);
+        // The device dequantises the shared base pack, which carries no
+        // patch; a patched tensor uploads its patched view under its own key.
+        matrix.DeviceWeightF16 = PatchedDeviceKey(operand) is { } patchedKey
+            ? CudaShim.UploadRawF16(patchedKey, BitPattern.F32ToFp16Bytes(dequant), rows, cols)
+            : CudaShim.UploadWeightF16(
+                operand.ObjectId, operand.TensorName, _packs[key].Packed, _packs[key].BlockScales, rows, cols);
         AnyDeviceWeight = matrix.DeviceWeightF16 != IntPtr.Zero;
         return matrix;
     }
@@ -347,6 +356,15 @@ public sealed class WeightLoader
             }
         }
     }
+
+    /// <summary>The process-wide device cache is keyed by tensor name, so a
+    /// tensor this loader's patch changes gets a key of its own — otherwise
+    /// it would reuse (or leave behind) another runtime's device copy.
+    /// Null when the patch does not touch the tensor.</summary>
+    private string? PatchedDeviceKey(OperandRef operand) =>
+        _patch is not null && _patch.TryGet(operand.ObjectId, operand.TensorName, out _)
+            ? $"{operand.ObjectId}/{operand.TensorName}#patch{_patch.Id}"
+            : null;
 
     /// <summary>Merges the patch delta for this operand into the widened
     /// weight, in place. A delta whose element count differs from the

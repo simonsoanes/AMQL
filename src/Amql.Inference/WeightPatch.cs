@@ -40,6 +40,12 @@ public sealed class WeightPatch
     private const string MetadataModel = "model";
 
     private readonly Dictionary<string, WeightPatchEntry> _byKey = new(StringComparer.Ordinal);
+    private static long s_nextId;
+
+    /// <summary>Process-unique id for this patch instance — tags the device
+    /// copies of patched tensors, which must never be shared with runtimes
+    /// that load the same tensor unpatched (or under another patch).</summary>
+    public long Id { get; } = Interlocked.Increment(ref s_nextId);
 
     private WeightPatch(IEnumerable<WeightPatchEntry> entries, string? model)
     {
