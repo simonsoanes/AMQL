@@ -300,12 +300,68 @@ public sealed class WeightLoader
     public int LoadedMatrixCount => _matrices.Count;
     public int LoadedVectorCount => _vectors.Count;
 
+    /// <summary>Deltas added in memory this session (<see cref="AddDelta"/>),
+    /// on top of the construction-time patch.</summary>
+    private readonly Dictionary<(string ObjectId, string Tensor), float[]> _added = new();
+
+    /// <summary>
+    /// Adds <paramref name="delta"/> to a matrix in memory — the live
+    /// session's weight changes at once, without rebuilding the runtime or
+    /// widening the tensor again. The resident f32 view is updated in place
+    /// and, when the tensor has a device FP16 copy, that copy is rewritten
+    /// from the updated values, so GPU GEMMs see the change too. The delta
+    /// is also remembered, so a compact working set that evicts and
+    /// re-widens the tensor still includes it. Adding the negated delta
+    /// undoes it.
+    /// </summary>
+    public void AddDelta(OperandRef operand, int rows, int cols, float[] delta)
+    {
+        if (delta.Length != (long)rows * cols)
+        {
+            throw new ArgumentException(
+                $"delta for '{operand.ObjectId}/{operand.TensorName}' holds {delta.Length} values — expected {rows}x{cols}");
+        }
+        // Load first, so the cached view does not already carry the delta
+        // when it is added below.
+        var matrix = Matrix(operand, rows, cols);
+        var key = (operand.ObjectId, operand.TensorName);
+        if (!_added.TryGetValue(key, out var total))
+        {
+            total = new float[delta.Length];
+            _added[key] = total;
+        }
+        var data = matrix.Data;
+        for (int i = 0; i < delta.Length; i++)
+        {
+            data[i] += delta[i];
+            total[i] += delta[i];
+        }
+        if (matrix.DeviceWeightF16 != IntPtr.Zero)
+        {
+            var fp16 = BitPattern.F32ToFp16Bytes(data);
+            if (CudaShim.CopyHostToDevice(matrix.DeviceWeightF16, fp16, fp16.Length) != 0)
+            {
+                // A device copy that no longer matches the host weight would
+                // silently compute with the old values; drop to managed GEMMs.
+                matrix.DeviceWeightF16 = IntPtr.Zero;
+            }
+        }
+    }
+
     /// <summary>Merges the patch delta for this operand into the widened
     /// weight, in place. A delta whose element count differs from the
     /// widened tensor cannot be the same weight — the patch was made for a
     /// different container or tensor.</summary>
     private void ApplyPatch(OperandRef operand, float[] widened)
     {
+        if (_added.TryGetValue((operand.ObjectId, operand.TensorName), out var added) &&
+            added.Length == widened.Length)
+        {
+            for (int i = 0; i < widened.Length; i++)
+            {
+                widened[i] += added[i];
+            }
+        }
         if (_patch is null || !_patch.TryGet(operand.ObjectId, operand.TensorName, out var entry))
         {
             return;

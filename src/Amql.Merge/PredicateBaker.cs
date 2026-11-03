@@ -34,6 +34,11 @@ public sealed record PredicateBakeOptions
     /// <summary>How many probes to re-generate with and without the patch
     /// for the report.</summary>
     public int Samples { get; init; } = 3;
+
+    /// <summary>The weight working set. Null follows <c>AMQL_WEIGHTS</c>,
+    /// except that with CUDA available and no choice made the on-demand
+    /// set is used, so the forward GEMMs run on the GPU.</summary>
+    public WeightWorkingSet? WorkingSet { get; init; }
 }
 
 /// <summary>Per edited layer: the tensor and how much of the
@@ -53,7 +58,17 @@ public sealed record PredicateBakeReport(
     double Top1Before,
     double Top1After,
     IReadOnlyList<PredicateSample> Samples,
-    IReadOnlyList<string> Notes);
+    IReadOnlyList<string> Notes)
+{
+    public WeightWorkingSet WorkingSet { get; init; }
+
+    /// <summary>Whether the forward passes ran their GEMMs on the GPU
+    /// (stack weights resident on the device).</summary>
+    public bool ForwardOnGpu { get; init; }
+
+    /// <summary>Whether the closed-form solve used CUDA.</summary>
+    public bool SolverOnGpu { get; init; }
+}
 
 /// <summary>
 /// Bakes a predicate into the weights: the model is shown the predicate
@@ -103,80 +118,109 @@ public static class PredicateBaker
         var layers = ResolveLayers(plan, options);
         int hidden = plan.HiddenSize;
         var notes = new List<string>();
-
-        // ── teacher: the model reads the predicate and answers ──────────
-        var teacher = new DecodeSession(plan, store);
-        var completions = new List<int[]>(probes.Count);
-        var teacherResiduals = new List<Dictionary<int, float[]>>(probes.Count);
-        var teacherLogProbs = new List<float[][]>(probes.Count);
-        foreach (var probe in probes)
-        {
-            var y = Greedy(teacher, probe.TeacherPrompt, options.MaxNewTokens, options.StopTokens);
-            completions.Add(y);
-            var pass = Forward(teacher.Runtime, probe.TeacherPrompt, y, layers, ffnLayer: -1);
-            teacherResiduals.Add(pass.Residuals);
-            teacherLogProbs.Add(pass.LogProbs);
-        }
-        int alignedRows = completions.Sum(y => y.Length);
-
-        // ── before: how far the bare model is from the teacher ───────────
-        var (klBefore, top1Before) = Divergence(teacher.Runtime, probes, completions, teacherLogProbs);
-
-        // ── fit, shallow to deep ────────────────────────────────────────
-        var entries = new List<WeightPatchEntry>();
         var fits = new List<PredicateLayerFit>();
-        for (int li = 0; li < layers.Count; li++)
-        {
-            int layer = layers[li];
-            var dense = plan.Layers[layer].Ffn!.Dense!;
-            int inter = dense.IntermediateSize;
-            var rt = new GenericRuntime(plan, store, entries.Count == 0 ? null : WeightPatch.FromEntries(entries));
+        var samples = new List<PredicateSample>();
+        int alignedRows;
+        bool solverGpu = false, forwardGpu;
+        double klBefore, top1Before, klAfter, top1After;
 
-            var keys = new float[alignedRows * inter];
-            var targets = new float[alignedRows * hidden];
-            float share = 1f / (layers.Count - li);
-            double gap = 0;
-            int row = 0;
-            for (int p = 0; p < probes.Count; p++)
+        // One session for the whole bake: the weights are loaded (and, on
+        // CUDA, uploaded) once, and each fitted layer's update is added to
+        // them in memory, so the next layer is fitted against the model as
+        // it now stands. With a GPU and no AMQL_WEIGHTS choice the stack runs
+        // from the on-demand working set, whose device FP16 copies put the
+        // forward GEMMs on the GPU.
+        var workingSet = options.WorkingSet ??
+            (Environment.GetEnvironmentVariable("AMQL_WEIGHTS") is null && CudaShim.Enabled
+                ? WeightWorkingSet.OnDemandBf16
+                : WeightWorkingSetExtensions.FromEnv());
+        var session = new DecodeSession(plan, store, workingSet: workingSet);
+        var rt = session.Runtime;
+        var entries = new List<WeightPatchEntry>();
+        try
+        {
+            // ── teacher: the model reads the predicate and answers ──────
+            var completions = new List<int[]>(probes.Count);
+            var teacherResiduals = new List<Dictionary<int, float[]>>(probes.Count);
+            var teacherLogProbs = new List<float[][]>(probes.Count);
+            foreach (var probe in probes)
             {
-                var pass = Forward(rt, probes[p].StudentPrompt, completions[p], new[] { layer }, ffnLayer: layer);
-                var act = Intermediate(rt, dense, pass.FfnInput!, hidden);
-                Array.Copy(act.Data, 0, keys, row * inter, act.Data.Length);
-                var student = pass.Residuals[layer];
-                var target = teacherResiduals[p][layer];
-                for (int i = 0; i < student.Length; i++)
+                var y = Greedy(session, probe.TeacherPrompt, options.MaxNewTokens, options.StopTokens);
+                completions.Add(y);
+                var pass = Forward(rt, probe.TeacherPrompt, y, layers, ffnLayer: -1);
+                teacherResiduals.Add(pass.Residuals);
+                teacherLogProbs.Add(pass.LogProbs);
+            }
+            alignedRows = completions.Sum(y => y.Length);
+
+            // ── before: how far the bare model is from the teacher ───────
+            (klBefore, top1Before) = Divergence(rt, probes, completions, teacherLogProbs);
+            int sampleCount = Math.Min(options.Samples, probes.Count);
+            var bareBefore = Enumerable.Range(0, sampleCount)
+                .Select(p => Greedy(session, probes[p].StudentPrompt, options.MaxNewTokens, options.StopTokens))
+                .ToList();
+
+            // ── fit, shallow to deep, updating the live weights ──────────
+            for (int li = 0; li < layers.Count; li++)
+            {
+                int layer = layers[li];
+                var dense = plan.Layers[layer].Ffn!.Dense!;
+                int inter = dense.IntermediateSize;
+
+                var keys = new float[alignedRows * inter];
+                var targets = new float[alignedRows * hidden];
+                float share = 1f / (layers.Count - li);
+                double gap = 0;
+                int row = 0;
+                for (int p = 0; p < probes.Count; p++)
                 {
-                    float d = target[i] - student[i];
-                    gap += (double)d * d;
-                    targets[row * hidden + i] = share * d;
+                    var pass = Forward(rt, probes[p].StudentPrompt, completions[p], new[] { layer }, ffnLayer: layer);
+                    var act = Intermediate(rt, dense, pass.FfnInput!, hidden);
+                    Array.Copy(act.Data, 0, keys, row * inter, act.Data.Length);
+                    var student = pass.Residuals[layer];
+                    var target = teacherResiduals[p][layer];
+                    for (int i = 0; i < student.Length; i++)
+                    {
+                        float d = target[i] - student[i];
+                        gap += (double)d * d;
+                        targets[row * hidden + i] = share * d;
+                    }
+                    row += act.Rows;
                 }
-                row += act.Rows;
+
+                var (delta, explained, solvedOnGpu) = LeastSquares.FitMinimumNormUpdate(
+                    targets, keys, alignedRows, hidden, inter, options.Ridge);
+                solverGpu |= solvedOnGpu;
+                var shape = store.Resolve(dense.Down).Shape;
+                if (WeightPatch.ElementCount(shape) != delta.Length)
+                    throw new MergeException(
+                        $"layer {layer} down-projection is [{string.Join("x", shape)}], expected {hidden}x{inter}");
+                rt.Weights.AddDelta(dense.Down, hidden, inter, delta);
+                entries.Add(new WeightPatchEntry(dense.Down.ObjectId, dense.Down.TensorName, shape, delta));
+                fits.Add(new PredicateLayerFit(layer, dense.Down.ObjectId, dense.Down.TensorName, explained,
+                    Math.Sqrt(gap / alignedRows)));
             }
 
-            var (delta, explained) = LeastSquares.FitMinimumNormUpdate(
-                targets, keys, alignedRows, hidden, inter, options.Ridge);
-            var shape = store.Resolve(dense.Down).Shape;
-            if (WeightPatch.ElementCount(shape) != delta.Length)
-                throw new MergeException(
-                    $"layer {layer} down-projection is [{string.Join("x", shape)}], expected {hidden}x{inter}");
-            entries.Add(new WeightPatchEntry(dense.Down.ObjectId, dense.Down.TensorName, shape, delta));
-            fits.Add(new PredicateLayerFit(layer, dense.Down.ObjectId, dense.Down.TensorName, explained,
-                Math.Sqrt(gap / alignedRows)));
+            // ── after: the same session now carries every update ─────────
+            (klAfter, top1After) = Divergence(rt, probes, completions, teacherLogProbs);
+            for (int p = 0; p < sampleCount; p++)
+            {
+                samples.Add(new PredicateSample(p, completions[p], bareBefore[p],
+                    Greedy(session, probes[p].StudentPrompt, options.MaxNewTokens, options.StopTokens)));
+            }
+            WeightPatch.Save(outPatchPath, entries, container.Index.Model);
+            forwardGpu = rt.Weights.AnyDeviceWeight;
         }
-
-        var patch = WeightPatch.FromEntries(entries, container.Index.Model);
-        var (klAfter, top1After) = Divergence(new GenericRuntime(plan, store, patch), probes, completions, teacherLogProbs);
-        WeightPatch.Save(outPatchPath, entries, container.Index.Model);
-
-        // ── samples: the bare prompt, before and after the patch ────────
-        var samples = new List<PredicateSample>();
-        var before = new DecodeSession(plan, store);
-        var after = new DecodeSession(plan, store, patch);
-        for (int p = 0; p < Math.Min(options.Samples, probes.Count); p++)
+        finally
         {
-            samples.Add(new PredicateSample(p, completions[p],
-                Greedy(before, probes[p].StudentPrompt, options.MaxNewTokens, options.StopTokens),
-                Greedy(after, probes[p].StudentPrompt, options.MaxNewTokens, options.StopTokens)));
+            // Device weight copies are cached process-wide by tensor name, so
+            // a later runtime would otherwise inherit the baked weights.
+            foreach (var entry in entries)
+            {
+                var negated = entry.Delta.Select(v => -v).ToArray();
+                int rows = (int)entry.Shape[0];
+                rt.Weights.AddDelta(new OperandRef(entry.ObjectId, entry.TensorName), rows, negated.Length / rows, negated);
+            }
         }
 
         if (klAfter >= klBefore)
@@ -185,7 +229,12 @@ public static class PredicateBaker
             notes.Add($"only {alignedRows} aligned positions — the update is fitted to very little evidence");
 
         return new PredicateBakeReport(outPatchPath, componentId, probes.Count, alignedRows, fits,
-            klBefore, klAfter, top1Before, top1After, samples, notes);
+            klBefore, klAfter, top1Before, top1After, samples, notes)
+        {
+            WorkingSet = workingSet,
+            ForwardOnGpu = forwardGpu,
+            SolverOnGpu = solverGpu,
+        };
     }
 
     /// <summary>The layers whose FFN can carry a linear residual update: a

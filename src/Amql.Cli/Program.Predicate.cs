@@ -106,6 +106,8 @@ internal static partial class Program
         Console.WriteLine();
         Console.WriteLine($"component: {report.ComponentId}");
         Console.WriteLine($"aligned:   {report.Probes} probes → {report.AlignedRows} teacher-generated positions");
+        Console.WriteLine($"compute:   forward {(report.ForwardOnGpu ? "CUDA" : "CPU")} ({report.WorkingSet} weights), " +
+                          $"solve {(report.SolverOnGpu ? "CUDA" : "CPU")}; updates applied in memory");
         foreach (var fit in report.Layers)
         {
             Console.WriteLine($"layer {fit.Layer,3}: {fit.ObjectId}/{fit.TensorName}  gap rms {fit.GapNorm:F3}  " +
@@ -160,9 +162,15 @@ internal static partial class Program
         if (template is not null && template.Contains("<think>"))
             rendered += "<think>\n\n</think>\n\n";
         var tokens = tokenizer.EncodeToIds(rendered).ToArray();
+        // Same weights choice as the bake itself: device-resident on a GPU.
+        var workingSet = Environment.GetEnvironmentVariable("AMQL_WEIGHTS") is null && CudaShim.Enabled
+            ? WeightWorkingSet.OnDemandBf16
+            : WeightWorkingSetExtensions.FromEnv();
         var (_, steps) = InferenceRunner.Generate(
             container, component, tokens, steps: 40 * count,
-            new SamplingConfig(Temperature: 0f), stopTokens: stop);
+            new SamplingConfig(Temperature: 0f),
+            options: new InferenceRunner.GenerateOptions(Trace: false, TraceTensors: false, WeightWorkingSet: workingSet),
+            stopTokens: stop);
         string text = tokenizer.DecodeText(steps.Select(s => s.Token).ToList());
         int thinkEnd = text.LastIndexOf("</think>", StringComparison.Ordinal);
         if (thinkEnd >= 0)

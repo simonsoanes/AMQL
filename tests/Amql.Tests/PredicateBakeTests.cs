@@ -8,8 +8,11 @@ namespace Amql.Tests;
 
 /// <summary>
 /// Tests for <c>amql-cli bake-predicate</c>: the closed-form context
-/// distillation that writes an in-context predicate into FFN weights.
+/// distillation that writes an in-context predicate into FFN weights. The
+/// bake can reach the GPU (solver, device weights), so it shares the
+/// collection whose tests reset the process-wide CUDA state.
 /// </summary>
+[Collection("gpu")]
 public class PredicateBakeTests
 {
     [Fact]
@@ -24,7 +27,7 @@ public class PredicateBakeTests
         keys[2 * dIn + 2] = 1f;
         var targets = new float[] { 1f, 0f, 0f, 1f, -1f, 2f };
 
-        var (delta, explained) = LeastSquares.FitMinimumNormUpdate(targets, keys, n, dOut, dIn, ridgeRel: 1e-9);
+        var (delta, explained, _) = LeastSquares.FitMinimumNormUpdate(targets, keys, n, dOut, dIn, ridgeRel: 1e-9);
 
         Assert.True(explained > 0.999, $"explained {explained}");
         for (int i = 0; i < n; i++)
@@ -115,5 +118,86 @@ public class PredicateBakeTests
             new PredicateBakeOptions { Layers = new[] { 7 } }));
         Assert.Throws<MergeException>(() => PredicateBaker.Bake(container, "target",
             Array.Empty<PredicateProbe>(), patch));
+    }
+
+    [Fact]
+    public void MinimumNormUpdate_Gpu_Matches_Cpu()
+    {
+        int n = 200, dIn = 512, dOut = 64;
+        var rng = new Random(7);
+        var keys = Enumerable.Range(0, n * dIn).Select(_ => (float)(rng.NextDouble() - 0.5)).ToArray();
+        var targets = Enumerable.Range(0, n * dOut).Select(_ => (float)(rng.NextDouble() - 0.5)).ToArray();
+        try
+        {
+            CudaShim.Reset();
+            CudaShim.ForceDisable();
+            var cpu = LeastSquares.FitMinimumNormUpdate(targets, keys, n, dOut, dIn);
+            Assert.False(cpu.Gpu);
+
+            CudaShim.Reset();
+            if (!CudaShim.Enabled)
+            {
+                return; // no device here — the CPU path above is the whole test
+            }
+            var gpu = LeastSquares.FitMinimumNormUpdate(targets, keys, n, dOut, dIn);
+            Assert.True(gpu.Gpu);
+
+            double diff = 0, norm = 0;
+            for (int i = 0; i < cpu.Delta.Length; i++)
+            {
+                diff += Math.Pow(cpu.Delta[i] - gpu.Delta[i], 2);
+                norm += Math.Pow(cpu.Delta[i], 2);
+            }
+            Assert.True(Math.Sqrt(diff / norm) < 1e-4, $"relative difference {Math.Sqrt(diff / norm):g3}");
+            Assert.Equal(cpu.Explained, gpu.Explained, 4);
+        }
+        finally
+        {
+            CudaShim.Reset();
+        }
+    }
+
+    [Fact]
+    public void AddDelta_Matches_A_Loaded_Patch_And_Undoes_Exactly()
+    {
+        using var dir = new TempDir();
+        var containerPath = WriteContainer(dir);
+        using var container = Vindex3Container.Open(containerPath);
+        using var store = container.CreateOperandStore();
+        var plan = Planner.Plan(container, "target", store);
+        var down = plan.Layers[1].Ffn!.Dense!.Down;
+        var rng = new Random(3);
+        var delta = Enumerable.Range(0, 16 * 64).Select(_ => (float)(rng.NextDouble() - 0.5) * 0.2f).ToArray();
+        int[] tokens = { 1, 2, 3, 4 };
+
+        float[] Logits(GenericRuntime rt)
+        {
+            rt.ResetKvCache();
+            var hidden = rt.Embed(tokens);
+            var positions = Enumerable.Range(0, tokens.Length).ToArray();
+            for (int l = 0; l < plan.Layers.Count; l++)
+                hidden = rt.RunLayerInternal(hidden, l, positions, positions, appendKv: true);
+            return rt.FinalNormAndHead(hidden).Data;
+        }
+
+        var live = new GenericRuntime(plan, store);
+        var baseLogits = Logits(live);
+        live.Weights.AddDelta(down, 16, 64, delta);
+        var liveLogits = Logits(live);
+
+        var patched = new GenericRuntime(plan, store, WeightPatch.FromEntries(new[]
+        {
+            new WeightPatchEntry(down.ObjectId, down.TensorName, new long[] { 16, 64 }, delta),
+        }));
+        Assert.Equal(Logits(patched), liveLogits);
+        Assert.NotEqual(baseLogits, liveLogits);
+
+        live.Weights.AddDelta(down, 16, 64, delta.Select(v => -v).ToArray());
+        // w + d − d is not bit-exact in f32; within rounding of the logit scale.
+        var undone = Logits(live);
+        float scale = baseLogits.Max(MathF.Abs);
+        for (int i = 0; i < undone.Length; i++)
+            Assert.True(MathF.Abs(baseLogits[i] - undone[i]) <= 1e-5f * scale,
+                $"logit {i}: {baseLogits[i]} vs {undone[i]} after undo");
     }
 }

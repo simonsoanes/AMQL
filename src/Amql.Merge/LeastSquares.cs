@@ -280,7 +280,7 @@ public static class LeastSquares
     /// <param name="k">Keys, row-major n×dIn.</param>
     /// <returns>ΔW row-major dOut×dIn, and the fraction of ‖T‖² the fit
     /// removes (1 = exact, 0 = nothing).</returns>
-    public static (float[] Delta, double Explained) FitMinimumNormUpdate(
+    public static (float[] Delta, double Explained, bool Gpu) FitMinimumNormUpdate(
         float[] t, float[] k, int n, int dOut, int dIn, double ridgeRel = 1e-2)
     {
         if (n <= 0)
@@ -292,18 +292,44 @@ public static class LeastSquares
             throw new MergeException($"update samples do not match (n={n}, in={dIn}, out={dOut})");
         }
 
-        // G = KKᵀ (n×n), rows independent.
+        // CUDA path: the three products (KKᵀ, XᵀK, G·X) are fp32 cuBLAS
+        // GEMMs and the solve is cuSOLVER's fp64 Cholesky. Each step falls
+        // back to the managed code on its own, so a device failure part way
+        // through still yields the update.
+        bool gpu = CudaShim.Enabled;
+        bool usedGpu = false;
+        var options = new ParallelOptions { MaxDegreeOfParallelism = ComputeBudget.Cores };
+
+        // G = KKᵀ (n×n).
         var gram = new double[n * n];
-        Parallel.For(0, n, new ParallelOptions { MaxDegreeOfParallelism = ComputeBudget.Cores }, i =>
+        if (gpu && CudaShim.TryGemmTransposedBF32WithMap(k, k, n, dIn, n, out var gram32))
         {
-            var ki = k.AsSpan(i * dIn, dIn);
-            for (int j = 0; j <= i; j++)
+            // Symmetrise: the fp32 GEMM need not round (i,j) and (j,i) alike,
+            // and Cholesky reads only one triangle.
+            for (int i = 0; i < n; i++)
             {
-                double dot = TensorOps.Dot(ki, k.AsSpan(j * dIn, dIn));
-                gram[i * n + j] = dot;
-                gram[j * n + i] = dot;
+                for (int j = 0; j <= i; j++)
+                {
+                    double v = 0.5 * ((double)gram32![i * n + j] + gram32[j * n + i]);
+                    gram[i * n + j] = v;
+                    gram[j * n + i] = v;
+                }
             }
-        });
+            usedGpu = true;
+        }
+        else
+        {
+            Parallel.For(0, n, options, i =>
+            {
+                var ki = k.AsSpan(i * dIn, dIn);
+                for (int j = 0; j <= i; j++)
+                {
+                    double dot = TensorOps.Dot(ki, k.AsSpan(j * dIn, dIn));
+                    gram[i * n + j] = dot;
+                    gram[j * n + i] = dot;
+                }
+            });
+        }
 
         double trace = 0;
         for (int i = 0; i < n; i++)
@@ -317,67 +343,151 @@ public static class LeastSquares
             system[i * n + i] += ridge;
         }
 
-        // X = (G + λI)⁻¹ T  (n×dOut)
-        var rhs = new double[n * dOut];
-        for (int i = 0; i < rhs.Length; i++)
-        {
-            rhs[i] = t[i];
-        }
-        var chol = Cholesky(system, n);
+        // X = (G + λI)⁻¹ T, kept column-major (n rows, dOut columns): column
+        // o is x[o·n .. o·n + n). The system is symmetric, so its row-major
+        // array is also its column-major one.
         var x = new double[n * dOut];
-        SolveLower(chol, x, rhs, n, dOut);
-        SolveUpperTranspose(chol, x, n, dOut);
-
-        // ΔW[o, j] = Σ_i X[i, o] · K[i, j]
-        var delta = new float[dOut * dIn];
-        Parallel.For(0, dOut, new ParallelOptions { MaxDegreeOfParallelism = ComputeBudget.Cores }, o =>
+        for (int i = 0; i < n; i++)
         {
-            var acc = new double[dIn];
+            for (int o = 0; o < dOut; o++)
+            {
+                x[o * n + i] = t[i * dOut + o];
+            }
+        }
+        bool solved = false;
+        if (gpu)
+        {
+            var factor = (double[])system.Clone();
+            var rhs = (double[])x.Clone();
+            try
+            {
+                if (CudaShim.amql_cuda_cholesky_solve_f64(factor, n, rhs, dOut, 0) == 0)
+                {
+                    x = rhs;
+                    solved = usedGpu = true;
+                }
+            }
+            catch (Exception e) when (e is DllNotFoundException or EntryPointNotFoundException)
+            {
+            }
+        }
+        if (!solved)
+        {
+            var rowMajor = new double[n * dOut];
             for (int i = 0; i < n; i++)
             {
-                double xo = x[i * dOut + o];
-                if (xo == 0)
+                for (int o = 0; o < dOut; o++)
                 {
-                    continue;
+                    rowMajor[i * dOut + o] = x[o * n + i];
                 }
-                int kRow = i * dIn;
+            }
+            var chol = Cholesky(system, n);
+            var solution = new double[n * dOut];
+            SolveLower(chol, solution, rowMajor, n, dOut);
+            SolveUpperTranspose(chol, solution, n, dOut);
+            for (int i = 0; i < n; i++)
+            {
+                for (int o = 0; o < dOut; o++)
+                {
+                    x[o * n + i] = solution[i * dOut + o];
+                }
+            }
+        }
+
+        // Xᵀ as fp32 dOut×n row-major is exactly the column-major X.
+        var xt = new float[n * dOut];
+        for (int i = 0; i < xt.Length; i++)
+        {
+            xt[i] = (float)x[i];
+        }
+
+        // ΔW[o, j] = Σ_i X[i, o] · K[i, j]  =  Xᵀ · (Kᵀ)ᵀ.
+        float[] delta;
+        var kt = gpu ? Transpose(k, n, dIn) : null;
+        if (gpu && CudaShim.TryGemmTransposedBF32WithMap(xt, kt!, dOut, n, dIn, out var gpuDelta))
+        {
+            delta = gpuDelta!;
+            usedGpu = true;
+        }
+        else
+        {
+            delta = new float[dOut * dIn];
+            Parallel.For(0, dOut, options, o =>
+            {
+                var acc = new double[dIn];
+                for (int i = 0; i < n; i++)
+                {
+                    double xo = x[o * n + i];
+                    if (xo == 0)
+                    {
+                        continue;
+                    }
+                    int kRow = i * dIn;
+                    for (int j = 0; j < dIn; j++)
+                    {
+                        acc[j] += xo * k[kRow + j];
+                    }
+                }
                 for (int j = 0; j < dIn; j++)
                 {
-                    acc[j] += xo * k[kRow + j];
+                    delta[o * dIn + j] = (float)acc[j];
                 }
-            }
-            for (int j = 0; j < dIn; j++)
-            {
-                delta[o * dIn + j] = (float)acc[j];
-            }
-        });
+            });
+        }
 
         // The fitted targets are K·ΔWᵀ = G·X; report how much of ‖T‖² they
         // remove.
-        var totals = new double[n];
-        var lefts = new double[n];
-        Parallel.For(0, n, new ParallelOptions { MaxDegreeOfParallelism = ComputeBudget.Cores }, i =>
+        double[] fitted;
+        float[]? gram32b = null;
+        if (gpu)
         {
-            var fitted = new double[dOut];
-            for (int j = 0; j < n; j++)
+            gram32b = new float[n * n];
+            for (int i = 0; i < gram32b.Length; i++)
             {
-                double g = gram[i * n + j];
-                int xRow = j * dOut;
-                for (int o = 0; o < dOut; o++)
+                gram32b[i] = (float)gram[i];
+            }
+        }
+        if (gpu && CudaShim.TryGemmTransposedBF32WithMap(gram32b!, xt, n, n, dOut, out var gpuFitted))
+        {
+            fitted = Array.ConvertAll(gpuFitted!, v => (double)v);
+            usedGpu = true;
+        }
+        else
+        {
+            fitted = new double[n * dOut];
+            Parallel.For(0, n, options, i =>
+            {
+                for (int j = 0; j < n; j++)
                 {
-                    fitted[o] += g * x[xRow + o];
+                    double g = gram[i * n + j];
+                    for (int o = 0; o < dOut; o++)
+                    {
+                        fitted[i * dOut + o] += g * x[o * n + j];
+                    }
                 }
-            }
-            for (int o = 0; o < dOut; o++)
+            });
+        }
+        double total = 0, left = 0;
+        for (int i = 0; i < t.Length; i++)
+        {
+            double diff = t[i] - fitted[i];
+            total += (double)t[i] * t[i];
+            left += diff * diff;
+        }
+        return (delta, total > 0 ? 1.0 - left / total : 1.0, usedGpu);
+    }
+
+    private static float[] Transpose(float[] a, int rows, int cols)
+    {
+        var result = new float[a.Length];
+        for (int r = 0; r < rows; r++)
+        {
+            for (int c = 0; c < cols; c++)
             {
-                double target = t[i * dOut + o];
-                double diff = target - fitted[o];
-                totals[i] += target * target;
-                lefts[i] += diff * diff;
+                result[c * rows + r] = a[r * cols + c];
             }
-        });
-        double total = totals.Sum(), left = lefts.Sum();
-        return (delta, total > 0 ? 1.0 - left / total : 1.0);
+        }
+        return result;
     }
 
     private static double[] Cholesky(double[] a, int d)
