@@ -58,6 +58,7 @@ AMQL is nine projects with a CLI front-end and a WPF desktop GUI:
 | `Amql.Inference` | Inference engine, tracing, LoRA adapter execution |
 | `Amql.Hf` | HuggingFace checkpoint loading, config parsing, architecture mapping |
 | `Amql.Merge` | Model merging, MoE-ification, fine-tuning, pruning, model conversion |
+| `Amql.Entail` | The Entail language: statements compiled into model weights |
 | `Amql.Onnx` | ONNX graph builder — zero-dependency protobuf writer |
 | `Amql.Gguf` | GGUF v3 converter for llama.cpp deployment |
 
@@ -92,6 +93,8 @@ amql-cli prune <container> --out <dir> --target-bytes <size> [--approach provena
 amql-cli strip <container> --keep Q4_0|BF16|FP4|Q8_0|FP32 [--out <slim-dir>]
 amql-cli fine-tune <container> --data <pairs.tsv> --out <patch> [--lr 1e-4]
 amql-cli bake-predicate <container> --predicate "<rule>" --out <patch> [--prompts <file>] [--layers 6,9,12]
+amql-cli entail compile <program> --out <dir>
+amql-cli entail graft <program> --host <dir> --out <dir>
 amql-cli create-model --hidden 768 --layers 12 --vocab 32000 --out <dir>
 amql-cli convert-to-classifier <container> --num-labels N --out <dir>
 amql-cli convert-to-embedding <container> --out <dir>
@@ -174,6 +177,13 @@ for itself; then the FFN down-projections of a few middle layers are solved in c
 form (minimum-norm ridge, layer by layer) so the model *without* the predicate
 reproduces its hidden states *with* it. The output is an ordinary weight patch, and the
 run reports KL and top-1 agreement against the predicated model before and after.
+
+`entail` is the deterministic counterpart: a small language in which each statement
+compiles to specific weights, with nothing learned or fitted. `compile` turns a program
+into a new, empty model; `graft` restructures a Qwen3.5 checkpoint around it, in lanes the
+host cannot touch. `scripts/entail/mathematics.entail.txt` defines decimal arithmetic:
+grafted into Qwen 3.5 0.8B it takes direct arithmetic from 43.8% to 100% with top-1
+predictions on prose unchanged. See [docs/entail.md](docs/entail.md).
 
 ### Model Merging & Transformation
 
@@ -348,6 +358,8 @@ multi-million-element matrix is too small to measure downstream. See
 - [Embedding Models](docs/embedding-models-nomic-embed-text.md) — nomic-bert encoder
 - [Decision Models](docs/decision-models-von.md) — Von (ModernBERT option-marker) import/export
 - [Inference Visualiser](docs/inference-visualiser.md) — operator trace format and the map UI
+- [Entail](docs/entail.md) — compiling statements into weights: design and results
+- [The Entail Language](docs/entail-language.md) — language reference
 - [CUDA Backend Plan](docs/CUDA_PLAN.md) — GPU kernel roadmap
 - [MTP Drafter](docs/MTP_DRAFTER.md) — speculative decoding drafter design
 

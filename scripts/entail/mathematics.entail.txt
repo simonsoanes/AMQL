@@ -1,0 +1,582 @@
+# ═══════════════════════════════════════════════════════════════════════════
+#  mathematics.entail — decimal integer arithmetic, stated as consequences
+# ═══════════════════════════════════════════════════════════════════════════
+#
+#  Entail is a language for writing down what a model's weights MEAN.
+#  A predicate says what must be the case. An entailment says what must
+#  FOLLOW from what, so it can be compiled: every statement below becomes a
+#  specific group of weights, and nothing is learned, sampled or fitted.
+#
+#    token "7" means val = 7     an input fact        → embedding row
+#    state x[8]                  an interim fact      → residual lanes
+#    let y = a + 2*b             a name for a sum     → no weights; inlined
+#    attend back k ... end       what lies k tokens   → an attention head
+#                                behind this one
+#    entail y when E >= c        a consequence        → SwiGLU neurons
+#    entail y = V when f, g      a gated consequence  → one SwiGLU neuron
+#    emit "7" when o[7]          an output fact       → an output row
+#
+#  Rules of the language
+#    · A state is written, then read. Once anything has read it, it is closed
+#      and writing to it again is an error, so the file IS a dataflow graph.
+#    · Several `entail` statements on one state add up. Exclusive conditions
+#      therefore read as "or", and a value as a case analysis.
+#    · A bare `when` list is a conjunction of facts that are exactly 0 or 1.
+#    · A threshold (>=, <=, ==) may compare any whole-number sum. Thresholds
+#      regenerate their input, so noise never accumulates along a chain.
+#    · The compiler places each statement at the earliest layer its inputs
+#      allow; layers are a consequence of the graph, never written down.
+#
+#  What is defined here: + - * / on whole numbers written in decimal digits,
+#  plain or grouped in threes by commas (the answer is written plain), with
+#  the operand limits below, negative results and up to FRAC decimal
+#  places of a quotient (truncated). An expression is recognised at its "="
+#  and the answer is produced one digit per position, each digit a pure
+#  function of the tokens before it. Anything that is not exactly such an
+#  expression entails nothing at all, and the model it lives in carries on.
+
+program mathematics
+
+const ADD   = 8     # digits per operand for + and -
+const MUL   = 6     # digits per operand for *
+const DIVA  = 6     # digits of dividend for /
+const DIVB  = 4     # digits of divisor for /
+const FRAC  = 2     # decimal places of a quotient
+const RES   = 12    # digits of the longest whole-number result
+const SLOTS = 14    # answer tokens: sign, RES digits, end of answer
+const WIN   = 26    # how far back the expression can reach
+
+# ─── 1. Tokens: what each input token is ────────────────────────────────────
+#
+# Two facts per token: its digit value, and its kind.
+#   0 anything else         1 digit         2 add      3 subtract
+#   4 multiply              5 divide        6 equals, written tight
+#   7 equals, spaced        8 blank, or a currency mark, inside an expression
+#   9 a mark that makes the neighbouring number something else
+#   10 a comma, which may group the digits of a number
+
+const K_DIGIT = 1
+const K_ADD   = 2
+const K_SUB   = 3
+const K_MUL   = 4
+const K_DIV   = 5
+const K_EQ    = 6
+const K_EQS   = 7
+const K_GAP   = 8
+const K_BAD   = 9
+const K_COMMA = 10
+
+state val
+state kind
+
+for d in 0 to 9
+    token "{d}" means val = d, kind = K_DIGIT
+end
+token "+", " +"                  means kind = K_ADD
+token "-", " -", "−", " −"       means kind = K_SUB
+token "*", " *", "×", " ×", "x", " x", " times", "times", "cdot" means kind = K_MUL
+token "/", " /", "÷", " ÷", "div" means kind = K_DIV
+token "="                        means kind = K_EQ
+token " ="                       means kind = K_EQS
+token " ", "$", " $", "£", " £", "\", " \", "$\" means kind = K_GAP
+token ".", ")", "^", "%", "_", ":" means kind = K_BAD
+token ","                        means kind = K_COMMA
+
+# ─── 2. Sight: the tokens behind this one ───────────────────────────────────
+#
+# wv[k], wk[k] are the value and kind of the token k places back. Looking
+# further back than the start of the text finds the first token. If that is
+# not a digit, the window simply ends there. If the text opens with a digit,
+# the first number seems to run on past any limit, so nothing is entailed:
+# an expression needs at least one token in front of it.
+
+state wv[WIN + 1], wk[WIN + 1]
+for k in 1 to WIN
+    attend back k
+        wv[k] <- val
+        wk[k] <- kind
+    end
+end
+
+# Facts about each place in that window. Offset 0 is the token itself.
+state dg[WIN + 1], gp[WIN + 1], op[WIN + 1], bad[WIN + 1], cm[WIN + 1]
+state eqt[WIN + 1], eqs[WIN + 1], ans[WIN + 1]
+
+let kk[0] = kind
+let vv[0] = val
+for k in 1 to WIN
+    let kk[k] = wk[k]
+    let vv[k] = wv[k]
+end
+
+for k in 0 to WIN
+    entail dg[k]  when kk[k] == K_DIGIT
+    entail gp[k]  when kk[k] == K_GAP
+    entail cm[k]  when kk[k] == K_COMMA
+    entail eqt[k] when kk[k] == K_EQ
+    entail eqs[k] when kk[k] == K_EQS
+    entail op[k]  when kk[k] >= K_ADD, kk[k] <= K_DIV
+    # an operator or a mark next to a number means it is not a plain operand
+    entail bad[k] when kk[k] >= K_ADD, kk[k] <= K_DIV
+    entail bad[k] when kk[k] == K_BAD
+    entail bad[k] when kk[k] == K_COMMA
+    # tokens that can stand in an answer already being written
+    entail ans[k] when kk[k] == K_DIGIT
+    entail ans[k] when kk[k] == K_SUB
+    entail ans[k] when kk[k] == K_BAD
+    entail ans[k] when kk[k] == K_COMMA
+end
+
+# ─── 3. Reading the expression, right to left, from its "=" ─────────────────
+#
+#     A  [gap] op [gap]  B  [gap]  =
+#     └ start at offset s      └ offset e
+#
+# atEq: this token is the "=". e is 1, or 2 if a blank stands before the "=".
+
+state atEq, e1, e2
+entail atEq when eqt[0]
+entail atEq when eqs[0]
+entail e1 when atEq, not gp[1]
+entail e2 when atEq, gp[1]
+
+let ee[1] = e1
+let ee[2] = e2
+
+# A number is plain (1234) or grouped in threes (1,234). Counting from its
+# right-hand end, the digit worth 10^j of a grouped number stands
+# j + floor(j/3) tokens along, and a number of m digits spans the same sum.
+#
+# lenB[e][m]: B ends at offset e and is exactly m plain digits long.
+# grpB[e][m]: the same, grouped.
+state lenB[3][ADD + 1], grpB[3][ADD + 1], bend[WIN + 1]
+for e in 1 to 2
+    for m in 1 to ADD
+        entail lenB[e][m] when ee[e], (sum i in 0 to m-1 : dg[e+i]) >= m, not dg[e+m], not cm[e+m]
+        entail bend[e+m] when lenB[e][m]
+        if m >= 4
+            const SPAN = m + floor((m-1)/3)
+            const GROUPS = floor((m-1)/3)
+            entail grpB[e][m] when ee[e], (sum i in 0 to m-1 : dg[e+i+floor(i/3)]) + (sum c in 0 to GROUPS-1 : cm[e+3+4*c]) >= m + GROUPS, not dg[e+SPAN], not cm[e+SPAN]
+            entail bend[e+SPAN] when grpB[e][m]
+        end
+    end
+end
+
+# opAt[o]: the operator stands at offset o.
+state opAt[WIN + 1]
+for o in 2 to WIN - 1
+    entail opAt[o] when bend[o], op[o]
+    if o >= 3
+        entail opAt[o] when bend[o-1], gp[o-1], op[o]
+    end
+end
+
+# aEnd[s]: the digits of A start at offset s.
+state aEnd[WIN + 1]
+for s in 3 to WIN - 1
+    entail aEnd[s] when opAt[s-1], not gp[s]
+    if s >= 4
+        entail aEnd[s] when opAt[s-2], gp[s-1]
+    end
+end
+
+# lenA[s][n]: A starts at offset s and is exactly n digits long, and what
+# stands before it does not turn it into part of something else.
+state lenA[WIN + 1][ADD + 1], grpA[WIN + 1][ADD + 1], sized[ADD + 1], sizedB[ADD + 1]
+for s in 3 to WIN - 1
+    for n in 1 to ADD
+        if s + n <= WIN
+            entail lenA[s][n] when aEnd[s], (sum i in 0 to n-1 : dg[s+i]) >= n, not dg[s+n], not bad[s+n]
+            entail sized[n] when lenA[s][n]
+        end
+        if n >= 4
+            const SPAN = n + floor((n-1)/3)
+            const GROUPS = floor((n-1)/3)
+            if s + SPAN <= WIN
+                entail grpA[s][n] when aEnd[s], (sum i in 0 to n-1 : dg[s+i+floor(i/3)]) + (sum c in 0 to GROUPS-1 : cm[s+3+4*c]) >= n + GROUPS, not dg[s+SPAN], not bad[s+SPAN]
+                entail sized[n] when grpA[s][n]
+            end
+        end
+    end
+end
+for e in 1 to 2
+    for m in 1 to ADD
+        entail sizedB[m] when lenB[e][m]
+        if m >= 4
+            entail sizedB[m] when grpB[e][m]
+        end
+    end
+end
+
+# The operand digits, least significant first. a[j] is the digit worth 10^j.
+state a[ADD], b[ADD]
+for e in 1 to 2
+    for m in 1 to ADD
+        for j in 0 to m-1
+            entail b[j] = vv[e+j] when lenB[e][m]
+            if m >= 4
+                entail b[j] = vv[e+j+floor(j/3)] when grpB[e][m]
+            end
+        end
+    end
+end
+for s in 3 to WIN - 1
+    for n in 1 to ADD
+        if s + n <= WIN
+            for j in 0 to n-1
+                entail a[j] = vv[s+j] when lenA[s][n]
+            end
+        end
+        if n >= 4
+            if s + n + floor((n-1)/3) <= WIN
+                for j in 0 to n-1
+                    entail a[j] = vv[s+j+floor(j/3)] when grpA[s][n]
+                end
+            end
+        end
+    end
+end
+
+# Which operation, and whether the operands fit it.
+state isAdd, isSub, isMul0, isDiv0
+for o in 2 to WIN - 1
+    entail isAdd  when opAt[o], kk[o] == K_ADD
+    entail isSub  when opAt[o], kk[o] == K_SUB
+    entail isMul0 when opAt[o], kk[o] == K_MUL
+    entail isDiv0 when opAt[o], kk[o] == K_DIV
+end
+
+let aLen = (sum n in 1 to ADD : n * sized[n])
+let bLen = (sum m in 1 to ADD : m * sizedB[m])
+let aVal = (sum j in 0 to ADD-1 : 10^j * a[j])
+let bVal = (sum j in 0 to DIVB-1 : 10^j * b[j])
+
+state isMul, isDiv, doAdd, doSub
+entail doAdd when isAdd, aLen >= 1
+entail doSub when isSub, aLen >= 1
+entail isMul when isMul0, aLen >= 1, aLen <= MUL, bLen <= MUL
+entail isDiv when isDiv0, aLen >= 1, aLen <= DIVA, bLen <= DIVB, bVal >= 1
+
+# ─── 4. Chains: when does something at one place reach the next? ────────────
+#
+# Each place either generates (2), propagates (1) or kills (0) a carry. Read
+# t as digits of a base-4 number: a carry reaches place k exactly when the
+# number below k, less the all-propagate number, is positive. That is one
+# threshold per place, with no ripple through the layers. Eight places are
+# compared at a time so the sum stays exact in a 32-bit float.
+
+def chain(p, n)
+    state {p}_c[n + 1]
+    for k in 1 to min(n, 8)
+        entail {p}_c[k] when (sum i in 0 to k-1 : 4^i * ({p}_t[i] - 1)) >= 1
+    end
+    for k in 9 to n
+        entail {p}_c[k] when 2*{p}_c[8] - 1 + (sum i in 8 to k-1 : 4^(i-7) * ({p}_t[i] - 1)) >= 1
+    end
+end
+
+# ─── 5. Addition ────────────────────────────────────────────────────────────
+
+state add_g[ADD], add_q[ADD], add_w[ADD + 1]
+for j in 0 to ADD-1
+    let add_s[j] = a[j] + b[j]
+    entail add_g[j] when add_s[j] >= 10
+    entail add_q[j] when add_s[j] == 9
+    let add_t[j] = 2*add_g[j] + add_q[j]
+end
+call chain(add, ADD)
+
+let add_v[0] = add_s[0]
+for j in 1 to ADD-1
+    let add_v[j] = add_s[j] + add_c[j]
+end
+for j in 0 to ADD-1
+    entail add_w[j] when add_v[j] >= 10
+    let add_r[j] = add_v[j] - 10*add_w[j]
+end
+let add_r[ADD] = add_c[ADD]
+
+# ─── 6. Subtraction ─────────────────────────────────────────────────────────
+#
+# Both a-b and b-a are worked out. The borrow out of the top of a-b says
+# which of them is the answer, and that the answer is negative.
+
+def difference(p, x, y)
+    state {p}_g[ADD], {p}_q[ADD], {p}_w[ADD]
+    for j in 0 to ADD-1
+        let {p}_d[j] = x[j] - y[j]
+        entail {p}_g[j] when {p}_d[j] <= -1
+        entail {p}_q[j] when {p}_d[j] == 0
+        let {p}_t[j] = 2*{p}_g[j] + {p}_q[j]
+    end
+    call chain({p}, ADD)
+    let {p}_v[0] = {p}_d[0]
+    for j in 1 to ADD-1
+        let {p}_v[j] = {p}_d[j] - {p}_c[j]
+    end
+    for j in 0 to ADD-1
+        entail {p}_w[j] when {p}_v[j] <= -1
+        let {p}_r[j] = {p}_v[j] + 10*{p}_w[j]
+    end
+end
+
+call difference(sab, a, b)
+call difference(sba, b, a)
+
+state subPos, subNeg
+entail subPos when doSub, not sab_c[ADD]
+entail subNeg when doSub, sab_c[ADD]
+
+# ─── 7. Multiplication ──────────────────────────────────────────────────────
+#
+# A digit of a is a staircase of facts (a>=1, a>=2, ...). Each step that holds
+# adds the digit of b into its column, so a[i]*b[j] needs no table.
+
+state ge[MUL][10]
+for i in 0 to MUL-1
+    for d in 1 to 9
+        entail ge[i][d] when a[i] >= d
+    end
+end
+
+const COLS = 2*MUL
+state col[COLS] scale 1/16
+for i in 0 to MUL-1
+    for j in 0 to MUL-1
+        for d in 1 to 9
+            entail col[i+j] = b[j] when ge[i][d], isMul
+        end
+    end
+end
+
+# Columns hold up to 6*81. Split each into decimal digits, in stages that
+# happen in every column at once.
+state f1[COLS] scale 1/16, f2[COLS], f3[COLS], mul_g[COLS], mul_q[COLS], mul_w[COLS]
+for k in 0 to COLS-1
+    for m in 1 to 49
+        entail f1[k] when col[k] >= 10*m
+    end
+    let u1[k] = col[k] - 10*f1[k]
+    for m in 1 to 4
+        entail f2[k] when f1[k] >= 10*m
+    end
+    let u2[k] = f1[k] - 10*f2[k]
+end
+let s3[0] = u1[0]
+let s3[1] = u1[1] + u2[0]
+for k in 2 to COLS-1
+    let s3[k] = u1[k] + u2[k-1] + f2[k-2]
+end
+for k in 0 to COLS-1
+    entail f3[k] when s3[k] >= 10
+    entail f3[k] when s3[k] >= 20
+    let u3[k] = s3[k] - 10*f3[k]
+end
+let mul_s[0] = u3[0]
+for k in 1 to COLS-1
+    let mul_s[k] = u3[k] + f3[k-1]
+end
+for k in 0 to COLS-1
+    entail mul_g[k] when mul_s[k] >= 10
+    entail mul_q[k] when mul_s[k] == 9
+    let mul_t[k] = 2*mul_g[k] + mul_q[k]
+end
+call chain(mul, COLS)
+
+let mul_v[0] = mul_s[0]
+for k in 1 to COLS-1
+    let mul_v[k] = mul_s[k] + mul_c[k]
+end
+for k in 0 to COLS-1
+    entail mul_w[k] when mul_v[k] >= 10
+    let mul_r[k] = mul_v[k] - 10*mul_w[k]
+end
+
+# ─── 8. Division ────────────────────────────────────────────────────────────
+#
+# Long division. At each step the remainder so far is compared with every
+# multiple of the divisor; the multiples that fit are the next quotient digit
+# and what they take from the remainder.
+
+const STEPS = DIVA + FRAC
+state rem[STEPS + 1] scale 1/8192, fit[STEPS][10]
+let next[0] = a[DIVA-1]
+for i in 1 to STEPS-1
+    if i < DIVA
+        let next[i] = a[DIVA-1-i]
+    else
+        let next[i] = 0
+    end
+end
+entail rem[0] = next[0] when isDiv
+for i in 0 to STEPS-1
+    for k in 1 to 9
+        entail fit[i][k] when rem[i] - k*bVal >= 0
+    end
+    let quo[i] = (sum k in 1 to 9 : fit[i][k])
+    if i < STEPS-1
+        entail rem[i+1] = 10*rem[i] + next[i+1] when isDiv
+        for k in 1 to 9
+            entail rem[i+1] = -10*bVal when fit[i][k]
+        end
+    end
+end
+
+# quo[i] is worth 10^(DIVA-1-i): the whole part is quo[0..DIVA-1], and the
+# decimal places follow it.
+let fr[0] = quo[DIVA]
+let fr[1] = quo[DIVA+1]
+
+# ─── 9. The answer, as digits ───────────────────────────────────────────────
+
+state res[RES]
+for k in 0 to RES-1
+    if k <= ADD
+        entail res[k] = add_r[k] when doAdd
+    end
+    if k < ADD
+        entail res[k] = sab_r[k] when subPos
+        entail res[k] = sba_r[k] when subNeg
+    end
+    if k < COLS
+        entail res[k] = mul_r[k] when isMul
+    end
+    if k < DIVA
+        entail res[k] = quo[DIVA-1-k] when isDiv
+    end
+end
+
+state live, nz[RES], top[RES], frac1, frac2
+entail live when doAdd
+entail live when doSub
+entail live when isMul
+entail live when isDiv
+
+for k in 0 to RES-1
+    entail nz[k] when res[k] >= 1
+end
+for k in 1 to RES-1
+    # the highest digit that is not zero
+    if k < RES-1
+        entail top[k] when live, nz[k], (sum i in k+1 to RES-1 : nz[i]) <= 0
+    else
+        entail top[k] when live, nz[k]
+    end
+end
+entail top[0] when live, (sum i in 1 to RES-1 : nz[i]) <= 0
+
+# How many decimal places are worth writing.
+entail frac2 when isDiv, fr[1] >= 1
+entail frac1 when isDiv, fr[0] >= 1, not frac2
+
+# ─── 10. The answer, as a sequence of tokens ────────────────────────────────
+#
+# code[s] says what the s-th answer token is. Written as digit + 1, so that
+# 0 can mean nothing at all.
+
+const C_MINUS = 11
+const C_POINT = 12
+const C_END   = 13
+
+state code[SLOTS]
+state pos0[RES], neg0[RES]
+for k in 0 to RES-1
+    entail pos0[k] when top[k], not subNeg
+    entail neg0[k] when top[k], subNeg
+end
+entail code[0] = C_MINUS when subNeg
+
+def spell(sel, shift)
+    # sel: a digit k is the leading one. The digits occupy slots
+    # shift .. shift+k, then the decimal places, then the end of the answer.
+    for k in 0 to RES-1
+        if k + shift + 1 < SLOTS
+            for s in 0 to k
+                entail code[shift+s] = res[k-s] + 1 when sel[k]
+            end
+            entail code[shift+k+1] = C_END when sel[k], not frac1, not frac2
+            if k + shift + 4 < SLOTS
+                entail code[shift+k+1] = C_POINT when sel[k], frac1
+                entail code[shift+k+2] = fr[0] + 1 when sel[k], frac1
+                entail code[shift+k+3] = C_END when sel[k], frac1
+                entail code[shift+k+1] = C_POINT when sel[k], frac2
+                entail code[shift+k+2] = fr[0] + 1 when sel[k], frac2
+                entail code[shift+k+3] = fr[1] + 1 when sel[k], frac2
+            end
+            if k + shift + 5 < SLOTS
+                entail code[shift+k+4] = C_END when sel[k], frac2
+            end
+        end
+    end
+end
+call spell(pos0, 0)
+call spell(neg0, 1)
+
+# ─── 11. Writing it out ─────────────────────────────────────────────────────
+#
+# Any later token finds its "=" in its window. If everything between is
+# answer, it is the slot that many places on; one blank straight after the
+# "=" is not counted, and a spaced "=" opens with that blank. Each answer
+# token then looks straight back at the "=" and reads its own code.
+
+state from[SLOTS + 2], slot[SLOTS]
+for c in 0 to SLOTS + 1
+    # c tokens back stands the "=", and nothing in between but answer
+    if c == 0
+        entail from[c] when eqt[0]
+        entail from[c] when eqs[0]
+    end
+    if c == 1
+        entail from[c] when eqt[1], ans[0]
+        entail from[c] when eqt[1], gp[0]
+        entail from[c] when eqs[1], gp[0]
+    end
+    if c >= 2
+        entail from[c] when eqt[c], (sum i in 0 to c-1 : ans[i]) >= c
+        entail from[c] when eqt[c], (sum i in 0 to c-2 : ans[i]) >= c-1, gp[c-1]
+        entail from[c] when eqs[c], (sum i in 0 to c-2 : ans[i]) >= c-1, gp[c-1]
+    end
+end
+for c in 0 to SLOTS - 1
+    if c == 0
+        entail slot[0] when eqt[0]
+    end
+    if c == 1
+        entail slot[1] when eqt[1], ans[0]
+        entail slot[0] when eqt[1], gp[0]
+        entail slot[0] when eqs[1], gp[0]
+    end
+    if c >= 2
+        entail slot[c] when eqt[c], (sum i in 0 to c-1 : ans[i]) >= c
+        entail slot[c-1] when eqt[c], (sum i in 0 to c-2 : ans[i]) >= c-1, gp[c-1]
+        entail slot[c-1] when eqs[c], (sum i in 0 to c-2 : ans[i]) >= c-1, gp[c-1]
+    end
+end
+
+state seen[SLOTS]
+attend back by from
+    for s in 0 to SLOTS-1
+        seen[s] <- code[s]
+    end
+end
+
+state say
+for s in 0 to SLOTS-1
+    entail say = seen[s] when slot[s]
+end
+
+# ─── 12. Output: the token that must come next ──────────────────────────────
+
+state o[14], blank
+for d in 1 to 13
+    entail o[d] when say == d
+end
+entail blank when eqs[0], seen[0] >= 1
+for d in 0 to 9
+    emit "{d}" when o[d+1]
+end
+emit "-" when o[C_MINUS]
+emit "." when o[C_POINT]
+emit " " when blank
+emit end when o[C_END]

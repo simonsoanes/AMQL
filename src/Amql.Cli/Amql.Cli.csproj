@@ -1,6 +1,7 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <ItemGroup>
+    <ProjectReference Include="..\Amql.Entail\Amql.Entail.csproj" />
     <ProjectReference Include="..\Amql.Gguf\Amql.Gguf.csproj" />
     <ProjectReference Include="..\Amql.Onnx\Amql.Onnx.csproj" />
     <ProjectReference Include="..\Amql.Safetensors\Amql.Safetensors.csproj" />

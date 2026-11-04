@@ -100,6 +100,7 @@ internal static partial class Program
                 "prune" => Prune(args[1..]),
                 "fine-tune" => FineTune(args[1..]),
                 "bake-predicate" => BakePredicate(args[1..]),
+                "entail" => EntailCommand(args[1..]),
                 "classify" => Classify(args[1..]),
                 "tool-eval" => ToolEval.Run(args[1..], OptionValue, HasOption),
                 "decide" or "decisions" => Decide(args[1..]),
@@ -2707,6 +2708,10 @@ internal static partial class Program
                               --out <patch.safetensors>
                               [--tokenizer <checkpoint-dir>] [--component target]
                               [--lr 1e-4] [--epochs 1]
+              amql-cli entail check|run <program.entail.txt> [--expr "12+34="]
+              amql-cli entail compile <program.entail.txt> --out <checkpoint-dir>
+              amql-cli entail graft <program.entail.txt> --host <checkpoint-dir> --out <checkpoint-dir>
+              amql-cli entail eval <container-dir> --cases <cases.jsonl> [--text <file>] [--report <json>]
               amql-cli bake-predicate <container-dir> --predicate "<rule>"
                               --out <patch.safetensors>
                               [--prompts <file>] [--self-probes 8] [--layers 6,9,12]
