@@ -3,6 +3,9 @@
   python make_cases.py empty  [per-category] [seed]   # the compiled empty model
   python make_cases.py direct [per-category] [seed]   # "Calculate: a op b=" on a host
   python make_cases.py chat   [per-category] [seed]   # questions and word problems, in chat
+  python make_cases.py reload [per-category] [seed] <subject.json> <evidence.jsonl>
+                                                      # a subject's relations, on operands
+                                                      # its extraction never saw
 
 Operands are drawn at random, so a different seed is a fresh test. A case
 passes when the first number of the reply (or, for chat, the last) is the
@@ -108,8 +111,33 @@ def chat(n):
                           f"its 12 rooms. How many books does it have now?" + ask, a + b + c * 12, 320)
 
 
+def reload(n, subject_path, evidence_path):
+    """True arithmetic, not the model's answers: this tests what reloading fixed."""
+    subject = json.load(open(subject_path, encoding="utf8"))
+    laws = {"add": lambda a, b: a + b, "sub": lambda a, b: a - b, "mul": lambda a, b: a * b}
+    seen = set()
+    for line in open(evidence_path, encoding="utf8"):
+        row = json.loads(line)
+        seen.add((row["relation"], tuple(row["values"])))
+    for relation in subject["relations"]:
+        law = laws[relation["name"]]
+        lo, hi = (int(x) for x in relation["slots"]["a"].split("-"))
+        drawn = 0
+        while drawn < n:
+            a, b = random.randint(lo, hi), random.randint(lo, hi)
+            if (relation["name"], (str(a), str(b))) in seen:
+                continue
+            seen.add((relation["name"], (str(a), str(b))))
+            prompt = relation["shots"] + relation["template"].replace("{a}", str(a)).replace("{b}", str(b))
+            emit(category=relation["name"], prompt=prompt, answer=str(law(a, b)), first=True, max_tokens=6)
+            drawn += 1
+
+
 if __name__ == "__main__":
     suite = sys.argv[1] if len(sys.argv) > 1 else "direct"
     count = int(sys.argv[2]) if len(sys.argv) > 2 else 20
     random.seed(int(sys.argv[3]) if len(sys.argv) > 3 else 11)
-    {"empty": empty, "direct": direct, "chat": chat}[suite](count)
+    if suite == "reload":
+        reload(count, sys.argv[4], sys.argv[5])
+    else:
+        {"empty": empty, "direct": direct, "chat": chat}[suite](count)

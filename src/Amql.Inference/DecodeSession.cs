@@ -45,6 +45,17 @@ public sealed class DecodeSession
     }
 
     /// <summary>
+    /// Forward pass returning the logits of EVERY position (T × vocabulary):
+    /// what the model would say next at each token of the sequence.
+    /// </summary>
+    public Tensor2D PrefillLogits(int[] tokens)
+    {
+        var allLogits = _runtime.FinalNormAndHead(RunPrefill(tokens));
+        LastLogits = SliceLastRow(allLogits);
+        return allLogits;
+    }
+
+    /// <summary>
     /// Forward pass over a token sequence that stops at the final norm: the
     /// post-norm hidden state of the LAST position (1 × hidden), the row a
     /// last-token pooled head reads. No vocabulary projection is computed.

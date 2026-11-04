@@ -2712,6 +2712,13 @@ internal static partial class Program
               amql-cli entail compile <program.entail.txt> --out <checkpoint-dir>
               amql-cli entail graft <program.entail.txt> --host <checkpoint-dir> --out <checkpoint-dir>
               amql-cli entail eval <container-dir> --cases <cases.jsonl> [--text <file>] [--report <json>]
+              amql-cli entail find <container-dir> --subject <file> --out <dir> [--top 64] [--verify]
+              amql-cli entail extract <container-dir> --subject <file> --out <dir>
+              amql-cli entail decompile <container-dir> --corpus <dir> --out <dir> [--contrast <file>] [--extra <file>] [--cover] [--units 4000] [--vote lift|share|bayes] [--from <study.bin>] [--no-columns]
+              amql-cli entail fidelity <program.entail.txt> --holdout <file> [--lines 40]
+              amql-cli entail optimise <dir> [--confidence 0.5]
+              amql-cli entail review <dir> [--endpoint <url> --model <name> --rounds 3]
+              amql-cli entail accept <dir> --candidate <file> --rule <rule> --why "<reason>"
               amql-cli bake-predicate <container-dir> --predicate "<rule>"
                               --out <patch.safetensors>
                               [--prompts <file>] [--self-probes 8] [--layers 6,9,12]

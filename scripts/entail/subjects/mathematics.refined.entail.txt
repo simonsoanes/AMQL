@@ -1,0 +1,148 @@
+# Extracted from Qwen 3.5 0.8B, then refined.
+# R1: keep rows with softmax margin of at least 0.5
+# R4: add: value = a + b (58 of 58 rows)
+# R4: sub: value = a - b (38 of 38 rows)
+# R4: mul: value = a*b (70 of 70 rows)
+# R6: the answer is worked out once, at the "=", for all three relations;
+#     later positions read it back. See docs/entail-optimisation.md.
+
+program mathematics
+
+# What each token is.
+state sym, num
+token "\n" means sym = 1
+token "*" means sym = 2
+token "+" means sym = 3
+token "-" means sym = 4
+token "0" means sym = 5, num = 0
+token "1" means sym = 6, num = 1
+token "2" means sym = 7, num = 2
+token "3" means sym = 8, num = 3
+token "4" means sym = 9, num = 4
+token "5" means sym = 10, num = 5
+token "6" means sym = 11, num = 6
+token "7" means sym = 12, num = 7
+token "8" means sym = 13, num = 8
+token "9" means sym = 14, num = 9
+token "=" means sym = 15
+
+const EQ = 15
+
+# The tokens behind this one.
+state w[7], n[7]
+for k in 1 to 6
+    attend back k
+        w[k] <- sym
+        n[k] <- num
+    end
+end
+let c[0] = sym
+let v[0] = num
+for k in 1 to 6
+    let c[k] = w[k]
+    let v[k] = n[k]
+end
+
+# Which tokens are digits, and which can stand in an answer.
+state dig[7], ans[7]
+for k in 0 to 6
+    entail dig[k] when c[k] >= 5, c[k] <= 14
+    entail ans[k] when c[k] >= 5, c[k] <= 14
+    entail ans[k] when c[k] == 4
+end
+
+# The question: newline, two digits, an operator, two digits, equals.
+state on, isAdd, isSub, isMul
+entail on when c[6] == 1, c[0] == EQ, dig[5], dig[4], dig[2], dig[1]
+entail isAdd when on, c[3] == 3
+entail isSub when on, c[3] == 4
+entail isMul when on, c[3] == 2
+
+let a = 10*v[5] + v[4]
+let b = 10*v[2] + v[1]
+
+# a*b: every step of a's digits adds b, at that digit's place.
+state prod scale 1/256
+for d in 1 to 9
+    entail prod = 10*b when isMul, v[5] >= d
+    entail prod = b when isMul, v[4] >= d
+end
+
+# The laws, one value for all three relations.
+state value scale 1/256, neg, mag scale 1/256
+entail value = a + b when isAdd
+entail value = a - b when isSub
+entail value = prod when isMul
+entail neg when on, value <= -1
+entail mag = value when on, not neg
+entail mag = -1*value when neg
+
+# Digits from the top: each is a staircase on what remains.
+state d[4], big[4]
+for m in 1 to 9
+    entail d[3] when mag >= 1000*m
+end
+for m in 1 to 9
+    entail d[2] when mag - 1000*d[3] >= 100*m
+end
+for m in 1 to 9
+    entail d[1] when mag - 1000*d[3] - 100*d[2] >= 10*m
+end
+let d[0] = mag - 1000*d[3] - 100*d[2] - 10*d[1]
+for k in 1 to 3
+    entail big[k] when mag >= 10^k
+end
+let gt[1] = 1
+let gt[2] = big[1]
+let gt[3] = big[2]
+let gt[4] = big[3]
+let gt[5] = 0
+
+# The answer as tokens: digit + 1, 11 for a minus sign, 12 for the end.
+state pl[5], ng[5], code[6]
+for L in 1 to 4
+    entail pl[L] when on, not neg, gt[L], not gt[L+1]
+    entail ng[L] when neg, gt[L], not gt[L+1]
+    for s in 0 to L-1
+        entail code[s] = d[L-1-s] + 1 when pl[L]
+        entail code[s+1] = d[L-1-s] + 1 when ng[L]
+    end
+    entail code[L] = 12 when pl[L]
+    entail code[L+1] = 12 when ng[L]
+    entail code[0] = 11 when ng[L]
+end
+
+# Each answer position finds its "=" and reads its own token.
+state from[6], seen[6], say
+entail from[0] when c[0] == EQ
+for p in 1 to 5
+    entail from[p] when c[p] == EQ, (sum i in 0 to p-1 : ans[i]) >= p
+end
+attend back by from
+    for s in 0 to 5
+        seen[s] <- code[s]
+    end
+end
+for s in 0 to 5
+    entail say = seen[s] when from[s]
+end
+
+# What must come next.
+state o[11], stop
+for t in 0 to 9
+    entail o[t+1] when say == t + 1
+end
+entail o[0] when say == 11
+entail stop when say == 12
+emit "-" when o[0]
+emit "0" when o[1]
+emit "1" when o[2]
+emit "2" when o[3]
+emit "3" when o[4]
+emit "4" when o[5]
+emit "5" when o[6]
+emit "6" when o[7]
+emit "7" when o[8]
+emit "8" when o[9]
+emit "9" when o[10]
+emit end when stop

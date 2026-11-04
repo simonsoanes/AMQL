@@ -22,6 +22,14 @@ internal static class EntailLexer
         "<-", ">=", "<=", "==", "!=", "+", "-", "*", "/", "^", "(", ")", "[", "]", ",", ":", "=", "<", ">",
     };
 
+    /// <summary>Stands in for a literal brace until templates have expanded.</summary>
+    public const char Brace = '\uE000';
+
+    private static string Unescape(string text) => text
+        .Replace("\\n", "\n", StringComparison.Ordinal)
+        .Replace("\\q", "\"", StringComparison.Ordinal)
+        .Replace("\\{", Brace.ToString(), StringComparison.Ordinal);
+
     public static List<Token> Lex(string source)
     {
         var tokens = new List<Token>();
@@ -52,7 +60,7 @@ internal static class EntailLexer
                 {
                     throw new EntailException(line, "unterminated string");
                 }
-                tokens.Add(new Token(Tok.Str, source[(i + 1)..end], line));
+                tokens.Add(new Token(Tok.Str, Unescape(source[(i + 1)..end]), line));
                 i = end + 1;
             }
             else if (char.IsDigit(c))
@@ -119,6 +127,7 @@ internal sealed record AttendStmt(Expr? Offset, string? Pointer, IReadOnlyList<S
 internal sealed record CopyStmt(RefExpr Target, Expr Source, int Line) : Stmt(Line);
 internal sealed record EntailStmt(RefExpr Target, Expr? Value, IReadOnlyList<Cond> When, int Line) : Stmt(Line);
 internal sealed record EmitStmt(string? Text, RefExpr Lane, int Line) : Stmt(Line);
+internal sealed record VoteStmt(string Text, Expr Value, int Line) : Stmt(Line);
 
 /// <summary>Recursive-descent parser for the statement forms of Entail.</summary>
 internal sealed class EntailParser
@@ -414,6 +423,19 @@ internal sealed class EntailParser
             var lane = Reference();
             EndOfLine();
             return new EmitStmt(text, lane, line);
+        }
+
+        if (AcceptWord("vote"))
+        {
+            if (Peek.Kind != Tok.Str)
+            {
+                throw new EntailException(line, "vote expects a quoted token");
+            }
+            var text = Next().Text;
+            ExpectWord("by");
+            var value = Expression();
+            EndOfLine();
+            return new VoteStmt(text, value, line);
         }
 
         // Inside an attend block: dst <- source.

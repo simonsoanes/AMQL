@@ -117,6 +117,10 @@ public sealed class EntailProgram
     public List<EntailOp> Ops { get; } = new();
     /// <summary>(token text, or null for "end of answer", lane).</summary>
     public List<(string? Text, int Lane)> Emits { get; } = new();
+    /// <summary>Soft output: token text → what adds to its score. The highest
+    /// positive score wins, as a softmax's would. An optimised program has
+    /// none: votes are what `emit` replaces.</summary>
+    public Dictionary<string, Lin> Votes { get; } = new(StringComparer.Ordinal);
     public int Layers { get; set; }
     public int MaxNeurons { get; set; }
     public int Statements { get; set; }
@@ -204,6 +208,10 @@ public static class EntailCompiler
                     Write(p, dest, 2 * layer);
                 }
             }
+        }
+        foreach (var vote in p.Votes.Values)
+        {
+            Read(vote, -1);
         }
         p.Layers = p.Ops.Max(o => o.Layer) + 1;
         p.MaxNeurons = neurons.Values.DefaultIfEmpty(0).Max();
@@ -426,7 +434,7 @@ public static class EntailCompiler
                         {
                             writes[LaneFor(lane)] = Eval(value).Const;
                         }
-                        Program.Tokens[Name(text)] = writes;
+                        Program.Tokens[Literal(Name(text))] = writes;
                     }
                     break;
                 case ForStmt s:
@@ -473,11 +481,21 @@ public static class EntailCompiler
                     {
                         int lane = LaneFor(s.Lane);
                         Program.Lanes[lane].Emits = true;
-                        Program.Emits.Add((s.Text is null ? null : Name(s.Text), lane));
+                        Program.Emits.Add((s.Text is null ? null : Literal(Name(s.Text)), lane));
+                    }
+                    break;
+                case VoteStmt s:
+                    {
+                        var key = Literal(Name(s.Text));
+                        Program.Votes[key] = Program.Votes.TryGetValue(key, out var sum)
+                            ? sum.Add(Eval(s.Value))
+                            : Eval(s.Value);
                     }
                     break;
             }
         }
+
+        private static string Literal(string text) => text.Replace(EntailLexer.Brace, '{');
 
         private void Call(CallStmt s)
         {
@@ -650,9 +668,11 @@ public static class EntailInterpreter
                     if (op is Neuron n)
                     {
                         double up = n.Up.Eval(x[t]);
-                        if (up != 0)
+                        double gate = n.Gate.Eval(x[t]);
+                        // A closed gate adds nothing a double could hold.
+                        if (up != 0 && gate > -40)
                         {
-                            delta.Add((t, n.Dest, n.Coef * Silu(n.Gate.Eval(x[t])) * up));
+                            delta.Add((t, n.Dest, n.Coef * Silu(gate) * up));
                         }
                     }
                     else if (op is Head h)
@@ -701,7 +721,18 @@ public static class EntailInterpreter
                 return text ?? string.Empty;
             }
         }
-        return null;
+        string? best = null;
+        double top = 0;
+        foreach (var (text, score) in p.Votes)
+        {
+            double value = score.Eval(lanes);
+            if (value > top)
+            {
+                top = value;
+                best = text;
+            }
+        }
+        return best;
     }
 
     /// <summary>Writes out the answer to an expression by feeding each output

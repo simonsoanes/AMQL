@@ -16,7 +16,7 @@ internal static partial class Program
     private static int EntailCommand(string[] args)
     {
         string verb = Arg(args, 0) ?? throw new CliException(
-            "entail requires a verb: check | run | compile | graft | eval");
+            "entail requires a verb: check | run | compile | graft | eval | find | extract | optimise | review | accept");
         var rest = args[1..];
         return verb switch
         {
@@ -25,6 +25,14 @@ internal static partial class Program
             "compile" => EntailCompile(rest),
             "graft" => EntailGraft(rest),
             "eval" => EntailEval(rest),
+            "find" => EntailFind(rest),
+            "decompile" => EntailDecompile(rest),
+            "fidelity" => EntailFidelity(rest),
+            "extract" => EntailExtract(rest),
+            "background" => EntailBackground(rest),
+            "optimise" => EntailOptimise(rest),
+            "review" => EntailReview(rest),
+            "accept" => EntailAccept(rest),
             _ => throw new CliException($"unknown entail verb '{verb}'"),
         };
     }

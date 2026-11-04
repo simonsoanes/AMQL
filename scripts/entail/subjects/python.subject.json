@@ -1,0 +1,68 @@
+{
+  "name": "python",
+  "lines": [
+    "def add(a, b):\n    return a + b",
+    "for item in items:\n    print(item)",
+    "class Point:\n    def __init__(self, x, y):\n        self.x = x",
+    "import os\nimport sys\nfrom pathlib import Path",
+    "if value is None:\n    raise ValueError(\"missing\")",
+    "with open(path) as handle:\n    text = handle.read()",
+    "result = [x * 2 for x in numbers if x > 0]",
+    "try:\n    run()\nexcept KeyError as error:\n    log(error)",
+    "names = {\"a\": 1, \"b\": 2}\nfor key, value in names.items():\n    pass",
+    "while not done:\n    done = step()",
+    "lambda x: x + 1",
+    "def main():\n    args = parse()\n    return 0",
+    "self.items.append(item)\nreturn len(self.items)",
+    "print(f\"total: {total}\")",
+    "async def fetch(url):\n    return await client.get(url)",
+    "assert isinstance(value, int)",
+    "@dataclass\nclass Config:\n    name: str = \"x\"",
+    "numbers = list(range(10))\nnumbers.sort(reverse=True)",
+    "if __name__ == \"__main__\":\n    main()",
+    "yield from walk(child)"
+  ],
+  "contrast": [
+    "The old lighthouse stood at the edge of the cliff, battered by wind and rain.",
+    "She packed her suitcase slowly, wondering whether she would ever return.",
+    "Bees communicate the location of flowers through an elaborate dance.",
+    "The committee will meet next week to discuss the proposed changes.",
+    "Fresh bread from the corner bakery filled the street with a warm smell.",
+    "He had never seen the ocean before, and it took his breath away.",
+    "Many birds migrate south in autumn and return when the weather warms.",
+    "The museum's new exhibition explores the art of ancient Egypt.",
+    "Please remember to lock the door when you leave the building.",
+    "A gentle river winds through the valley past fields of wheat.",
+    "The novel follows a young doctor working in a remote village.",
+    "Our neighbours adopted a small grey cat from the local shelter.",
+    "Autumn leaves drifted across the empty playground in the evening light.",
+    "The chef tasted the soup and added a little more salt and pepper.",
+    "Her grandmother told stories about the war and the long journey home.",
+    "The orchestra tuned their instruments as the audience took their seats.",
+    "Volcanoes form where molten rock escapes through the crust of the earth.",
+    "He apologised for being late and quietly took a seat at the back.",
+    "The garden was full of roses, lavender and the sound of insects.",
+    "They walked along the beach collecting shells until the sun went down."
+  ],
+  "relations": [
+    {
+      "name": "block",
+      "shots": "if ready:\n    go()\nwhile busy:\n    wait()\n",
+      "template": "{kw} {name}",
+      "slots": {
+        "kw": [ "if", "while", "elif" ],
+        "name": [ "ready", "done", "found", "valid", "active", "running", "empty", "full", "open", "closed", "alive", "dirty" ]
+      },
+      "until": "\n",
+      "max_tokens": 2
+    },
+    {
+      "name": "bool_not",
+      "shots": "x = not True  # False\ny = not False  # True\nz = not True  # False\n",
+      "template": "w = not {v}  #",
+      "slots": { "v": [ "True", "False" ] },
+      "until": "\n",
+      "max_tokens": 2
+    }
+  ]
+}

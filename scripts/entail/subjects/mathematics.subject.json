@@ -1,0 +1,73 @@
+{
+  "name": "mathematics",
+  "lines": [
+    "The sum of 48 and 27 is 75, because 40 plus 20 is 60 and 8 plus 7 is 15.",
+    "To find 15% of 240, multiply 240 by 0.15, which gives 36.",
+    "If 3x + 5 = 20, then 3x = 15 and so x = 5.",
+    "The area of a rectangle 12 cm by 7 cm is 84 square centimetres.",
+    "Seven times eight is fifty-six, and nine times nine is eighty-one.",
+    "144 divided by 12 equals 12, so 12 is the square root of 144.",
+    "A triangle's angles add up to 180 degrees.",
+    "1/2 + 1/4 = 3/4, since 1/2 is the same as 2/4.",
+    "The average of 10, 20 and 60 is 90 divided by 3, which is 30.",
+    "Subtracting 199 from 500 leaves 301.",
+    "The derivative of x squared is 2x, and the integral of 2x is x squared plus a constant.",
+    "256 is 2 to the power of 8, and 1024 is 2 to the power of 10.",
+    "In a right triangle with legs 3 and 4 the hypotenuse is 5.",
+    "A prime number has exactly two divisors: 2, 3, 5, 7, 11 and 13 are prime.",
+    "63 / 7 = 9 and 9 * 7 = 63, so the two operations undo each other.",
+    "The remainder when 100 is divided by 7 is 2, because 98 is 14 times 7.",
+    "Round 3.14159 to two decimal places and you get 3.14.",
+    "Twelve dozen is 144, and a gross is the same number.",
+    "The circumference of a circle is 2 pi r, so a radius of 5 gives about 31.4.",
+    "If a train covers 180 km in 3 hours its speed is 60 km per hour."
+  ],
+  "contrast": [
+    "The old lighthouse stood at the edge of the cliff, battered by wind and rain.",
+    "She packed her suitcase slowly, wondering whether she would ever return.",
+    "Bees communicate the location of flowers through an elaborate dance.",
+    "The committee will meet next week to discuss the proposed changes.",
+    "Fresh bread from the corner bakery filled the street with a warm smell.",
+    "He had never seen the ocean before, and it took his breath away.",
+    "Many birds migrate south in autumn and return when the weather warms.",
+    "The museum's new exhibition explores the art of ancient Egypt.",
+    "Please remember to lock the door when you leave the building.",
+    "A gentle river winds through the valley past fields of wheat.",
+    "The novel follows a young doctor working in a remote village.",
+    "Our neighbours adopted a small grey cat from the local shelter.",
+    "Autumn leaves drifted across the empty playground in the evening light.",
+    "The chef tasted the soup and added a little more salt and pepper.",
+    "Her grandmother told stories about the war and the long journey home.",
+    "The orchestra tuned their instruments as the audience took their seats.",
+    "Volcanoes form where molten rock escapes through the crust of the earth.",
+    "He apologised for being late and quietly took a seat at the back.",
+    "The garden was full of roses, lavender and the sound of insects.",
+    "They walked along the beach collecting shells until the sun went down."
+  ],
+  "relations": [
+    {
+      "name": "add",
+      "shots": "3+4=7\n12+5=17\n90+8=98\n",
+      "template": "{a}+{b}=",
+      "slots": { "a": "10-99", "b": "10-99" },
+      "sample": 90,
+      "max_tokens": 5
+    },
+    {
+      "name": "sub",
+      "shots": "9-4=5\n12-5=7\n90-8=82\n7-9=-2\n",
+      "template": "{a}-{b}=",
+      "slots": { "a": "10-99", "b": "10-99" },
+      "sample": 90,
+      "max_tokens": 5
+    },
+    {
+      "name": "mul",
+      "shots": "3*4=12\n12*5=60\n11*11=121\n",
+      "template": "{a}*{b}=",
+      "slots": { "a": "10-99", "b": "10-99" },
+      "sample": 120,
+      "max_tokens": 6
+    }
+  ]
+}

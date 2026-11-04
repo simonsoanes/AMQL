@@ -461,6 +461,7 @@ public static class EntailWeights
     /// </summary>
     public static EntailBuildReport WriteFresh(EntailProgram p, string outDir, int context = 8192)
     {
+        RefuseVotes(p);
         Directory.CreateDirectory(outDir);
         int hidden = WidthFor(Allocate(p, firstDim: 0, keepEmitsLive: true).Used);
         var (ballastDims, shift) = BallastShape(hidden);
@@ -608,6 +609,14 @@ public static class EntailWeights
         return root.ToJsonString();
     }
 
+    private static void RefuseVotes(EntailProgram p)
+    {
+        if (p.Votes.Count > 0)
+        {
+            throw new EntailException("this program still has soft votes: refine them into `emit` before compiling it");
+        }
+    }
+
     private static int RoundUp(int value, int unit) => (value + unit - 1) / unit * unit;
 
     // ── target 2: grafted into a host checkpoint, in situ ───────────────────
@@ -645,6 +654,7 @@ public static class EntailWeights
     /// </summary>
     public static EntailBuildReport WriteGraft(EntailProgram p, string hostDir, string outDir, int context = 8192)
     {
+        RefuseVotes(p);
         Directory.CreateDirectory(outDir);
         var hostConfig = JsonNode.Parse(File.ReadAllText(Path.Combine(hostDir, "config.json")))!.AsObject();
         var text = hostConfig["text_config"]?.AsObject() ?? hostConfig;

@@ -185,6 +185,18 @@ host cannot touch. `scripts/entail/mathematics.entail.txt` defines decimal arith
 grafted into Qwen 3.5 0.8B it takes direct arithmetic from 43.8% to 100% with top-1
 predictions on prose unchanged. See [docs/entail.md](docs/entail.md).
 
+`entail find`, `extract`, `optimise`, `review` and `accept` go the other way: from a trained
+model to a subject's Entail. They locate the experts or neurons that carry a subject, probe
+what the model does, and refine the resulting table into exact laws through documented
+rewrite rules, with any model able to propose a change and a mechanical gate deciding.
+From Qwen 3.5 0.8B's own noisy answers this derived `a + b`, `a - b` and `a*b`, and reloading
+the result took it from 84% to 100% on unseen two-digit arithmetic.
+
+`entail decompile` writes down what a model's neurons do across a whole corpus, unrelated
+trained-in material included, as the raw state before optimisation, and `entail fidelity`
+measures it. For Python on the same model that is 1.8 million rule lines. See
+[docs/entail-optimisation.md](docs/entail-optimisation.md).
+
 ### Model Merging & Transformation
 
 - **`merge`** — Two models into one via consensus-gated token alignment. Shared tokens
@@ -360,6 +372,7 @@ multi-million-element matrix is too small to measure downstream. See
 - [Inference Visualiser](docs/inference-visualiser.md) — operator trace format and the map UI
 - [Entail](docs/entail.md) — compiling statements into weights: design and results
 - [The Entail Language](docs/entail-language.md) — language reference
+- [Extracting and Optimising a Subject](docs/entail-optimisation.md) — the cycle, its rewrite rules and the reviewer's brief
 - [CUDA Backend Plan](docs/CUDA_PLAN.md) — GPU kernel roadmap
 - [MTP Drafter](docs/MTP_DRAFTER.md) — speculative decoding drafter design
 

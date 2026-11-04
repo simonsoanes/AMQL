@@ -66,14 +66,14 @@ leading space: see [The start of the text](#the-start-of-the-text).
 - Indentation means nothing; blocks close with `end`.
 - Names are letters, digits and `_`, starting with a letter or `_`.
 - Numbers are decimal, with an optional fraction: `9`, `0.5`.
-- Strings are in double quotes and have no escape sequences: `"\"` is one
-  backslash, and a string cannot contain a `"`.
+- Strings are in double quotes. `\n` is a newline, `\q` is a double quote and `\{` is
+  a literal brace. There are no other escape sequences: `"\"` is one backslash.
 - `{x}` inside a name or string is replaced by the value of the loop variable or
   `def` parameter `x`: `token "{d}"`, `state {p}_carry[n]`. Constants cannot be
   used this way.
 
 Reserved words: `program const state scale let token means for in to if else end
-def call attend back by entail when not emit sum min floor`.
+def call attend back by entail when not emit vote sum min floor`.
 
 ## Expressions
 
@@ -235,6 +235,15 @@ and the host says what comes next.
 
 Where no output lane is set, the program says nothing. In a host, this is what
 leaves the model's own prediction untouched.
+
+```
+vote "TEXT" by EXPRESSION
+```
+A soft output, for programs that describe a model before they replace it. Votes for
+one token add up, and the token with the highest positive score is said, as a softmax
+would choose. An `emit` that fires comes first. `entail decompile` writes votes, the
+interpreter runs them, and `compile` and `graft` refuse them: a vote is what is left to
+be refined into `emit`.
 
 ## Rules the compiler enforces
 
