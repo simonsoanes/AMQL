@@ -1,0 +1,574 @@
+# ═══════════════════════════════════════════════════════════════════════════
+#  dates.entail — the Gregorian calendar
+# ═══════════════════════════════════════════════════════════════════════════
+#
+#  A date is three numbers, and the calendar is one law: 365 days, plus a day
+#  every 4 years, less one every 100, plus one every 400. Everything here
+#  follows from that. Nothing is listed year by year.
+#
+#    2024-03-15 was a                       Friday
+#    March 15, 2024 falls on a              Friday
+#    Days from 2024-01-01 to 2024-03-15 =   74 days
+#    2024-03-15 + 30 days =                 2024-04-14
+#    30 days after 15 March 2024 is         2024-04-14
+#    Is 1900 a leap year?                   No
+#    February 2024 has                      29 days
+#
+#  Years run from 1583, the first whole Gregorian year, to 9999. Two dates may
+#  be up to 300 years apart, and up to 9999 days may be added or taken away.
+#  A date that does not exist, such as 2023-02-29, entails nothing.
+
+program dates
+
+const W = 13    # how far back a date and its connecting word can reach
+const S = 12    # answer tokens: a blank, ten characters, the end of the answer
+const K = 29    # years a sum can move a date: 9999 days and a little more
+
+# ─── 1. Tokens ──────────────────────────────────────────────────────────────
+
+const K_DIGIT = 1
+const K_DASH  = 2
+const K_GAP   = 3
+const K_COMMA = 4
+const K_MONTH = 5
+const K_TO    = 6     # joins two dates
+const K_AFTER = 7
+const K_BEFORE = 8
+const K_DAYS  = 9
+const K_PLUS  = 10
+const K_MINUS = 11
+const K_IS    = 12
+const K_WAS   = 13
+const K_ON    = 14
+const K_FALL  = 15
+const K_A     = 16
+const K_EQ    = 17    # ends a question, as " is" also does
+const K_LEAP  = 18
+const K_YEAR  = 19
+const K_ASK   = 20
+const K_HAS   = 21
+const K_SAID  = 22    # a word the answer itself uses
+
+state val, kind
+
+for d in 0 to 9
+    token "{d}" means val = d, kind = K_DIGIT
+end
+token "-"  means kind = K_DASH
+token " "  means kind = K_GAP
+token ","  means kind = K_COMMA
+token " January", "January", " Jan", "Jan"   means val = 1, kind = K_MONTH
+token " February", "February", " Feb", "Feb" means val = 2, kind = K_MONTH
+token " March", "March", " Mar", "Mar"       means val = 3, kind = K_MONTH
+token " April", "April", " Apr", "Apr"       means val = 4, kind = K_MONTH
+token " May", "May"                          means val = 5, kind = K_MONTH
+token " June", "June", " Jun", "Jun"         means val = 6, kind = K_MONTH
+token " July", "July", " Jul", "Jul"         means val = 7, kind = K_MONTH
+token " August", "August", " Aug", "Aug"     means val = 8, kind = K_MONTH
+token " September", "September", " Sep", "Sep", " Sept", "Sept" means val = 9, kind = K_MONTH
+token " October", "October", " Oct", "Oct"   means val = 10, kind = K_MONTH
+token " November", "November", " Nov", "Nov" means val = 11, kind = K_MONTH
+token " December", "December", " Dec", "Dec" means val = 12, kind = K_MONTH
+token " to", " and"         means kind = K_TO
+token " after"              means kind = K_AFTER
+token " before"             means kind = K_BEFORE
+token " days", " day"       means kind = K_DAYS
+token " +"                  means kind = K_PLUS
+token " -"                  means kind = K_MINUS
+token " is"                 means kind = K_IS
+token " was", " be"         means kind = K_WAS
+token " on"                 means kind = K_ON
+token " falls", " fell", " fall" means kind = K_FALL
+token " a"                  means kind = K_A
+token " =", "=", ":"        means kind = K_EQ
+token " leap"               means kind = K_LEAP
+token " year"               means kind = K_YEAR
+token "?"                   means kind = K_ASK
+token " has"                means kind = K_HAS
+token " Sunday", " Monday", " Tuesday", " Wednesday", " Thursday", " Friday", " Saturday", " Yes", " No" means kind = K_SAID
+
+# ─── 2. Sight ───────────────────────────────────────────────────────────────
+
+state wv[W + 1], wk[W + 1]
+for k in 1 to W
+    attend back k
+        wv[k] <- val
+        wk[k] <- kind
+    end
+end
+
+let kk[0] = kind
+let vv[0] = val
+for k in 1 to W
+    let kk[k] = wk[k]
+    let vv[k] = wv[k]
+end
+
+state dg[W + 1], gp[W + 1], ds[W + 1], mn[W + 1], cm[W + 1], ans[W + 1]
+for k in 0 to W
+    entail dg[k] when kk[k] == K_DIGIT
+    entail gp[k] when kk[k] == K_GAP
+    entail ds[k] when kk[k] == K_DASH
+    entail mn[k] when kk[k] == K_MONTH
+    entail cm[k] when kk[k] == K_COMMA
+    entail ans[k] when kk[k] == K_DIGIT
+    entail ans[k] when kk[k] == K_DASH
+    entail ans[k] when kk[k] == K_GAP
+    entail ans[k] when kk[k] == K_DAYS
+    entail ans[k] when kk[k] == K_SAID
+end
+
+# ─── 3. A date ending at this token ─────────────────────────────────────────
+#
+#   iso     2024-03-15        offsets 9..0
+#   dmy1/2  5 March 2024      the day is one or two digits
+#   mdy1/2  March 5, 2024
+#   my      March 2024        a month, for "has"
+
+state yearH, iso, dmy1, dmy2, mdy1, mdy2, my
+entail yearH when (sum i in 0 to 3 : dg[i]) >= 4, not dg[4]
+entail iso  when dg[0] + dg[1] + ds[2] + dg[3] + dg[4] + ds[5] + (sum i in 6 to 9 : dg[i]) >= 10, not dg[10], not ds[10]
+entail dmy1 when yearH, gp[4] + mn[5] + dg[6] >= 3, not dg[7]
+entail dmy2 when yearH, gp[4] + mn[5] + dg[6] + dg[7] >= 4, not dg[8]
+entail mdy1 when yearH, gp[4] + cm[5] + dg[6] + gp[7] + mn[8] >= 5
+entail mdy2 when yearH, gp[4] + cm[5] + dg[6] + dg[7] + gp[8] + mn[9] >= 6
+entail my   when yearH, gp[4] + mn[5] >= 2, not dg[6]
+
+state yd[4], mo, dy
+for i in 0 to 3
+    entail yd[i] = vv[6+i] when iso
+    entail yd[i] = vv[i] when yearH
+end
+entail mo = 10*vv[4] + vv[3] when iso
+entail dy = 10*vv[1] + vv[0] when iso
+entail mo = vv[5] when dmy1
+entail dy = vv[6] when dmy1
+entail mo = vv[5] when dmy2
+entail dy = 10*vv[7] + vv[6] when dmy2
+entail mo = vv[8] when mdy1
+entail dy = vv[6] when mdy1
+entail mo = vv[9] when mdy2
+entail dy = 10*vv[7] + vv[6] when mdy2
+entail mo = vv[5] when my
+
+let Y = 10*yd[1] + yd[0]    # the year within its century
+let C = 10*yd[3] + yd[2]    # the century
+
+# ─── 4. The law ─────────────────────────────────────────────────────────────
+#
+# floor(Y/4) and floor(C/4) are counts of thresholds. They give the leap days
+# before a year: 24C + fY + fC, from 25C + fY - C + fC.
+
+state q4[25], c4[25]
+for k in 1 to 24
+    entail q4[k] when Y >= 4*k
+    entail c4[k] when C >= 4*k
+end
+let fY = (sum k in 1 to 24 : q4[k])
+let fC = (sum k in 1 to 24 : c4[k])
+let r4 = Y - 4*fY
+let k4 = C - 4*fC
+
+state lp
+entail lp when r4 == 0, Y >= 1
+entail lp when Y == 0, k4 == 0
+
+let len[1] = 31
+let len[2] = 28
+let len[3] = 31
+let len[4] = 30
+let len[5] = 31
+let len[6] = 30
+let len[7] = 31
+let len[8] = 31
+let len[9] = 30
+let len[10] = 31
+let len[11] = 30
+let len[12] = 31
+let cum[1] = 0
+for m in 2 to 12
+    let cum[m] = cum[m-1] + len[m-1]
+end
+
+state mge[13], mis[13], febl, late
+for m in 2 to 12
+    entail mge[m] when mo >= m
+end
+for m in 1 to 12
+    entail mis[m] when mo == m
+end
+entail febl when lp, mis[2]
+entail late when lp, mge[3]
+
+let mlen = (sum m in 1 to 12 : len[m]*mis[m]) + febl
+let doy  = (sum m in 1 to 11 : len[m]*mge[m+1]) + dy - 1 + late    # 0 on 1 January
+let form = iso + dmy1 + dmy2 + mdy1 + mdy2
+
+state good
+entail good when form >= 1, dy >= 1, dy - mlen <= 0, 100*C + Y >= 1583
+
+# The weekday, 0 for Sunday: y + leap days before it, and 365 and 100 reduced by 7.
+let wx = 5*C + Y + fY + fC - lp + doy
+state w7[150]
+for k in 1 to 149
+    entail w7[k] when wx >= 7*k
+end
+let wday = wx - 7*(sum k in 1 to 149 : w7[k])
+
+# Days since an origin, in two parts, so a difference never holds a large number.
+let lo = 24*C + fY + fC - lp + doy
+
+# ─── 5. A number ending at this token ───────────────────────────────────────
+
+state nl[5], nv scale 1/32
+for n in 1 to 4
+    entail nl[n] when (sum i in 0 to n-1 : dg[i]) >= n, not dg[n]
+    entail nv = (sum i in 0 to n-1 : 10^i * vv[i]) when nl[n]
+end
+
+# ─── 6. What stands in front of a date ──────────────────────────────────────
+#
+# cp[o]: the word before this date stands at offset o.
+
+state cp[W + 1]
+entail cp[11] when iso, gp[10]
+entail cp[8]  when dmy1, gp[7]
+entail cp[9]  when dmy2, gp[8]
+entail cp[9]  when mdy1
+entail cp[10] when mdy2
+
+state pairP[W + 1], aftP[W + 1], isAft, isBef
+for o in 8 to 11
+    entail pairP[o+1] when cp[o], kk[o] == K_TO
+    entail aftP[o+2] when cp[o], kk[o] == K_AFTER, kk[o+1] == K_DAYS
+    entail aftP[o+2] when cp[o], kk[o] == K_BEFORE, kk[o+1] == K_DAYS
+    entail isAft when cp[o], kk[o] == K_AFTER, kk[o+1] == K_DAYS
+    entail isBef when cp[o], kk[o] == K_BEFORE, kk[o+1] == K_DAYS
+end
+
+# The date before the connecting word.
+state c1, y1, l1 scale 1/16, ok1
+attend back by pairP
+    c1 <- C
+    y1 <- Y
+    l1 <- lo
+    ok1 <- good
+end
+
+# The number in "30 days after".
+state an scale 1/32, anok
+attend back by aftP
+    an <- nv
+    anok <- nl[1] + nl[2] + nl[3] + nl[4]
+end
+
+let dyr = 100*(C - c1) + Y - y1
+let dif = 365*dyr + lo - l1
+
+state pairOK, dpos, dneg
+entail pairOK when good, ok1, (pairP[9] + pairP[10] + pairP[11] + pairP[12]) >= 1, dyr >= -300, dyr <= 300
+entail dpos when pairOK, dif >= 0
+entail dneg when pairOK, dif <= -1
+
+state ab scale 1/1024
+entail ab = dif when dpos
+entail ab = 0 - dif when dneg
+
+# Its digits, from the top.
+def digits(p, src, n)
+    state {p}_t[n][10]
+    let {p}_r[n-1] = src
+    for j in 0 to n-1
+        const PLACE = n - 1 - j
+        for t in 1 to 9
+            entail {p}_t[PLACE][t] when {p}_r[PLACE] >= t * 10^PLACE
+        end
+        let {p}_d[PLACE] = (sum t in 1 to 9 : {p}_t[PLACE][t])
+        if PLACE > 0
+            let {p}_r[PLACE-1] = {p}_r[PLACE] - 10^PLACE * {p}_d[PLACE]
+        end
+    end
+end
+call digits(gap, ab, 6)
+
+state gtop[6]
+entail gtop[0] when ab <= 9
+for j in 1 to 4
+    entail gtop[j] when ab >= 10^j, ab <= 10^(j+1) - 1
+end
+entail gtop[5] when ab >= 100000
+state oneDay
+entail oneDay when ab == 1
+
+# ─── 7. A question, asked at this token ─────────────────────────────────────
+#
+# ptr[c]: the date this question is about ends c tokens back.
+
+state atWD, atLeap, atHas, atEnd, atPlus[5], atMinus[5], addn scale 1/32, subn scale 1/32
+state ptr[W + 1]
+
+state wasK[3]
+for i in 1 to 2
+    entail wasK[i] when kk[i] == K_WAS
+    entail wasK[i] when kk[i] == K_IS
+end
+state anA, onA
+entail anA when kk[0] == K_A
+entail onA when anA, kk[1] == K_ON
+entail ptr[2] when anA, wasK[1]
+entail ptr[3] when onA, wasK[2]
+entail ptr[3] when onA, kk[2] == K_FALL
+entail atWD when anA, wasK[1]
+entail atWD when onA, wasK[2]
+entail atWD when onA, kk[2] == K_FALL
+
+entail atLeap when kk[0] == K_ASK, kk[1] == K_YEAR, kk[2] == K_LEAP, kk[3] == K_A
+entail ptr[4] when atLeap
+
+entail atHas when kk[0] == K_HAS
+entail ptr[1] when atHas
+
+state ender
+entail ender when kk[0] == K_EQ
+entail ender when kk[0] == K_IS
+entail ender when kk[0] == K_ASK
+entail atEnd when ender, dg[1]
+entail ptr[1] when atEnd
+
+# date + 30 days =
+for n in 1 to 4
+    entail atPlus[n]  when ender, kk[1] == K_DAYS, (sum i in 0 to n-1 : dg[2+i]) >= n, not dg[2+n], gp[2+n], kk[3+n] == K_PLUS
+    entail atMinus[n] when ender, kk[1] == K_DAYS, (sum i in 0 to n-1 : dg[2+i]) >= n, not dg[2+n], gp[2+n], kk[3+n] == K_MINUS
+    entail ptr[4+n] when atPlus[n]
+    entail ptr[4+n] when atMinus[n]
+    entail addn = (sum i in 0 to n-1 : 10^i * vv[2+i]) when atPlus[n]
+    entail subn = (sum i in 0 to n-1 : 10^i * vv[2+i]) when atMinus[n]
+end
+let plusAny  = (sum n in 1 to 4 : atPlus[n])
+let minusAny = (sum n in 1 to 4 : atMinus[n])
+
+# ─── 8. What the date says ──────────────────────────────────────────────────
+
+state gGood, gYear, gMy, gPair, gAft, gBef, gLp, gMlen, gWd
+state gC, gY, gR4, gK4, gDoy scale 1/4, gAn scale 1/32, gAnok
+state gGapD[6], gTop[6], gOne
+attend back by ptr
+    gGood <- good
+    gYear <- yearH
+    gMy <- my
+    gPair <- pairOK
+    gAft <- isAft
+    gBef <- isBef
+    gLp <- lp
+    gMlen <- mlen
+    gWd <- wday
+    gC <- C
+    gY <- Y
+    gR4 <- r4
+    gK4 <- k4
+    gDoy <- doy
+    gAn <- an
+    gAnok <- anok
+    gOne <- oneDay
+    for j in 0 to 5
+        gGapD[j] <- gap_d[j]
+        gTop[j] <- gtop[j]
+    end
+end
+
+state qWD, qDiff, qAdd, qLeap, qHas
+entail qWD when atWD, gGood
+entail qLeap when atLeap, gYear, 100*gC + gY >= 1583
+entail qHas when atHas, gMy, gMlen >= 28
+entail qDiff when atEnd, gPair
+entail qAdd when atEnd, gGood, gAnok >= 1, gAft
+entail qAdd when atEnd, gGood, gAnok >= 1, gBef
+entail qAdd when gGood, plusAny >= 1
+entail qAdd when gGood, minusAny >= 1
+
+# ─── 9. Moving a date ───────────────────────────────────────────────────────
+#
+# T counts days from 1 January of the date's year. lk[k]: year y+k is a leap
+# year. Only the year's place in its 4-year and 100-year cycles matters, so no
+# year is ever divided. A century is reached at Y = -k going back, or
+# Y = 100-k going forward, where the next century counts.
+
+state aAdd scale 1/32, aSub scale 1/32
+entail aAdd = gAn when atEnd, gAft
+entail aSub = gAn when atEnd, gBef
+let T = gDoy + addn + aAdd - subn - aSub
+
+state lk[2*K + 2], cen[2*K + 2], ck[2*K + 2]
+for i in 0 to 2*K + 1
+    const YEARS = i - K
+    const REM = YEARS - 4*floor(YEARS/4)
+    const BACK4 = 4*min(1, REM) - REM     # the r4 that makes y+k divisible by 4
+    if YEARS <= 0
+        entail cen[i] when gY == 0 - YEARS
+        entail ck[i] when cen[i], gK4 == 0
+    else
+        entail cen[i] when gY == 100 - YEARS
+        entail ck[i] when cen[i], gK4 == 3
+    end
+    entail lk[i] when gR4 == BACK4, not cen[i]
+    entail lk[i] = ck[i]
+end
+
+# bb[i]: days from 1 January of y to 1 January of y+k.
+let bb[K] = 0
+for j in 1 to K + 1
+    let bb[K+j] = bb[K+j-1] + 365 + lk[K+j-1]
+end
+for j in 1 to K
+    let bb[K-j] = bb[K-j+1] - 365 - lk[K-j]
+end
+
+state ge[2*K + 2], sel[2*K + 1]
+for i in 0 to 2*K + 1
+    entail ge[i] when T - bb[i] >= 0
+end
+for i in 0 to 2*K
+    entail sel[i] when ge[i], not ge[i+1]
+end
+
+state tp scale 1/4, ls, yo
+for i in 0 to 2*K
+    entail tp = T - bb[i] when sel[i]
+    entail ls = lk[i] when sel[i]
+    entail yo = i - K when sel[i]
+end
+
+let yy = 100*gC + gY + yo
+state yOK
+entail yOK when qAdd, yy >= 1583, yy <= 9999, (sum i in 0 to 2*K : sel[i]) >= 1
+
+state ng[13], late2
+entail ng[2] when tp >= 31
+for m in 3 to 12
+    entail ng[m] when tp - ls - cum[m] >= 0
+end
+entail late2 when ls, ng[3]
+let nm = 1 + (sum m in 2 to 12 : ng[m])
+let nd = tp + 1 - (sum m in 1 to 11 : len[m]*ng[m+1]) - late2
+
+state yy_s scale 1/64
+entail yy_s = yy when yOK
+call digits(yr, yy_s, 4)
+call digits(mth, nm, 2)
+call digits(dom, nd, 2)
+call digits(mln, gMlen, 2)
+
+# ─── 10. The answer, as a sequence of tokens ────────────────────────────────
+
+const C_DASH  = 11
+const C_BLANK = 12
+const C_DAYS  = 13
+const C_DAY   = 14
+const C_WD    = 15    # to 21
+const C_YES   = 22
+const C_NO    = 23
+const C_END   = 24
+
+state code[S]
+
+entail code[0] = C_WD + gWd when qWD
+entail code[1] = C_END when qWD
+
+state lpY, lpN
+entail lpY when qLeap, gLp
+entail lpN when qLeap, not gLp
+entail code[0] = C_YES when lpY
+entail code[0] = C_NO when lpN
+entail code[1] = C_END when qLeap
+
+entail code[0] = C_BLANK when qHas
+entail code[1] = mln_d[1] + 1 when qHas
+entail code[2] = mln_d[0] + 1 when qHas
+entail code[3] = C_DAYS when qHas
+entail code[4] = C_END when qHas
+
+state dt[6]
+for j in 0 to 5
+    entail dt[j] when qDiff, gTop[j]
+end
+entail code[0] = C_BLANK when qDiff
+for j in 0 to 5
+    for s in 0 to j
+        entail code[1+s] = gGapD[j-s] + 1 when dt[j]
+    end
+    entail code[j+2] = C_DAYS when dt[j], not gOne
+    entail code[j+2] = C_DAY when dt[j], gOne
+    entail code[j+3] = C_END when dt[j]
+end
+
+entail code[0] = C_BLANK when yOK
+for j in 0 to 3
+    entail code[1+j] = yr_d[3-j] + 1 when yOK
+end
+entail code[5] = C_DASH when yOK
+entail code[6] = mth_d[1] + 1 when yOK
+entail code[7] = mth_d[0] + 1 when yOK
+entail code[8] = C_DASH when yOK
+entail code[9] = dom_d[1] + 1 when yOK
+entail code[10] = dom_d[0] + 1 when yOK
+entail code[11] = C_END when yOK
+
+# ─── 11. Writing it out ─────────────────────────────────────────────────────
+
+state anc
+entail anc when qWD
+entail anc when qLeap
+entail anc when qHas
+entail anc when qDiff
+entail anc when yOK
+
+state wa[S]
+for c in 1 to S - 1
+    attend back c
+        wa[c] <- anc
+    end
+end
+
+state from[S], slot[S]
+entail from[0] when anc
+entail slot[0] when anc
+for c in 1 to S - 1
+    entail from[c] when wa[c], (sum i in 0 to c-1 : ans[i]) >= c
+    entail slot[c] when wa[c], (sum i in 0 to c-1 : ans[i]) >= c
+end
+
+state seen[S]
+attend back by from
+    for s in 0 to S-1
+        seen[s] <- code[s]
+    end
+end
+
+state say
+for s in 0 to S-1
+    entail say = seen[s] when slot[s]
+end
+
+# ─── 12. Output ─────────────────────────────────────────────────────────────
+
+state o[25]
+for d in 1 to 24
+    entail o[d] when say == d
+end
+for d in 0 to 9
+    emit "{d}" when o[d+1]
+end
+emit "-" when o[C_DASH]
+emit " " when o[C_BLANK]
+emit " days" when o[C_DAYS]
+emit " day" when o[C_DAY]
+emit " Sunday" when o[C_WD]
+emit " Monday" when o[C_WD+1]
+emit " Tuesday" when o[C_WD+2]
+emit " Wednesday" when o[C_WD+3]
+emit " Thursday" when o[C_WD+4]
+emit " Friday" when o[C_WD+5]
+emit " Saturday" when o[C_WD+6]
+emit " Yes" when o[C_YES]
+emit " No" when o[C_NO]
+emit end when o[C_END]

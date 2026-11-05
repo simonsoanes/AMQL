@@ -53,6 +53,90 @@ public class EntailTests
     public void Chemistry_Adds_Up_Atoms_And_Conserves_Mass(string tokens, string answer) =>
         Assert.Equal(answer, EntailInterpreter.Answer(Chemistry.Value, tokens.Split('|')));
 
+    private static EntailProgram Load(string name) =>
+        EntailCompiler.Compile(File.ReadAllText(RepoFile("scripts", "entail", name + ".entail.txt")));
+
+    private static readonly Lazy<EntailProgram> Dates = new(() => Load("dates"));
+    private static readonly Lazy<EntailProgram> Bases = new(() => Load("bases"));
+    private static readonly Lazy<EntailProgram> Logic = new(() => Load("logic"));
+    private static readonly Lazy<EntailProgram> Json = new(() => Load("json"));
+
+    [Theory]
+    [InlineData(" |2|0|2|4|-|0|3|-|1|5| was| a", " Friday")]
+    [InlineData(" March| |1|5|,| |2|0|2|4| falls| on| a", " Friday")]
+    [InlineData(" |2|9| February| |2|0|0|0| was| a", " Tuesday")]
+    [InlineData(" from| |2|0|2|4|-|0|1|-|0|1| to| |2|0|2|4|-|0|3|-|1|5| =", " 74 days")]
+    [InlineData(" |2|0|2|4|-|0|3|-|1|5| +| |3|0| days| =", " 2024-04-14")]
+    [InlineData(" |1|9|9|9|-|1|2|-|3|1| +| |1| day| =", " 2000-01-01")]
+    [InlineData(" |3|0| days| before| |1| March| |2|0|2|4| is", " 2024-01-31")]
+    [InlineData(" Is| |1|9|0|0| a| leap| year|?", " No")]
+    [InlineData(" Is| |2|0|0|0| a| leap| year|?", " Yes")]
+    [InlineData(" February| |2|0|2|4| has", " 29 days")]
+    [InlineData(" |2|0|2|3|-|0|2|-|2|9| was| a", "")]
+    public void Dates_Follow_From_The_Calendars_Law(string tokens, string answer) =>
+        Assert.Equal(answer, EntailInterpreter.Answer(Dates.Value, tokens.Split('|')));
+
+    [Theory]
+    [InlineData(" |2|5|5| in| binary| is", " 11111111")]
+    [InlineData(" |2|5|5| in| hex| is", " ff")]
+    [InlineData(" |0|xff| in| decimal| is", " 255")]
+    [InlineData(" |0|xDE|ADB|EE|F| =", " 3735928559")]
+    [InlineData(" |0|b|1|0|1|1| =", " 11")]
+    [InlineData(" |0|o|7|5|5| in| binary| is", " 111101101")]
+    [InlineData(" |1|2|0|3| base| |7| in| decimal| is", " 444")]
+    [InlineData(" |1|0|0|0| in| base| |7| is", " 2626")]
+    [InlineData(" |4|2|9|4|9|6|7|2|9|5| in| hex| is", " ffffffff")]
+    [InlineData(" |4|2|9|4|9|6|7|2|9|6| in| hex| is", "")]
+    [InlineData(" |0|b|1|0|2| =", "")]
+    public void Bases_Convert_By_Columns_And_Carries(string tokens, string answer) =>
+        Assert.Equal(answer, EntailInterpreter.Answer(Bases.Value, tokens.Split('|')));
+
+    [Theory]
+    [InlineData("\n|true| and| not| false| is", " true")]
+    [InlineData("\n| (|true| or| false|)| and| false| =", " false")]
+    [InlineData("\n| p| or| not| p| is", " a tautology")]
+    [InlineData("\n| p| and| not| p| is", " a contradiction")]
+    [InlineData("\n| p| ->| q| is", " contingent")]
+    [InlineData("\n| not| (|p| and| q|)| <->| (|not| p| or| not| q|)| is", " a tautology")]
+    [InlineData(" Truth| table| of| p| xor| q|:", " 0110")]
+    [InlineData(" Truth| table| of| (|p| or| q|):", " 0111")]
+    [InlineData("\n| p| xor| q| or| r| is", "")]
+    [InlineData("\n| and| or| true| is", "")]
+    public void Logic_Evaluates_Every_Assignment(string tokens, string answer) =>
+        Assert.Equal(answer, EntailInterpreter.Answer(Logic.Value, tokens.Split('|')));
+
+    [Theory]
+    [InlineData("\n|JSON|:| {\"|a|\":| |1|}|\n|Valid|:", " yes")]
+    [InlineData("\n|JSON|:| [|1|,| |2|}|\n|Valid|:", " no")]
+    [InlineData("\n|JSON|:| {\"|a|\":| \"|}|\",| \"|b|\":| [|]}|\n|Valid|:", " yes")]
+    [InlineData("\n|JSON|:| {\"|a|\":| |1|,|}|\n|Valid|:", " no")]
+    [InlineData("\n|JSON|:| [|0| .|5|]|\n|Valid|:", " no")]
+    [InlineData("\n|JSON|:| [\"|tab|\\|there|\"]|\n|Valid|:", " yes")]
+    [InlineData(" nothing| here|\n|Valid|:", "")]
+    public void Json_Is_Read_Against_Its_Grammar(string tokens, string answer) =>
+        Assert.Equal(answer, EntailInterpreter.Answer(Json.Value, tokens.Split('|')));
+
+    [Fact]
+    public void A_Mask_Needs_A_Host()
+    {
+        var p = EntailCompiler.Compile("state a, b\ntoken \"x\" means a = 1\nentail b when a\nonly \"x\", \"y\" when b\nforbid \"z\" when b");
+        Assert.Equal(2, p.Masks.Count);
+        Assert.True(p.Masks[0].Allow);
+        Assert.False(p.Masks[1].Allow);
+        var dir = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName());
+        Assert.Throws<EntailException>(() => EntailWeights.WriteFresh(p, dir));
+    }
+
+    [Fact]
+    public void Strings_Can_Name_Any_Token()
+    {
+        var p = EntailCompiler.Compile("state a, b\ntoken \"\\en\", \"\\t\", \"\\r\", \"\\\" means a = 1\nentail b when a");
+        Assert.Contains("\\n", p.Tokens.Keys);
+        Assert.Contains("\t", p.Tokens.Keys);
+        Assert.Contains("\r", p.Tokens.Keys);
+        Assert.Contains("\\", p.Tokens.Keys);
+    }
+
     private static string Say(string expression) =>
         EntailInterpreter.Answer(Mathematics.Value, Chars(expression));
 

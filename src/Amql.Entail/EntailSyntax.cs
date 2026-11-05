@@ -28,7 +28,10 @@ internal static class EntailLexer
     private static string Unescape(string text) => text
         .Replace("\\n", "\n", StringComparison.Ordinal)
         .Replace("\\q", "\"", StringComparison.Ordinal)
-        .Replace("\\{", Brace.ToString(), StringComparison.Ordinal);
+        .Replace("\\t", "\t", StringComparison.Ordinal)
+        .Replace("\\r", "\r", StringComparison.Ordinal)
+        .Replace("\\{", Brace.ToString(), StringComparison.Ordinal)
+        .Replace("\\e", "\\", StringComparison.Ordinal);
 
     public static List<Token> Lex(string source)
     {
@@ -127,6 +130,7 @@ internal sealed record AttendStmt(Expr? Offset, string? Pointer, IReadOnlyList<S
 internal sealed record CopyStmt(RefExpr Target, Expr Source, int Line) : Stmt(Line);
 internal sealed record EntailStmt(RefExpr Target, Expr? Value, IReadOnlyList<Cond> When, int Line) : Stmt(Line);
 internal sealed record EmitStmt(string? Text, RefExpr Lane, int Line) : Stmt(Line);
+internal sealed record MaskStmt(bool Allow, IReadOnlyList<string> Texts, RefExpr Lane, int Line) : Stmt(Line);
 internal sealed record VoteStmt(string Text, Expr Value, int Line) : Stmt(Line);
 
 /// <summary>Recursive-descent parser for the statement forms of Entail.</summary>
@@ -423,6 +427,26 @@ internal sealed class EntailParser
             var lane = Reference();
             EndOfLine();
             return new EmitStmt(text, lane, line);
+        }
+
+        bool only = AcceptWord("only");
+        if (only || AcceptWord("forbid"))
+        {
+            var texts = new List<string>();
+            do
+            {
+                SkipNewlines();
+                if (Peek.Kind != Tok.Str)
+                {
+                    throw new EntailException(line, "only and forbid expect quoted tokens");
+                }
+                texts.Add(Next().Text);
+            }
+            while (AcceptSym(","));
+            ExpectWord("when");
+            var lane = Reference();
+            EndOfLine();
+            return new MaskStmt(only, texts, lane, line);
         }
 
         if (AcceptWord("vote"))

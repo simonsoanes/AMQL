@@ -66,14 +66,15 @@ leading space: see [The start of the text](#the-start-of-the-text).
 - Indentation means nothing; blocks close with `end`.
 - Names are letters, digits and `_`, starting with a letter or `_`.
 - Numbers are decimal, with an optional fraction: `9`, `0.5`.
-- Strings are in double quotes. `\n` is a newline, `\q` is a double quote and `\{` is
-  a literal brace. There are no other escape sequences: `"\"` is one backslash.
+- Strings are in double quotes. `\n` is a newline, `\t` a tab, `\r` a carriage return,
+  `\q` a double quote, `\{` a literal brace and `\e` a backslash, for when one comes
+  before a letter. There are no other escape sequences: `"\"` is one backslash.
 - `{x}` inside a name or string is replaced by the value of the loop variable or
   `def` parameter `x`: `token "{d}"`, `state {p}_carry[n]`. Constants cannot be
   used this way.
 
 Reserved words: `program const state scale let token means for in to if else end
-def call attend back by entail when not emit vote sum min floor`.
+def call attend back by entail when not emit only forbid vote sum min floor`.
 
 ## Expressions
 
@@ -237,6 +238,16 @@ Where no output lane is set, the program says nothing. In a host, this is what
 leaves the model's own prediction untouched.
 
 ```
+only "TEXT", "TEXT" when LANE
+forbid "TEXT", "TEXT" when LANE
+```
+A mask rules tokens out without choosing one, so the host still decides what to say.
+With the lane set, `only` lowers every token in the vocabulary but those listed, and
+`forbid` lowers those listed. A list may break after any comma. `compile` refuses a mask,
+which has no predictions to narrow, and `entail run` ignores one, so test a mask in a
+graft. See `json.entail.txt`, which uses them to keep a text valid while it is written.
+
+```
 vote "TEXT" by EXPRESSION
 ```
 A soft output, for programs that describe a model before they replace it. Votes for
@@ -271,6 +282,7 @@ dependencies. Attention at a layer runs before that layer's neurons.
 | a `when` list, or a value | two neurons, plus any thresholds it needs |
 | `emit`, tied head (host) | one column of the embedding |
 | `emit`, untied head (empty model) | one entry of an output row |
+| `only`, `forbid` (host) | one column of the embedding, negative in the rows ruled out |
 
 ## Limits a program must respect
 
@@ -282,7 +294,7 @@ doubles: test the compiled model too.
 |---|---|
 | Heads per layer | 8 (4 per KV group); extra heads move to a later layer |
 | Distinct values one KV group reads in a layer | 256 |
-| Neurons per layer | 3584 by default (`--neurons-per-layer`); extra ones move later |
+| Neurons per layer | 3584 by default (`--neurons-per-layer`); extra ones move later. A graft also spends neurons clearing dead lanes, so a program this wide needs a lower figure: `logic.entail.txt` uses 3200 |
 | Largest whole number in a threshold | below 131072, for 24-bit exactness at gain 128 |
 | Sum of squares of all raw lanes at one position | about 65536 × ballast dimensions |
 | `scale` | a power of two |
@@ -292,6 +304,14 @@ A host's embedding is bf16, so a larger value has to arrive in parts and be join
 `let`: see `lfh` and `lfl` in `chemistry.entail.txt`. Keep coefficients to values a float holds exactly. The two ramps of a threshold only
 cancel exactly if they do, which is why the carry chain in the mathematics program
 compares eight places at a time.
+
+## Seeing further than a window
+
+`attend back K` sees one fixed place, so a window costs a head per token. To carry a fact
+over a long text, let each token combine with what lies 1 back, then 2, 4, 8 and so on.
+Nine steps cover 512 tokens, with one head each. `json.entail.txt` does this for sums, such
+as depth, and for "the latest value written", such as what stands open at each depth. A
+marker that clears what came before makes the result start where a text starts.
 
 ## The start of the text
 

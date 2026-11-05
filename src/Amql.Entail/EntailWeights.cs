@@ -106,7 +106,7 @@ public static class EntailWeights
         }
 
         int end = 2 * p.Layers + 1;
-        foreach (var (_, lane) in p.Emits)
+        foreach (int lane in p.Emits.Select(e => e.Lane).Concat(p.Masks.Select(m => m.Lane)))
         {
             lastRead[lane] = keepEmitsLive ? int.MaxValue : end;
             if (keepEmitsLive)
@@ -386,7 +386,7 @@ public static class EntailWeights
         {
             if (at >= inter)
             {
-                throw new EntailException($"layer {index}: more than {inter} neurons");
+                throw new EntailException($"layer {index}: more than {inter} neurons, once dead lanes are cleared; lower --neurons-per-layer to leave room");
             }
             ReadInto(layer.Gate, at, h, gate, g);
             ReadInto(layer.Up, at, h, up, g);
@@ -462,6 +462,10 @@ public static class EntailWeights
     public static EntailBuildReport WriteFresh(EntailProgram p, string outDir, int context = 8192)
     {
         RefuseVotes(p);
+        if (p.Masks.Count > 0)
+        {
+            throw new EntailException("`only` and `forbid` narrow a host's predictions: graft this program instead");
+        }
         Directory.CreateDirectory(outDir);
         int hidden = WidthFor(Allocate(p, firstDim: 0, keepEmitsLive: true).Used);
         var (ballastDims, shift) = BallastShape(hidden);
@@ -743,7 +747,19 @@ public static class EntailWeights
                 WriteU16(embed, (long)vocabIds[token!] * hidden + alloc.Dim[lane], Bf16(-EmitRow));
             }
         }
-        var outputLanes = outputs.Select(o => o.Lane).Concat(ends).ToList();
+        // A mask's lane is a column too, negative in the rows it rules out.
+        foreach (var (allow, texts, lane) in p.Masks)
+        {
+            var listed = texts.Where(vocabIds.ContainsKey).Select(t => vocabIds[t]).ToHashSet();
+            for (int id = 0; id < vocab; id++)
+            {
+                if (listed.Contains(id) != allow)
+                {
+                    WriteU16(embed, (long)id * hidden + alloc.Dim[lane], Bf16(-EmitRow));
+                }
+            }
+        }
+        var outputLanes = outputs.Select(o => o.Lane).Concat(ends).Concat(p.Masks.Select(m => m.Lane)).ToList();
         tensors.Add(new TensorPayload { Name = embedName, Dtype = Dtype.BF16, Shape = new[] { vocab, hidden }, Data = embed });
 
         // The compiled block, then the two layers that hand over to the host.
@@ -889,7 +905,8 @@ public static class EntailWeights
         var byteMap = ByteLevelMap();
         var ids = new Dictionary<string, int>(StringComparer.Ordinal);
         var missing = new List<string>();
-        foreach (var token in p.Tokens.Keys.Concat(p.Emits.Where(e => e.Text is not null).Select(e => e.Text!)).Distinct())
+        foreach (var token in p.Tokens.Keys.Concat(p.Emits.Where(e => e.Text is not null).Select(e => e.Text!))
+            .Concat(p.Masks.SelectMany(m => m.Texts)).Distinct())
         {
             var encoded = string.Concat(Encoding.UTF8.GetBytes(token).Select(b => byteMap[b]));
             if (vocab.TryGetPropertyValue(encoded, out var id) && id is not null)

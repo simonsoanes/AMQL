@@ -117,6 +117,11 @@ public sealed class EntailProgram
     public List<EntailOp> Ops { get; } = new();
     /// <summary>(token text, or null for "end of answer", lane).</summary>
     public List<(string? Text, int Lane)> Emits { get; } = new();
+
+    /// <summary>Token sets a lane rules out: every token but these
+    /// (<c>only</c>), or these (<c>forbid</c>). They need a host, whose
+    /// predictions they narrow.</summary>
+    public List<(bool Allow, IReadOnlyList<string> Texts, int Lane)> Masks { get; } = new();
     /// <summary>Soft output: token text → what adds to its score. The highest
     /// positive score wins, as a softmax's would. An optimised program has
     /// none: votes are what `emit` replaces.</summary>
@@ -482,6 +487,13 @@ public static class EntailCompiler
                         int lane = LaneFor(s.Lane);
                         Program.Lanes[lane].Emits = true;
                         Program.Emits.Add((s.Text is null ? null : Literal(Name(s.Text)), lane));
+                    }
+                    break;
+                case MaskStmt s:
+                    {
+                        int lane = LaneFor(s.Lane);
+                        Program.Lanes[lane].Emits = true;
+                        Program.Masks.Add((s.Allow, s.Texts.Select(t => Literal(Name(t))).ToList(), lane));
                     }
                     break;
                 case VoteStmt s:
