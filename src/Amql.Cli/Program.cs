@@ -2711,6 +2711,7 @@ internal static partial class Program
               amql-cli entail check|run <program.entail.txt> [--expr "12+34="]
               amql-cli entail compile <program.entail.txt> --out <checkpoint-dir>
               amql-cli entail graft <program.entail.txt> --host <checkpoint-dir> --out <checkpoint-dir>
+              amql-cli entail run <program> --expr <text>|--cases <cases.jsonl> [--tokenizer <dir>] [--report <json>]
               amql-cli entail eval <container-dir> --cases <cases.jsonl> [--batch N] [--text <file>] [--report <json>]
               amql-cli entail find <container-dir> --subject <file> --out <dir> [--top 64] [--verify]
               amql-cli entail extract <container-dir> --subject <file> --out <dir>

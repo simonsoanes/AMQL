@@ -20,6 +20,8 @@ one at a time. `run` executes the program's meaning with no weights at all, whic
 compiled model has to reproduce. `scripts/entail/compile-and-evaluate.sh` does
 the whole experiment end to end.
 
+For physics and chemistry, see [entail-sciences.md](entail-sciences.md).
+
 ## The language
 
 This is a summary; the full reference is [entail-language.md](entail-language.md).

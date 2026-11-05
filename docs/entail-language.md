@@ -286,8 +286,10 @@ doubles: test the compiled model too.
 | Largest whole number in a threshold | below 131072, for 24-bit exactness at gain 128 |
 | Sum of squares of all raw lanes at one position | about 65536 × ballast dimensions |
 | `scale` | a power of two |
+| A `token` value in a graft | exact in bf16, so whole numbers up to 256 |
 
-Keep coefficients to values a float holds exactly. The two ramps of a threshold only
+A host's embedding is bf16, so a larger value has to arrive in parts and be joined by a
+`let`: see `lfh` and `lfl` in `chemistry.entail.txt`. Keep coefficients to values a float holds exactly. The two ramps of a threshold only
 cancel exactly if they do, which is why the carry chain in the mathematics program
 compares eight places at a time.
 
@@ -311,6 +313,9 @@ Compiles, reports the size, and proves every head's attention margin over the co
 amql-cli entail run program.entail.txt --expr " 12+34="
 ```
 Runs the meaning with no weights, one character per token, feeding each output back.
+`--tokenizer <dir>` splits the text as that model would, and `--cases <file>` answers
+each case, with `--report <json>` for the replies. This is the quick way to test a
+program before grafting it.
 
 ```bash
 amql-cli entail compile program.entail.txt --out model

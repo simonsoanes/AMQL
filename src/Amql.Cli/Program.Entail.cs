@@ -70,13 +70,48 @@ internal static partial class Program
         return 0;
     }
 
-    /// <summary>Runs an expression through the program's meaning alone — no
-    /// weights — character by character.</summary>
+    /// <summary>Runs text through the program's meaning alone — no weights — one
+    /// character per token, or as a model's tokenizer would split it. With
+    /// --cases, answers each case and reports the replies.</summary>
     private static int EntailRun(string[] args)
     {
         var p = LoadEntail(args);
-        var text = OptionValue(args, "--expr") ?? throw new CliException("entail run requires '--expr \"12+34=\"'");
-        Console.WriteLine(text + EntailInterpreter.Answer(p, text.Select(c => c.ToString())));
+        Func<string, IEnumerable<string>> split = text => text.Select(c => c.ToString());
+        if (OptionValue(args, "--tokenizer") is { } dir)
+        {
+            var tokenizer = Tokenizer(dir);
+            split = text => tokenizer.EncodeToIds(text).Select(id => tokenizer.DecodeText(new List<int> { id }));
+        }
+
+        int limit = IntOption(args, "--max-tokens", 32);
+        if (OptionValue(args, "--cases") is { } casesPath)
+        {
+            var cases = File.ReadAllLines(casesPath).Where(l => l.Trim().Length > 0)
+                .Select(l => JsonNode.Parse(l)!.AsObject()).ToList();
+            var replies = new string[cases.Count];
+            Parallel.For(0, cases.Count, i =>
+                replies[i] = EntailInterpreter.Answer(p, split(cases[i]["prompt"]!.GetValue<string>()), limit));
+            var details = new JsonArray();
+            for (int i = 0; i < cases.Count; i++)
+            {
+                var c = (JsonObject)cases[i].DeepClone();
+                c["reply"] = replies[i];
+                details.Add(c);
+            }
+            var report = new JsonObject { ["cases"] = details }.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
+            if (OptionValue(args, "--report") is { } reportPath)
+            {
+                File.WriteAllText(reportPath, report);
+            }
+            else
+            {
+                Console.WriteLine(report);
+            }
+            return 0;
+        }
+
+        var expression = OptionValue(args, "--expr") ?? throw new CliException("entail run requires '--expr \"12+34=\"' or '--cases <cases.jsonl>'");
+        Console.WriteLine(expression + EntailInterpreter.Answer(p, split(expression), limit));
         return 0;
     }
 

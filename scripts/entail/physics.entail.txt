@@ -1,0 +1,873 @@
+# ═══════════════════════════════════════════════════════════════════════════
+#  physics.entail — quantities with units, stated as consequences
+# ═══════════════════════════════════════════════════════════════════════════
+#
+#  Most of school physics is one law wearing many names. F = ma, W = Fd,
+#  P = VI and V = IR are all "multiply or divide two quantities, and the units
+#  follow". So this program does not list the laws: it states the algebra of
+#  units, and every such law falls out of it.
+#
+#     12 kg * 3 m/s^2 =   36 N
+#     100 J / 4 s =       25 W
+#     3 km + 200 m =      3200 m
+#     3 m + 2 s =         incompatible units
+#
+#  A unit is a vector of exponents over kg, m, s, A, K and mol, plus a power of
+#  ten. Multiplying adds the vectors, dividing subtracts them, and adding demands
+#  that they match. All of that is linear, which is exactly what Entail can
+#  say. The numbers are decimal digits, handled as in mathematics.entail.txt.
+#
+#  What is defined: one operation between two quantities, each up to MD digits
+#  with up to FD decimal places, in SI units with decimal prefixes. The answer is
+#  in coherent SI, named where a name is listed in section 12. A divisor has up to
+#  DIVB digits, and a quotient is truncated after FRAC more digits, not rounded.
+#  Anything else entails nothing and the model carries on. That includes hours,
+#  minutes, degrees Celsius and any unit whose result has no listed name.
+
+program physics
+
+const MD    = 6     # digits in a number
+const FD    = 3     # decimal places in a number
+const UL    = 6     # tokens in a unit
+const NW    = 10    # how far back a number's shape is read
+const OPW   = 16    # how far back the operator can be from the "="
+const AS    = 12    # digits of an aligned sum
+const DIVB  = 4     # digits of a divisor
+const FRAC  = 4     # extra digits of a quotient
+const STEPS = MD + FRAC
+const RES   = 13    # digits of a result, before it is placed
+const P     = 6     # places after the point in the register
+const R     = 16    # places in the register
+const SLOTS = 24    # answer tokens
+const WIN   = 25    # how far back an answer token finds its "="
+
+# ─── 1. Tokens ──────────────────────────────────────────────────────────────
+#
+# uk um us ua ut un are the unit's exponents, ue its power of ten.
+# ans marks a token that can stand in an answer being written.
+
+state val, dig, pt, gap, lead, cm
+state oMul, oDiv, oAdd, oSub, eqt, eqs, ans
+state unit, pz, pw, sq, cu
+state uk, um, us, ua, ut, un, ue
+state isInc, isUnits
+
+for d in 0 to 9
+    token "{d}" means val = d, dig = 1, ans = 1
+end
+token "."                         means pt = 1, ans = 1
+token ","                         means cm = 1
+token " "                         means gap = 1
+token "\n", "\n\n", ":", "(", " (" means lead = 1
+token "*", " *", "×", " ×", " x", "·", " ·" means oMul = 1
+token " /", "÷", " ÷"             means oDiv = 1
+token "+", " +"                   means oAdd = 1
+token "-", " -", "−", " −"        means oSub = 1, ans = 1
+token "="                         means eqt = 1
+token " ="                        means eqs = 1
+token " incompatible"             means isInc = 1
+token " units"                    means isUnits = 1
+
+# A unit's spellings: after a blank, or joined by * or a dot. After a slash it is
+# the same vector, negated. Bare, it needs a prefix in front of it, so 12kg is
+# not read: see pz below.
+def plain(name, k, m, s, a, t, n, e)
+    token " {name}", "*{name}", "·{name}" means unit = 1, ans = 1, uk = k, um = m, us = s, ua = a, ut = t, un = n, ue = e
+    token "{name}" means unit = 1, ans = 1, uk = k, um = m, us = s, ua = a, ut = t, un = n, ue = e, pz = -1
+    token "/{name}" means unit = 1, ans = 1, uk = -k, um = -m, us = -s, ua = -a, ut = -t, un = -n, ue = -e
+end
+
+call plain(kg,  1, 0, 0, 0, 0, 0, 0)
+call plain(g,   1, 0, 0, 0, 0, 0, -3)
+call plain(mg,  1, 0, 0, 0, 0, 0, -6)
+call plain(m,   0, 1, 0, 0, 0, 0, 0)
+call plain(km,  0, 1, 0, 0, 0, 0, 3)
+call plain(cm,  0, 1, 0, 0, 0, 0, -2)
+call plain(mm,  0, 1, 0, 0, 0, 0, -3)
+call plain(s,   0, 0, 1, 0, 0, 0, 0)
+call plain(ms,  0, 0, 1, 0, 0, 0, -3)
+call plain(A,   0, 0, 0, 1, 0, 0, 0)
+call plain(mA,  0, 0, 0, 1, 0, 0, -3)
+call plain(K,   0, 0, 0, 0, 1, 0, 0)
+call plain(mol, 0, 0, 0, 0, 0, 1, 0)
+call plain(N,   1, 1, -2, 0, 0, 0, 0)
+call plain(J,   1, 2, -2, 0, 0, 0, 0)
+call plain(W,   1, 2, -3, 0, 0, 0, 0)
+call plain(kW,  1, 2, -3, 0, 0, 0, 3)
+call plain(MW,  1, 2, -3, 0, 0, 0, 6)
+call plain(kJ,  1, 2, -2, 0, 0, 0, 3)
+call plain(kN,  1, 1, -2, 0, 0, 0, 3)
+call plain(Pa,  1, -1, -2, 0, 0, 0, 0)
+call plain(kPa, 1, -1, -2, 0, 0, 0, 3)
+call plain(V,   1, 2, -3, -1, 0, 0, 0)
+call plain(kV,  1, 2, -3, -1, 0, 0, 3)
+call plain(mV,  1, 2, -3, -1, 0, 0, -3)
+call plain(Ω,   1, 2, -3, -2, 0, 0, 0)
+call plain(C,   0, 0, 1, 1, 0, 0, 0)
+call plain(Hz,  0, 0, -1, 0, 0, 0, 0)
+call plain(kHz, 0, 0, -1, 0, 0, 0, 3)
+call plain(MHz, 0, 0, -1, 0, 0, 0, 6)
+
+# Where a tokenizer splits a prefix from its unit, the prefix is a token of its
+# own and the unit is a bare one. pz keeps them paired: it must sum to zero.
+token " k" means unit = 1, ue = 3, pz = 1
+token " M" means unit = 1, ue = 6, pz = 1
+
+token "^"       means pw = 1, ans = 1
+token "²"       means sq = 1
+token "³"       means cu = 1
+
+# ─── 2. Powers: the exponent acts on the unit before it ─────────────────────
+#
+# A unit's vector is spread over the tokens that spell it, and each token adds
+# what it changes. In s^2, the s says -1 and the 2 says -1 more.
+
+state p1[7], p2[7], b1unit, b2unit, b1pw, b1dig, b1inc, b1eq
+attend back 1
+    p1[0] <- uk
+    p1[1] <- um
+    p1[2] <- us
+    p1[3] <- ua
+    p1[4] <- ut
+    p1[5] <- un
+    p1[6] <- ue
+    b1unit <- unit
+    b1pw <- pw
+    b1dig <- dig
+    b1inc <- isInc
+    b1eq <- eqt + eqs
+end
+attend back 2
+    p2[0] <- uk
+    p2[1] <- um
+    p2[2] <- us
+    p2[3] <- ua
+    p2[4] <- ut
+    p2[5] <- un
+    p2[6] <- ue
+    b2unit <- unit
+end
+
+state ex1, ex2, ex3, sqOn, cuOn
+entail ex1 when dig, b1pw, b2unit, val == 1
+entail ex2 when dig, b1pw, b2unit, val == 2
+entail ex3 when dig, b1pw, b2unit, val == 3
+entail sqOn when sq, b1unit
+entail cuOn when cu, b1unit
+
+state x[7]
+for i in 0 to 6
+    entail x[i] = p2[i] when ex2
+    entail x[i] = 2*p2[i] when ex3
+    entail x[i] = p1[i] when sqOn
+    entail x[i] = 2*p1[i] when cuOn
+end
+let cu_[0] = uk + x[0]
+let cu_[1] = um + x[1]
+let cu_[2] = us + x[2]
+let cu_[3] = ua + x[3]
+let cu_[4] = ut + x[4]
+let cu_[5] = un + x[5]
+let cu_[6] = ue + x[6]
+
+# uq: this token is part of a unit. nd: this token is a digit of a number.
+state uq, nd
+entail uq when unit
+entail uq when b1unit, pw
+entail uq when ex1
+entail uq when ex2
+entail uq when ex3
+entail uq when sqOn
+entail uq when cuOn
+entail nd when dig, not b1pw
+
+# ─── 3. Sight: the facts of the tokens behind this one ──────────────────────
+
+state wu[NW + 1], wn[NW + 1], wp[NW + 1], wv[NW + 1], wz[UL + 1]
+state wg[NW + 1], wl[NW + 1], wo[NW + 1], wc[NW + 1], wq[NW + 1]
+state wd[UL + 1][7]
+for k in 1 to NW
+    attend back k
+        wu[k] <- uq
+        wn[k] <- nd
+        wp[k] <- pt
+        wv[k] <- val
+        wg[k] <- gap
+        wl[k] <- lead + eqt + eqs
+        wo[k] <- oMul + oDiv + oAdd + oSub
+        wc[k] <- cm
+        if k <= UL
+            wz[k] <- pz
+            for i in 0 to 6
+                wd[k][i] <- cu_[i]
+            end
+        end
+    end
+end
+
+let fu[0] = uq
+let fn[0] = nd
+let fp[0] = pt
+let fv[0] = val
+for k in 1 to NW
+    let fu[k] = wu[k]
+    let fn[k] = wn[k]
+    let fp[k] = wp[k]
+    let fv[k] = wv[k]
+end
+let fz[0] = pz
+for k in 1 to UL
+    let fz[k] = wz[k]
+end
+for i in 0 to 6
+    let fd[i] = cu_[i]
+    for k in 1 to UL
+        let fd[7*k + i] = wd[k][i]
+    end
+end
+
+# ─── 4. A number ending here ────────────────────────────────────────────────
+#
+# pat[m][f]: this digit ends a number of m digits, f of them after the point.
+# What stands before it must not make it part of something else: a blank, a
+# line, an "=", or an operator.
+
+state pat[MD + 1][FD + 1], num
+state n[MD], nf, nl, ng, nc
+for m in 1 to MD
+    for f in 0 to FD
+        if f < m
+            if f == 0
+                const T = m
+                entail pat[m][f] when (sum i in 0 to m-1 : fn[i]) >= m, wg[T] + wl[T] + wo[T] >= 1
+                for j in 0 to m-1
+                    entail n[j] = fv[j] when pat[m][f]
+                end
+            else
+                const T = m + 1
+                entail pat[m][f] when (sum i in 0 to f-1 : fn[i]) + fp[f] + (sum i in f+1 to m : fn[i]) >= m + 1, wg[T] + wl[T] + wo[T] >= 1
+                for j in 0 to m-1
+                    if j < f
+                        entail n[j] = fv[j] when pat[m][f]
+                    else
+                        entail n[j] = fv[j+1] when pat[m][f]
+                    end
+                end
+            end
+            entail num when pat[m][f]
+            entail nf = f when pat[m][f]
+            entail nl = T when pat[m][f]
+            entail ng when pat[m][f], wg[T]
+            # an operator just before this number means it is the right-hand side
+            entail nc when pat[m][f], wo[T]
+            if T + 1 <= NW
+                entail nc when pat[m][f], wg[T], wo[T+1]
+            end
+        end
+    end
+end
+
+# ─── 5. A quantity ending here: a number, then a unit ───────────────────────
+#
+# uL[l]: the last l tokens are a unit, and a number ends just before them.
+
+state uL[UL], qty
+state od[7]
+state num1[UL]
+attend back 1
+    num1[1] <- num
+end
+attend back 2
+    num1[2] <- num
+end
+attend back 3
+    num1[3] <- num
+end
+attend back 4
+    num1[4] <- num
+end
+attend back 5
+    num1[5] <- num
+end
+
+entail uL[0] when num
+for l in 1 to UL - 1
+    entail uL[l] when num1[l], (sum i in 0 to l-1 : fu[i]) >= l, (sum i in 0 to l-1 : fz[i]) == 0
+    for i in 0 to 6
+        entail od[i] = (sum k in 0 to l-1 : fd[7*k + i]) when uL[l]
+    end
+end
+for l in 0 to UL - 1
+    entail qty when uL[l]
+end
+
+# The number behind that unit.
+state qn[MD], qf, ql, qg, qc
+attend back by uL
+    for j in 0 to MD-1
+        qn[j] <- n[j]
+    end
+    qf <- nf
+    ql <- nl
+    qg <- ng
+    qc <- nc
+end
+let qspan = ql + (sum l in 1 to UL-1 : l * uL[l])
+
+# ─── 6. The left-hand side, as seen from the operator ───────────────────────
+#
+# An operator looks one token back. If a quantity ends there, it is A, unless
+# that quantity is itself the right-hand side of something: chains are refused.
+
+state l_n[MD], l_f, l_q, l_c, l_d[7]
+attend back 1
+    for j in 0 to MD-1
+        l_n[j] <- qn[j]
+    end
+    l_f <- qf
+    l_q <- qty
+    l_c <- qc
+    for i in 0 to 6
+        l_d[i] <- od[i]
+    end
+end
+
+state hasA
+entail hasA when l_q, not l_c, oMul + oDiv + oAdd + oSub >= 1
+
+# ─── 7. The right-hand side, as seen from the "=" ───────────────────────────
+
+state r_n[MD], r_f, r_q, r_s, r_g, r_c, r_d[7]
+attend back 1
+    for j in 0 to MD-1
+        r_n[j] <- qn[j]
+    end
+    r_f <- qf
+    r_q <- qty
+    r_s <- qspan
+    r_g <- qg
+    r_c <- qc
+    for i in 0 to 6
+        r_d[i] <- od[i]
+    end
+end
+
+state atEq
+entail atEq when eqt
+entail atEq when eqs
+
+# opAt[c]: the operator stands c tokens back.
+state opAt[OPW + 1], ready
+entail ready when atEq, r_q, r_c
+for c in 2 to OPW
+    entail opAt[c] when ready, r_s + r_g + 1 == c
+end
+
+state a[MD], fa, dA[7], kA, kMul, kDiv, kAdd, kSub
+attend back by opAt
+    for j in 0 to MD-1
+        a[j] <- l_n[j]
+    end
+    fa <- l_f
+    for i in 0 to 6
+        dA[i] <- l_d[i]
+    end
+    kA <- hasA
+    kMul <- oMul
+    kDiv <- oDiv
+    kAdd <- oAdd
+    kSub <- oSub
+end
+
+# ─── 8. The units of the answer ─────────────────────────────────────────────
+#
+# Each exponent is one sum, and adding demands a match. xa and xb are the
+# powers of ten of each number's last digit.
+
+let xa = dA[6] - fa
+let xb = r_d[6] - r_f
+
+state doMul, doDiv, doAS, doAdd, doSub
+entail doMul when ready, kA, kMul
+entail doDiv when ready, kA, kDiv, (sum j in 0 to DIVB-1 : r_n[j]) >= 1, (sum j in DIVB to MD-1 : r_n[j]) <= 0
+entail doAdd when ready, kA, kAdd
+entail doSub when ready, kA, kSub
+entail doAS when doAdd
+entail doAS when doSub
+
+state dR[6]
+for i in 0 to 5
+    entail dR[i] = dA[i] + r_d[i] when doMul
+    entail dR[i] = dA[i] - r_d[i] when doDiv
+    entail dR[i] = dA[i] when doAS
+end
+
+state same[6], differ
+for i in 0 to 5
+    entail same[i] when doAS, dA[i] - r_d[i] == 0
+end
+entail differ when doAS, (sum i in 0 to 5 : same[i]) <= 5
+
+# ─── 9. Chains ──────────────────────────────────────────────────────────────
+#
+# As in mathematics.entail.txt: a carry reaches place k exactly when the base-4
+# number below k, less the all-propagate number, is positive.
+
+def chain(p, n)
+    state {p}_c[n + 1]
+    for k in 1 to min(n, 8)
+        entail {p}_c[k] when (sum i in 0 to k-1 : 4^i * ({p}_t[i] - 1)) >= 1
+    end
+    for k in 9 to n
+        entail {p}_c[k] when 2*{p}_c[8] - 1 + (sum i in 8 to k-1 : 4^(i-7) * ({p}_t[i] - 1)) >= 1
+    end
+end
+
+# ─── 10. The arithmetic ─────────────────────────────────────────────────────
+
+# Sums first line up their last digits, so the finer number sets the scale.
+state sft[2*MD + 1], A2[AS], B2[AS], xs, fits
+for k in 0 to MD
+    entail sft[MD+k] when doAS, xa - xb == k
+    entail fits when sft[MD+k]
+    if k >= 1
+        entail sft[MD-k] when doAS, xb - xa == k
+        entail fits when sft[MD-k]
+    end
+end
+for k in 0 to MD
+    for j in 0 to MD-1
+        entail A2[j+k] = a[j] when sft[MD+k]
+        if k >= 1
+            entail B2[j] = r_n[j] when sft[MD+k]
+            entail B2[j+k] = r_n[j] when sft[MD-k]
+            entail A2[j] = a[j] when sft[MD-k]
+        else
+            entail B2[j] = r_n[j] when sft[MD]
+        end
+    end
+    if k >= 1
+        entail xs = xa - k when sft[MD+k]
+        entail xs = xb - k when sft[MD-k]
+    else
+        entail xs = xa when sft[MD]
+    end
+end
+
+state add_g[AS], add_q[AS], add_w[AS]
+for j in 0 to AS-1
+    let add_s[j] = A2[j] + B2[j]
+    entail add_g[j] when add_s[j] >= 10
+    entail add_q[j] when add_s[j] == 9
+    let add_t[j] = 2*add_g[j] + add_q[j]
+end
+call chain(add, AS)
+let add_v[0] = add_s[0]
+for j in 1 to AS-1
+    let add_v[j] = add_s[j] + add_c[j]
+end
+for j in 0 to AS-1
+    entail add_w[j] when add_v[j] >= 10
+    let add_r[j] = add_v[j] - 10*add_w[j]
+end
+let add_r[AS] = add_c[AS]
+
+def difference(p, x, y)
+    state {p}_g[AS], {p}_q[AS], {p}_w[AS]
+    for j in 0 to AS-1
+        let {p}_d[j] = x[j] - y[j]
+        entail {p}_g[j] when {p}_d[j] <= -1
+        entail {p}_q[j] when {p}_d[j] == 0
+        let {p}_t[j] = 2*{p}_g[j] + {p}_q[j]
+    end
+    call chain({p}, AS)
+    let {p}_v[0] = {p}_d[0]
+    for j in 1 to AS-1
+        let {p}_v[j] = {p}_d[j] - {p}_c[j]
+    end
+    for j in 0 to AS-1
+        entail {p}_w[j] when {p}_v[j] <= -1
+        let {p}_r[j] = {p}_v[j] + 10*{p}_w[j]
+    end
+end
+call difference(sab, A2, B2)
+call difference(sba, B2, A2)
+
+state subPos, subNeg
+entail subPos when doSub, not sab_c[AS]
+entail subNeg when doSub, sab_c[AS]
+
+state go
+entail go when doMul
+entail go when doDiv
+entail go when doAS, not differ, fits
+
+# Multiplication: a digit of a is a staircase of facts, and each step that holds
+# adds the digit of b into its column.
+state ge[MD][10]
+for i in 0 to MD-1
+    for d in 1 to 9
+        entail ge[i][d] when a[i] >= d
+    end
+end
+
+const COLS = 2*MD
+state col[COLS] scale 1/16
+for i in 0 to MD-1
+    for j in 0 to MD-1
+        for d in 1 to 9
+            entail col[i+j] = r_n[j] when ge[i][d], doMul
+        end
+    end
+end
+
+state f1[COLS] scale 1/16, f2[COLS], f3[COLS], mul_g[COLS], mul_q[COLS], mul_w[COLS]
+for k in 0 to COLS-1
+    for m in 1 to 49
+        entail f1[k] when col[k] >= 10*m
+    end
+    let u1[k] = col[k] - 10*f1[k]
+    for m in 1 to 4
+        entail f2[k] when f1[k] >= 10*m
+    end
+    let u2[k] = f1[k] - 10*f2[k]
+end
+let s3[0] = u1[0]
+let s3[1] = u1[1] + u2[0]
+for k in 2 to COLS-1
+    let s3[k] = u1[k] + u2[k-1] + f2[k-2]
+end
+for k in 0 to COLS-1
+    entail f3[k] when s3[k] >= 10
+    entail f3[k] when s3[k] >= 20
+    let u3[k] = s3[k] - 10*f3[k]
+end
+let mul_s[0] = u3[0]
+for k in 1 to COLS-1
+    let mul_s[k] = u3[k] + f3[k-1]
+end
+for k in 0 to COLS-1
+    entail mul_g[k] when mul_s[k] >= 10
+    entail mul_q[k] when mul_s[k] == 9
+    let mul_t[k] = 2*mul_g[k] + mul_q[k]
+end
+call chain(mul, COLS)
+let mul_v[0] = mul_s[0]
+for k in 1 to COLS-1
+    let mul_v[k] = mul_s[k] + mul_c[k]
+end
+for k in 0 to COLS-1
+    entail mul_w[k] when mul_v[k] >= 10
+    let mul_r[k] = mul_v[k] - 10*mul_w[k]
+end
+
+# Long division, FRAC places past the last digit of a.
+let bVal = (sum j in 0 to DIVB-1 : 10^j * r_n[j])
+state rem[STEPS + 1] scale 1/8192, fit[STEPS][10]
+let next[0] = a[MD-1]
+for i in 1 to STEPS-1
+    if i < MD
+        let next[i] = a[MD-1-i]
+    else
+        let next[i] = 0
+    end
+end
+entail rem[0] = next[0] when doDiv
+for i in 0 to STEPS-1
+    for k in 1 to 9
+        entail fit[i][k] when rem[i] - k*bVal >= 0
+    end
+    let quo[i] = (sum k in 1 to 9 : fit[i][k])
+    if i < STEPS-1
+        entail rem[i+1] = 10*rem[i] + next[i+1] when doDiv
+        for k in 1 to 9
+            entail rem[i+1] = -10*bVal when fit[i][k]
+        end
+    end
+end
+
+# ─── 11. The result, placed ─────────────────────────────────────────────────
+#
+# res[k] is worth 10^(k + xr). The register has a fixed point, so placing a
+# result is a choice of shift and every prefix has already been dealt with.
+
+state res[RES], xr
+for k in 0 to RES-1
+    if k <= AS
+        entail res[k] = add_r[k] when doAdd
+    end
+    if k < AS
+        entail res[k] = sab_r[k] when subPos
+        entail res[k] = sba_r[k] when subNeg
+    end
+    if k < COLS
+        entail res[k] = mul_r[k] when doMul
+    end
+    if k < STEPS
+        entail res[k] = quo[STEPS-1-k] when doDiv
+    end
+end
+entail xr = xa + xb when doMul
+entail xr = xa - xb - FRAC when doDiv
+entail xr = xs when doAS
+
+const XLO = -20
+const XHI = 12
+state xe[XHI - XLO + 1], reg[R], lost
+for e in XLO to XHI
+    entail xe[e - XLO] when go, xr == e
+    for k in 0 to RES-1
+        if k + e + P >= 0
+            if k + e + P < R
+                entail reg[k+e+P] = res[k] when xe[e - XLO]
+            end
+        end
+    end
+    # digits past the top are lost, and past the bottom are only lost in a quotient
+    if e + P + RES - 1 >= R
+        if R - e - P >= 0
+            entail lost when xe[e - XLO], (sum k in R-e-P to RES-1 : res[k]) >= 1
+        end
+    end
+    if e + P < 0
+        entail lost when xe[e - XLO], not doDiv, (sum k in 0 to min(RES-1, -e-P-1) : res[k]) >= 1
+    end
+end
+
+# ─── 12. The name of the answer's unit ──────────────────────────────────────
+#
+# The exponents pack into one whole number, base 7, so a unit is one test.
+
+let dimCode = (sum i in 0 to 5 : 7^i * (dR[i] + 3))
+state inRange[6], fine
+for i in 0 to 5
+    entail inRange[i] when dR[i] >= -3, dR[i] <= 3
+end
+entail fine when go, (sum i in 0 to 5 : inRange[i]) >= 6, not lost
+
+const T_DONE = 13
+const T_KG = 14
+const T_M = 15
+const T_S = 16
+const T_A = 17
+const T_K = 18
+const T_MOL = 19
+const T_N = 20
+const T_J = 21
+const T_W = 22
+const T_PA = 23
+const T_V = 24
+const T_OHM = 25
+const T_C = 26
+const T_HZ = 27
+const T_PER_S = 28
+const T_PER_M = 29
+const T_POW = 30
+const T_TWO = 3
+const T_THREE = 4
+const LAST = 30
+
+const NAMES = 21
+state nm[NAMES], uc[4], ulen[5], named
+def name(id, k, m, s, a, t, n, len, c0, c1, c2, c3)
+    entail nm[id] when fine, dimCode == (k+3) + 7*(m+3) + 49*(s+3) + 343*(a+3) + 2401*(t+3) + 16807*(n+3)
+    entail uc[0] = c0 when nm[id]
+    entail uc[1] = c1 when nm[id]
+    entail uc[2] = c2 when nm[id]
+    entail uc[3] = c3 when nm[id]
+    entail ulen[len] when nm[id]
+    entail named when nm[id]
+end
+
+call name(0,  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+call name(1,  1, 0, 0, 0, 0, 0, 1, T_KG, 0, 0, 0)
+call name(2,  0, 1, 0, 0, 0, 0, 1, T_M, 0, 0, 0)
+call name(3,  0, 0, 1, 0, 0, 0, 1, T_S, 0, 0, 0)
+call name(4,  0, 0, 0, 1, 0, 0, 1, T_A, 0, 0, 0)
+call name(5,  0, 0, 0, 0, 1, 0, 1, T_K, 0, 0, 0)
+call name(6,  0, 0, 0, 0, 0, 1, 1, T_MOL, 0, 0, 0)
+call name(7,  1, 1, -2, 0, 0, 0, 1, T_N, 0, 0, 0)
+call name(8,  1, 2, -2, 0, 0, 0, 1, T_J, 0, 0, 0)
+call name(9,  1, 2, -3, 0, 0, 0, 1, T_W, 0, 0, 0)
+call name(10, 1, -1, -2, 0, 0, 0, 1, T_PA, 0, 0, 0)
+call name(11, 1, 2, -3, -1, 0, 0, 1, T_V, 0, 0, 0)
+call name(12, 1, 2, -3, -2, 0, 0, 1, T_OHM, 0, 0, 0)
+call name(13, 0, 0, 1, 1, 0, 0, 1, T_C, 0, 0, 0)
+call name(14, 0, 0, -1, 0, 0, 0, 1, T_HZ, 0, 0, 0)
+call name(15, 0, 1, -1, 0, 0, 0, 2, T_M, T_PER_S, 0, 0)
+call name(16, 0, 2, 0, 0, 0, 0, 3, T_M, T_POW, T_TWO, 0)
+call name(17, 0, 3, 0, 0, 0, 0, 3, T_M, T_POW, T_THREE, 0)
+call name(18, 0, 1, -2, 0, 0, 0, 4, T_M, T_PER_S, T_POW, T_TWO)
+call name(19, 1, -3, 0, 0, 0, 0, 4, T_KG, T_PER_M, T_POW, T_THREE)
+call name(20, 1, 1, -1, 0, 0, 0, 3, T_KG, T_M, T_PER_S, 0)
+
+# ─── 13. The answer, as a sequence of tokens ────────────────────────────────
+
+state live, nz[R], top[R], bot[P], hasFrac
+entail live when named
+for i in 0 to R-1
+    entail nz[i] when reg[i] >= 1
+end
+for t in P to R-1
+    if t == P
+        entail top[t] when live, (sum i in P+1 to R-1 : nz[i]) <= 0
+    else
+        if t < R-1
+            entail top[t] when live, nz[t], (sum i in t+1 to R-1 : nz[i]) <= 0
+        else
+            entail top[t] when live, nz[t]
+        end
+    end
+end
+for i in 0 to P-1
+    if i == 0
+        entail bot[i] when live, nz[i]
+    else
+        entail bot[i] when live, nz[i], (sum j in 0 to i-1 : nz[j]) <= 0
+    end
+    entail hasFrac when bot[i]
+end
+
+# keep[i]: this decimal place is at or above the last one worth writing.
+for i in 0 to P-1
+    let keep[i] = (sum j in 0 to i : bot[j])
+end
+
+const C_MINUS = 11
+const C_POINT = 12
+
+state code[SLOTS], posT[R], negT[R], en[SLOTS]
+for t in P to R-1
+    entail posT[t] when top[t], not subNeg
+    entail negT[t] when top[t], subNeg
+end
+entail code[0] = C_MINUS when live, subNeg
+
+def spell(sel, shift)
+    for t in P to R-1
+        for s in 0 to t-P
+            entail code[shift+s] = reg[t-s] + 1 when sel[t]
+        end
+        const PS = shift + t - P + 1
+        entail en[PS] when sel[t], not hasFrac
+        entail code[PS] = C_POINT when sel[t], hasFrac
+        for i in 0 to P-1
+            const SLOT = PS + P - i
+            if SLOT < SLOTS
+                entail en[SLOT + 1] when sel[t], bot[i]
+                entail code[SLOT] = reg[i] + 1 when sel[t], keep[i]
+            end
+        end
+    end
+end
+call spell(posT, 0)
+call spell(negT, 1)
+
+for s in 1 to SLOTS - 6
+    for u in 0 to 3
+        entail code[s+u] = uc[u] when en[s]
+    end
+    for l in 0 to 4
+        entail code[s+l] = T_DONE when en[s], ulen[l]
+    end
+end
+
+# ─── 14. Writing it out ─────────────────────────────────────────────────────
+#
+# Any later token finds its "=" in its window. If everything between is answer,
+# it is the slot that many places on. As in mathematics.entail.txt, a blank
+# straight after a spaced "=" is not counted.
+
+state et[WIN + 1], es[WIN + 1], wa[WIN + 1], gp[WIN + 1]
+for k in 1 to WIN
+    attend back k
+        et[k] <- eqt
+        es[k] <- eqs
+        wa[k] <- ans
+        gp[k] <- gap
+    end
+end
+
+let ansF[0] = ans
+let gpF[0] = gap
+for k in 1 to WIN
+    let ansF[k] = wa[k]
+    let gpF[k] = gp[k]
+end
+
+state from[SLOTS + 2], slot[SLOTS]
+entail from[0] when eqt
+entail from[0] when eqs
+entail slot[0] when eqt
+entail from[1] when et[1], ans
+entail from[1] when et[1], gap
+entail from[1] when es[1], gap
+entail slot[1] when et[1], ans
+entail slot[0] when et[1], gap
+entail slot[0] when es[1], gap
+for c in 2 to SLOTS
+    entail from[c] when et[c], (sum i in 0 to c-1 : ansF[i]) >= c
+    entail from[c] when et[c], (sum i in 0 to c-2 : ansF[i]) >= c-1, gpF[c-1]
+    entail from[c] when es[c], (sum i in 0 to c-2 : ansF[i]) >= c-1, gpF[c-1]
+    if c < SLOTS
+        entail slot[c] when et[c], (sum i in 0 to c-1 : ansF[i]) >= c
+    end
+    entail slot[c-1] when et[c], (sum i in 0 to c-2 : ansF[i]) >= c-1, gpF[c-1]
+    entail slot[c-1] when es[c], (sum i in 0 to c-2 : ansF[i]) >= c-1, gpF[c-1]
+end
+
+state seen[SLOTS]
+attend back by from
+    for s in 0 to SLOTS-1
+        seen[s] <- code[s]
+    end
+end
+
+state say
+for s in 0 to SLOTS-1
+    entail say = seen[s] when slot[s]
+end
+
+# ─── 15. Output: the token that must come next ──────────────────────────────
+
+state bdiff
+attend back 1
+    bdiff <- differ
+end
+
+state o[LAST + 1], blank, refuse, refuse2, refuse3
+for d in 1 to LAST
+    entail o[d] when say == d
+end
+entail blank when eqs, seen[0] >= 1
+entail refuse when differ
+entail refuse2 when isInc, bdiff
+entail refuse3 when isUnits, b1inc
+
+for d in 0 to 9
+    emit "{d}" when o[d+1]
+end
+emit "-" when o[C_MINUS]
+emit "." when o[C_POINT]
+emit " kg" when o[T_KG]
+emit " m" when o[T_M]
+emit " s" when o[T_S]
+emit " A" when o[T_A]
+emit " K" when o[T_K]
+emit " mol" when o[T_MOL]
+emit " N" when o[T_N]
+emit " J" when o[T_J]
+emit " W" when o[T_W]
+emit " Pa" when o[T_PA]
+emit " V" when o[T_V]
+emit " Ω" when o[T_OHM]
+emit " C" when o[T_C]
+emit " Hz" when o[T_HZ]
+emit "/s" when o[T_PER_S]
+emit "/m" when o[T_PER_M]
+emit "^" when o[T_POW]
+emit " " when blank
+emit " incompatible" when refuse
+emit " units" when refuse2
+emit end when o[T_DONE]
+emit end when refuse3

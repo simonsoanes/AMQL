@@ -714,7 +714,12 @@ public static class EntailWeights
         }
         foreach (var (textToken, id) in vocabIds)
         {
-            foreach (var (lane, value) in p.Tokens[textToken])
+            // A token that is only ever said has no input facts.
+            if (!p.Tokens.TryGetValue(textToken, out var writes))
+            {
+                continue;
+            }
+            foreach (var (lane, value) in writes)
             {
                 if (alloc.Dim[lane] >= 0)
                 {

@@ -12,6 +12,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **feat:** `amql-cli entail decompile|fidelity` — the raw extract: every neuron seen across a corpus as Entail rules and observed `vote`s, with a saved study (`--from`), and its agreement with the model on held-out text. `scripts/entail/python_coverage.py` measures it against Python's own documentation
 - **feat:** Entail `vote`, a soft output the interpreter runs and `compile` and `graft` refuse, and the string escapes `\q` and `\{`
 - **feat:** Synthetic Python: `scripts/entail/subjects/python.synthetic.entail.txt`, its generator and scoring, and the steps in [docs/entail-synthesis.md](docs/entail-synthesis.md)
+- **feat:** `scripts/entail/physics.entail.txt` and `chemistry.entail.txt`, with `make_chemistry.py`, `science_cases.py` and [docs/entail-sciences.md](docs/entail-sciences.md)
+- **feat:** `amql-cli entail run --tokenizer <dir> --cases <file>` tests a program on a model's real tokens, without weights
+- **fix:** `entail graft` no longer fails on a token that is only ever emitted
 - **feat:** `amql-cli entail decompile --only-holdout` records a test set from a corpus without studying it
 - **feat:** `amql-cli entail eval --batch N` runs N cases at once on sessions sharing one copy of the weights, with `DecodeSession.Sibling`
 - **feat:** `DecodeSession.PrefillLogits` — logits of every position from one batched forward pass

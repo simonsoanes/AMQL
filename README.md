@@ -202,6 +202,12 @@ the extract, that turns a request into code. For a slice of Python on the same m
 unseen requests from 14 of 26 to 20 of 26, with the derivation still written by hand. See
 [docs/entail-synthesis.md](docs/entail-synthesis.md).
 
+Physics and chemistry have laws of their own. `physics.entail.txt` states the algebra of units,
+so `12 kg * 3 m/s^2 =` gives `36 N`, and `chemistry.entail.txt` gives molar masses and checks that
+equations balance. Grafted into the same model they got 192 of 196 and 182 of 182 test cases right
+on notation they can read, against 12 and 104 before, but changed no chat reply, because the model
+writes its working in LaTeX. See [docs/entail-sciences.md](docs/entail-sciences.md).
+
 ### Model Merging & Transformation
 
 - **`merge`** — Two models into one via consensus-gated token alignment. Shared tokens
@@ -379,6 +385,7 @@ multi-million-element matrix is too small to measure downstream. See
 - [The Entail Language](docs/entail-language.md) — language reference
 - [Extracting and Optimising a Subject](docs/entail-optimisation.md) — the cycle, its rewrite rules and the reviewer's brief
 - [Synthesising a Subject](docs/entail-synthesis.md) — from an extract to a program that answers requests, step by step
+- [Physics and Chemistry](docs/entail-sciences.md) — the algebra of units, molar mass and conservation of mass, with results and limits
 - [CUDA Backend Plan](docs/CUDA_PLAN.md) — GPU kernel roadmap
 - [MTP Drafter](docs/MTP_DRAFTER.md) — speculative decoding drafter design
 

@@ -26,7 +26,32 @@ public class EntailTests
     private static readonly Lazy<EntailProgram> Mathematics = new(() =>
         EntailCompiler.Compile(File.ReadAllText(RepoFile("scripts", "entail", "mathematics.entail.txt"))));
 
+    private static readonly Lazy<EntailProgram> Physics = new(() =>
+        EntailCompiler.Compile(File.ReadAllText(RepoFile("scripts", "entail", "physics.entail.txt"))));
+
+    private static readonly Lazy<EntailProgram> Chemistry = new(() =>
+        EntailCompiler.Compile(File.ReadAllText(RepoFile("scripts", "entail", "chemistry.entail.txt"))));
+
     private static IEnumerable<string> Chars(string text) => text.Select(c => c.ToString());
+
+    [Theory]
+    [InlineData(" |1|2| kg| *| |3| m|/s|^|2| =", " 36 N")]
+    [InlineData(" |3| km| +| |2|0|0| m| =", " 3200 m")]
+    [InlineData(" |1| m| /| |3| s| =", " 0.3333 m/s")]
+    [InlineData(" |3| m| +| |2| s| =", " incompatible units")]
+    [InlineData(" |3| h| *| |2| km| =", "")]
+    public void Physics_Follows_From_The_Algebra_Of_Units(string tokens, string answer) =>
+        Assert.Equal(answer, EntailInterpreter.Answer(Physics.Value, tokens.Split('|')));
+
+    [Theory]
+    [InlineData(" M|(H|2|O|)=", "18.015 g/mol")]
+    [InlineData(" M|(C|a|(O|H|)|2|)=", "74.094 g/mol")]
+    [InlineData(" mass| of| Na|Cl| is", " 58.440 g/mol")]
+    [InlineData("\n|2|H|2| +| O|2| ->| |2|H|2|O| is", " balanced")]
+    [InlineData("\n|H|2| +| O|2| ->| H|2|O| is", " unbalanced")]
+    [InlineData(" M|(X|x|2|)=", "")]
+    public void Chemistry_Adds_Up_Atoms_And_Conserves_Mass(string tokens, string answer) =>
+        Assert.Equal(answer, EntailInterpreter.Answer(Chemistry.Value, tokens.Split('|')));
 
     private static string Say(string expression) =>
         EntailInterpreter.Answer(Mathematics.Value, Chars(expression));
