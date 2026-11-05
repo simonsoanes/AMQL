@@ -12,10 +12,11 @@ amql-cli entail check   scripts/entail/mathematics.entail.txt
 amql-cli entail run     scripts/entail/mathematics.entail.txt --expr " 347*829="
 amql-cli entail compile scripts/entail/mathematics.entail.txt --out <checkpoint>
 amql-cli entail graft   scripts/entail/mathematics.entail.txt --host <checkpoint> --out <checkpoint>
-amql-cli entail eval    <container> --cases <cases.jsonl> [--text <file>] [--report <json>]
+amql-cli entail eval    <container> --cases <cases.jsonl> [--batch N] [--text <file>] [--report <json>]
 ```
 
-`run` executes the program's meaning with no weights at all, which is what the
+`--batch N` answers N cases at once, on the CPU only, and gives the same replies as
+one at a time. `run` executes the program's meaning with no weights at all, which is what the
 compiled model has to reproduce. `scripts/entail/compile-and-evaluate.sh` does
 the whole experiment end to end.
 

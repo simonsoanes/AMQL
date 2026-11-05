@@ -22,6 +22,14 @@ public sealed class GenericRuntime
         _weights = new WeightLoader(store, patch, workingSet);
     }
 
+    /// <summary>A runtime over weights another runtime already loaded, with its own
+    /// KV cache and recurrent state. See <see cref="DecodeSession.Sibling"/>.</summary>
+    internal GenericRuntime(ComponentOpPlan plan, WeightLoader weights)
+    {
+        _plan = plan;
+        _weights = weights;
+    }
+
     public ComponentOpPlan Plan => _plan;
     public WeightLoader Weights => _weights;
     public RowKvCache Kv { get; } = new();

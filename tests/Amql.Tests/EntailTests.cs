@@ -157,10 +157,12 @@ public class EntailTests
         var plan = Planner.Plan(container, "target", store);
         var session = new DecodeSession(plan, store, null, WeightWorkingSet.ResidentF32);
 
-        string Generate(string prompt)
+        string Generate(string prompt) => GenerateOn(session, prompt);
+
+        string GenerateOn(DecodeSession on, string prompt)
         {
-            session.Reset();
-            var logits = session.Prefill(tokenizer.EncodeToIds(prompt).ToArray());
+            on.Reset();
+            var logits = on.Prefill(tokenizer.EncodeToIds(prompt).ToArray());
             var reply = new List<int>();
             for (int i = 0; i < 16; i++)
             {
@@ -178,7 +180,7 @@ public class EntailTests
                     break;   // <none> or <eos>
                 }
                 reply.Add(best);
-                logits = session.Step(best);
+                logits = on.Step(best);
             }
             return tokenizer.DecodeText(reply);
         }
@@ -190,5 +192,34 @@ public class EntailTests
         Assert.Equal("1424.17", Generate(" 967017/679="));
         Assert.Equal("12.37", Generate(" 99/8="));
         Assert.Equal(string.Empty, Generate(" 1.5+2="));
+
+        // Sessions sharing those weights keep their own state, on their own threads.
+        // On the GPU they would corrupt each other silently, so they must refuse.
+        if (CudaShim.Enabled)
+        {
+            Assert.Throws<InvalidOperationException>(() => session.Sibling());
+            return;
+        }
+        string[] sums = [" 99999999+1=", " 5-7=", " 123456*654321=", " 7/2=", " 967017/679=", " 99/8="];
+        string[] expected = ["100000000", "-2", "80779853376", "3.5", "1424.17", "12.37"];
+        var together = new string[sums.Length];
+        Parallel.For(0, sums.Length, i => together[i] = GenerateOn(session.Sibling(), sums[i]));
+        Assert.Equal(expected, together);
+    }
+
+    [Fact]
+    public void A_Session_That_Has_Not_Run_Cannot_Share_Its_Weights()
+    {
+        using var dir = new TempDir();
+        var checkpoint = Path.Combine(dir.Path, "checkpoint");
+        var containerPath = Path.Combine(dir.Path, "container");
+        EntailWeights.WriteFresh(Mathematics.Value, checkpoint);
+        ModelToContainer.Encode(checkpoint, containerPath, "entail-mathematics");
+        using var container = Vindex3Container.Open(containerPath);
+        using var store = container.CreateOperandStore();
+        var plan = Planner.Plan(container, "target", store);
+
+        var session = new DecodeSession(plan, store, null, WeightWorkingSet.ResidentF32);
+        Assert.Throws<InvalidOperationException>(() => session.Sibling());
     }
 }

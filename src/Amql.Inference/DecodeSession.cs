@@ -20,6 +20,33 @@ public sealed class DecodeSession
         _runtime = new GenericRuntime(plan, store, patch, workingSet);
     }
 
+    private DecodeSession(GenericRuntime runtime) => _runtime = runtime;
+
+    /// <summary>
+    /// A second session over the same weights, so sequences can run on separate
+    /// threads without a copy of the model each. It needs a resident working set
+    /// and a session that has already prefilled and stepped: the loader's caches
+    /// are not safe to write from two threads, and from then on they are only read.
+    /// It also needs the CPU. GEMMs from several threads on the CUDA path corrupt
+    /// each other with no error, so the answers would simply be wrong.
+    /// </summary>
+    public DecodeSession Sibling()
+    {
+        if (CudaShim.Enabled)
+        {
+            throw new InvalidOperationException("sessions can only share weights on the CPU");
+        }
+        if (_runtime.Weights.WorkingSet != WeightWorkingSet.ResidentF32)
+        {
+            throw new InvalidOperationException("sessions can only share resident f32 weights");
+        }
+        if (LastLogits is null)
+        {
+            throw new InvalidOperationException("run this session once before sharing its weights");
+        }
+        return new DecodeSession(new GenericRuntime(_runtime.Plan, _runtime.Weights));
+    }
+
     public GenericRuntime Runtime => _runtime;
 
     /// <summary>Tokens consumed so far — the next token's absolute position.

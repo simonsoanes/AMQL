@@ -234,6 +234,11 @@ table of what the model said after each token or pair. Coverage says a name is s
 the program. It does not say the program knows what the name means.
 
 Text in the held-out set is not studied, so items that appear only there read as missing.
+`--only-holdout` records what the model says and studies nothing, which makes a test set
+from any corpus.
+
+To go from an extract to a program that answers requests, see
+[entail-synthesis.md](entail-synthesis.md).
 
 ## Results
 

@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -154,11 +155,11 @@ internal static partial class Program
             var totals = new SortedDictionary<string, (int Pass, int Count)>(StringComparer.Ordinal);
             var details = new JsonArray();
             var clock = Stopwatch.StartNew();
-            foreach (var c in cases.Take(limit))
+            var chosen = cases.Take(limit).ToList();
+
+            string Answer(DecodeSession on, JsonObject c)
             {
-                string category = c["category"]!.GetValue<string>();
                 string prompt = c["prompt"]!.GetValue<string>();
-                string answer = c["answer"]!.GetValue<string>();
                 bool chat = c["chat"]?.GetValue<bool>() ?? false;
                 string rendered = prompt;
                 if (chat)
@@ -174,8 +175,8 @@ internal static partial class Program
                     }
                 }
 
-                session.Reset();
-                var logits = session.Prefill(tokenizer.EncodeToIds(rendered).ToArray());
+                on.Reset();
+                var logits = on.Prefill(tokenizer.EncodeToIds(rendered).ToArray());
                 var reply = new List<int>();
                 for (int i = 0; i < (c["max_tokens"]?.GetValue<int>() ?? maxTokens); i++)
                 {
@@ -185,9 +186,47 @@ internal static partial class Program
                         break;
                     }
                     reply.Add(next);
-                    logits = session.Step(next);
+                    logits = on.Step(next);
                 }
-                string text = tokenizer.DecodeText(reply);
+                return tokenizer.DecodeText(reply);
+            }
+
+            // Cases are independent, so each thread takes the next one on its own session.
+            // The first runs alone, because it is what loads the weights the others share.
+            var replies = new string[chosen.Count];
+            int batch = Math.Clamp(IntOption(args, "--batch", 1), 1, Math.Max(chosen.Count, 1));
+            if (batch > 1)
+            {
+                if (CudaShim.Enabled)
+                {
+                    throw new CliException("--batch runs on the CPU: add --cpu");
+                }
+                session.Reset();
+                session.Prefill(tokenizer.EncodeToIds("a b").ToArray());
+                session.Step(tokenizer.EncodeToIds("a")[0]);
+                var sessions = new ConcurrentBag<DecodeSession>(Enumerable.Range(0, batch).Select(_ => session.Sibling()));
+                Parallel.For(0, chosen.Count, new ParallelOptions { MaxDegreeOfParallelism = batch }, i =>
+                {
+                    sessions.TryTake(out var on);
+                    replies[i] = Answer(on!, chosen[i]);
+                    sessions.Add(on!);
+                });
+            }
+            else
+            {
+                for (int i = 0; i < chosen.Count; i++)
+                {
+                    replies[i] = Answer(session, chosen[i]);
+                }
+            }
+
+            for (int i = 0; i < chosen.Count; i++)
+            {
+                var c = chosen[i];
+                string category = c["category"]!.GetValue<string>();
+                string prompt = c["prompt"]!.GetValue<string>();
+                string answer = c["answer"]!.GetValue<string>();
+                string text = replies[i];
                 bool pass = EntailScore(text, answer, c["first"]?.GetValue<bool>() ?? false);
                 var (p, n) = totals.GetValueOrDefault(category);
                 totals[category] = (p + (pass ? 1 : 0), n + 1);

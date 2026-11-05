@@ -217,7 +217,8 @@ internal static partial class Program
             }
         }
         chunks = chunks.OrderBy(_ => random.Next()).ToList();
-        int held = Math.Max(4, chunks.Count / 20);
+        // `--only-holdout` records what the model says and studies nothing: a test set.
+        int held = HasOption(args, "--only-holdout") ? chunks.Count : Math.Max(4, chunks.Count / 20);
         var holdout = chunks.Take(held).ToList();
         var study = chunks.Skip(held).ToList();
         Console.WriteLine($"corpus:     {study.Sum(c => c.Length)} tokens to study, {holdout.Sum(c => c.Length)} held out, from {files.Count} files");

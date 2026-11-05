@@ -197,6 +197,11 @@ trained-in material included, as the raw state before optimisation, and `entail 
 measures it. For Python on the same model that is 1.8 million rule lines. See
 [docs/entail-optimisation.md](docs/entail-optimisation.md).
 
+A subject can also be synthesised: a new program, built with vocabulary from the model and
+the extract, that turns a request into code. For a slice of Python on the same model it took
+unseen requests from 14 of 26 to 20 of 26, with the derivation still written by hand. See
+[docs/entail-synthesis.md](docs/entail-synthesis.md).
+
 ### Model Merging & Transformation
 
 - **`merge`** — Two models into one via consensus-gated token alignment. Shared tokens
@@ -373,6 +378,7 @@ multi-million-element matrix is too small to measure downstream. See
 - [Entail](docs/entail.md) — compiling statements into weights: design and results
 - [The Entail Language](docs/entail-language.md) — language reference
 - [Extracting and Optimising a Subject](docs/entail-optimisation.md) — the cycle, its rewrite rules and the reviewer's brief
+- [Synthesising a Subject](docs/entail-synthesis.md) — from an extract to a program that answers requests, step by step
 - [CUDA Backend Plan](docs/CUDA_PLAN.md) — GPU kernel roadmap
 - [MTP Drafter](docs/MTP_DRAFTER.md) — speculative decoding drafter design
 
