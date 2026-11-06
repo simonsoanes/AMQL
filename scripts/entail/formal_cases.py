@@ -227,7 +227,7 @@ def logic(out, seed):
     cases = []
 
     def add(category, text, answer):
-        cases.append(dict(category=category, prompt=f"{drill}\n{text}", answer=answer, max_tokens=8))
+        cases.append(dict(category=category, prompt=f"{drill}\n{text}", answer=answer, max_tokens=10))
 
     def expression(names, depth):
         while True:

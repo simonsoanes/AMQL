@@ -13,6 +13,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **feat:** Entail `vote`, a soft output the interpreter runs and `compile` and `graft` refuse, and the string escapes `\q` and `\{`
 - **feat:** Synthetic Python: `scripts/entail/subjects/python.synthetic.entail.txt`, its generator and scoring, and the steps in [docs/entail-synthesis.md](docs/entail-synthesis.md)
 - **feat:** `scripts/entail/physics.entail.txt` and `chemistry.entail.txt`, with `make_chemistry.py`, `science_cases.py` and [docs/entail-sciences.md](docs/entail-sciences.md)
+- **feat:** `scripts/entail/dates.entail.txt`, `bases.entail.txt`, `logic.entail.txt` and `json.entail.txt`, with `make_bases.py`, `make_logic.py`, `make_json.py`, `formal_cases.py` and [docs/entail-formal.md](docs/entail-formal.md)
+- **feat:** Entail `only` and `forbid`, masks that rule tokens out without choosing one, for a program that keeps a host's text valid as it is written; and the string escapes `\t`, `\r` and `\e`
 - **feat:** `amql-cli entail run --tokenizer <dir> --cases <file>` tests a program on a model's real tokens, without weights
 - **fix:** `entail graft` no longer fails on a token that is only ever emitted
 - **feat:** `amql-cli entail decompile --only-holdout` records a test set from a corpus without studying it

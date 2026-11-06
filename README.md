@@ -208,6 +208,13 @@ equations balance. Grafted into the same model they got 192 of 196 and 182 of 18
 on notation they can read, against 12 and 104 before, but changed no chat reply, because the model
 writes its working in LaTeX. See [docs/entail-sciences.md](docs/entail-sciences.md).
 
+Dates, number bases, boolean logic and JSON are rule systems too. Grafted into the same model,
+dates went from 54 to 250 of 250 test cases, bases from 41 to 315 of 315, logic from 45 to 217 of
+218 and JSON verdicts from 217 to 370 of 370. A JSON guard rules out any token that would break a
+text as it is written, which kept 60 of 60 unfinished texts valid against 38. No chat answer got
+better, and Qwen's native tool calls are XML, so the guard helps JSON output rather than those.
+See [docs/entail-formal.md](docs/entail-formal.md).
+
 ### Model Merging & Transformation
 
 - **`merge`** — Two models into one via consensus-gated token alignment. Shared tokens
@@ -386,6 +393,7 @@ multi-million-element matrix is too small to measure downstream. See
 - [Extracting and Optimising a Subject](docs/entail-optimisation.md) — the cycle, its rewrite rules and the reviewer's brief
 - [Synthesising a Subject](docs/entail-synthesis.md) — from an extract to a program that answers requests, step by step
 - [Physics and Chemistry](docs/entail-sciences.md) — the algebra of units, molar mass and conservation of mass, with results and limits
+- [Dates, Bases, Logic and JSON](docs/entail-formal.md) — the calendar, number bases, truth tables and a JSON guard, with results and limits
 - [CUDA Backend Plan](docs/CUDA_PLAN.md) — GPU kernel roadmap
 - [MTP Drafter](docs/MTP_DRAFTER.md) — speculative decoding drafter design
 
