@@ -95,6 +95,8 @@ amql-cli fine-tune <container> --data <pairs.tsv> --out <patch> [--lr 1e-4]
 amql-cli bake-predicate <container> --predicate "<rule>" --out <patch> [--prompts <file>] [--layers 6,9,12]
 amql-cli entail compile <program> --out <dir>
 amql-cli entail graft <program> --host <dir> --out <dir>
+amql-cli entail adapter <program> --tokenizer <partner-dir> --out <dir>
+amql-cli entail side <container> --adapter <dir>[,<dir>] --prompt <text>
 amql-cli create-model --hidden 768 --layers 12 --vocab 32000 --out <dir>
 amql-cli convert-to-classifier <container> --num-labels N --out <dir>
 amql-cli convert-to-embedding <container> --out <dir>
@@ -207,6 +209,12 @@ so `12 kg * 3 m/s^2 =` gives `36 N`, and `chemistry.entail.txt` gives molar mass
 equations balance. Grafted into the same model they got 192 of 196 and 182 of 182 test cases right
 on notation they can read, against 12 and 104 before, but changed no chat reply, because the model
 writes its working in LaTeX. See [docs/entail-sciences.md](docs/entail-sciences.md).
+
+A program can also run beside a model rather than inside it. `entail adapter` builds one for a
+model's tokenizer and `entail side` runs them together: the program reads every token in doubles
+and rules on the next one at the sampler, so the model is never changed and keeps its own precision.
+Four programs beside the same model matched their grafts, in about 1 MB instead of 14.4 GB, and left
+its prose loss identical. See [docs/entail-adapter.md](docs/entail-adapter.md).
 
 Dates, number bases, boolean logic and JSON are rule systems too. Grafted into the same model,
 dates went from 54 to 250 of 250 test cases, bases from 41 to 315 of 315, logic from 45 to 217 of

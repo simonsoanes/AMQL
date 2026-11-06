@@ -89,6 +89,9 @@ weight's value:
 Wherever the program says nothing, the host's computation is unchanged. The same
 compiled layers serve the empty model and the graft.
 
+A program can also run beside a model instead of inside it, which leaves the model
+untouched at its own precision: see [entail-adapter.md](entail-adapter.md).
+
 ## Results
 
 Greedy decoding on the CPU, Qwen 3.5 0.8B before and after, on operands drawn
@@ -130,7 +133,8 @@ reasoning and hard arithmetic, not a general reasoning benchmark.
   tell the start of the text from a run of identical tokens, so a number opening
   the text looks too long and the program stays silent.
 - Exactness needs float32. The fp16 GPU weight path cannot hold the ballast and
-  would round the block's weights, so run on the CPU. A grafted model is also
+  would round the block's weights, so run on the CPU, or run the program as an
+  [adapter](entail-adapter.md), which doesn't depend on the host's precision. A grafted model is also
   larger and slower: 59 layers instead of 24, hidden 1664 instead of 1024, with
   the block stored in f32.
 - Targets are the Qwen3.5 layer shape with 8 query heads, 2 KV heads, head_dim 256

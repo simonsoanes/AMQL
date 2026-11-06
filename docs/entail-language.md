@@ -338,6 +338,12 @@ each case, with `--report <json>` for the replies. This is the quick way to test
 program before grafting it.
 
 ```bash
+amql-cli entail adapter program.entail.txt --tokenizer <partner-dir> --out adapter
+```
+Builds an adapter that runs beside a model without changing it. See
+[entail-adapter.md](entail-adapter.md).
+
+```bash
 amql-cli entail compile program.entail.txt --out model
 ```
 Writes a checkpoint for an empty model. Use `amql-cli encode` to make it a container.

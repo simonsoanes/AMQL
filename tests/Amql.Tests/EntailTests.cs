@@ -13,7 +13,7 @@ namespace Amql.Tests;
 [Collection("gpu")]
 public class EntailTests
 {
-    private static string RepoFile(params string[] parts)
+    internal static string RepoFile(params string[] parts)
     {
         var dir = new DirectoryInfo(AppContext.BaseDirectory);
         while (dir is not null && !File.Exists(Path.Combine(dir.FullName, "AMQL.slnx")))

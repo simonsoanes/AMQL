@@ -3,6 +3,7 @@
   <ItemGroup>
     <ProjectReference Include="..\Amql.Vindex3\Amql.Vindex3.csproj" />
     <ProjectReference Include="..\Amql.Safetensors\Amql.Safetensors.csproj" />
+    <ProjectReference Include="..\Amql.Entail\Amql.Entail.csproj" />
   </ItemGroup>
 
   <PropertyGroup>

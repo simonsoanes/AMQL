@@ -466,6 +466,89 @@ public static class EntailWeights
         {
             throw new EntailException("`only` and `forbid` narrow a host's predictions: graft this program instead");
         }
+        // Vocabulary: two control tokens, then printable ASCII.
+        var vocab = new List<string> { "<none>", "<eos>" };
+        for (char c = ' '; c <= '~'; c++)
+        {
+            vocab.Add(c.ToString());
+        }
+        var ids = vocab.Select((t, i) => (t, i)).ToDictionary(x => x.t, x => x.i, StringComparer.Ordinal);
+        var missing = p.Tokens.Keys.Where(t => !ids.ContainsKey(t)).ToList();
+        var inputs = p.Tokens.Keys.Where(ids.ContainsKey).Select(t => (ids[t], t)).ToList();
+        var outputs = p.Emits.Select(e => (e.Text is null ? 1 : ids[e.Text], e.Lane, 64f)).ToList();
+        return WriteBlank(p, outDir, context, vocab, inputs, outputs, missing);
+    }
+
+    /// <summary>
+    /// Writes a program as an adapter to run beside a partner model: the same
+    /// blank model as <see cref="WriteFresh"/>, reading the partner's token ids
+    /// through a table, and with one output row per output lane. Its logits are
+    /// therefore its verdict, and all zero where it has nothing to say.
+    /// </summary>
+    public static (EntailBuildReport Report, EntailAdapterManifest Manifest) WriteAdapter(
+        EntailProgram p, string partnerTokenizerDir, string outDir, int context = 8192)
+    {
+        var binding = BindAdapter(p, partnerTokenizerDir);
+        int size = Math.Max(binding.Manifest.Rows.Count + 2, binding.Manifest.Outputs.Count);
+        var vocab = new List<string> { "<none>", "<eos>" };
+        vocab.AddRange(Enumerable.Range(2, size - 2).Select(i => $"r{i}"));
+        var outputs = binding.Outputs.Select(o => (o.Row, o.Lane, 1f)).ToList();
+        var report = WriteBlank(p, outDir, context, vocab, binding.Inputs, outputs, binding.Missing);
+        binding.Manifest.Save(outDir);
+        return (report, binding.Manifest);
+    }
+
+    /// <summary>Joins a program to a partner's tokens: which token each input
+    /// row is, and what each output row means.</summary>
+    public static EntailAdapterBinding BindAdapter(EntailProgram p, string partnerTokenizerDir)
+    {
+        RefuseVotes(p);
+        var (ids, missing) = BindTokens(p, partnerTokenizerDir);
+
+        // Row 0 stands for every token the program does not know, row 1 is unused.
+        var rows = new Dictionary<int, int>();
+        var inputs = new List<(int Row, string Text)>();
+        foreach (var text in p.Tokens.Keys.Where(ids.ContainsKey))
+        {
+            int row = rows.Count + 2;
+            rows[ids[text]] = row;
+            inputs.Add((row, text));
+        }
+
+        var bound = p.Emits.Where(e => e.Text is not null && ids.ContainsKey(e.Text)).ToList();
+        var said = bound.Where(e => e.Text != " ").Select(e => ids[e.Text!]).Distinct().ToArray();
+        var entries = new List<EntailAdapterOutput>();
+        var outputs = new List<(int Row, int Lane)>();
+        void Add(EntailOutputKind kind, int lane, int[] tokens)
+        {
+            outputs.Add((entries.Count, lane));
+            entries.Add(new EntailAdapterOutput(entries.Count, kind, tokens));
+        }
+        foreach (var (text, lane) in p.Emits)
+        {
+            if (text is null)
+            {
+                Add(EntailOutputKind.End, lane, said);
+            }
+            else if (ids.TryGetValue(text, out int id))
+            {
+                Add(EntailOutputKind.Say, lane, new[] { id });
+            }
+        }
+        foreach (var (allow, texts, lane) in p.Masks)
+        {
+            Add(allow ? EntailOutputKind.Only : EntailOutputKind.Forbid, lane,
+                texts.Where(ids.ContainsKey).Select(t => ids[t]).Distinct().ToArray());
+        }
+
+        var manifest = new EntailAdapterManifest(p.Name,
+            EntailAdapterManifest.TokenizerHash(partnerTokenizerDir), rows, entries);
+        return new EntailAdapterBinding(manifest, inputs, outputs, missing);
+    }
+
+    private static EntailBuildReport WriteBlank(EntailProgram p, string outDir, int context, IReadOnlyList<string> vocab,
+        IReadOnlyList<(int Row, string Text)> inputs, IReadOnlyList<(int Row, int Lane, float Weight)> outputs, List<string> missing)
+    {
         Directory.CreateDirectory(outDir);
         int hidden = WidthFor(Allocate(p, firstDim: 0, keepEmitsLive: true).Used);
         var (ballastDims, shift) = BallastShape(hidden);
@@ -480,46 +563,32 @@ public static class EntailWeights
             Scale = scale, HostDim = new bool[hidden],
         };
 
-        // Vocabulary: two control tokens, then printable ASCII.
-        var vocab = new List<string> { "<none>", "<eos>" };
-        for (char c = ' '; c <= '~'; c++)
-        {
-            vocab.Add(c.ToString());
-        }
-        var ids = vocab.Select((t, i) => (t, i)).ToDictionary(x => x.t, x => x.i, StringComparer.Ordinal);
-
-        var embed = new float[vocab.Count * hidden];
+        var embed = new float[(long)vocab.Count * hidden];
         for (int t = 0; t < vocab.Count; t++)
         {
             for (int d = 0; d < ballastDims; d++)
             {
-                embed[t * hidden + d] = (float)Ballast;
+                embed[(long)t * hidden + d] = (float)Ballast;
             }
         }
-        var missing = new List<string>();
-        int bound = 0;
-        foreach (var (text, writes) in p.Tokens)
+        foreach (var (row, text) in inputs)
         {
-            if (!ids.TryGetValue(text, out int id))
-            {
-                missing.Add(text);
-                continue;
-            }
-            bound++;
-            foreach (var (lane, value) in writes)
+            foreach (var (lane, value) in p.Tokens[text])
             {
                 if (alloc.Dim[lane] >= 0)
                 {
-                    embed[id * hidden + alloc.Dim[lane]] = (float)(value * scale[lane]);
+                    embed[(long)row * hidden + alloc.Dim[lane]] = (float)(value * scale[lane]);
                 }
             }
         }
 
-        var head = new float[vocab.Count * hidden];
-        foreach (var (text, lane) in p.Emits)
+        var head = new float[(long)vocab.Count * hidden];
+        foreach (var (row, lane, weight) in outputs)
         {
-            int id = text is null ? 1 : ids[text];
-            head[id * hidden + alloc.Dim[lane]] = 64f;
+            if (alloc.Dim[lane] >= 0)
+            {
+                head[(long)row * hidden + alloc.Dim[lane]] = weight;
+            }
         }
 
         var tensors = new List<TensorPayload> { F32("model.embed_tokens.weight", embed, vocab.Count, hidden) };
@@ -562,7 +631,7 @@ public static class EntailWeights
         File.WriteAllText(Path.Combine(outDir, "generation_config.json"), "{ \"eos_token_id\": 1 }");
 
         return new EntailBuildReport(outDir, hidden, p.Layers, p.Layers, alloc.Used, alloc.Peak,
-            p.Ops.Count(o => o is Neuron), p.Ops.Count(o => o is Head), AttentionGap(p, context), bound, missing);
+            p.Ops.Count(o => o is Neuron), p.Ops.Count(o => o is Head), AttentionGap(p, context), inputs.Count, missing);
     }
 
     private static string TokenizerJson(IReadOnlyList<string> vocab)
@@ -903,6 +972,8 @@ public static class EntailWeights
         var root = JsonNode.Parse(File.ReadAllText(Path.Combine(hostDir, "tokenizer.json")))!.AsObject();
         var vocab = root["model"]!["vocab"]!.AsObject();
         var byteMap = ByteLevelMap();
+        var added = (root["added_tokens"]?.AsArray() ?? new JsonArray()).ToDictionary(
+            t => t!["content"]!.GetValue<string>(), t => t!["id"]!.GetValue<int>(), StringComparer.Ordinal);
         var ids = new Dictionary<string, int>(StringComparer.Ordinal);
         var missing = new List<string>();
         foreach (var token in p.Tokens.Keys.Concat(p.Emits.Where(e => e.Text is not null).Select(e => e.Text!))
@@ -912,6 +983,10 @@ public static class EntailWeights
             if (vocab.TryGetPropertyValue(encoded, out var id) && id is not null)
             {
                 ids[token] = id.GetValue<int>();
+            }
+            else if (added.TryGetValue(token, out int special))
+            {
+                ids[token] = special;
             }
             else
             {

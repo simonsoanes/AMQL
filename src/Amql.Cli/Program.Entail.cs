@@ -17,7 +17,7 @@ internal static partial class Program
     private static int EntailCommand(string[] args)
     {
         string verb = Arg(args, 0) ?? throw new CliException(
-            "entail requires a verb: check | run | compile | graft | eval | find | extract | optimise | review | accept");
+            "entail requires a verb: check | run | compile | graft | adapter | side | eval | find | extract | optimise | review | accept");
         var rest = args[1..];
         return verb switch
         {
@@ -25,6 +25,8 @@ internal static partial class Program
             "run" => EntailRun(rest),
             "compile" => EntailCompile(rest),
             "graft" => EntailGraft(rest),
+            "adapter" => EntailAdapter(rest),
+            "side" => EntailSide(rest),
             "eval" => EntailEval(rest),
             "find" => EntailFind(rest),
             "decompile" => EntailDecompile(rest),
@@ -136,6 +138,117 @@ internal static partial class Program
         return 0;
     }
 
+    /// <summary>Builds a program to run beside a partner, reading the partner's
+    /// token ids. With --dense it is a container of f32 weights, for a runtime
+    /// that can only run a model.</summary>
+    private static int EntailAdapter(string[] args)
+    {
+        var p = LoadEntail(args);
+        string tokenizer = OptionValue(args, "--tokenizer") ?? throw new CliException("entail adapter requires '--tokenizer <partner-dir>'");
+        string outDir = OptionValue(args, "--out") ?? throw new CliException("entail adapter requires '--out <dir>'");
+        PrintEntail(p);
+        if (!args.Contains("--dense"))
+        {
+            var written = EntailSparseAdapter.Write(File.ReadAllText(args[0]), tokenizer, outDir);
+            Console.WriteLine($"outputs:    {written.Outputs.Count} ({written.Rows.Count} partner tokens read)");
+            Console.WriteLine($"wrote:      {outDir}");
+            return 0;
+        }
+        string checkpoint = outDir.TrimEnd('/', '\\') + ".checkpoint";
+        var (report, manifest) = EntailWeights.WriteAdapter(p, tokenizer, checkpoint, IntOption(args, "--context", 8192));
+        PrintEntailBuild(report);
+        Console.WriteLine($"outputs:    {manifest.Outputs.Count} ({manifest.Rows.Count} partner tokens read)");
+        ModelToContainer.Encode(checkpoint, outDir, $"entail-{p.Name}");
+        manifest.Save(outDir);
+        Directory.Delete(checkpoint, recursive: true);
+        return 0;
+    }
+
+    private static List<IEntailAdapter> OpenAdapters(string[] args, string tokenizerDir)
+    {
+        try
+        {
+            return (OptionValue(args, "--adapter") ?? string.Empty).Split(',', StringSplitOptions.RemoveEmptyEntries)
+                .Select(dir => EntailAdapterRunner.Load(dir, tokenizerDir)).ToList();
+        }
+        catch (EntailException e)
+        {
+            throw new CliException(e.Message);
+        }
+    }
+
+    private static string EntailPrompt(string prompt, string? template, bool chat, bool think)
+    {
+        if (!chat)
+        {
+            return prompt;
+        }
+        if (template is null)
+        {
+            throw new CliException("this model has no chat template");
+        }
+        string rendered = ChatTemplate.Apply(template, prompt, null);
+        if (template.Contains("<think>", StringComparison.Ordinal))
+        {
+            rendered += think ? "<think>\n" : "<think>\n\n</think>\n\n";
+        }
+        return rendered;
+    }
+
+    /// <summary>Decodes one prompt with a partner and its adapters, marking
+    /// [[what a program said]] and {{what a rule steered}}.</summary>
+    private static int EntailSide(string[] args)
+    {
+        var containerDir = Arg(args, 0) ?? throw new CliException("entail side requires a partner container");
+        string prompt = OptionValue(args, "--prompt") ?? throw new CliException("entail side requires '--prompt <text>'");
+        string tokenizerDir = ResolveTokenizerDir(containerDir, args);
+        var tokenizer = Tokenizer(tokenizerDir);
+        var stop = ResolveStopTokens(tokenizerDir, tokenizer);
+        string? template = ChatTemplate.Load(tokenizerDir);
+
+        using var container = Vindex3Container.Open(containerDir);
+        using var store = container.CreateOperandStore();
+        var plan = Planner.Plan(container, OptionValue(args, "--component") ?? "target", store);
+        var adapters = OpenAdapters(args, tokenizerDir);
+        var side = new SideBySideSession(new DecodeSession(plan, store, null, WeightWorkingSet.ResidentF32), adapters);
+
+        side.Prefill(tokenizer.EncodeToIds(EntailPrompt(prompt, template, args.Contains("--chat"), args.Contains("--think"))).ToArray());
+        var spans = new List<(EntailTokenSource Source, List<int> Tokens)>();
+        var counts = new Dictionary<EntailTokenSource, int>();
+        for (int i = 0; i < IntOption(args, "--max-tokens", 128); i++)
+        {
+            var (token, source) = side.Choose();
+            if (stop.Contains(token))
+            {
+                break;
+            }
+            counts[source] = counts.GetValueOrDefault(source) + 1;
+            if (spans.Count == 0 || spans[^1].Source != source)
+            {
+                spans.Add((source, new List<int>()));
+            }
+            spans[^1].Tokens.Add(token);
+            side.Step(token);
+        }
+
+        foreach (var (source, tokens) in spans)
+        {
+            string text = tokenizer.DecodeText(tokens);
+            Console.Write(source switch
+            {
+                EntailTokenSource.Entail => $"[[{text}]]",
+                EntailTokenSource.Narrowed => $"{{{{{text}}}}}",
+                _ => text,
+            });
+        }
+        Console.WriteLine();
+        Console.WriteLine($"tokens:     partner {counts.GetValueOrDefault(EntailTokenSource.Partner)}, " +
+                          $"steered {counts.GetValueOrDefault(EntailTokenSource.Narrowed)}, " +
+                          $"said by a program {counts.GetValueOrDefault(EntailTokenSource.Entail)}");
+        adapters.ForEach(a => a.Dispose());
+        return 0;
+    }
+
     private static void PrintEntailBuild(EntailBuildReport r)
     {
         Console.WriteLine($"hidden:     {r.Hidden} ({r.LanesUsed} lane dims, {r.LanesPeak} live at once)");
@@ -166,7 +279,8 @@ internal static partial class Program
         using var container = Vindex3Container.Open(containerDir);
         using var store = container.CreateOperandStore();
         var plan = Planner.Plan(container, OptionValue(args, "--component") ?? "target", store);
-        var session = new DecodeSession(plan, store, null, WeightWorkingSet.ResidentF32);
+        var adapters = OpenAdapters(args, tokenizerDir);
+        var session = new SideBySideSession(new DecodeSession(plan, store, null, WeightWorkingSet.ResidentF32), adapters);
 
         static int ArgMax(ReadOnlySpan<float> row)
         {
@@ -192,43 +306,32 @@ internal static partial class Program
             var clock = Stopwatch.StartNew();
             var chosen = cases.Take(limit).ToList();
 
-            string Answer(DecodeSession on, JsonObject c)
+            (string Text, int Said, int Steered) Answer(SideBySideSession on, JsonObject c)
             {
-                string prompt = c["prompt"]!.GetValue<string>();
-                bool chat = c["chat"]?.GetValue<bool>() ?? false;
-                string rendered = prompt;
-                if (chat)
-                {
-                    if (template is null)
-                    {
-                        throw new CliException("this model has no chat template");
-                    }
-                    rendered = ChatTemplate.Apply(template, prompt, null);
-                    if (template.Contains("<think>", StringComparison.Ordinal))
-                    {
-                        rendered += "<think>\n\n</think>\n\n";
-                    }
-                }
-
+                string rendered = EntailPrompt(c["prompt"]!.GetValue<string>(), template,
+                    c["chat"]?.GetValue<bool>() ?? false, c["think"]?.GetValue<bool>() ?? false);
                 on.Reset();
-                var logits = on.Prefill(tokenizer.EncodeToIds(rendered).ToArray());
+                on.Prefill(tokenizer.EncodeToIds(rendered).ToArray());
                 var reply = new List<int>();
+                int said = 0, steered = 0;
                 for (int i = 0; i < (c["max_tokens"]?.GetValue<int>() ?? maxTokens); i++)
                 {
-                    int next = ArgMax(logits.Row(0));
+                    var (next, source) = on.Choose();
                     if (stop.Contains(next))
                     {
                         break;
                     }
+                    said += source == EntailTokenSource.Entail ? 1 : 0;
+                    steered += source == EntailTokenSource.Narrowed ? 1 : 0;
                     reply.Add(next);
-                    logits = on.Step(next);
+                    on.Step(next);
                 }
-                return tokenizer.DecodeText(reply);
+                return (tokenizer.DecodeText(reply), said, steered);
             }
 
             // Cases are independent, so each thread takes the next one on its own session.
             // The first runs alone, because it is what loads the weights the others share.
-            var replies = new string[chosen.Count];
+            var replies = new (string Text, int Said, int Steered)[chosen.Count];
             int batch = Math.Clamp(IntOption(args, "--batch", 1), 1, Math.Max(chosen.Count, 1));
             if (batch > 1)
             {
@@ -239,7 +342,7 @@ internal static partial class Program
                 session.Reset();
                 session.Prefill(tokenizer.EncodeToIds("a b").ToArray());
                 session.Step(tokenizer.EncodeToIds("a")[0]);
-                var sessions = new ConcurrentBag<DecodeSession>(Enumerable.Range(0, batch).Select(_ => session.Sibling()));
+                var sessions = new ConcurrentBag<SideBySideSession>(Enumerable.Range(0, batch).Select(_ => session.Sibling()));
                 Parallel.For(0, chosen.Count, new ParallelOptions { MaxDegreeOfParallelism = batch }, i =>
                 {
                     sessions.TryTake(out var on);
@@ -261,15 +364,21 @@ internal static partial class Program
                 string category = c["category"]!.GetValue<string>();
                 string prompt = c["prompt"]!.GetValue<string>();
                 string answer = c["answer"]!.GetValue<string>();
-                string text = replies[i];
+                string text = replies[i].Text;
                 bool pass = EntailScore(text, answer, c["first"]?.GetValue<bool>() ?? false);
                 var (p, n) = totals.GetValueOrDefault(category);
                 totals[category] = (p + (pass ? 1 : 0), n + 1);
-                details.Add(new JsonObject
+                var detail = new JsonObject
                 {
                     ["category"] = category, ["prompt"] = prompt, ["answer"] = answer,
                     ["reply"] = text, ["pass"] = pass,
-                });
+                };
+                if (adapters.Count > 0)
+                {
+                    detail["said"] = replies[i].Said;
+                    detail["steered"] = replies[i].Steered;
+                }
+                details.Add(detail);
             }
             Console.WriteLine($"{"category",-22} {"exact",12}");
             int allPass = 0, allCount = 0;
@@ -291,12 +400,18 @@ internal static partial class Program
             int count = IntOption(args, "--text-tokens", 1024);
             var ids = tokenizer.EncodeToIds(File.ReadAllText(textPath)[..(count * 12)]).Take(count).ToArray();
             session.Reset();
-            var logits = session.Prefill(ids[..1]);
+            session.Prefill(ids[..1]);
             double nll = 0;
+            int spoke = 0, overruled = 0;
             var top = new JsonArray();
             for (int i = 1; i < ids.Length; i++)
             {
-                var row = logits.Row(0);
+                var row = session.Logits.Row(0);
+                if (!session.Verdict.Silent)
+                {
+                    spoke++;
+                    overruled += session.Choose().Token != ArgMax(row) ? 1 : 0;
+                }
                 double max = double.NegativeInfinity;
                 foreach (var v in row)
                 {
@@ -309,17 +424,27 @@ internal static partial class Program
                 }
                 nll += Math.Log(sum) + max - row[ids[i]];
                 top.Add(ArgMax(row));
-                logits = session.Step(ids[i]);
+                session.Step(ids[i]);
             }
             double mean = nll / (ids.Length - 1);
+            var (partnerTime, adapterTime) = session.Spent;
             Console.WriteLine($"text:       {ids.Length} tokens, loss {mean:F5} nats/token, perplexity {Math.Exp(mean):F3}");
             report["text"] = new JsonObject { ["tokens"] = ids.Length, ["loss"] = mean, ["top1"] = top };
+            if (adapters.Count > 0)
+            {
+                Console.WriteLine($"adapters:   spoke at {spoke} of {ids.Length - 1} positions, overruling the partner at {overruled}");
+                Console.WriteLine($"time:       {adapterTime.TotalMilliseconds / ids.Length:F2} ms a token in adapters, " +
+                                  $"{partnerTime.TotalMilliseconds / ids.Length:F2} ms in the partner");
+                report["text"]!["spoke"] = spoke;
+                report["text"]!["overruled"] = overruled;
+            }
         }
 
         if (reportPath is not null)
         {
             File.WriteAllText(reportPath, report.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
         }
+        adapters.ForEach(a => a.Dispose());
         return 0;
     }
 
