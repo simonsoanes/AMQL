@@ -745,16 +745,16 @@ public static partial class ArchMapper
     private static NamedTensorData ToTensorData(HfInventory inventory, string fullName, string relative)
     {
         var info = inventory.Get(fullName);
-        // Tensors beyond the 2 GiB single-buffer ceiling (Qwen3.8-27B's
-        // 2.5 GiB embedding / lm_head) travel as chunks.
-        bool chunked = info.DataLength > HfInventory.MaxBufferedPayloadBytes;
+        // Read from the checkpoint's memory map only when the segment is
+        // written, a chunk at a time: encoding a checkpoint never holds more
+        // than one chunk of it, however large the model.
         return new NamedTensorData
         {
             Name = relative,
             Dtype = info.Dtype,
             Shape = info.Shape,
-            Data = chunked ? Array.Empty<byte>() : inventory.ReadBytes(fullName),
-            Chunks = chunked ? inventory.ReadChunks(fullName) : null,
+            Source = (offset, count) => inventory.ReadBytes(fullName, offset, count),
+            SourceLength = info.DataLength,
         };
     }
 

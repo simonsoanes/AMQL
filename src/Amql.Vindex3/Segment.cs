@@ -127,20 +127,18 @@ public static class SegmentWriter
 
             foreach (var (tensor, _) in entries)
             {
-                if (tensor.Chunks is { } chunks)
+                long written = 0;
+                foreach (var chunk in tensor.PayloadChunks())
                 {
-                    foreach (var chunk in chunks)
-                    {
-                        file.Write(chunk);
-                        fileSha.AppendData(chunk);
-                        payloadSha.AppendData(chunk);
-                    }
+                    file.Write(chunk);
+                    fileSha.AppendData(chunk);
+                    payloadSha.AppendData(chunk);
+                    written += chunk.Length;
                 }
-                else
+                if (written != tensor.PayloadLength)
                 {
-                    file.Write(tensor.Data);
-                    fileSha.AppendData(tensor.Data);
-                    payloadSha.AppendData(tensor.Data);
+                    throw new ContainerException(
+                        $"tensor '{tensor.Name}': wrote {written} payload bytes, expected {tensor.PayloadLength}");
                 }
             }
         }
@@ -160,17 +158,73 @@ public sealed record NamedTensorData
     public required Dtype Dtype { get; init; }
     public required long[] Shape { get; init; }
 
-    /// <summary>The raw payload.</summary>
-    public byte[] Data { get; init; } = Array.Empty<byte>();
+    private readonly byte[]? _data;
+
+    /// <summary>The raw payload. For a tensor backed by <see cref="Source"/>
+    /// this reads it afresh on every access; writers stream
+    /// <see cref="PayloadChunks"/> instead.</summary>
+    public byte[] Data
+    {
+        get => _data ?? ReadSource();
+        init => _data = value;
+    }
 
     /// <summary>Chunked payload for tensors beyond the 2 GiB single-buffer
     /// ceiling — when present its concatenation IS the payload and
     /// <see cref="Data"/> is ignored.</summary>
     public IReadOnlyList<byte[]>? Chunks { get; init; }
 
+    /// <summary>A lazy payload, <c>(offset, count) → bytes</c>, typically a
+    /// read from a memory-mapped checkpoint. Nothing is read until the
+    /// tensor is written, so a container far larger than memory encodes with
+    /// one chunk in flight. <see cref="SourceLength"/> is the payload size.</summary>
+    public Func<long, int, byte[]>? Source { get; init; }
+
+    public long SourceLength { get; init; }
+
+    private bool FromSource => _data is null && Chunks is null && Source is not null;
+
     public long PayloadLength => Chunks is { } chunks
         ? chunks.Sum(c => (long)c.Length)
-        : Data.Length;
+        : FromSource ? SourceLength : Data.Length;
+
+    /// <summary>The payload as consecutive buffers, read lazily when the
+    /// tensor is backed by <see cref="Source"/>.</summary>
+    public IEnumerable<byte[]> PayloadChunks(int chunkBytes = 64 * 1024 * 1024)
+    {
+        if (Chunks is { } chunks)
+        {
+            foreach (var chunk in chunks)
+            {
+                yield return chunk;
+            }
+        }
+        else if (FromSource)
+        {
+            for (long done = 0; done < SourceLength; done += chunkBytes)
+            {
+                yield return Source!(done, (int)Math.Min(chunkBytes, SourceLength - done));
+            }
+        }
+        else
+        {
+            yield return Data;
+        }
+    }
+
+    private byte[] ReadSource()
+    {
+        if (Source is null || SourceLength == 0)
+        {
+            return Array.Empty<byte>();
+        }
+        if (SourceLength > Array.MaxLength)
+        {
+            throw new ContainerException(
+                $"tensor '{Name}' holds {SourceLength} bytes, over the single-buffer ceiling: read it with PayloadChunks");
+        }
+        return Source(0, (int)SourceLength);
+    }
 
     /// <summary>Shape/dtype/payload agreement — the reference's tensor
     /// fact validation.</summary>
@@ -320,6 +374,23 @@ public sealed class SegmentFile : IDisposable
     /// <summary>Copies a sub-range of a tensor payload out of the mapping —
     /// chunked reads for operands beyond the 2 GiB single-buffer ceiling
     /// (Qwen3.8-27B's 2.37 GiB embedding).</summary>
+    /// <summary>Copies a sub-range of a tensor's payload into a caller's
+    /// buffer (pooled, so streaming a tensor allocates nothing per chunk).
+    /// Safe to call from several threads at once.</summary>
+    public void ReadInto(string name, long offset, byte[] buffer, int count)
+    {
+        var tensor = GetTensor(name);
+        if (offset < 0 || count < 0 || offset + count > tensor.Len || count > buffer.Length)
+        {
+            throw new ContainerException(
+                $"segment '{Path}': range [{offset}, {offset + count}) is outside '{name}' ({tensor.Len} bytes)");
+        }
+        if (count > 0)
+        {
+            _accessor.ReadArray(checked(PayloadStart + tensor.Offset + offset), buffer, 0, count);
+        }
+    }
+
     public byte[] ReadBytes(string name, long offset, int count)
     {
         var tensor = GetTensor(name);

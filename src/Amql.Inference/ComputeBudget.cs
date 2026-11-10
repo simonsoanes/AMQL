@@ -15,7 +15,7 @@ namespace Amql.Inference;
 /// <c>AMQL_CORES</c> (int) caps the parallel degree and
 /// <c>AMQL_MEMORY_GB</c> (decimal) sets the session memory ceiling in
 /// GiB. The MXFP4 working set adds two more: <c>AMQL_WEIGHTS</c>
-/// (<c>bf16</c> | <c>mxfp4</c>) selects the resident weight format, and
+/// (<c>bf16</c> | <c>mxfp4</c> | <c>disk</c>) selects the resident weight format, and
 /// <c>AMQL_F32_CACHE_GB</c> bounds the dequantised f32 LRU that MXFP4
 /// mode caches on top of the packs (a small default: packs are the
 /// resident truth, dequant is cheap). Any parallel site that matters
@@ -44,6 +44,11 @@ public static class ComputeBudget
     /// dequantised stack projections stay resident on top of the packs.
     /// Defaults to a quarter of the memory budget (and is bounded by it).</summary>
     public static long ResidentCacheBytes { get; } = DiscoverResidentCache();
+
+    /// <summary>How many f32 bytes of weights the disk working set keeps in
+    /// memory: <c>AMQL_F32_CACHE_GB</c> when set, else half the memory
+    /// budget. Weights past it are read from disk on every pass.</summary>
+    public static long DiskCacheBytes { get; } = DiscoverDiskCache();
 
     public static string Describe() => $"{Cores} cores, {FormatBytes(MemoryBudgetBytes)} memory budget";
 
@@ -84,6 +89,16 @@ public static class ComputeBudget
         return Math.Max(1L << 30, quarter); // at least 1 GiB, at most a quarter of the budget
     }
 
+    private static long DiscoverDiskCache()
+    {
+        string? raw = Environment.GetEnvironmentVariable("AMQL_F32_CACHE_GB");
+        if (double.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out double gb) && gb > 0)
+        {
+            return (long)(gb * 1024.0 * 1024.0 * 1024.0);
+        }
+        return Math.Max(1L << 30, MemoryBudgetBytes / 2);
+    }
+
     private static string FormatBytes(long bytes) =>
         bytes >= 1L << 30
             ? $"{bytes / (double)(1L << 30):0.0} GiB"
@@ -112,6 +127,14 @@ public enum WeightWorkingSet
     /// bit-exact; ~4× the memory saving of BF16 and the exact input
     /// Blackwell FP4 tensor cores consume (CUDA phase).</summary>
     Mxfp4,
+
+    /// <summary>Nothing held for the session: every matrix is widened to
+    /// f32 from the container's memory map when it is used, and kept only
+    /// while it fits in <see cref="ComputeBudget.DiskCacheBytes"/>; the rest
+    /// is read again on every pass. The resident path's exact f32 numerics
+    /// on the CPU (nothing goes to the GPU), for a model whose f32 weights
+    /// exceed memory: slower, bounded by the cache rather than the model.</summary>
+    Disk,
 }
 
 public static class WeightWorkingSetExtensions
@@ -123,6 +146,7 @@ public static class WeightWorkingSetExtensions
         {
             "mxfp4" or "fp4" or "quantized" => WeightWorkingSet.Mxfp4,
             "bf16" or "on-demand" or "ondemand" => WeightWorkingSet.OnDemandBf16,
+            "disk" or "stream" or "streamed" => WeightWorkingSet.Disk,
             _ => WeightWorkingSet.ResidentF32,
         };
     }

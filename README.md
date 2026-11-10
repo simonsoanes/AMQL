@@ -133,23 +133,29 @@ Import and export these checkpoint formats:
 
 ### Inference & Weight Management
 
-Three weight working-set modes, selected by `AMQL_WEIGHTS` (or `--weights` on `generate`):
+Four weight working-set modes, selected by `AMQL_WEIGHTS` (or `--weights` on `generate`, `entail eval` and `entail side`):
 
 | Mode | Resident size | Description |
 |------|-------------|-------------|
 | `f32` | All weights widened to f32 | Byte-exact reference |
 | `bf16` | Stored BF16, widened on access into LRU cache | ~2× smaller |
 | `mxfp4` | MXFP4 packs dequantised into LRU cache | ~4× smaller |
+| `disk` | Only what fits the cache; the rest is widened from the container on every pass | Exact f32 on the CPU for a model larger than RAM |
 
 When `AMQL_GPU=1` and the CUDA backend is built (`native/amql_cuda/build-cuda.cmd`),
 MXFP4 packs are dequantised to FP16 on-device and GEMMs run on tensor cores with FP32
 accumulate. Elementwise ops — RMSNorm (auto-dispatched), SiLU, RoPE — and fused
 GQA attention (QKᵀ + causal mask + softmax + PV) also run on-device. KV caches can
 be allocated and appended on-device with zero host round-trips. Embeddings, norms,
-and the output head stay f32 in every mode. A cuSOLVER fp64 Cholesky path accelerates
+and the output head stay f32 in every mode (in `disk`, only while they fit the cache). A cuSOLVER fp64 Cholesky path accelerates
 merge normal-equation solves.
 
 Tune memory with `AMQL_MEMORY_GB`, `AMQL_F32_CACHE_GB`, and `AMQL_CORES`.
+
+`entail graft` and `encode` stream: they read the host through its memory map and write each tensor as
+it is made, so neither holds a model in memory, and a sharded host (`model.safetensors.index.json`)
+grafts like a single file. `entail eval` and `entail side` switch to `disk` by themselves when a
+graft's f32 weights would exceed the memory budget. It never uses the GPU, so GPU memory isn't a limit either.
 
 ### Token Relationship Probing
 
@@ -380,10 +386,10 @@ multi-million-element matrix is too small to measure downstream. See
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `AMQL_WEIGHTS` | `f32` | Weight working-set: `f32`, `bf16`, or `mxfp4` |
+| `AMQL_WEIGHTS` | `f32` | Weight working-set: `f32`, `bf16`, `mxfp4`, or `disk` |
 | `AMQL_GPU` | `0` | Enable CUDA GPU acceleration |
 | `AMQL_MEMORY_GB` | auto | Total memory budget for LRU cache |
-| `AMQL_F32_CACHE_GB` | ¼ of budget | F32 LRU cache cap |
+| `AMQL_F32_CACHE_GB` | ¼ of budget (½ for `disk`) | F32 cache cap |
 | `AMQL_CORES` | auto | CPU core budget for parallel work |
 | `AMQL_MERGE_GPU` | `0` | Enable GPU-accelerated merge GEMM |
 

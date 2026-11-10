@@ -34,9 +34,17 @@ namespace Amql.Inference;
 ///     quantisation error — within tolerance, never bit-exact, and small
 ///     models degrade more than large ones (FP4 is a large-model
 ///     technique).</item>
+///     <item><see cref="WeightWorkingSet.Disk"/>: nothing is held for the
+///     session. Every matrix (embedding and head included) is widened to
+///     f32 from the container's memory map when it is used and kept only
+///     while <see cref="ComputeBudget.DiskCacheBytes"/> has room; the rest
+///     is read again on each pass. The resident path's exact numerics, on
+///     the CPU, for a model whose f32 weights exceed RAM (a graft of a
+///     large host) — paid for in reads, not memory.</item>
 ///   </list>
 /// Embeddings, the output head, norms and other 1-D tensors stay
-/// f32-resident in every mode (precision-sensitive, small by comparison).
+/// f32-resident in every mode but disk (precision-sensitive, small by
+/// comparison); disk keeps only the 1-D tensors.
 /// </summary>
 public sealed class WeightLoader
 {
@@ -120,6 +128,10 @@ public sealed class WeightLoader
     /// is a defect, not a convenience.</summary>
     public Tensor2D Matrix(OperandRef operand, int rows, int cols)
     {
+        if (_workingSet == WeightWorkingSet.Disk)
+        {
+            return MatrixDisk(operand, rows, cols);
+        }
         var key = (operand.ObjectId, operand.TensorName);
         if (_matrices.TryGetValue(key, out var cached))
         {
@@ -244,6 +256,99 @@ public sealed class WeightLoader
                 operand.ObjectId, operand.TensorName, _packs[key].Packed, _packs[key].BlockScales, rows, cols);
         AnyDeviceWeight = matrix.DeviceWeightF16 != IntPtr.Zero;
         return matrix;
+    }
+
+    private readonly object _diskLock = new();
+    private readonly Dictionary<(string ObjectId, string Tensor), WeakReference<Tensor2D>> _streamed = new();
+
+    /// <summary>The disk working set's entry point. Sibling sessions on
+    /// other threads share this loader, so the cache and the operand store
+    /// are only touched under a lock. A matrix that streamed through is
+    /// remembered weakly: while any session still holds it, another gets
+    /// the same array instead of reading it again.</summary>
+    private Tensor2D MatrixDisk(OperandRef operand, int rows, int cols)
+    {
+        var key = (operand.ObjectId, operand.TensorName);
+        lock (_diskLock)
+        {
+            bool hit = _matrices.TryGetValue(key, out var matrix) ||
+                       (_streamed.TryGetValue(key, out var weak) && weak.TryGetTarget(out matrix));
+            if (!hit)
+            {
+                matrix = MatrixFromDisk(operand, rows, cols);
+                if (!CacheWhileRoom(key, matrix))
+                {
+                    _streamed[key] = new WeakReference<Tensor2D>(matrix);
+                    ReclaimStreamed(matrix.Data.LongLength * 4L);
+                }
+            }
+            LoadTrace?.Invoke(operand.ObjectId, operand.TensorName, new long[] { rows, cols }, hit);
+            return matrix!;
+        }
+    }
+
+    private long _streamedSinceCollect;
+
+    /// <summary>A matrix that streams through is garbage as soon as its layer
+    /// has run, but each is a large-object allocation, and with RAM to spare
+    /// the GC lets tens of GiB of them pile up before a full collection. The
+    /// cache is what is meant to bound this working set, so once a quarter of
+    /// it (between 256 MiB and 2 GiB) has streamed through, they are
+    /// collected. Weight arrays hold no references, so the collection is
+    /// cheap next to the reads that made them.</summary>
+    private void ReclaimStreamed(long bytes)
+    {
+        _streamedSinceCollect += bytes;
+        long threshold = Math.Clamp(DiskCacheBytes / 4, 256L << 20, 2L << 30);
+        if (_streamedSinceCollect >= threshold)
+        {
+            _streamedSinceCollect = 0;
+            GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, blocking: true);
+        }
+    }
+
+    /// <summary>Disk path: widened from the container's memory map on every
+    /// miss, nothing else retained — the stored bytes stay on disk (and in
+    /// the OS page cache while there is room for them). Exact f32, CPU only:
+    /// no device copy is made, so GPU memory is not a limit either.</summary>
+    private Tensor2D MatrixFromDisk(OperandRef operand, int rows, int cols)
+    {
+        var resolution = _store.ResolveWidened(operand);
+        if (resolution.Shape.Length == 0 || ElementCount(resolution.Shape) != (long)rows * cols)
+        {
+            throw new ContainerException(
+                $"operand '{operand.ObjectId}/{operand.TensorName}' resolves to shape " +
+                $"[{string.Join(",", resolution.Shape)}] — expected [{rows} x {cols}]");
+        }
+        ApplyPatch(operand, resolution.Values);
+        DiskReads++;
+        return new Tensor2D(resolution.Values, rows, cols);
+    }
+
+    /// <summary>f32 bytes the disk working set keeps in memory; defaults to
+    /// <see cref="ComputeBudget.DiskCacheBytes"/>. Zero streams every matrix.</summary>
+    public long DiskCacheBytes { get; set; } = ComputeBudget.DiskCacheBytes;
+
+    /// <summary>Matrices the disk working set has read from the container
+    /// (cache misses), for reporting how much of a model streams.</summary>
+    public long DiskReads { get; private set; }
+
+    /// <summary>The disk working set's cache: a matrix stays while it fits,
+    /// and once the cache is full new ones stream through without
+    /// displacing it. A forward pass visits the layers in the same order
+    /// every time, and under LRU a model larger than the cache would evict
+    /// each matrix just before it is needed again; keeping the first ones
+    /// resident makes the hit rate the share of the model that fits.</summary>
+    private bool CacheWhileRoom((string ObjectId, string Tensor) key, Tensor2D matrix)
+    {
+        long bytes = matrix.Data.LongLength * 4L;
+        if (_lruBytes + bytes > DiskCacheBytes)
+        {
+            return false;
+        }
+        _matrices[key] = matrix;
+        _lruBytes += bytes;
+        return true;
     }
 
     private void CacheBounded((string ObjectId, string Tensor) key, Tensor2D matrix)

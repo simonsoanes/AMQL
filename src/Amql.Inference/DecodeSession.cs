@@ -24,9 +24,10 @@ public sealed class DecodeSession
 
     /// <summary>
     /// A second session over the same weights, so sequences can run on separate
-    /// threads without a copy of the model each. It needs a resident working set
-    /// and a session that has already prefilled and stepped: the loader's caches
-    /// are not safe to write from two threads, and from then on they are only read.
+    /// threads without a copy of the model each. It needs a resident or disk
+    /// working set and a session that has already prefilled and stepped: the
+    /// resident caches are not safe to write from two threads, and from then on
+    /// they are only read (the disk working set locks its own).
     /// It also needs the CPU. GEMMs from several threads on the CUDA path corrupt
     /// each other with no error, so the answers would simply be wrong.
     /// </summary>
@@ -36,9 +37,9 @@ public sealed class DecodeSession
         {
             throw new InvalidOperationException("sessions can only share weights on the CPU");
         }
-        if (_runtime.Weights.WorkingSet != WeightWorkingSet.ResidentF32)
+        if (_runtime.Weights.WorkingSet is not (WeightWorkingSet.ResidentF32 or WeightWorkingSet.Disk))
         {
-            throw new InvalidOperationException("sessions can only share resident f32 weights");
+            throw new InvalidOperationException("sessions can only share resident f32 or disk weights");
         }
         if (LastLogits is null)
         {

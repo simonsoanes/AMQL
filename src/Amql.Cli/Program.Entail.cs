@@ -164,6 +164,39 @@ internal static partial class Program
         return 0;
     }
 
+    /// <summary>Grafts are exact only in f32 on the CPU, so a graft runs
+    /// either resident in f32 or from disk. <c>--weights disk</c> (or
+    /// AMQL_WEIGHTS=disk) streams the weights from the container; with
+    /// neither, disk is chosen when the model's f32 weights would not fit in
+    /// the memory budget, which a graft of a large host easily exceeds.</summary>
+    private static WeightWorkingSet EntailWorkingSet(string[] args, Vindex3Container container)
+    {
+        string? mode = OptionValue(args, "--weights")
+            ?? (WeightWorkingSetExtensions.FromEnv() == WeightWorkingSet.Disk ? "disk" : null);
+        switch (mode)
+        {
+            case "f32" or "fp32":
+                return WeightWorkingSet.ResidentF32;
+            case "disk":
+                Console.Error.WriteLine($"weights:    disk (exact f32, {FormatGiB(ComputeBudget.DiskCacheBytes)} kept in memory)");
+                return WeightWorkingSet.Disk;
+            case null:
+                long need = container.WidenedF32Bytes();
+                if (need <= ComputeBudget.MemoryBudgetBytes)
+                {
+                    return WeightWorkingSet.ResidentF32;
+                }
+                Console.Error.WriteLine($"weights:    disk: f32 weights need {FormatGiB(need)}, over the " +
+                    $"{FormatGiB(ComputeBudget.MemoryBudgetBytes)} budget; {FormatGiB(ComputeBudget.DiskCacheBytes)} kept in memory, " +
+                    "the rest read on every pass");
+                return WeightWorkingSet.Disk;
+            default:
+                throw new CliException($"unknown weight mode '{mode}' for entail: use f32 or disk (grafts need exact f32)");
+        }
+    }
+
+    private static string FormatGiB(long bytes) => $"{bytes / (double)(1L << 30):0.0} GiB";
+
     private static List<IEntailAdapter> OpenAdapters(string[] args, string tokenizerDir)
     {
         try
@@ -210,7 +243,7 @@ internal static partial class Program
         using var store = container.CreateOperandStore();
         var plan = Planner.Plan(container, OptionValue(args, "--component") ?? "target", store);
         var adapters = OpenAdapters(args, tokenizerDir);
-        var side = new SideBySideSession(new DecodeSession(plan, store, null, WeightWorkingSet.ResidentF32), adapters);
+        var side = new SideBySideSession(new DecodeSession(plan, store, null, EntailWorkingSet(args, container)), adapters);
 
         side.Prefill(tokenizer.EncodeToIds(EntailPrompt(prompt, template, args.Contains("--chat"), args.Contains("--think"))).ToArray());
         var spans = new List<(EntailTokenSource Source, List<int> Tokens)>();
@@ -280,7 +313,7 @@ internal static partial class Program
         using var store = container.CreateOperandStore();
         var plan = Planner.Plan(container, OptionValue(args, "--component") ?? "target", store);
         var adapters = OpenAdapters(args, tokenizerDir);
-        var session = new SideBySideSession(new DecodeSession(plan, store, null, WeightWorkingSet.ResidentF32), adapters);
+        var session = new SideBySideSession(new DecodeSession(plan, store, null, EntailWorkingSet(args, container)), adapters);
 
         static int ArgMax(ReadOnlySpan<float> row)
         {

@@ -275,77 +275,96 @@ public static class BitPattern
     /// reference's <c>tensor_to_f32</c> dispatch.</summary>
     public static float[] WidenToF32(Dtype dtype, ReadOnlySpan<byte> bytes)
     {
+        int size = WidenedElementBytes(dtype);
+        if (dtype == Dtype.F32 && bytes.Length % 4 != 0)
+        {
+            throw new SafetensorsException($"F32 payload length {bytes.Length} is not a multiple of 4");
+        }
+        var result = new float[bytes.Length / size];
+        WidenInto(dtype, bytes[..(result.Length * size)], result);
+        return result;
+    }
+
+    /// <summary>Stored bytes per element of a dtype that widens to f32.</summary>
+    public static int WidenedElementBytes(Dtype dtype) => dtype switch
+    {
+        Dtype.F32 => 4,
+        Dtype.F16 or Dtype.BF16 => 2,
+        Dtype.I8 or Dtype.F8_E4M3 or Dtype.F8_E5M2 or Dtype.F8_E8M0 => 1,
+        _ => throw new SafetensorsException(
+            $"dtype {dtype.Label()} cannot be widened to f32 — unsupported dtype"),
+    };
+
+    /// <summary>Widens <paramref name="bytes"/> into <paramref name="target"/>,
+    /// which holds exactly one f32 per stored element — so a caller can widen
+    /// a large tensor a chunk at a time, on several threads, into one array.</summary>
+    public static void WidenInto(Dtype dtype, ReadOnlySpan<byte> bytes, Span<float> target)
+    {
+        int size = WidenedElementBytes(dtype);
+        if ((long)target.Length * size != bytes.Length)
+        {
+            throw new SafetensorsException(
+                $"{dtype.Label()}: {bytes.Length} bytes cannot fill {target.Length} f32 values");
+        }
         switch (dtype)
         {
             case Dtype.F32:
-            {
-                if (bytes.Length % 4 != 0)
-                {
-                    throw new SafetensorsException($"F32 payload length {bytes.Length} is not a multiple of 4");
-                }
-                // One copy, not two: reinterpret the bytes instead of staging
-                // them through ToArray() (a 200 MB embedding copied twice).
-                var result = new float[bytes.Length / 4];
-                System.Runtime.InteropServices.MemoryMarshal.Cast<byte, float>(bytes).CopyTo(result);
-                return result;
-            }
+                System.Runtime.InteropServices.MemoryMarshal.Cast<byte, float>(bytes).CopyTo(target);
+                return;
             case Dtype.F16:
-            {
-                var result = new float[bytes.Length / 2];
-                for (int i = 0; i < result.Length; i++)
+                for (int i = 0; i < target.Length; i++)
                 {
-                    result[i] = DecodeF16((ushort)(bytes[2 * i] | (bytes[2 * i + 1] << 8)));
+                    target[i] = DecodeF16((ushort)(bytes[2 * i] | (bytes[2 * i + 1] << 8)));
                 }
-                return result;
-            }
+                return;
             case Dtype.BF16:
             {
-                var result = new float[bytes.Length / 2];
-                for (int i = 0; i < result.Length; i++)
+                // BF16 is the top half of an f32, so widening is a shift: done
+                // a vector at a time it keeps up with reading a model from disk.
+                var source = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, ushort>(bytes);
+                var bits = System.Runtime.InteropServices.MemoryMarshal.Cast<float, uint>(target);
+                int i = 0;
+                if (System.Numerics.Vector.IsHardwareAccelerated && BitConverter.IsLittleEndian)
                 {
-                    result[i] = DecodeBf16((ushort)(bytes[2 * i] | (bytes[2 * i + 1] << 8)));
+                    int lanes = System.Numerics.Vector<ushort>.Count;
+                    int half = System.Numerics.Vector<uint>.Count;
+                    for (; i <= source.Length - lanes; i += lanes)
+                    {
+                        System.Numerics.Vector.Widen(new System.Numerics.Vector<ushort>(source[i..]), out var low, out var high);
+                        (low << 16).CopyTo(bits[i..]);
+                        (high << 16).CopyTo(bits[(i + half)..]);
+                    }
                 }
-                return result;
+                for (; i < target.Length; i++)
+                {
+                    target[i] = DecodeBf16((ushort)(bytes[2 * i] | (bytes[2 * i + 1] << 8)));
+                }
+                return;
             }
             case Dtype.I8:
-            {
-                var result = new float[bytes.Length];
-                for (int i = 0; i < result.Length; i++)
+                for (int i = 0; i < target.Length; i++)
                 {
-                    result[i] = (sbyte)bytes[i];
+                    target[i] = (sbyte)bytes[i];
                 }
-                return result;
-            }
+                return;
             case Dtype.F8_E4M3:
-            {
-                var result = new float[bytes.Length];
-                for (int i = 0; i < result.Length; i++)
+                for (int i = 0; i < target.Length; i++)
                 {
-                    result[i] = DecodeF8E4M3(bytes[i]);
+                    target[i] = DecodeF8E4M3(bytes[i]);
                 }
-                return result;
-            }
+                return;
             case Dtype.F8_E5M2:
-            {
-                var result = new float[bytes.Length];
-                for (int i = 0; i < result.Length; i++)
+                for (int i = 0; i < target.Length; i++)
                 {
-                    result[i] = DecodeF8E5M2(bytes[i]);
+                    target[i] = DecodeF8E5M2(bytes[i]);
                 }
-                return result;
-            }
+                return;
             case Dtype.F8_E8M0:
-            {
-                var result = new float[bytes.Length];
-                for (int i = 0; i < result.Length; i++)
+                for (int i = 0; i < target.Length; i++)
                 {
-                    result[i] = DecodeF8E8M0(bytes[i]);
+                    target[i] = DecodeF8E8M0(bytes[i]);
                 }
-                return result;
-            }
-            default:
-                throw new SafetensorsException(
-                    $"dtype {dtype.Label()} cannot be widened to f32 — unsupported dtype");
+                return;
         }
     }
 

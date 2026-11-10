@@ -232,4 +232,73 @@ public class SafetensorsTests
         Assert.False(file.GetTensor("t").Dtype.IsWidenableToF32());
         Assert.Throws<SafetensorsException>(() => file.DecodeF32("t"));
     }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(7)]      // shorter than a vector
+    [InlineData(4099)]   // whole vectors plus a scalar tail
+    public void Bf16_Widen_Matches_Scalar_Decode_Bitwise(int count)
+    {
+        var random = new Random(count);
+        var bytes = new byte[count * 2];
+        random.NextBytes(bytes); // includes NaN, infinity and subnormal patterns
+        var widened = BitPattern.WidenToF32(Dtype.BF16, bytes);
+        Assert.Equal(count, widened.Length);
+        for (int i = 0; i < count; i++)
+        {
+            var expected = BitPattern.DecodeBf16((ushort)(bytes[2 * i] | (bytes[2 * i + 1] << 8)));
+            Assert.Equal(BitConverter.SingleToInt32Bits(expected), BitConverter.SingleToInt32Bits(widened[i]));
+        }
+    }
+
+    // ── streamed writing ───────────────────────────────────────────────────
+
+    [Theory]
+    [InlineData(1 << 16)] // header fits the reservation
+    [InlineData(1)]       // header outgrows it: the file is rewritten once
+    public void StreamWriter_RoundTrips(long reserve)
+    {
+        using var dir = new TempDir();
+        var path = System.IO.Path.Combine(dir.Path, "s.safetensors");
+        var big = Enumerable.Range(0, 3000).Select(i => (float)i * 0.5f).ToArray();
+        using (var writer = new SafetensorsStreamWriter(path, reserve))
+        {
+            writer.WriteF32("z.last", big, 3, 1000);
+            writer.Write("a.first", Dtype.BF16, new long[] { 2, 2 }, s => s.Write(new byte[] { 1, 2, 3, 4, 5, 6, 7, 8 }));
+            writer.Complete(new Dictionary<string, string> { ["format"] = "pt" });
+        }
+        using var file = SafetensorsFile.Open(path);
+        Assert.Equal(big, file.DecodeF32("z.last"));
+        Assert.Equal(new byte[] { 1, 2, 3, 4, 5, 6, 7, 8 }, file.ReadBytes("a.first"));
+        Assert.Equal("pt", file.Metadata!["format"]);
+        Assert.Equal(0, file.PayloadStart % SafetensorsFile.HeaderByteAlignment);
+    }
+
+    [Fact]
+    public void StreamWriter_Refuses_Wrong_Length_And_Leaves_No_File()
+    {
+        using var dir = new TempDir();
+        var path = System.IO.Path.Combine(dir.Path, "bad.safetensors");
+        using (var writer = new SafetensorsStreamWriter(path, 4096))
+        {
+            Assert.Throws<SafetensorsException>(() =>
+                writer.Write("t", Dtype.F32, new long[] { 4 }, s => s.Write(new byte[8])));
+        }
+        Assert.False(File.Exists(path));
+    }
+
+    [Fact]
+    public void OpenCheckpoint_Follows_The_Index_And_Skips_Side_Files()
+    {
+        using var dir = new TempDir();
+        void Shard(string name, string tensor) => SafetensorsWriter.Write(System.IO.Path.Combine(dir.Path, name),
+            new[] { new TensorPayload { Name = tensor, Dtype = Dtype.F32, Shape = new long[] { 1 }, Data = new byte[4] } });
+        Shard("model-00001-of-00002.safetensors", "model.a");
+        Shard("model-00002-of-00002.safetensors", "model.b");
+        Shard("mtp.safetensors", "mtp.c");
+        File.WriteAllText(System.IO.Path.Combine(dir.Path, "model.safetensors.index.json"),
+            "{\"weight_map\":{\"model.a\":\"model-00001-of-00002.safetensors\",\"model.b\":\"model-00002-of-00002.safetensors\"}}");
+        using var model = ModelDirectory.OpenCheckpoint(dir.Path);
+        Assert.Equal(new[] { "model.a", "model.b" }, model.TensorNames.OrderBy(n => n));
+    }
 }

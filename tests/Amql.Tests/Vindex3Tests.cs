@@ -50,6 +50,29 @@ public class Vindex3Tests
     }
 
     [Fact]
+    public void SegmentWriter_Reads_A_Lazy_Payload_Only_When_Writing()
+    {
+        using var dir = new TempDir();
+        var payload = SyntheticModel.ToBytes(Enumerable.Range(0, 64).Select(i => (float)i).ToArray());
+        int reads = 0;
+        var lazy = new NamedTensorData
+        {
+            Name = "w", Dtype = Dtype.F32, Shape = new long[] { 8, 8 }, SourceLength = payload.Length,
+            Source = (offset, count) => { reads++; return payload.AsSpan((int)offset, count).ToArray(); },
+        };
+        lazy.Validate();
+        Assert.Equal(0, reads);
+
+        var eager = SegmentWriter.Write(Path.Combine(dir.Path, "eager.bin"), "x@F32",
+            new[] { new NamedTensorData { Name = "w", Dtype = Dtype.F32, Shape = new long[] { 8, 8 }, Data = payload } });
+        var streamed = SegmentWriter.Write(Path.Combine(dir.Path, "lazy.bin"), "x@F32", new[] { lazy });
+
+        Assert.True(reads > 0);
+        Assert.Equal(eager.SegmentSha256Hex, streamed.SegmentSha256Hex);
+        Assert.Equal(payload, lazy.Data); // still readable whole when small
+    }
+
+    [Fact]
     public void Segment_Writes_Chunked_Payloads_Verbatim()
     {
         using var dir = new TempDir();

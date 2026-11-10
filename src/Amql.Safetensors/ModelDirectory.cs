@@ -54,6 +54,29 @@ public sealed class ModelDirectory : IDisposable
     public static ModelDirectory Open(string directory) =>
         new(directory, DiscoverShards(directory));
 
+    /// <summary>Opens a Hugging Face checkpoint's own weights: the shards
+    /// <c>model.safetensors.index.json</c> names, else <c>model.safetensors</c>,
+    /// else every shard <see cref="DiscoverShards"/> finds. Side files such as
+    /// <c>mtp.safetensors</c> are left out whenever the checkpoint says which
+    /// files are its own.</summary>
+    public static ModelDirectory OpenCheckpoint(string directory)
+    {
+        var index = System.IO.Path.Combine(directory, "model.safetensors.index.json");
+        if (File.Exists(index))
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(index));
+            var files = doc.RootElement.GetProperty("weight_map").EnumerateObject()
+                .Select(p => p.Value.GetString()!)
+                .Distinct(StringComparer.Ordinal)
+                .OrderBy(f => f, StringComparer.Ordinal)
+                .Select(f => System.IO.Path.Combine(directory, f))
+                .ToList();
+            return new ModelDirectory(directory, files);
+        }
+        var single = System.IO.Path.Combine(directory, "model.safetensors");
+        return File.Exists(single) ? new ModelDirectory(directory, new[] { single }) : Open(directory);
+    }
+
     public bool TryGet(string name, out SafetensorsFile file, out TensorInfo info)
     {
         foreach (var shard in _shards)
@@ -80,6 +103,17 @@ public sealed class ModelDirectory : IDisposable
     }
 
     public byte[] ReadRawBytes(string name) => Get(name).File.ReadBytes(name);
+
+    /// <summary>Copies a whole tensor payload into <paramref name="stream"/>
+    /// in bounded chunks, never holding it as one buffer.</summary>
+    public void CopyTo(string name, Stream stream, int chunkBytes = 64 * 1024 * 1024)
+    {
+        var (file, info) = Get(name);
+        for (long done = 0; done < info.DataLength; done += chunkBytes)
+        {
+            stream.Write(file.ReadBytes(info, done, (int)Math.Min(chunkBytes, info.DataLength - done)));
+        }
+    }
 
     /// <summary>Reads a sub-range of a shard tensor's payload — chunked
     /// reads for tensors beyond the 2 GiB single-buffer ceiling.</summary>

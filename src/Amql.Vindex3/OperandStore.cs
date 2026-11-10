@@ -166,23 +166,33 @@ public sealed class OperandStore : IDisposable
         {
             elements = checked(elements * dim);
         }
-        var values = new float[elements];
-        if (tensor.Len <= ChunkedReadThresholdBytes)
+        int size = BitPattern.WidenedElementBytes(dtype);
+        if (tensor.Len != elements * size)
         {
-            var widened = BitPattern.WidenToF32(dtype, segment.ReadBytes(tensorName));
-            Array.Copy(widened, values, widened.Length);
+            throw new ContainerException(
+                $"operand '{objectId}/{tensorName}' holds {tensor.Len} bytes, not {elements} {dtype.Label()} values");
         }
-        else
+        // Widened a chunk at a time, straight from the map into the result
+        // and on every core: no whole-tensor staging copy, nothing zeroed
+        // that is about to be overwritten. Each chunk lands in its own slice,
+        // so the values are the same however the chunks are scheduled.
+        var values = GC.AllocateUninitializedArray<float>(checked((int)elements));
+        long chunks = (elements + WidenChunkElements - 1) / WidenChunkElements;
+        Parallel.For(0L, chunks, chunk =>
         {
-            int offset = 0;
-            for (long done = 0; done < tensor.Len; done += ChunkedReadBytes)
+            long first = chunk * WidenChunkElements;
+            int count = (int)Math.Min(WidenChunkElements, elements - first);
+            var buffer = System.Buffers.ArrayPool<byte>.Shared.Rent(count * size);
+            try
             {
-                int count = (int)Math.Min(ChunkedReadBytes, tensor.Len - done);
-                var widened = BitPattern.WidenToF32(dtype, segment.ReadBytes(tensorName, done, count));
-                Array.Copy(widened, 0, values, offset, widened.Length);
-                offset += widened.Length;
+                segment.ReadInto(tensorName, first * size, buffer, count * size);
+                BitPattern.WidenInto(dtype, buffer.AsSpan(0, count * size), values.AsSpan((int)first, count));
             }
-        }
+            finally
+            {
+                System.Buffers.ArrayPool<byte>.Shared.Return(buffer);
+            }
+        });
 
         _touched.Add(objectId);
         Loads++;
@@ -192,11 +202,8 @@ public sealed class OperandStore : IDisposable
     public WidenedResolution ResolveWidened(OperandRef operand) =>
         ResolveWidened(operand.ObjectId, operand.TensorName);
 
-    /// <summary>Raw payloads up to this size resolve as one buffer; larger
-    /// tensors go through the chunked widened path. Below the 2 GiB array
-    /// ceiling, with headroom for the widened allocation.</summary>
-    private const long ChunkedReadThresholdBytes = 1L << 30; // 1 GiB
-    private const long ChunkedReadBytes = 512L * 1024 * 1024; // 512 MiB
+    /// <summary>Elements widened per chunk (4 MiB of f32).</summary>
+    private const long WidenChunkElements = 1L << 20;
 
     private SegmentFile OpenSegment(string relativePath)
     {

@@ -48,6 +48,9 @@ public sealed class HfInventory : IDisposable
     /// <summary>Raw payload bytes — read verbatim from the mapping.</summary>
     public byte[] ReadBytes(string fullName) => _model.ReadRawBytes(fullName);
 
+    /// <summary>A sub-range of a tensor's payload.</summary>
+    public byte[] ReadBytes(string fullName, long offset, int count) => _model.ReadBytes(fullName, offset, count);
+
     /// <summary>Maximum payload actually buffered as one array. Tensors
     /// larger than this are handed to the encoder as chunks, because a
     /// single byte[] cannot exceed the 2 GiB ceiling (Qwen3.8-27B's

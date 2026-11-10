@@ -81,8 +81,9 @@ internal static partial class Program
             "f32" or "fp32" => WeightWorkingSet.ResidentF32,
             "bf16" => WeightWorkingSet.OnDemandBf16,
             "mxfp4" or "fp4" => WeightWorkingSet.Mxfp4,
+            "disk" => WeightWorkingSet.Disk,
             "" => null,
-            var other => throw new CliException($"unknown weight mode '{other}' — use f32, bf16, or mxfp4"),
+            var other => throw new CliException($"unknown weight mode '{other}' — use f32, bf16, mxfp4 or disk"),
         };
 
         using var container = Vindex3Container.Open(containerDir);

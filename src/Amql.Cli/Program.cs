@@ -730,8 +730,9 @@ internal static partial class Program
             "bf16" => WeightWorkingSet.OnDemandBf16,
             "mxfp4" => WeightWorkingSet.Mxfp4,
             "fp4" => WeightWorkingSet.Mxfp4,
+            "disk" => WeightWorkingSet.Disk,
             "" or null => null, // use env var default
-            _ => throw new CliException($"unknown weight mode '{weightMode}' — use f32, bf16, or mxfp4"),
+            _ => throw new CliException($"unknown weight mode '{weightMode}' — use f32, bf16, mxfp4 or disk"),
         };
 
         using var container = Vindex3Container.Open(containerDir);
@@ -764,6 +765,10 @@ internal static partial class Program
         else if (workingSetEffective == WeightWorkingSet.OnDemandBf16)
         {
             Console.WriteLine("weights:   BF16 on-demand (LRU-bounded, widened on access)");
+        }
+        else if (workingSetEffective == WeightWorkingSet.Disk)
+        {
+            Console.WriteLine("weights:   disk (f32 widened from the container on use, CPU)");
         }
         else
         {
@@ -2655,7 +2660,7 @@ internal static partial class Program
                               [--steps N|-1] [--temperature 0] [--top-k 0] [--top-p 0]
                               [--seed 42] [--logits K] [--logprobs [K]] [--uncertainty] [--component target]
                               [--patch <patch.safetensors>]
-                              [--trace] [--trace-tensors] [--weights f32|bf16|mxfp4]
+                              [--trace] [--trace-tensors] [--weights f32|bf16|mxfp4|disk]
                               [--trace-json <trace.json>]
                               [--attribute --attribute-corrupt <text>]
                               [--attribute-source <row>] [--attribute-layers <end>]
@@ -2664,7 +2669,7 @@ internal static partial class Program
                             masked diffusion containers (a2d-qwen3) take instead:
                               [--chat] [--think] [--gen 128] [--steps <gen>] [--block 32]
                               [--remasking low_confidence|random] [--temperature 0]
-                              [--seed 42] [--show-steps] [--no-early-stop] [--weights f32|bf16|mxfp4]
+                              [--seed 42] [--show-steps] [--no-early-stop] [--weights f32|bf16|mxfp4|disk]
               amql-cli inspect-token <container-dir> <token>
                               [--tokens ctx,ids] [--neighbors 5] [--logits K]
                               [--tokenizer <checkpoint-dir>] [--component target]
@@ -2712,9 +2717,9 @@ internal static partial class Program
               amql-cli entail compile <program.entail.txt> --out <checkpoint-dir>
               amql-cli entail graft <program.entail.txt> --host <checkpoint-dir> --out <checkpoint-dir>
               amql-cli entail adapter <program.entail.txt> --tokenizer <partner-dir> --out <dir> [--dense]
-              amql-cli entail side <container-dir> --adapter <dir>[,<dir>] --prompt <text> [--chat] [--think] [--max-tokens N]
+              amql-cli entail side <container-dir> --adapter <dir>[,<dir>] --prompt <text> [--chat] [--think] [--max-tokens N] [--weights f32|disk]
               amql-cli entail run <program> --expr <text>|--cases <cases.jsonl> [--tokenizer <dir>] [--report <json>]
-              amql-cli entail eval <container-dir> --cases <cases.jsonl> [--adapter <dir>[,<dir>]] [--batch N] [--text <file>] [--report <json>]
+              amql-cli entail eval <container-dir> --cases <cases.jsonl> [--adapter <dir>[,<dir>]] [--batch N] [--text <file>] [--report <json>] [--weights f32|disk]
               amql-cli entail find <container-dir> --subject <file> --out <dir> [--top 64] [--verify]
               amql-cli entail extract <container-dir> --subject <file> --out <dir>
               amql-cli entail decompile <container-dir> --corpus <dir> --out <dir> [--contrast <file>] [--extra <file>] [--cover] [--only-holdout] [--units 4000] [--vote lift|share|bayes] [--from <study.bin>] [--no-columns]

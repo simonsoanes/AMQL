@@ -137,5 +137,10 @@ reasoning and hard arithmetic, not a general reasoning benchmark.
   [adapter](entail-adapter.md), which doesn't depend on the host's precision. A grafted model is also
   larger and slower: 59 layers instead of 24, hidden 1664 instead of 1024, with
   the block stored in f32.
+- Memory is not a limit, only speed. `graft` and `encode` stream to disk, and
+  `entail eval` runs a graft whose f32 weights exceed the memory budget with
+  `--weights disk`: exact f32 on the CPU, keeping what fits in memory and reading
+  the rest from the container on every pass. It picks this mode by itself when
+  the weights don't fit.
 - Targets are the Qwen3.5 layer shape with 8 query heads, 2 KV heads, head_dim 256
   and a bf16 tied embedding.

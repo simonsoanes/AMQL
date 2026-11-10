@@ -94,6 +94,54 @@ public class WorkingSetTests
         AssertClose(mxfp4, reference, tolerance: 2.0);
     }
 
+    [Theory]
+    [InlineData(-1L)]  // the default cache: everything fits
+    [InlineData(0L)]   // no cache: every matrix streams from the container
+    [InlineData(20L << 20)] // part resident, the rest streamed
+    public void Disk_Matches_ResidentF32_Exactly(long cacheBytes)
+    {
+        var tokens = new[] { 1, 3, 5, 7 };
+        using var dir = new TempDir();
+        var containerPath = Encode(dir);
+        var reference = Prefill(containerPath, WeightWorkingSet.ResidentF32, tokens);
+
+        string previous = Environment.GetEnvironmentVariable("AMQL_GPU") ?? string.Empty;
+        try
+        {
+            Environment.SetEnvironmentVariable("AMQL_GPU", "0");
+            CudaShim.Reset();
+            using var container = Vindex3Container.Open(containerPath);
+            using var store = container.CreateOperandStore();
+            var plan = Planner.Plan(container, "target", store);
+            var session = new DecodeSession(plan, store, workingSet: WeightWorkingSet.Disk);
+            var weights = session.Runtime.Weights;
+            if (cacheBytes >= 0)
+            {
+                weights.DiskCacheBytes = cacheBytes;
+            }
+            var first = session.Prefill(tokens).FirstRow().ToArray();
+            long readsAfterFirst = weights.DiskReads;
+            // A sibling shares the loader, as `entail eval --batch` does.
+            var again = session.Sibling().Prefill(tokens).FirstRow().ToArray();
+
+            // Widening from the map is the resident path's arithmetic.
+            Assert.Equal(reference, first);
+            Assert.Equal(reference, again);
+            if (cacheBytes == -1)
+            {
+                Assert.Equal(readsAfterFirst, weights.DiskReads); // all cached
+            }
+            else if (cacheBytes == 0)
+            {
+                Assert.Equal(0, weights.LoadedMatrixCount);
+            }
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("AMQL_GPU", previous);
+        }
+    }
+
     [Fact]
     public void Compacted_WorkingSet_Bounds_Resident_Cache()
     {

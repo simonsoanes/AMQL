@@ -143,7 +143,8 @@ amql-cli --cpu entail eval graft.container --tokenizer <dir> --cases requests.js
 python scripts/entail/python_requests.py score requests.jsonl graft.json --base base.json
 ```
 
-Run grafts on the CPU: the GPU path rounds the weights. With `--base`, a first line
+Run grafts on the CPU: the GPU path rounds the weights. A graft too large for memory
+runs from disk (`--weights disk`, chosen by itself when needed), exact but slower. With `--base`, a first line
 equal to the base model's counts as the host's answer, so "program spoke" means the
 program changed the answer. Where both would write the same line, the two can't be
 told apart from the reply.

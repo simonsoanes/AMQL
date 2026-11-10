@@ -260,6 +260,27 @@ public sealed class Vindex3Container : IDisposable
     internal SegmentFile OpenSegment(string relativePath) =>
         SegmentFile.Open(System.IO.Path.Combine(Root, relativePath));
 
+    /// <summary>Bytes the whole container would take widened to f32, from
+    /// the segment headers alone: what a resident f32 session would hold.</summary>
+    public long WidenedF32Bytes()
+    {
+        long total = 0;
+        foreach (var entry in Index.Representations.Values)
+        {
+            using var segment = OpenSegment(entry.Segment);
+            foreach (var tensor in segment.Header.Tensors)
+            {
+                long elements = 1;
+                foreach (var dim in tensor.Shape)
+                {
+                    elements = checked(elements * dim);
+                }
+                total = checked(total + elements * 4);
+            }
+        }
+        return total;
+    }
+
     public void Dispose()
     {
         // Stateless view: there is nothing to release. Operand stores own

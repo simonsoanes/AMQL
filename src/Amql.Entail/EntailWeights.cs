@@ -758,32 +758,38 @@ public static class EntailWeights
             Scale = scale, HostDim = hostDim,
         };
 
-        using var host = SafetensorsFile.Open(Path.Combine(hostDir, "model.safetensors"));
+        // Everything below streams: the host is read through its memory map
+        // and each output tensor goes to disk as it is made, so building a
+        // graft needs one compiled layer and a few row blocks in memory, not
+        // the whole widened model. A host larger than RAM grafts the same way.
+        using var host = ModelDirectory.OpenCheckpoint(hostDir);
         string Prefix(string name) => name.StartsWith("model.language_model.", StringComparison.Ordinal)
             ? "model.language_model." : "model.";
         string root = Prefix(host.TensorNames.First(n => n.Contains("embed_tokens", StringComparison.Ordinal)));
         string embedName = root + "embed_tokens.weight";
+        var hostNames = host.TensorNames
+            .Where(n => n.StartsWith(root, StringComparison.Ordinal) && n != embedName)
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+        int block = p.Layers + 2;
 
-        var tensors = new List<TensorPayload>();
         var (vocabIds, missing) = BindTokens(p, hostDir);
-
-        // Embedding: host dims as they are, then ballast and token lanes.
-        var embedInfo = host.GetTensor(embedName);
+        var (embedShard, embedInfo) = host.Get(embedName);
         if (embedInfo.Dtype != Dtype.BF16)
         {
             throw new EntailException($"expected a bf16 host embedding, found {embedInfo.Dtype.Label()}");
         }
         long vocab = embedInfo.Shape[0];
-        var hostEmbed = host.ReadBytes(embedInfo);
-        var embed = new byte[vocab * hidden * 2];
-        ushort ballastBits = Bf16(Ballast);
-        for (long t = 0; t < vocab; t++)
+
+        // Embedding writes, in the order they apply (a later write wins).
+        var rowWrites = new Dictionary<long, List<(int Dim, ushort Bits)>>();
+        void Put(long id, int dim, double value)
         {
-            Buffer.BlockCopy(hostEmbed, (int)(t * hostHidden * 2), embed, (int)(t * hidden * 2), hostHidden * 2);
-            for (int d = 0; d < ballastDims; d++)
+            if (!rowWrites.TryGetValue(id, out var list))
             {
-                WriteU16(embed, t * hidden + ballast + d, ballastBits);
+                rowWrites[id] = list = new List<(int, ushort)>();
             }
+            list.Add((dim, Bf16(value)));
         }
         foreach (var (textToken, id) in vocabIds)
         {
@@ -796,14 +802,14 @@ public static class EntailWeights
             {
                 if (alloc.Dim[lane] >= 0)
                 {
-                    WriteU16(embed, (long)id * hidden + alloc.Dim[lane], Bf16(value * scale[lane]));
+                    Put(id, alloc.Dim[lane], value * scale[lane]);
                 }
             }
         }
         var outputs = p.Emits.Where(e => e.Text is not null && vocabIds.ContainsKey(e.Text)).ToList();
         foreach (var (token, lane) in outputs)
         {
-            WriteU16(embed, (long)vocabIds[token!] * hidden + alloc.Dim[lane], Bf16(EmitRow));
+            Put(vocabIds[token!], alloc.Dim[lane], EmitRow);
         }
         // "End of answer" has no token in a host, whose text simply goes on.
         // Its lane is a column too, negative in the rows of the tokens an
@@ -813,26 +819,62 @@ public static class EntailWeights
         {
             foreach (var (token, _) in outputs.Where(o => o.Text != " "))
             {
-                WriteU16(embed, (long)vocabIds[token!] * hidden + alloc.Dim[lane], Bf16(-EmitRow));
+                Put(vocabIds[token!], alloc.Dim[lane], -EmitRow);
             }
         }
         // A mask's lane is a column too, negative in the rows it rules out.
-        foreach (var (allow, texts, lane) in p.Masks)
-        {
-            var listed = texts.Where(vocabIds.ContainsKey).Select(t => vocabIds[t]).ToHashSet();
-            for (int id = 0; id < vocab; id++)
-            {
-                if (listed.Contains(id) != allow)
-                {
-                    WriteU16(embed, (long)id * hidden + alloc.Dim[lane], Bf16(-EmitRow));
-                }
-            }
-        }
+        // It can cover most of the vocabulary, so it is a rule per row.
+        var masks = p.Masks
+            .Select(m => (m.Allow, Listed: m.Texts.Where(vocabIds.ContainsKey).Select(t => (long)vocabIds[t]).ToHashSet(),
+                Dim: alloc.Dim[m.Lane]))
+            .ToList();
         var outputLanes = outputs.Select(o => o.Lane).Concat(ends).Concat(p.Masks.Select(m => m.Lane)).ToList();
-        tensors.Add(new TensorPayload { Name = embedName, Dtype = Dtype.BF16, Shape = new[] { vocab, hidden }, Data = embed });
 
-        // The compiled block, then the two layers that hand over to the host.
-        int block = p.Layers + 2;
+        long reserve = 4096 + 192L * (hostNames.Count + 1 + block * 11);
+        using var writer = new SafetensorsStreamWriter(Path.Combine(outDir, "model.safetensors"), reserve);
+
+        // Embedding: host dims as they are, then ballast and token lanes,
+        // a block of rows at a time.
+        ushort ballastBits = Bf16(Ballast);
+        ushort negativeRow = Bf16(-EmitRow);
+        writer.Write(embedName, Dtype.BF16, new[] { vocab, (long)hidden }, stream =>
+        {
+            long rowsPerBlock = Math.Max(1, (32L << 20) / ((long)hidden * 2));
+            for (long first = 0; first < vocab; first += rowsPerBlock)
+            {
+                int rows = (int)Math.Min(rowsPerBlock, vocab - first);
+                var source = embedShard.ReadBytes(embedInfo, first * hostHidden * 2, rows * hostHidden * 2);
+                var rowsOut = new byte[(long)rows * hidden * 2];
+                for (int r = 0; r < rows; r++)
+                {
+                    long t = first + r;
+                    Buffer.BlockCopy(source, r * hostHidden * 2, rowsOut, r * hidden * 2, hostHidden * 2);
+                    long at = (long)r * hidden;
+                    for (int d = 0; d < ballastDims; d++)
+                    {
+                        WriteU16(rowsOut, at + ballast + d, ballastBits);
+                    }
+                    if (rowWrites.TryGetValue(t, out var list))
+                    {
+                        foreach (var (dim, bits) in list)
+                        {
+                            WriteU16(rowsOut, at + dim, bits);
+                        }
+                    }
+                    foreach (var (allow, listed, dim) in masks)
+                    {
+                        if (listed.Contains(t) != allow)
+                        {
+                            WriteU16(rowsOut, at + dim, negativeRow);
+                        }
+                    }
+                }
+                stream.Write(rowsOut);
+            }
+        });
+
+        // The compiled block, then the two layers that hand over to the host,
+        // each written and dropped before the next is built.
         for (int l = 0; l < p.Layers; l++)
         {
             var clears = ClearsFor(alloc, l);
@@ -840,24 +882,17 @@ public static class EntailWeights
             {
                 clears = clears.Concat(outputLanes.Select(lane => (EntailCompiler.G, lane, false)));
             }
-            var layer = BuildLayer(p, geometry, l, NoExtra, clears);
-            tensors.AddRange(LayerTensors(layer, $"{root}layers.{l}", hidden, inter));
+            WriteLayer(writer, BuildLayer(p, geometry, l, NoExtra, clears), $"{root}layers.{l}", hidden, inter);
         }
         var finalClears = alloc.LiveAtEnd.Select(lane => (EntailCompiler.G, lane, false));
-        tensors.AddRange(LayerTensors(BuildLayer(p, geometry, -1, NoExtra, finalClears),
-            $"{root}layers.{p.Layers}", hidden, inter));
-        tensors.AddRange(LayerTensors(BuildLayer(p, geometry, -1, NoExtra,
-            new[] { (EntailCompiler.G, 0, true) }), $"{root}layers.{p.Layers + 1}", hidden, inter));
+        WriteLayer(writer, BuildLayer(p, geometry, -1, NoExtra, finalClears), $"{root}layers.{p.Layers}", hidden, inter);
+        WriteLayer(writer, BuildLayer(p, geometry, -1, NoExtra, new[] { (EntailCompiler.G, 0, true) }),
+            $"{root}layers.{p.Layers + 1}", hidden, inter);
 
         // The host's own tensors, widened.
         double shrink = Math.Sqrt(hostHidden / (double)hidden);
-        foreach (var name in host.TensorNames)
+        foreach (var name in hostNames)
         {
-            if (!name.StartsWith(root, StringComparison.Ordinal) || name == embedName)
-            {
-                continue;
-            }
-            var info = host.GetTensor(name);
             var relative = name[root.Length..];
             string target = name;
             if (relative.StartsWith("layers.", StringComparison.Ordinal))
@@ -866,20 +901,22 @@ public static class EntailWeights
                 int index = int.Parse(relative[7..dot]);
                 target = $"{root}layers.{index + block}{relative[dot..]}";
             }
-            var widened = Widen(host, info, target, hostHidden, hidden, shrink, isFinalNorm: relative == "norm.weight");
             if (relative == "norm.weight")
             {
+                var widened = WidenNorm(host, name, hostHidden, hidden, shrink, isFinalNorm: true);
                 // logit += EmitRow · gamma · lane/rms: OutputForce at the host's usual norm.
                 double gamma = OutputForce * HostOutputNorm / (EmitRow * EmitLaneHeight * Math.Sqrt(hidden));
                 foreach (int lane in outputLanes)
                 {
-                    BitConverter.TryWriteBytes(widened.Data.AsSpan(alloc.Dim[lane] * 4), (float)(gamma - 1));
+                    widened[alloc.Dim[lane]] = (float)(gamma - 1);
                 }
+                writer.WriteF32(target, widened, hidden);
+                continue;
             }
-            tensors.Add(widened);
+            Widen(writer, host, name, target, hostHidden, hidden, shrink);
         }
 
-        SafetensorsWriter.Write(Path.Combine(outDir, "model.safetensors"), tensors);
+        writer.Complete();
 
         var types = new JsonArray();
         for (int i = 0; i < block; i++)
@@ -914,42 +951,78 @@ public static class EntailWeights
             vocabIds.Count, missing);
     }
 
-    private static TensorPayload Widen(SafetensorsFile host, TensorInfo info, string target,
-        int hostHidden, int hidden, double shrink, bool isFinalNorm)
+    private static void WriteLayer(SafetensorsStreamWriter writer, Layer layer, string prefix, int hidden, int inter)
     {
-        var bytes = host.ReadBytes(info);
-        int element = info.Dtype == Dtype.BF16 ? 2 : 4;
-        bool norm = info.Shape.Length == 1 && info.Shape[0] == hostHidden;
-        if (norm)
+        foreach (var tensor in LayerTensors(layer, prefix, hidden, inter))
         {
-            // (1+w)·shrink keeps the host's normalised values where they were
-            // under a mean over more dimensions. The final norm additionally
-            // zeroes the lanes, so they never reach the output head.
-            var widened = BitPattern.WidenToF32(info.Dtype, bytes);
-            var w = new float[hidden];
-            for (int d = 0; d < hidden; d++)
-            {
-                w[d] = d < hostHidden ? (float)((1 + (double)widened[d]) * shrink - 1) : isFinalNorm ? -1f : 0f;
-            }
-            return F32(target, w, hidden);
+            writer.Write(tensor);
         }
+    }
+
+    /// <summary>(1+w)·shrink keeps the host's normalised values where they
+    /// were under a mean over more dimensions. The final norm additionally
+    /// zeroes the lanes, so they never reach the output head.</summary>
+    private static float[] WidenNorm(ModelDirectory host, string name, int hostHidden, int hidden, double shrink,
+        bool isFinalNorm)
+    {
+        var (file, info) = host.Get(name);
+        var widened = BitPattern.WidenToF32(info.Dtype, file.ReadBytes(info));
+        var w = new float[hidden];
+        for (int d = 0; d < hidden; d++)
+        {
+            w[d] = d < hostHidden ? (float)((1 + (double)widened[d]) * shrink - 1) : isFinalNorm ? -1f : 0f;
+        }
+        return w;
+    }
+
+    /// <summary>Writes a host tensor with zeros in the new dimensions,
+    /// streaming it from the host a block of rows at a time.</summary>
+    private static void Widen(SafetensorsStreamWriter writer, ModelDirectory host, string name, string target,
+        int hostHidden, int hidden, double shrink)
+    {
+        var (file, info) = host.Get(name);
+        const long BlockBytes = 32L << 20;
+        if (info.Shape.Length == 1 && info.Shape[0] == hostHidden)
+        {
+            writer.WriteF32(target, WidenNorm(host, name, hostHidden, hidden, shrink, isFinalNorm: false), hidden);
+            return;
+        }
+        int element = (int)(info.DataLength / Math.Max(1, info.ElementCount));
         if (info.Shape.Length == 2 && info.Shape[1] == hostHidden)
         {
             long rows = info.Shape[0];
-            var data = new byte[rows * hidden * element];
-            for (long r = 0; r < rows; r++)
+            writer.Write(target, info.Dtype, new[] { rows, (long)hidden }, stream =>
             {
-                Buffer.BlockCopy(bytes, (int)(r * hostHidden * element), data, (int)(r * hidden * element), hostHidden * element);
-            }
-            return new TensorPayload { Name = target, Dtype = info.Dtype, Shape = new[] { rows, (long)hidden }, Data = data };
+                long rowsPerBlock = Math.Max(1, BlockBytes / ((long)hidden * element));
+                for (long first = 0; first < rows; first += rowsPerBlock)
+                {
+                    int count = (int)Math.Min(rowsPerBlock, rows - first);
+                    var source = file.ReadBytes(info, first * hostHidden * element, count * hostHidden * element);
+                    var data = new byte[(long)count * hidden * element];
+                    for (int r = 0; r < count; r++)
+                    {
+                        Buffer.BlockCopy(source, r * hostHidden * element, data, r * hidden * element, hostHidden * element);
+                    }
+                    stream.Write(data);
+                }
+            });
+            return;
         }
         if (info.Shape.Length == 2 && info.Shape[0] == hostHidden)
         {
-            var data = new byte[hidden * info.Shape[1] * element];
-            Buffer.BlockCopy(bytes, 0, data, 0, bytes.Length);
-            return new TensorPayload { Name = target, Dtype = info.Dtype, Shape = new[] { (long)hidden, info.Shape[1] }, Data = data };
+            writer.Write(target, info.Dtype, new[] { (long)hidden, info.Shape[1] }, stream =>
+            {
+                host.CopyTo(name, stream);
+                long zeros = (long)(hidden - hostHidden) * info.Shape[1] * element;
+                var blank = new byte[(int)Math.Min(zeros, BlockBytes)];
+                for (long done = 0; done < zeros; done += blank.Length)
+                {
+                    stream.Write(blank, 0, (int)Math.Min(blank.Length, zeros - done));
+                }
+            });
+            return;
         }
-        return new TensorPayload { Name = target, Dtype = info.Dtype, Shape = info.Shape, Data = bytes };
+        writer.Write(target, info.Dtype, info.Shape, stream => host.CopyTo(name, stream));
     }
 
     private static void WriteU16(byte[] data, long element, ushort value)

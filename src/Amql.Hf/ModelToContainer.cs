@@ -74,7 +74,7 @@ public static class ModelToContainer
             ancillaryCopied = ancillaryCopied.Append("classifier.json").ToList();
         }
 
-        long payload = spec.Representations.Sum(r => r.Tensors.Sum(t => (long)t.Data.Length));
+        long payload = spec.Representations.Sum(r => r.Tensors.Sum(t => t.PayloadLength));
         int tensors = spec.Representations.Sum(r => r.Tensors.Count);
         var encoding = result.Index.Representations.Values.FirstOrDefault()?.Encoding ?? "?";
         return new EncodeReport(modelName, containerOut, encoding, payload, tensors, tokenizerCopied,
