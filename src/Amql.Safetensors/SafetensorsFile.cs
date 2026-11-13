@@ -57,6 +57,12 @@ public sealed class SafetensorsFile : IDisposable
 
     public static SafetensorsFile Open(string path)
     {
+        // The Hugging Face cache stores shards as symlinks into blobs/; a
+        // link's own FileInfo.Length is 0, so read through to the target.
+        if (new FileInfo(path).ResolveLinkTarget(returnFinalTarget: true) is { } target)
+        {
+            path = target.FullName;
+        }
         var mapped = MemoryMappedFile.CreateFromFile(path, FileMode.Open, null, 0, MemoryMappedFileAccess.Read);
         var accessor = mapped.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
         try

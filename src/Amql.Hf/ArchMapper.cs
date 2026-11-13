@@ -45,35 +45,53 @@ public static partial class ArchMapper
             return MapNomicBert(modelId, facts, inventory, options, classification, prefix);
         }
 
+        // ── the stack's tensors and the role each plays ──────────────────
+        // Bound first: which norms, biases, gates and fusions exist is read
+        // from the tensors themselves, and every later judgement leans on it.
+        var conventions = FamilyConventions.For(facts.ModelType);
+        var (stackTensors, fused) = BindLayers(inventory, prefix, facts);
+        LayerRoleMap roles;
+        try
+        {
+            roles = TensorRoles.Judge(stackTensors.Select(t => t.Name), fused);
+        }
+        catch (ContainerException e)
+        {
+            throw new ModelConfigException(e.Message, e);
+        }
+        bool parallel = TensorRoles.IsParallelBlock(roles);
+        bool gatedFfn = roles.Name(TensorRoles.Gate) is not null || facts.Moe is not null;
+
         // ── per-layer policy table ────────────────────────────────────────
-        // Position policy: plain default rope (no MRoPE sections, full
-        // rotary factor, no frequency scaling) is SERVED as a standard
-        // PositionRope; every other rope fact (partial factor, MRoPE
-        // sections, scaled families) is carried verbatim as unresolved and
-        // refused by the planner naming the kind.
-        bool isLfm3 = facts.ModelType == "lfm3";
+        // Position policy: plain or partial rope (and per-layer-type rope
+        // blocks) are served; every other rope fact (MRoPE sections, scaled
+        // families) is carried verbatim as unresolved and refused by the
+        // planner naming the kind.
         DiffusionSurface? diffusion = JudgeDiffusion(facts);
-        PositionPolicy position = isLfm3 ? PositionPolicy.None : JudgePosition(facts);
+        PositionPolicy position = JudgePosition(facts, conventions);
+        bool anySliding = false;
         var policies = new List<AttentionLayerPolicy>(facts.NumLayers);
         for (int l = 0; l < facts.NumLayers; l++)
         {
-            bool linear = facts.LayerTypes[l] == "linear_attention";
-            bool sliding = facts.LayerTypes[l] == "sliding_attention";
-            if (sliding && !isLfm3)
-            {
-                throw new ModelConfigException(
-                    $"layer {l}: layer_type 'sliding_attention' is judged for lfm3 only (model_type '{facts.ModelType}')");
-            }
+            string layerType = facts.LayerTypes[l];
+            bool linear = layerType == "linear_attention";
+            // A sliding window without a per-layer table applies to every
+            // layer (Mistral, Phi-3, Starcoder2) unless the config switches it
+            // off (Qwen2/3 carry a size with use_sliding_window: false).
+            bool sliding = layerType == "sliding_attention" ||
+                           (layerType == "full_attention" && !facts.LayerTypesDeclared &&
+                            facts.SlidingWindow is not null && facts.UseSlidingWindow != false);
             if (sliding && facts.SlidingWindow is null)
             {
                 throw new ModelConfigException($"layer {l}: 'sliding_attention' declared but the config carries no sliding_window");
             }
+            anySliding |= sliding;
             HeadGeometry geometry = linear && facts.LinearAttention is { } lin
                 ? new HeadGeometry { HeadDim = lin.KeyHeadDim, NumKvHeads = lin.KeyHeads }
                 : new HeadGeometry { HeadDim = facts.HeadDim, NumKvHeads = facts.NumKvHeads };
             policies.Add(new AttentionLayerPolicy
             {
-                Operator = facts.LayerTypes[l] switch
+                Operator = layerType switch
                 {
                     "full_attention" or "sliding_attention" => LayerOperators.Softmax,
                     "linear_attention" => LayerOperators.LinearAttention,
@@ -83,23 +101,44 @@ public static partial class ArchMapper
                 },
                 Span = sliding ? AttentionSpan.Sliding : AttentionSpan.Full,
                 Window = sliding ? facts.SlidingWindow : null,
-                Position = isLfm3 ? JudgeLfm3Position(facts, facts.LayerTypes[l]) : position,
+                Position = LayerPosition(facts, conventions, l, layerType, position),
                 Geometry = geometry,
             });
         }
+        if (!conventions.RopeOnFullLayers && anySliding)
+        {
+            // EXAONE 4: with sliding layers present, the full layers are NoPE.
+            for (int l = 0; l < policies.Count; l++)
+            {
+                if (policies[l].Operator == LayerOperators.Softmax && policies[l].Span == AttentionSpan.Full)
+                {
+                    policies[l] = new AttentionLayerPolicy
+                    {
+                        Operator = policies[l].Operator,
+                        Span = policies[l].Span,
+                        Window = policies[l].Window,
+                        Position = PositionPolicy.None,
+                        Geometry = policies[l].Geometry,
+                    };
+                }
+            }
+        }
 
         // ── execution surface ────────────────────────────────────────────
-        // The 1+w affine convention is an architecture fact: Qwen3.5's
-        // RMSNorm (layer norms AND the per-head QK norms) applies
-        // RMS(x)·(1+w), i.e. weightOffset 1.0. The linear layers' internal
-        // z-gated norm multiplies the weight directly (offset 0) — that is
-        // an operator fact, not a surface fact.
+        // Norm kind is read from the checkpoint: a norm that ships a bias, or
+        // an epsilon spelled layer_norm_eps, is a LayerNorm. The affine
+        // convention (w or 1+w) is the one fact no checkpoint states; it comes
+        // from the family's conventions entry and defaults to plain w.
+        bool layerNorm = roles.Roles.Keys.Any(k => k.EndsWith("_norm.bias", StringComparison.Ordinal)) ||
+                         facts.NormEpsKey is "layer_norm_eps" or "layer_norm_epsilon" ||
+                         inventory.TryGet($"{prefix}.norm.bias", out _);
         var normSpec = new NormSpec
         {
-            Kind = NormType.RmsNorm,
+            Kind = layerNorm ? NormType.LayerNorm : NormType.RmsNorm,
             Eps = facts.RmsNormEps,
-            WeightOffset = NormWeightOffsetFor(facts.ModelType),
+            WeightOffset = conventions.NormWeightOffset,
         };
+        bool sandwich = roles.Name(TensorRoles.AttnOut) is not null || roles.Name(TensorRoles.FfnOut) is not null;
         var surface = new ExecutionSurface
         {
             ContextLength = facts.MaxPositionEmbeddings,
@@ -109,13 +148,14 @@ public static partial class ArchMapper
                 NumKvHeads = facts.NumKvHeads,
                 HeadDim = facts.HeadDim,
                 // Granite replaces the usual 1/sqrt(head_dim) with an explicit
-                // attention_multiplier; families that do not declare one get the
-                // standard scale. Reading it here rather than defaulting is what
-                // keeps a Granite import numerically faithful.
-                ScoreScale = facts.AttentionMultiplier ?? 1.0 / Math.Sqrt(facts.HeadDim),
+                // attention_multiplier; Gemma scales by query_pre_attn_scalar;
+                // everything else gets the standard scale.
+                ScoreScale = facts.AttentionMultiplier
+                             ?? (facts.QueryPreAttnScalar is { } qpas ? 1.0 / Math.Sqrt(qpas) : 1.0 / Math.Sqrt(facts.HeadDim)),
+                LogitSoftcapping = facts.AttnLogitSoftcapping is { } attnCap ? (float)attnCap : null,
                 QkNormScope = QkNormScope.PerHead,
-                QkNormWeightOffset = NormWeightOffsetFor(facts.ModelType),
-                AttentionBias = facts.AttentionBias,
+                QkNormWeightOffset = conventions.NormWeightOffset,
+                AttentionBias = roles.Name(TensorRoles.Q, "bias") is not null ? true : facts.AttentionBias ? true : null,
                 // LFM3 gates each head's output by sigmoid(gate_proj·x), one
                 // scalar per head — a different operator from Qwen3.5's
                 // elementwise gate folded into q_proj.
@@ -125,12 +165,13 @@ public static partial class ArchMapper
                         ? JsonSerializer.SerializeToElement(new { per_head_gate = true }, ViJson.Options)
                         : null,
                 Bidirectional = diffusion is not null,
+                RopeInterleaved = conventions.RopeInterleaved,
             },
             Ffn = new FfnSurface
             {
                 IntermediateSize = facts.IntermediateSize,
                 Activation = MapActivation(facts.HiddenAct),
-                FfnType = FfnType.Gated,
+                FfnType = gatedFfn ? FfnType.Gated : FfnType.Dense,
                 Moe = facts.Moe is { } moe
                     ? new MoeSurface
                     {
@@ -146,25 +187,25 @@ public static partial class ArchMapper
                 Pre = normSpec,
                 Post = normSpec,
                 FinalNorm = normSpec,
-                Placement = facts.UseSandwichNorm ? NormPlacement.Sandwich : NormPlacement.PreOnly,
+                Placement = sandwich ? NormPlacement.Sandwich : NormPlacement.PreOnly,
             },
             Head = new HeadSurface
             {
                 VocabSize = facts.VocabSize,
                 HeadReusesEmbedding = facts.TieWordEmbeddings,
-                // Granite's embedding_multiplier scales every looked-up row; the
-                // runtime applies EmbeddingOp.Scale, so carrying it here is what
-                // makes the knob live rather than decorative.
-                EmbedScale = facts.EmbeddingMultiplier,
-                // Granite divides the logits by logits_scaling; the head op
-                // multiplies, so the two are reciprocals.
+                // Granite's embedding_multiplier scales every looked-up row;
+                // Gemma's convention is sqrt(hidden_size).
+                EmbedScale = facts.EmbeddingMultiplier
+                             ?? (conventions.EmbedScaleSqrtHidden ? Math.Sqrt(facts.HiddenSize) : null),
+                // Granite divides the logits by logits_scaling; Cohere
+                // multiplies them by logit_scale; the head op multiplies.
                 OutputMultiplier = facts.LogitsScaling is { } scaling && scaling != 0.0
                     ? 1.0 / scaling
-                    : null,
+                    : facts.LogitScale,
+                FinalLogitSoftcapping = facts.FinalLogitSoftcapping is { } finalCap ? (float)finalCap : null,
             },
-            // Granite multiplies the incoming stream by residual_multiplier at
-            // BOTH decoder adds (h' = h*rm + branch); the runtime scales the
-            // residual before each AddInPlace when this is set.
+            // Granite multiplies each branch by residual_multiplier at BOTH
+            // decoder adds (h' = h + branch*rm).
             ResidualScale = facts.ResidualMultiplier,
             LinearAttention = facts.LinearAttention is { } la
                 ? JsonSerializer.SerializeToElement(new
@@ -195,6 +236,9 @@ public static partial class ArchMapper
                 }
                 : null,
             Diffusion = diffusion,
+            Roles = roles,
+            ParallelResidual = parallel,
+            Provenance = conventions.Provenance.Count > 0 ? conventions.Provenance : null,
         };
 
         // ── canonical encoding: judged from the stored dtype, never
@@ -430,11 +474,8 @@ public static partial class ArchMapper
         {
             Rep("target.embedding", encoding,
                 BindOne(inventory, prefix, "embed_tokens.weight")),
-            Rep("target.decoder_stack", encoding,
-                BindLayers(inventory, prefix)),
-            Rep("target.final_norm", encoding,
-                TryBindOne(inventory, prefix, "embedding_norm.weight")
-                ?? BindOne(inventory, prefix, "norm.weight")),
+            Rep("target.decoder_stack", encoding, stackTensors),
+            Rep("target.final_norm", encoding, BindFinalNorm(inventory, prefix)),
         };
         if (untied)
         {
@@ -490,12 +531,6 @@ public static partial class ArchMapper
         };
     }
 
-    /// <summary>The RMSNorm affine convention of a text family: Qwen3.5
-    /// applies RMS(x)·(1+w) to its layer norms and per-head QK norms;
-    /// other families this build maps default to plain RMS(x)·w.</summary>
-    private static float NormWeightOffsetFor(string modelType) =>
-        modelType is "qwen3_5_text" or "qwen3_5" ? 1.0f : 0f;
-
     /// <summary>dLLM's A2D ("autoregressive to diffusion") checkpoints are the
     /// base family's weights and config under <c>a2d-&lt;family&gt;</c>, with the
     /// causal mask replaced by a padding-only one and MDLM training on top.
@@ -537,78 +572,79 @@ public static partial class ArchMapper
     private static bool HasPerHeadGate(HfInventory inventory) =>
         inventory.TensorNames.Any(n => n.EndsWith(".self_attn.gate_proj.weight", StringComparison.Ordinal));
 
-    /// <summary>LFM3 keys its rope facts by layer type. The full-attention
-    /// layers use the zero-tail partial rotary (the progression of the full
-    /// head dim, trailing frequencies zeroed); a factor of 1 is plain rope.</summary>
-    private static PositionPolicy JudgeLfm3Position(TextArchitectureFacts facts, string layerType)
+    /// <summary>One layer's position policy. Conv layers carry none; SmolLM3's
+    /// <c>no_rope_layers</c> switches individual layers to NoPE; a rope block
+    /// keyed by the layer's own type (Gemma 3, LFM3: <c>rope_parameters.sliding_attention</c>)
+    /// wins over the stack-wide one.</summary>
+    private static PositionPolicy LayerPosition(TextArchitectureFacts facts, FamilyConventions conventions, int layer,
+        string layerType, PositionPolicy stackWide)
     {
         if (layerType == "conv")
         {
             return PositionPolicy.None;
         }
-        var rope = facts.RopeParameters;
-        if (rope.ValueKind != JsonValueKind.Object || !rope.TryGetProperty(layerType, out var p) ||
-            p.ValueKind != JsonValueKind.Object)
+        if (facts.NoRopeLayers is { } noRope && layer < noRope.Count && noRope[layer] == 0)
         {
-            throw new ModelConfigException($"lfm3: rope_parameters carries no '{layerType}' entry");
+            return PositionPolicy.None;
         }
-        string ropeType = p.TryGetProperty("rope_type", out var rt) ? rt.GetString() ?? "default" : "default";
+        var rope = facts.RopeParameters;
+        if (rope.ValueKind == JsonValueKind.Object && rope.TryGetProperty(layerType, out var block) &&
+            block.ValueKind == JsonValueKind.Object)
+        {
+            return RopeBlock(block, block.TryGetProperty("partial_rotary_factor", out var f) ? f.GetDouble() : 1.0, conventions);
+        }
+        return stackWide;
+    }
+
+    /// <summary>Judges one rope block (<c>rope_type</c>, <c>rope_theta</c>) at
+    /// the given partial factor. A factor below 1 is served as the family's
+    /// partial-rotary convention.</summary>
+    private static PositionPolicy RopeBlock(JsonElement block, double factor, FamilyConventions conventions)
+    {
+        string ropeType = block.TryGetProperty("rope_type", out var rt) ? rt.GetString() ?? "default" : "default";
         if (ropeType != "default")
         {
-            return new PositionUnresolved { Kind = $"rope_scaling({ropeType})", Payload = p.Clone() };
+            return new PositionUnresolved { Kind = $"rope_scaling({ropeType})", Payload = block.Clone() };
         }
-        double theta = p.TryGetProperty("rope_theta", out var t) ? t.GetDouble() : 10_000.0;
-        double factor = p.TryGetProperty("partial_rotary_factor", out var f) ? f.GetDouble() : 1.0;
-        return factor < 1.0
-            ? new PositionZeroTailRope { Theta = theta, RotaryFactor = factor }
-            : PositionPolicy.CreateRope(theta);
+        double theta = block.TryGetProperty("rope_theta", out var t) ? t.GetDouble() : 10_000.0;
+        if (factor < 1.0)
+        {
+            return conventions.ZeroTailPartialRotary
+                ? new PositionZeroTailRope { Theta = theta, RotaryFactor = factor }
+                : new PositionPartialRope { Theta = theta, RotaryFactor = factor };
+        }
+        return PositionPolicy.CreateRope(theta);
     }
 
     /// <summary>Judges whether the persisted rope facts are the served plain
     /// default rotary (PositionRope) or must be carried unresolved. The
     /// reference's rule is mirrored: a fact this build cannot serve is
     /// carried verbatim and refused by name, never approximated.</summary>
-    private static PositionPolicy JudgePosition(TextArchitectureFacts facts)
+    private static PositionPolicy JudgePosition(TextArchitectureFacts facts, FamilyConventions conventions)
     {
         var rope = facts.RopeParameters;
-        string? scaledType = rope.ValueKind == JsonValueKind.Object &&
-                             rope.TryGetProperty("rope_type", out var rtype)
-            ? rtype.GetString()
-            : "default";
-
-        if (scaledType == "default")
+        if (rope.ValueKind == JsonValueKind.Object && !rope.TryGetProperty("rope_type", out _) &&
+            !rope.TryGetProperty("rope_theta", out _))
         {
-            double theta = rope.ValueKind == JsonValueKind.Object &&
-                           rope.TryGetProperty("rope_theta", out var t)
-                ? t.GetDouble()
-                : 10_000.0;
-
-            // Text-only MRoPE carries identical positions across the
-            // streams, which collapses to standard rotary over the partial
-            // width — served as PositionPartialRope. A partial factor is
-            // exactly that; full factor is plain PositionRope.
-            if (facts.PartialRotaryFactor < 1.0)
-            {
-                return new PositionPartialRope { Theta = theta, RotaryFactor = facts.PartialRotaryFactor };
-            }
-            return PositionPolicy.CreateRope(theta);
+            // Keyed by layer type only (each layer resolves its own block);
+            // the stack-wide policy is never consulted for those layers.
+            return PositionPolicy.None;
         }
-
-        return new PositionUnresolved
-        {
-            Kind = $"rope_scaling({scaledType})",
-            Payload = facts.RopeParameters.Clone(),
-        };
+        // Text-only MRoPE carries identical positions across the streams,
+        // which collapses to standard rotary over the partial width.
+        return RopeBlock(rope, facts.PartialRotaryFactor, conventions);
     }
 
     /// <summary>Judges the persisted <c>hidden_act</c> string against the
     /// known activation set. Unknown activations refuse by name.</summary>
     private static Activation MapActivation(string hiddenAct) => hiddenAct switch
     {
-        "silu" => Activation.Silu,
+        "silu" or "swish" => Activation.Silu,
         "gelu" => Activation.Gelu,
+        "gelu_pytorch_tanh" or "gelu_new" or "gelu_fast" or "gelu_tanh" => Activation.GeluTanh,
+        "relu" => Activation.Relu,
         _ => throw new ModelConfigException(
-            $"hidden_act '{hiddenAct}' is not a judged FFN activation — this build maps 'silu' and 'gelu' only"),
+            $"hidden_act '{hiddenAct}' is not a judged FFN activation — this build maps silu, gelu, gelu_pytorch_tanh and relu"),
     };
 
     /// <summary>Finds the tensor prefix the text decoder actually lives
@@ -664,10 +700,16 @@ public static partial class ArchMapper
 
     /// <summary>Binds the layer tensors of the object to object-relative
     /// segment names: <c>layers.3.self_attn.q_proj.weight → 3.self_attn.q_proj.weight</c>.
-    /// Payload bytes are copied verbatim (no widening at encode time).</summary>
-    private static List<NamedTensorData> BindLayers(HfInventory inventory, string prefix)
+    /// Payload bytes are copied verbatim (no widening at encode time).
+    /// <para>A contiguous fusion (Phi-3's <c>qkv_proj</c>, GLM's
+    /// <c>gate_up_proj</c>) is bound as its parts: each part is a byte range of
+    /// the fused tensor (row-major, so a block of rows is contiguous), recorded
+    /// in the returned list so export can concatenate it back.</para></summary>
+    private static (List<NamedTensorData> Tensors, List<FusedTensor> Fused) BindLayers(
+        HfInventory inventory, string prefix, TextArchitectureFacts facts)
     {
         var bound = new List<NamedTensorData>();
+        var fused = new Dictionary<string, FusedTensor>(StringComparer.Ordinal);
         var layersPrefix = $"{prefix}.layers.";
         foreach (var fullName in inventory.TensorNames)
         {
@@ -675,13 +717,69 @@ public static partial class ArchMapper
             {
                 continue;
             }
-            bound.Add(ToTensorData(inventory, fullName, fullName[layersPrefix.Length..]));
+            string relative = fullName[layersPrefix.Length..];
+            if (SplitFusion(inventory, fullName, relative, facts) is { } split)
+            {
+                bound.AddRange(split.Parts);
+                fused.TryAdd(split.Fused.Name, split.Fused);
+                continue;
+            }
+            bound.Add(ToTensorData(inventory, fullName, relative));
         }
         if (bound.Count == 0)
         {
             throw new ModelConfigException($"no tensors bound from '{layersPrefix}' — inventory mismatch");
         }
-        return bound;
+        return (bound, fused.Values.ToList());
+    }
+
+    /// <summary>Splits a contiguous fusion into its role tensors, or returns null
+    /// when <paramref name="relative"/> (<c>3.mlp.gate_up_proj.weight</c>) is not one.</summary>
+    private static (List<NamedTensorData> Parts, FusedTensor Fused)? SplitFusion(
+        HfInventory inventory, string fullName, string relative, TextArchitectureFacts facts)
+    {
+        int dot = relative.IndexOf('.');
+        string suffix = relative[(dot + 1)..];
+        int lastDot = suffix.LastIndexOf('.');
+        string stem = suffix[..lastDot], part = suffix[(lastDot + 1)..];
+        if (!TensorRoles.ContiguousFusions.TryGetValue(stem, out var partStems))
+        {
+            return null;
+        }
+        var info = inventory.Get(fullName);
+        long rows = info.Shape[0];
+        long[] partRows = partStems.Length == 3
+            ? new long[] { (long)facts.NumQueryHeads * facts.HeadDim, (long)facts.NumKvHeads * facts.HeadDim, (long)facts.NumKvHeads * facts.HeadDim }
+            : new long[] { rows / 2, rows / 2 };
+        if (partRows.Sum() != rows || info.DataLength % rows != 0)
+        {
+            throw new ModelConfigException(
+                $"'{fullName}' has {rows} rows but its parts ({string.Join(" + ", partStems)}) need {partRows.Sum()} — refusing to guess the split");
+        }
+        long bytesPerRow = info.DataLength / rows;
+        string layer = relative[..dot];
+        var parts = new List<NamedTensorData>();
+        long rowStart = 0;
+        for (int i = 0; i < partStems.Length; i++)
+        {
+            long byteStart = rowStart * bytesPerRow;
+            var shape = (long[])info.Shape.Clone();
+            shape[0] = partRows[i];
+            parts.Add(new NamedTensorData
+            {
+                Name = $"{layer}.{partStems[i]}.{part}",
+                Dtype = info.Dtype,
+                Shape = shape,
+                Source = (offset, count) => inventory.ReadBytes(fullName, byteStart + offset, count),
+                SourceLength = partRows[i] * bytesPerRow,
+            });
+            rowStart += partRows[i];
+        }
+        return (parts, new FusedTensor
+        {
+            Name = $"{stem}.{part}",
+            Parts = partStems.Select(s => $"{s}.{part}").ToList(),
+        });
     }
 
     /// <summary>Binds one object-relative tensor:
@@ -701,6 +799,19 @@ public static partial class ArchMapper
             return null;
         }
         return new List<NamedTensorData> { ToTensorData(inventory, fullName, "weight") };
+    }
+
+    /// <summary>The final norm's weight — and its bias, for a LayerNorm that
+    /// ships one — as the object-relative <c>weight</c> / <c>bias</c>.</summary>
+    private static List<NamedTensorData> BindFinalNorm(HfInventory inventory, string prefix)
+    {
+        string stem = inventory.TryGet($"{prefix}.embedding_norm.weight", out _) ? "embedding_norm" : "norm";
+        var bound = BindOne(inventory, prefix, $"{stem}.weight");
+        if (inventory.TryGet($"{prefix}.{stem}.bias", out _))
+        {
+            bound.Add(ToTensorData(inventory, $"{prefix}.{stem}.bias", "bias"));
+        }
+        return bound;
     }
 
     /// <summary>Binds an untied output head. The Qwen3.5 multimodal wrapper

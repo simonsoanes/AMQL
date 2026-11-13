@@ -27,9 +27,13 @@ public sealed class NormOp
     public float WeightOffset { get; init; }
     public required int Width { get; init; }
 
-    public static NormOp From(OperandRef weight, NormSpec spec, int width) => new()
+    /// <summary>LayerNorm's additive shift, when the checkpoint ships one.</summary>
+    public OperandRef? Bias { get; init; }
+
+    public static NormOp From(OperandRef weight, NormSpec spec, int width, OperandRef? bias = null) => new()
     {
         Weight = weight,
+        Bias = bias,
         Kind = spec.Kind,
         Eps = spec.Eps,
         WeightOffset = spec.WeightOffset,
@@ -90,6 +94,17 @@ public sealed class AttentionOp
     public required OperandRef VProj { get; init; }
     public required OperandRef OProj { get; init; }
 
+    /// <summary>Additive projection biases (Qwen2, StableLM, Starcoder2…);
+    /// null where the checkpoint has none.</summary>
+    public OperandRef? QBias { get; init; }
+    public OperandRef? KBias { get; init; }
+    public OperandRef? VBias { get; init; }
+    public OperandRef? OBias { get; init; }
+
+    /// <summary>Rotary pairs are adjacent dims (2i, 2i+1) rather than the
+    /// two halves of the rotary window.</summary>
+    public bool RopeInterleaved { get; init; }
+
     /// <summary>Width of the q_proj operand: QDim when ungated, 2×QDim
     /// when the output gate is declared.</summary>
     public int QProjWidth => OutputGate ? 2 * QDim : QDim;
@@ -103,6 +118,9 @@ public sealed class DenseFfnOp
     public required OperandRef Up { get; init; }
     public required OperandRef Down { get; init; }
     public OperandRef? Gate { get; init; }
+    public OperandRef? GateBias { get; init; }
+    public OperandRef? UpBias { get; init; }
+    public OperandRef? DownBias { get; init; }
     public required Activation Activation { get; init; }
     public required int IntermediateSize { get; init; }
     public required int HiddenSize { get; init; }
@@ -209,6 +227,10 @@ public sealed class LayerPlan
 
     public LayerFfn? Ffn { get; init; }
 
+    /// <summary>The FFN reads the attention's input (the pre-attention norm
+    /// output) and both branches add to the residual together.</summary>
+    public bool ParallelResidual { get; init; }
+
     /// <summary>Whether this layer carries a stateful operator (its states
     /// must advance position by position — prefill cannot batch rows).</summary>
     public bool IsStateful => LinearAttention is not null || Conv is not null;
@@ -240,9 +262,9 @@ public sealed class ComponentOpPlan
     public required NormOp FinalNorm { get; init; }
     public OutputOp? Output { get; init; }
 
-    /// <summary>Multiplier on the incoming residual stream at every decoder
-    /// add (Granite: h' = h·scale + branch, at both the mixer and the FFN
-    /// join). 1.0 is the plain add every other family uses.</summary>
+    /// <summary>Multiplier on each branch at every decoder add (Granite:
+    /// h' = h + branch·scale, at both the mixer and the FFN join). 1.0 is the
+    /// plain add every other family uses.</summary>
     public double ResidualScale { get; init; } = 1.0;
 
     /// <summary>Set for a masked diffusion LM: the stack is bidirectional and

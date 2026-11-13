@@ -215,7 +215,9 @@ public class ExportTests
         var report = ModelToContainer.Encode(modelDir, containerPath, "synth-ancillary");
 
         Assert.Equal(
-            new[] { "chat_template.jinja", "generation_config.json", "preprocessor_config.json" },
+            // source_config.json is the checkpoint's config.json, kept as the
+            // base export writes the judged facts over.
+            new[] { "chat_template.jinja", "generation_config.json", "preprocessor_config.json", "source_config.json" },
             report.AncillaryCopied.OrderBy(name => name, StringComparer.Ordinal).ToArray());
         Assert.Equal(template, File.ReadAllText(Path.Combine(containerPath, "chat_template.jinja")));
         Assert.False(File.Exists(Path.Combine(containerPath, "README.md")));

@@ -85,7 +85,11 @@ public static class ModelExporter
         }
         else
         {
-            configJson = ExportConfig.BuildJson(container, quantizeMxfp4);
+            // The checkpoint's own config with the judged facts written over
+            // it when the container carries one; otherwise rebuilt from the
+            // judged facts alone.
+            configJson = GenericExport.TryBuildConfig(container, quantizeMxfp4)
+                         ?? ExportConfig.BuildJson(container, quantizeMxfp4);
         }
 
         using var store = container.CreateOperandStore();
@@ -259,6 +263,19 @@ public static class ModelExporter
                           "(HyperConnection streams, shared expert) — " +
                           "the checkpoint is structurally loadable; HC identity init means " +
                           "the model passes the residual through unchanged");
+            }
+        }
+
+        // Tensors the importer split (Phi-3's qkv_proj, GLM's gate_up_proj)
+        // go back out fused, under the checkpoint's own names.
+        var primarySurface = graph.Components.First(c => c.Id == primaryId).Execution;
+        var stackObject = graph.Objects.FirstOrDefault(o => o.Component == primaryId && o.Kind == ObjectKind.DecoderStack);
+        if (stackObject is not null && objectPrefixes.TryGetValue(stackObject.Id, out var stackPrefix))
+        {
+            int refused = GenericExport.Refuse(payloads, primarySurface?.Roles, stackPrefix);
+            if (refused > 0)
+            {
+                notes.Add($"{refused} tensors fused back into their checkpoint form ({string.Join(", ", primarySurface!.Roles!.Fused!.Select(f => f.Name))})");
             }
         }
 

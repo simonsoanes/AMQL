@@ -114,6 +114,39 @@ public sealed record TextArchitectureFacts(
     /// <summary>The id of the tokenizer's <c>mask_token</c>, resolved through the
     /// checkpoint's tokenizer files; null when it declares none.</summary>
     public int? MaskTokenId { get; init; }
+
+    /// <summary>Whether the config spelled out a per-layer table (<c>layer_types</c>
+    /// or a sliding-window period) rather than leaving every layer implied full.</summary>
+    public bool LayerTypesDeclared { get; init; }
+
+    /// <summary><c>use_sliding_window</c> when the config states it (Qwen2/3 set it
+    /// false while still carrying a <c>sliding_window</c> size).</summary>
+    public bool? UseSlidingWindow { get; init; }
+
+    /// <summary>Gemma's <c>query_pre_attn_scalar</c>: scores scale by its inverse
+    /// square root instead of the head dim's.</summary>
+    public double? QueryPreAttnScalar { get; init; }
+
+    /// <summary><c>attn_logit_softcapping</c>: scores pass through cap·tanh(s/cap).</summary>
+    public double? AttnLogitSoftcapping { get; init; }
+
+    /// <summary><c>final_logit_softcapping</c>: logits pass through cap·tanh(l/cap).</summary>
+    public double? FinalLogitSoftcapping { get; init; }
+
+    /// <summary>Cohere's <c>logit_scale</c>: logits are multiplied by it.</summary>
+    public double? LogitScale { get; init; }
+
+    /// <summary>SmolLM3's <c>no_rope_layers</c>: per layer, 1 rotates and 0 is NoPE.</summary>
+    public IReadOnlyList<int>? NoRopeLayers { get; init; }
+
+    /// <summary>The config key the norm epsilon was read from. <c>layer_norm_eps</c>
+    /// / <c>layer_norm_epsilon</c> name a LayerNorm; <c>rms_norm_eps</c> an RMSNorm.</summary>
+    public string? NormEpsKey { get; init; }
+
+    /// <summary>The text config exactly as the checkpoint wrote it. Export starts
+    /// from it and overwrites every fact the container judges, so keys this build
+    /// has no notion of still reach the exported checkpoint.</summary>
+    public JsonElement? SourceConfig { get; init; }
 }
 
 /// <summary>G1 reader: <c>config.json</c> → <see cref="TextArchitectureFacts"/>.</summary>
@@ -152,6 +185,20 @@ public static class ModelConfig
             if (text.TryGetProperty("layer_types", out var types) && types.ValueKind == JsonValueKind.Array)
             {
                 layerTypes.AddRange(types.EnumerateArray().Select(t => t.GetString() ?? string.Empty));
+            }
+            bool layerTypesDeclared = layerTypes.Count > 0;
+            if (layerTypes.Count == 0 && text.TryGetProperty("sliding_window_pattern", out var swp) &&
+                swp.ValueKind == JsonValueKind.Number && swp.GetInt32() > 1 &&
+                text.TryGetProperty("num_hidden_layers", out var swpLayers))
+            {
+                // The period form of a sliding/full alternation (older Gemma 2/3
+                // configs): every pattern-th layer is full, the rest slide.
+                int period = swp.GetInt32();
+                for (int i = 0; i < swpLayers.GetInt32(); i++)
+                {
+                    layerTypes.Add((i + 1) % period == 0 ? "full_attention" : "sliding_attention");
+                }
+                layerTypesDeclared = true;
             }
             if (layerTypes.Count == 0 && text.TryGetProperty("global_attn_every_n_layers", out var every) &&
                 text.TryGetProperty("num_hidden_layers", out var mbLayers))
@@ -269,24 +316,9 @@ public static class ModelConfig
                 : text.TryGetProperty("activation_function", out var af)
                     ? af.GetString() switch { "swiglu" => "silu", var a => a ?? "silu" }
                     : "silu";
-            // Map Gemma 4's gelu_pytorch_tanh → the closest judged activation.
-            hiddenAct = hiddenAct switch
-            {
-                "gelu_pytorch_tanh" => "gelu",
-                "gelu_new" => "gelu",
-                "gelu_fast" => "gelu",
-                "gelu_accurate" => "gelu",
-                _ => hiddenAct,
-            };
-            double rmsNormEps = text.TryGetProperty("rms_norm_eps", out var eps)
-                ? eps.GetDouble()
-                : text.TryGetProperty("layer_norm_eps", out var lne)
-                    ? lne.GetDouble()
-                    : text.TryGetProperty("layer_norm_epsilon", out var lne2)
-                        ? lne2.GetDouble()
-                        : text.TryGetProperty("norm_eps", out var ne)
-                            ? ne.GetDouble()
-                            : 1e-6;
+            string? normEpsKey = new[] { "rms_norm_eps", "layer_norm_eps", "layer_norm_epsilon", "norm_eps", "norm_epsilon" }
+                .FirstOrDefault(k => text.TryGetProperty(k, out var v) && v.ValueKind == JsonValueKind.Number);
+            double rmsNormEps = normEpsKey is not null ? text.GetProperty(normEpsKey).GetDouble() : 1e-6;
 
             return new TextArchitectureFacts(
                 ModelType: text.GetProperty("model_type").GetString() ?? "unknown",
@@ -337,6 +369,20 @@ public static class ModelConfig
                     ? autoMap.Clone()
                     : null,
                 MaskTokenId = ResolveMaskTokenId(root, Path.GetDirectoryName(Path.GetFullPath(configPath))!),
+                LayerTypesDeclared = layerTypesDeclared,
+                UseSlidingWindow = text.TryGetProperty("use_sliding_window", out var usw) &&
+                                   usw.ValueKind is JsonValueKind.True or JsonValueKind.False
+                    ? usw.GetBoolean()
+                    : null,
+                QueryPreAttnScalar = NumberOrNull(text, "query_pre_attn_scalar"),
+                AttnLogitSoftcapping = NumberOrNull(text, "attn_logit_softcapping"),
+                FinalLogitSoftcapping = NumberOrNull(text, "final_logit_softcapping"),
+                LogitScale = OptionalDouble(text, "logit_scale"),
+                NoRopeLayers = text.TryGetProperty("no_rope_layers", out var nrl) && nrl.ValueKind == JsonValueKind.Array
+                    ? nrl.EnumerateArray().Select(e => e.GetInt32()).ToList()
+                    : null,
+                NormEpsKey = normEpsKey,
+                SourceConfig = root.Clone(),
             };
         }
     }
@@ -452,6 +498,10 @@ public static class ModelConfig
         }
         throw new ModelConfigException($"config is missing required field '{name}'");
     }
+
+    /// <summary>A number when present and not null; null otherwise.</summary>
+    private static double? NumberOrNull(JsonElement obj, string name) =>
+        obj.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.Number ? value.GetDouble() : null;
 
     /// <summary>Reads an optional scaling factor, treating an explicit 1.0 the
     /// same as absence: it is the identity, and recording it would put noise in

@@ -90,9 +90,8 @@ public sealed class GenericRuntime
         if (layerPlan.PreAttentionNorm is { } preAttnNorm)
         {
             h = x.Clone();
-            var preAttnW = _weights.Vector(preAttnNorm.Weight, hidden);
             long t = TraceStart;
-            Norms.ApplyInPlace(h, preAttnNorm.Kind, preAttnNorm.Eps, preAttnW, preAttnNorm.WeightOffset);
+            ApplyNorm(h, preAttnNorm, hidden);
             Report(layer, "pre_attn_norm", preAttnNorm.Weight, h, t);
         }
 
@@ -121,21 +120,25 @@ public sealed class GenericRuntime
         // mixer output before the residual add, whichever operator ran.
         if (layerPlan.PostAttentionNorm is { } postAttnNorm)
         {
-            var postAttnW = _weights.Vector(postAttnNorm.Weight, hidden);
             long tn = TraceStart;
-            Norms.ApplyInPlace(mixerOut, postAttnNorm.Kind, postAttnNorm.Eps, postAttnW, postAttnNorm.WeightOffset);
+            ApplyNorm(mixerOut, postAttnNorm, hidden);
             Report(layer, "post_attn_norm", postAttnNorm.Weight, mixerOut, tn);
         }
-        AddResidualInPlace(x, mixerOut);
+        // A parallel block's FFN reads the attention's own normalised input;
+        // the attention branch joins the residual together with the FFN's.
+        bool parallel = layerPlan.ParallelResidual;
+        if (!parallel)
+        {
+            AddResidualInPlace(x, mixerOut);
+        }
 
         // Pre-FFN norm.
-        Tensor2D hf = x;
-        if (layerPlan.PreFfnNorm is { } preFfnNorm)
+        Tensor2D hf = parallel ? h : x;
+        if (!parallel && layerPlan.PreFfnNorm is { } preFfnNorm)
         {
             hf = x.Clone();
-            var preFfnW = _weights.Vector(preFfnNorm.Weight, hidden);
             long t = TraceStart;
-            Norms.ApplyInPlace(hf, preFfnNorm.Kind, preFfnNorm.Eps, preFfnW, preFfnNorm.WeightOffset);
+            ApplyNorm(hf, preFfnNorm, hidden);
             Report(layer, "pre_ffn_norm", preFfnNorm.Weight, hf, t);
         }
 
@@ -152,7 +155,10 @@ public sealed class GenericRuntime
                     : _weights.Matrix(dense.Gate, dense.IntermediateSize, hidden);
                 var up = _weights.Matrix(dense.Up, dense.IntermediateSize, hidden);
                 var down = _weights.Matrix(dense.Down, hidden, dense.IntermediateSize);
-                ffnOut = FfnKernel.Dense(hf, gate, up, down, dense.Activation, dense.IsGated);
+                ffnOut = FfnKernel.Dense(hf, gate, up, down, dense.Activation, dense.IsGated,
+                    OptionalVector(dense.GateBias, dense.IntermediateSize),
+                    OptionalVector(dense.UpBias, dense.IntermediateSize),
+                    OptionalVector(dense.DownBias, hidden));
                 Report(layer, "ffn_dense", dense.Down, ffnOut, t);
             }
             else
@@ -164,12 +170,23 @@ public sealed class GenericRuntime
 
             if (layerPlan.PostFfnNorm is { } postFfnNorm)
             {
-                var postFfnW = _weights.Vector(postFfnNorm.Weight, hidden);
                 long tn = TraceStart;
-                Norms.ApplyInPlace(ffnOut, postFfnNorm.Kind, postFfnNorm.Eps, postFfnW, postFfnNorm.WeightOffset);
+                ApplyNorm(ffnOut, postFfnNorm, hidden);
                 Report(layer, "post_ffn_norm", postFfnNorm.Weight, ffnOut, tn);
             }
-            AddResidualInPlace(x, ffnOut);
+            if (parallel)
+            {
+                AddInPlace(mixerOut, ffnOut);
+                AddResidualInPlace(x, mixerOut);
+            }
+            else
+            {
+                AddResidualInPlace(x, ffnOut);
+            }
+        }
+        else if (parallel)
+        {
+            AddResidualInPlace(x, mixerOut);
         }
 
         ApplyPatches(x, layer, queryPositions);
@@ -179,17 +196,31 @@ public sealed class GenericRuntime
         return x;
     }
 
-    /// <summary>Granite's decoder join is h' = h·residual_multiplier + branch
-    /// at BOTH the mixer and the FFN add; families without the knob carry
-    /// scale 1.0 and this is the plain add.</summary>
+    /// <summary>Applies a norm op in place: the normalisation, the learned
+    /// weight (with its affine offset) and, for a LayerNorm that ships one, the
+    /// additive bias.</summary>
+    private void ApplyNorm(Tensor2D x, NormOp norm, int width)
+    {
+        var w = _weights.Vector(norm.Weight, width);
+        Norms.ApplyInPlace(x, norm.Kind, norm.Eps, w, norm.WeightOffset);
+        FfnKernel.AddRowBias(x, OptionalVector(norm.Bias, width));
+    }
+
+    private float[]? OptionalVector(OperandRef? operand, int length) =>
+        operand is null ? null : _weights.Vector(operand, length);
+
+    /// <summary>Granite's decoder join is h' = h + branch·residual_multiplier
+    /// at BOTH the mixer and the FFN add (transformers' GraniteDecoderLayer:
+    /// <c>residual + hidden_states * residual_multiplier</c>); families without
+    /// the knob carry scale 1.0 and this is the plain add.</summary>
     private void AddResidualInPlace(Tensor2D x, Tensor2D branch)
     {
         double scale = _plan.ResidualScale;
         if (scale != 1.0)
         {
-            for (int i = 0; i < x.Data.Length; i++)
+            for (int i = 0; i < branch.Data.Length; i++)
             {
-                x.Data[i] = (float)(x.Data[i] * scale);
+                branch.Data[i] = (float)(branch.Data[i] * scale);
             }
         }
         AddInPlace(x, branch);
@@ -234,6 +265,9 @@ public sealed class GenericRuntime
         // Sub-operator observations carry no duration: on the GPU path q, k and
         // v are a single batched launch, so a per-projection time would be
         // fiction. Timing lives on the layer-level operators instead.
+        FfnKernel.AddRowBias(qRaw, OptionalVector(attn.QBias, attn.QProjWidth));
+        FfnKernel.AddRowBias(k, OptionalVector(attn.KBias, attn.KvDim));
+        FfnKernel.AddRowBias(v, OptionalVector(attn.VBias, attn.KvDim));
         Report(layer, "attn_q", attn.QProj, qRaw, 0);
         Report(layer, "attn_k", attn.KProj, k, 0);
         Report(layer, "attn_v", attn.VProj, v, 0);
@@ -256,13 +290,13 @@ public sealed class GenericRuntime
 
         // RoPE — position policy from the per-layer table; partial rotary
         // (text mrope) rotates the first head_dim × factor dims.
-        Rope.Apply(q, attn.NumQHeads, attn.HeadDim, attn.Position, queryPositions);
+        Rope.Apply(q, attn.NumQHeads, attn.HeadDim, attn.Position, queryPositions, attn.RopeInterleaved);
 
         int kvRows = k.Rows;
         var ropeKvPositions = kvRows == kvPositions.Length
             ? kvPositions
             : kvPositions[^kvRows..];
-        Rope.Apply(k, attn.NumKvHeads, attn.HeadDim, attn.Position, ropeKvPositions);
+        Rope.Apply(k, attn.NumKvHeads, attn.HeadDim, attn.Position, ropeKvPositions, attn.RopeInterleaved);
 
         if (attn.VFromK)
         {
@@ -366,6 +400,7 @@ public sealed class GenericRuntime
         }
 
         var o = TensorOps.MatMulTransposedB(output, _weights.Matrix(attn.OProj, hidden, attn.QDim));
+        FfnKernel.AddRowBias(o, OptionalVector(attn.OBias, hidden));
         Report(layer, "attn_output", attn.OProj, o, 0);
         return o;
     }
@@ -375,7 +410,7 @@ public sealed class GenericRuntime
         if (qNorm is { } qn)
         {
             var w = _weights.Vector(qn.Weight, qn.Width);
-            if (attn.QkNormScope == QkNormScope.PerHead)
+            if (qn.Width == attn.HeadDim)
             {
                 ApplyPerHead(q, attn.NumQHeads, attn.HeadDim, w, qn.Eps, qn.WeightOffset);
             }
@@ -387,7 +422,7 @@ public sealed class GenericRuntime
         if (kNorm is { } kn)
         {
             var w = _weights.Vector(kn.Weight, kn.Width);
-            if (attn.QkNormScope == QkNormScope.PerHead)
+            if (kn.Width == attn.HeadDim)
             {
                 ApplyPerHead(k, attn.NumKvHeads, attn.HeadDim, w, kn.Eps, kn.WeightOffset);
             }
@@ -1013,9 +1048,7 @@ public sealed class GenericRuntime
     /// head (a classifier's score linear) reads.</summary>
     public Tensor2D FinalNorm(Tensor2D hidden)
     {
-        var finalNorm = _plan.FinalNorm;
-        var w = _weights.Vector(finalNorm.Weight, hidden.Cols);
-        Norms.ApplyInPlace(hidden, finalNorm.Kind, finalNorm.Eps, w, finalNorm.WeightOffset);
+        ApplyNorm(hidden, _plan.FinalNorm, hidden.Cols);
         return hidden;
     }
 

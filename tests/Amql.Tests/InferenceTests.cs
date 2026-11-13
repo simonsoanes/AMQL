@@ -193,7 +193,7 @@ public class InferenceTests
             var o = MatMulTransposedB(ao, T, qDim, Wm(hidden, qDim, 5, l), hidden);
             for (int i = 0; i < x.Length; i++)
             {
-                x[i] = x[i] * rm + o[i];
+                x[i] = x[i] + rm * o[i];
             }
 
             // Pre-FFN norm.
@@ -212,7 +212,7 @@ public class InferenceTests
             var down = MatMulTransposedB(up, T, d.Intermediate, Wm(hidden, d.Intermediate, 8, l), hidden);
             for (int i = 0; i < x.Length; i++)
             {
-                x[i] = x[i] * rm + down[i];
+                x[i] = x[i] + rm * down[i];
             }
         }
 
@@ -288,7 +288,7 @@ public class InferenceTests
     [Fact]
     public void ResidualScale_Matches_NaiveReference()
     {
-        // Granite's decoder join (h' = h·rm + branch) at both adds; the naive
+        // Granite's decoder join (h' = h + branch·rm, transformers' GraniteDecoderLayer) at both adds; the naive
         // reference applies the same scale independently of the runtime.
         var d = new Dims(ResidualScale: 0.5);
         var tokens = new[] { 1, 3, 5 };

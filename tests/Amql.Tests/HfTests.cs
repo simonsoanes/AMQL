@@ -304,7 +304,7 @@ public class HfTests
         Assert.Equal(SyntheticGemma4Checkpoint.Hidden, facts.HiddenSize);
         Assert.Equal(SyntheticGemma4Checkpoint.NumQHeads, facts.NumQueryHeads);
         Assert.Equal(SyntheticGemma4Checkpoint.NumKvHeads, facts.NumKvHeads);
-        Assert.Equal("gelu", facts.HiddenAct);
+        Assert.Equal("gelu_pytorch_tanh", facts.HiddenAct); // kept exactly as written; judged GeluTanh
         Assert.True(facts.TieWordEmbeddings);
 
         using var inventory = HfInventory.Open(dir.Path);
@@ -319,11 +319,11 @@ public class HfTests
         Assert.Equal(2, steps.Count);
 
         var surface = container.Graph!.Components[0].Execution!;
-        Assert.Equal(Activation.Gelu, surface.Ffn!.Activation);
+        Assert.Equal(Activation.GeluTanh, surface.Ffn!.Activation); // gelu_pytorch_tanh, judged exactly
     }
 
     [Fact]
-    public void Gemma4_Config_Refuses_Relu()
+    public void Gemma4_Config_Refuses_Unknown_Activation()
     {
         using var dir = new TempDir();
         var configPath = Path.Combine(dir.Path, "config.json");
@@ -335,7 +335,7 @@ public class HfTests
             "model_type": "gemma4_text",
             "hidden_size": 128, "num_hidden_layers": 2,
             "num_attention_heads": 4, "num_key_value_heads": 1, "head_dim": 32,
-            "intermediate_size": 256, "hidden_act": "relu",
+            "intermediate_size": 256, "hidden_act": "quick_gelu",
             "rms_norm_eps": 1e-6, "vocab_size": 1000,
             "max_position_embeddings": 512,
             "layer_types": ["full_attention", "full_attention"]
@@ -344,15 +344,15 @@ public class HfTests
         """);
 
         var facts = ModelConfig.ReadTextFacts(configPath);
-        Assert.Equal("relu", facts.HiddenAct);
+        Assert.Equal("quick_gelu", facts.HiddenAct);
 
         SyntheticGemma4Checkpoint.WriteMinimalSafetensors(dir.Path);
 
         using var inventory = HfInventory.Open(dir.Path);
-        // relu is not a judged activation — ArchMapper must refuse it.
+        // quick_gelu has no runtime kernel — ArchMapper must refuse it by name.
         var ex = Assert.Throws<ModelConfigException>(() =>
             ArchMapper.MapToContainerSpec("test", facts, inventory, new ArchMapper.EncodeOptions()));
         Assert.Contains("hidden_act", ex.Message);
-        Assert.Contains("relu", ex.Message);
+        Assert.Contains("quick_gelu", ex.Message);
     }
 }

@@ -5,6 +5,10 @@
     <ProjectReference Include="..\Amql.Vindex3\Amql.Vindex3.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <EmbeddedResource Include="family-conventions.json" LogicalName="Amql.Hf.family-conventions.json" />
+  </ItemGroup>
+
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>

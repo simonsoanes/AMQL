@@ -1250,7 +1250,7 @@ public static class GgufConverter
     /// order. Returns null when the checkpoint ships none, which makes the
     /// GGUF completion-only rather than failing the conversion — a base model
     /// legitimately has no template.</summary>
-    private static string? LoadChatTemplate(string checkpointDir)
+    public static string? LoadChatTemplate(string checkpointDir)
     {
         var jinja = Path.Combine(checkpointDir, "chat_template.jinja");
         if (File.Exists(jinja))
@@ -1294,7 +1294,7 @@ public static class GgufConverter
     /// <c>model.vocab</c>; ignoring it truncates the vocabulary and leaves
     /// the table shorter than the ids the tokenizer hands out, which reads
     /// past the end of the embedding at load time.</summary>
-    private static TokenizerBlock LoadTokenizer(string tokenizerPath, int vocab)
+    public static TokenizerBlock LoadTokenizer(string tokenizerPath, int vocab)
     {
         if (!File.Exists(tokenizerPath))
         {
@@ -1401,7 +1401,7 @@ public static class GgufConverter
         return new TokenizerBlock(tokens, scores, types, merges.ToArray(), eos, pad);
     }
 
-    private sealed record TokenizerBlock(
+    public sealed record TokenizerBlock(
         string[] Tokens,
         float[]? Scores,
         uint[] Types,

@@ -46,6 +46,7 @@
     <None Update="fixtures\qwen-cls-tiny\**" CopyToOutputDirectory="PreserveNewest" />
     <None Update="fixtures\gated_delta_golden.json" CopyToOutputDirectory="PreserveNewest" />
     <None Update="fixtures\qwen-lm-tiny\**" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="fixtures\arch-zoo\**" CopyToOutputDirectory="PreserveNewest" />
     <None Update="fixtures\qwen35_chat_template.jinja" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 

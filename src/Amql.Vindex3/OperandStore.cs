@@ -134,6 +134,17 @@ public sealed class OperandStore : IDisposable
         return OpenSegment(path).Contains(tensorName);
     }
 
+    /// <summary>Every tensor name the object's segment carries (header only).</summary>
+    public IReadOnlyList<string> TensorNames(string objectId)
+    {
+        ThrowIfDisposed();
+        if (SegmentPathFor(objectId) is not { } path)
+        {
+            return Array.Empty<string>();
+        }
+        return OpenSegment(path).Header.Tensors.Select(t => t.Name).ToList();
+    }
+
     public OperandResolution Resolve(OperandRef operand) => Resolve(operand.ObjectId, operand.TensorName);
 
     /// <summary>Resolves an operand widened to f32 in a single buffer.

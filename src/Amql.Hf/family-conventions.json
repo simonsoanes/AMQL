@@ -1,0 +1,32 @@
+{
+  "_comment": [
+    "Modelling conventions a family's checkpoint does not state anywhere: not in config.json, not in its tensor names or shapes.",
+    "Everything that IS stated is read from the checkpoint; this file only fills the residue, keyed by model_type.",
+    "Each fact applied is recorded in the container's surface provenance, so it is never a silent guess.",
+    "Extend support to a new family that follows a known convention by adding one entry here; no code changes.",
+    "Set AMQL_CONVENTIONS to a JSON file of the same shape to add or override entries without rebuilding.",
+    "Facts:",
+    "  norm_weight_offset  1 when RMSNorm multiplies by (1 + w) rather than w (zero-centred norm weights).",
+    "  embed_scale         'sqrt_hidden' when embeddings are multiplied by sqrt(hidden_size).",
+    "  rope_interleaved    true when rotary pairs are adjacent dims (2i, 2i+1), the GPT-J layout.",
+    "  partial_rotary      'zero_tail' when a partial rotary keeps the full head dim's frequency progression and zeroes the tail.",
+    "  rope_on_full_layers false when, in a stack with sliding layers, the full-attention layers use no position encoding."
+  ],
+  "gemma": { "norm_weight_offset": 1, "embed_scale": "sqrt_hidden" },
+  "gemma2": { "norm_weight_offset": 1, "embed_scale": "sqrt_hidden" },
+  "gemma3": { "norm_weight_offset": 1, "embed_scale": "sqrt_hidden" },
+  "gemma3_text": { "norm_weight_offset": 1, "embed_scale": "sqrt_hidden" },
+  "qwen3_5": { "norm_weight_offset": 1 },
+  "qwen3_5_text": { "norm_weight_offset": 1 },
+  "qwen3_5_moe": { "norm_weight_offset": 1 },
+  "qwen3_5_moe_text": { "norm_weight_offset": 1 },
+  "qwen3_next": { "norm_weight_offset": 1 },
+  "cohere": { "rope_interleaved": true },
+  "cohere2": { "rope_interleaved": true },
+  "glm": { "rope_interleaved": true },
+  "glm4": { "rope_interleaved": true },
+  "helium": { "rope_interleaved": true },
+  "exaone4": { "rope_on_full_layers": false },
+  "lfm3": { "partial_rotary": "zero_tail" },
+  "lfm3_vl": { "partial_rotary": "zero_tail" }
+}

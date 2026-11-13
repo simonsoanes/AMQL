@@ -112,6 +112,11 @@ public sealed class AttentionSurface
     /// the same tensors give a different (and wrong) distribution.</summary>
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
     public bool Bidirectional { get; init; }
+
+    /// <summary>Rotary pairs are adjacent dims (2i, 2i+1) — the GPT-J layout
+    /// Cohere and GLM use — rather than the two halves of the rotary window.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool RopeInterleaved { get; init; }
 }
 
 // ── Masked diffusion surface ─────────────────────────────────────────────
@@ -458,4 +463,21 @@ public sealed class ExecutionSurface
 
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public DiffusionSurface? Diffusion { get; init; }
+
+    /// <summary>Which stack tensor plays which role, judged on import (see
+    /// <see cref="TensorRoles"/>). Absent on containers written before roles
+    /// existed; the planner then judges the map from the segment itself.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public LayerRoleMap? Roles { get; init; }
+
+    /// <summary>Attention and FFN read the same normalised input and both add
+    /// to the residual (<c>x + attn(n(x)) + ffn(n(x))</c>), as in Cohere and
+    /// GPT-J, instead of running one after the other.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool ParallelResidual { get; init; }
+
+    /// <summary>Where each fact the importer could not read from the checkpoint
+    /// came from (a family convention, by name), so a guess is never silent.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public Dictionary<string, string>? Provenance { get; init; }
 }

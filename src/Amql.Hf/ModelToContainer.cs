@@ -21,6 +21,9 @@ public sealed record EncodeReport(
 /// </summary>
 public static class ModelToContainer
 {
+    /// <summary>The source checkpoint's config.json, kept in the container root.</summary>
+    public const string SourceConfigFile = "source_config.json";
+
     public static EncodeReport Encode(
         string modelDir,
         string containerOut,
@@ -52,6 +55,15 @@ public static class ModelToContainer
         // loses its image/video processor settings — neither is recoverable
         // from the tensors, so the container is the only place to keep them.
         var ancillaryCopied = HfAncillaryFiles.CopyInto(modelDir, containerOut);
+
+        // The config itself rides along too, as the base an export overwrites
+        // with the container's judged facts: keys this build has no notion of
+        // survive the round trip instead of being dropped.
+        if (facts.SourceConfig is { } sourceConfig)
+        {
+            File.WriteAllText(Path.Combine(containerOut, SourceConfigFile), sourceConfig.GetRawText());
+            ancillaryCopied = ancillaryCopied.Append(SourceConfigFile).ToList();
+        }
 
         // A classifier's top-level facts, mirrored beside the graph (which is
         // the authority) so they can be read without parsing it.

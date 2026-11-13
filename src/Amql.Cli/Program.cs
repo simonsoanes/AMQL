@@ -1317,6 +1317,32 @@ internal static partial class Program
         var containerDir = Arg(args, 0) ?? throw new CliException(
             "export requires a container directory, e.g. 'amql-cli export <container-dir> --out <checkpoint-dir>'");
         string outDir = OptionValue(args, "--out") ?? throw new CliException("export requires '--out <checkpoint-dir>'");
+        string format = OptionValue(args, "--format") ?? "hf";
+        if (format == "gguf")
+        {
+            if (OptionValue(args, "--patch") is not null || OptionValue(args, "--quant") is not null)
+            {
+                throw new CliException("--format gguf writes the container's own weights at their stored precision — --patch and --quant do not apply");
+            }
+            using var ggufContainer = Vindex3Container.Open(containerDir);
+            var gguf = GgufExport.Export(ggufContainer, outDir);
+            Console.WriteLine($"exported:  {gguf.OutFile}");
+            Console.WriteLine($"arch:       {gguf.Architecture}");
+            Console.WriteLine($"tensors:    {gguf.Tensors}  ({FormatBytes(gguf.Bytes)})");
+            foreach (var note in gguf.Notes)
+            {
+                Console.WriteLine($"note:       {note}");
+            }
+            return 0;
+        }
+        if (format == "onnx")
+        {
+            return ExportOnnx(args);
+        }
+        if (format != "hf")
+        {
+            throw new CliException($"unknown export format '{format}' — this build writes 'hf' (safetensors + config.json, default), 'gguf' or 'onnx'");
+        }
         string quant = OptionValue(args, "--quant") ?? "none";
         if (quant != "none" && quant != "mxfp4" && quant != "ptq1" && quant != "pq2")
         {
@@ -2682,7 +2708,10 @@ internal static partial class Program
                               --out <patch.safetensors>
               amql-cli save-lora <patch.safetensors> --out <lora-dir>
                               [--rank 8] [--alpha 16] [--container <container-dir>]
-              amql-cli export <container-dir> --out <checkpoint-dir>
+              amql-cli export <container-dir> --out <checkpoint-dir|file.gguf|file.onnx>
+                              [--format hf|gguf|onnx]   hf (default): safetensors + the
+                              checkpoint's own config with judged facts written over it;
+                              gguf: llama.cpp layout chosen from the model's properties
                               [--patch <patch.safetensors>] [--quant mxfp4]
                               [--arch qwen4-next]
               amql-cli to-gguf <checkpoint-dir|container-dir> --out <file.gguf> [--force]

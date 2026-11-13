@@ -21,7 +21,7 @@ public static class Rope
     /// <see cref="PositionNone"/> this is a no-op.
     /// </summary>
     public static void Apply(Tensor2D x, int numHeads, int headDim,
-        PositionPolicy positionPolicy, ReadOnlySpan<int> positions)
+        PositionPolicy positionPolicy, ReadOnlySpan<int> positions, bool interleaved = false)
     {
         int rotaryWidth;
         double theta;
@@ -29,7 +29,7 @@ public static class Rope
         {
             case PositionNone:
                 return;
-            case PositionZeroTailRope zeroTail:
+            case PositionZeroTailRope zeroTail when !interleaved:
                 ApplyZeroTail(x, numHeads, headDim, zeroTail, positions);
                 return;
             case PositionRope rope:
@@ -40,6 +40,8 @@ public static class Rope
                 rotaryWidth = partial.RotaryWidth(headDim);
                 theta = partial.Theta;
                 break;
+            case PositionZeroTailRope:
+                throw new UnsupportedOperatorException("zero-tail rope with interleaved pairs has no managed implementation");
             default:
                 throw new UnsupportedOperatorException(
                     $"position policy '{((PositionUnresolved)positionPolicy).Kind}' has no managed rotary implementation");
@@ -65,11 +67,12 @@ public static class Rope
             {
                 int head = h * headDim;
                 // The reference pairs the two halves of the rotary window:
-                // dims i and i + rotaryWidth/2 rotate together.
+                // dims i and i + rotaryWidth/2 rotate together. Interleaved
+                // (GPT-J layout) pairs neighbours: 2i and 2i + 1.
                 for (int i = 0; i < pairCount; i++)
                 {
-                    int a = rowStart + head + i;
-                    int b = a + pairCount;
+                    int a = interleaved ? rowStart + head + 2 * i : rowStart + head + i;
+                    int b = interleaved ? a + 1 : a + pairCount;
                     double angle = position * invFreq[i];
                     double cos = Math.Cos(angle);
                     double sin = Math.Sin(angle);

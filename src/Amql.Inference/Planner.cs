@@ -79,8 +79,6 @@ public static class Planner
                 $"component '{componentId}': diffusion objective '{other.Objective}' has no managed implementation");
         }
 
-        bool prePost = normSurface.Placement == NormPlacement.PrePost;
-        bool sandwich = normSurface.Placement == NormPlacement.Sandwich;
         if (normSurface.Post is null)
         {
             throw new ContainerException(
@@ -88,10 +86,15 @@ public static class Planner
                 "and this build refuses to fabricate one");
         }
 
+        // Which tensor plays which role: judged on import and persisted; a
+        // container from before roles existed has its map judged here from
+        // the segment's own names — the same rules either way.
+        var roles = surface.Roles ?? TensorRoles.Judge(store.TensorNames(stack.Id));
+
         var layers = new List<LayerPlan>(component.NumLayers);
         for (int l = 0; l < component.NumLayers; l++)
         {
-            layers.Add(BuildLayer(store, stack.Id, l, policies[l], surface, ffnSurface, normSurface, prePost, sandwich, component.HiddenSize));
+            layers.Add(BuildLayer(store, stack.Id, l, policies[l], surface, ffnSurface, normSurface, roles, component.HiddenSize));
         }
 
         return new ComponentOpPlan
@@ -99,7 +102,8 @@ public static class Planner
             ComponentId = componentId,
             Embedding = BuildEmbedding(store, embedObj, surface, component.HiddenSize),
             Layers = layers,
-            FinalNorm = BindNorm(store, finalNormObj.Id, "weight", normSurface.FinalNorm, component.HiddenSize),
+            FinalNorm = NormOp.From(Bound(store, finalNormObj.Id, "weight"), normSurface.FinalNorm, component.HiddenSize,
+                store.ContainsTensor(finalNormObj.Id, "bias") ? new OperandRef(finalNormObj.Id, "bias") : null),
             Output = BuildOutput(store, embedObj, headObj, surface, component.HiddenSize),
             ResidualScale = surface.ResidualScale ?? 1.0,
             Diffusion = surface.Diffusion is { } diffusion
@@ -116,8 +120,7 @@ public static class Planner
         ExecutionSurface surface,
         FfnSurface ffnSurface,
         NormSurface normSurface,
-        bool prePost,
-        bool sandwich,
+        LayerRoleMap roles,
         int hiddenSize)
     {
         bool linear = policy.Operator == LayerOperators.LinearAttention;
@@ -142,60 +145,60 @@ public static class Planner
                 $"layer {layer}: expert gate policy '{ffnSurface.GatePolicy.GetType().Name}' has no managed implementation");
         }
 
-        // ── norm sites + FFN (shared by both operator families) ──────────
-        // Try canonical Qwen names first, then LFM2.5 variants
-        string preAttnName = TryResolve(store, stackId, layer,
-            "input_layernorm.weight", "operator_norm.weight")
-            ?? throw new UnsupportedOperatorException($"layer {layer}: no pre-attention norm found");
-        string postAttnName = TryResolve(store, stackId, layer,
-            "post_attention_layernorm.weight", "ffn_norm.weight")
-            ?? throw new UnsupportedOperatorException($"layer {layer}: no post-attention norm found");
-        Require(store, stackId, preAttnName, layer, "pre-attention norm");
-
-        NormOp? preAttention = BindNorm(store, stackId, preAttnName, normSurface.Pre, hiddenSize);
-        NormOp? postAttention = null;
-        NormOp? preFfn;
-        NormOp? postFfn = null;
-        if (sandwich)
+        // ── norm sites, by role: which exist is the block's shape ─────────
+        // (pre-only, sandwich, post-only); the pre-attention site reads the
+        // pre spec, every other site the post spec.
+        NormOp? preAttention = BindRoleNorm(store, stackId, layer, roles, TensorRoles.AttnIn, normSurface.Pre, hiddenSize);
+        NormOp? postAttention = BindRoleNorm(store, stackId, layer, roles, TensorRoles.AttnOut, normSurface.Post!, hiddenSize);
+        NormOp? preFfn = BindRoleNorm(store, stackId, layer, roles, TensorRoles.FfnIn, normSurface.Post!, hiddenSize);
+        NormOp? postFfn = BindRoleNorm(store, stackId, layer, roles, TensorRoles.FfnOut, normSurface.Post!, hiddenSize);
+        if (preAttention is null && postAttention is null && preFfn is null && postFfn is null)
         {
-            // LFM3: operator_norm → mixer → post_operator_norm → +residual,
-            // ffn_norm → FFN → post_ffn_norm → +residual.
-            string postOpName = $"{layer}.post_operator_norm.weight";
-            string postFfnName = $"{layer}.post_ffn_norm.weight";
-            Require(store, stackId, postOpName, layer, "post-operator norm");
-            Require(store, stackId, postFfnName, layer, "post-ffn norm");
-            postAttention = BindNorm(store, stackId, postOpName, normSurface.Post!, hiddenSize);
-            preFfn = BindNorm(store, stackId, postAttnName, normSurface.Post!, hiddenSize);
-            postFfn = BindNorm(store, stackId, postFfnName, normSurface.Post!, hiddenSize);
+            throw new UnsupportedOperatorException($"layer {layer}: no norm of any role found — refusing an unnormalised block");
         }
-        else if (prePost)
+        if (surface.ParallelResidual && (preAttention is null || preFfn is not null || postAttention is not null))
         {
-            Require(store, stackId, postAttnName, layer, "post-attention norm");
-            postAttention = BindNorm(store, stackId, postAttnName, normSurface.Post!, hiddenSize);
-            string preFfnName = $"{layer}.mlp.pre_layernorm.weight";
-            string postFfnName = $"{layer}.mlp.post_layernorm.weight";
-            Require(store, stackId, preFfnName, layer, "pre-ffn norm");
-            Require(store, stackId, postFfnName, layer, "post-ffn norm");
-            preFfn = BindNorm(store, stackId, preFfnName, normSurface.Post!, hiddenSize);
-            postFfn = BindNorm(store, stackId, postFfnName, normSurface.Post!, hiddenSize);
-        }
-        else
-        {
-            preFfn = BindNorm(store, stackId, postAttnName, normSurface.Post!, hiddenSize);
+            throw new ContainerException(
+                $"layer {layer}: a parallel block reads one input norm, but the layer's norms do not have that shape");
         }
 
         // ── the token mixer ─────────────────────────────────────────────
         return new LayerPlan
         {
-            Attention = softmax ? BuildSoftmaxAttention(store, stackId, layer, policy, surface, normSurface) : null,
+            Attention = softmax ? BuildSoftmaxAttention(store, stackId, layer, policy, surface, normSurface, roles) : null,
             LinearAttention = linear ? BuildLinearAttention(store, stackId, layer, surface, normSurface, hiddenSize) : null,
             Conv = conv ? BuildConv(store, stackId, layer, surface, hiddenSize) : null,
             PreAttentionNorm = preAttention,
             PostAttentionNorm = postAttention,
             PreFfnNorm = preFfn,
             PostFfnNorm = postFfn,
-            Ffn = BuildFfn(store, stackId, layer, ffnSurface, hiddenSize),
+            Ffn = BuildFfn(store, stackId, layer, ffnSurface, roles, hiddenSize),
+            ParallelResidual = surface.ParallelResidual,
         };
+    }
+
+    /// <summary>The layer-qualified tensor for a role, when this layer has it.</summary>
+    private static string? RoleTensor(OperandStore store, string stackId, int layer, LayerRoleMap roles, string role, string part = "weight")
+    {
+        if (roles.Name(role, part) is not { } name)
+        {
+            return null;
+        }
+        string full = $"{layer}.{name}";
+        return store.ContainsTensor(stackId, full) ? full : null;
+    }
+
+    private static OperandRef? RoleOperand(OperandStore store, string stackId, int layer, LayerRoleMap roles, string role, string part = "weight") =>
+        RoleTensor(store, stackId, layer, roles, role, part) is { } name ? new OperandRef(stackId, name) : null;
+
+    private static NormOp? BindRoleNorm(OperandStore store, string stackId, int layer, LayerRoleMap roles, string role, NormSpec spec, int width)
+    {
+        if (RoleTensor(store, stackId, layer, roles, role) is not { } weight)
+        {
+            return null;
+        }
+        return NormOp.From(new OperandRef(stackId, weight), spec, width,
+            RoleOperand(store, stackId, layer, roles, role, "bias"));
     }
 
     private static AttentionOp BuildSoftmaxAttention(
@@ -204,7 +207,8 @@ public static class Planner
         int layer,
         AttentionLayerPolicy policy,
         ExecutionSurface surface,
-        NormSurface normSurface)
+        NormSurface normSurface,
+        LayerRoleMap roles)
     {
         var attnSurface = surface.Attention!;
         if (attnSurface.Sinks is not null)
@@ -228,7 +232,13 @@ public static class Planner
             headGate = new OperandRef(stackId, gateName);
         }
 
-        var op = new AttentionOp
+        OperandRef Projection(string role) =>
+            RoleOperand(store, stackId, layer, roles, role)
+            ?? throw new ContainerException(
+                $"operand closure: layer {layer}: a softmax layer implies the '{role}' projection but the segment carries none " +
+                $"(looked for '{roles.Name(role) ?? string.Join("' / '", TensorRoles.Aliases[role].Select(s => s + ".weight"))}')");
+
+        return new AttentionOp
         {
             NumQHeads = attnSurface.NumQHeads,
             NumKvHeads = attnSurface.NumKvHeads,
@@ -238,6 +248,7 @@ public static class Planner
             Window = policy.Window,
             Causal = !attnSurface.Bidirectional,
             Position = policy.Position,
+            RopeInterleaved = attnSurface.RopeInterleaved,
             VFromK = policy.VFromK,
             OutputGate = attnSurface.OutputGate is not null && !perHeadGate,
             HeadGate = headGate,
@@ -245,59 +256,54 @@ public static class Planner
             QkNormWeightOffset = attnSurface.QkNormWeightOffset,
             ParameterFreeQkNorm = attnSurface.ParameterFreeQkNorm,
             ParameterFreeQkNormEps = normSurface.Pre.Eps,
-            QNorm = BindOptionalQkNorm(store, stackId, layer, "q_norm", attnSurface, normSurface),
-            KNorm = BindOptionalQkNorm(store, stackId, layer, "k_norm", attnSurface, normSurface),
-            QProj = new OperandRef(stackId, TryResolve(store, stackId, layer, "self_attn.q_proj.weight") ?? $"{layer}.self_attn.q_proj.weight"),
-            KProj = new OperandRef(stackId, TryResolve(store, stackId, layer, "self_attn.k_proj.weight") ?? $"{layer}.self_attn.k_proj.weight"),
-            VProj = new OperandRef(stackId, TryResolve(store, stackId, layer, "self_attn.v_proj.weight") ?? $"{layer}.self_attn.v_proj.weight"),
-            OProj = new OperandRef(stackId, TryResolve(store, stackId, layer, "self_attn.o_proj.weight", "self_attn.out_proj.weight") ?? $"{layer}.self_attn.o_proj.weight"),
+            QNorm = BindOptionalQkNorm(store, stackId, layer, roles, TensorRoles.QNorm, attnSurface, normSurface),
+            KNorm = BindOptionalQkNorm(store, stackId, layer, roles, TensorRoles.KNorm, attnSurface, normSurface),
+            QProj = Projection(TensorRoles.Q),
+            KProj = Projection(TensorRoles.K),
+            VProj = Projection(TensorRoles.V),
+            OProj = Projection(TensorRoles.O),
+            QBias = RoleOperand(store, stackId, layer, roles, TensorRoles.Q, "bias"),
+            KBias = RoleOperand(store, stackId, layer, roles, TensorRoles.K, "bias"),
+            VBias = RoleOperand(store, stackId, layer, roles, TensorRoles.V, "bias"),
+            OBias = RoleOperand(store, stackId, layer, roles, TensorRoles.O, "bias"),
         };
-        string qName = TryResolve(store, stackId, layer, "self_attn.q_proj.weight") ?? $"{layer}.self_attn.q_proj.weight";
-        string kName = TryResolve(store, stackId, layer, "self_attn.k_proj.weight") ?? $"{layer}.self_attn.k_proj.weight";
-        string vName = TryResolve(store, stackId, layer, "self_attn.v_proj.weight") ?? $"{layer}.self_attn.v_proj.weight";
-        string oName = TryResolve(store, stackId, layer, "self_attn.o_proj.weight", "self_attn.out_proj.weight") ?? $"{layer}.self_attn.o_proj.weight";
-        Require(store, stackId, qName, layer, "attention (q_proj)");
-        Require(store, stackId, kName, layer, "attention (k_proj)");
-        Require(store, stackId, vName, layer, "attention (v_proj)");
-        Require(store, stackId, oName, layer, "attention (o_proj)");
-        return op;
     }
 
     /// <summary>Binds a weighted QK norm operand when the learned tensor
     /// exists. The pair is symmetric in the reference — one without the
-    /// other is a defect this build refuses.</summary>
+    /// other is a defect this build refuses. Its width — one head, or the
+    /// whole projection (OLMo 2) — is read from the tensor's shape.</summary>
     private static NormOp? BindOptionalQkNorm(
-        OperandStore store, string stackId, int layer, string kind,
+        OperandStore store, string stackId, int layer, LayerRoleMap roles, string role,
         AttentionSurface attnSurface, NormSurface normSurface)
     {
-        string name = $"{layer}.self_attn.{kind}.weight";
-        string other = $"{layer}.self_attn.{(kind == "q_norm" ? "k_norm" : "q_norm")}.weight";
-        bool present = store.ContainsTensor(stackId, name);
-        bool otherPresent = store.ContainsTensor(stackId, other);
-        if (present != otherPresent)
+        string otherRole = role == TensorRoles.QNorm ? TensorRoles.KNorm : TensorRoles.QNorm;
+        string? name = RoleTensor(store, stackId, layer, roles, role);
+        string? other = RoleTensor(store, stackId, layer, roles, otherRole);
+        if ((name is null) != (other is null))
         {
             throw new ContainerException(
                 $"operand closure: layer {layer}: weighted QK norm pair is asymmetric " +
-                $"('{name}' present: {present}, '{other}' present: {otherPresent})");
+                $"('{role}' present: {name is not null}, '{otherRole}' present: {other is not null})");
         }
-        if (!present)
+        if (name is null)
         {
             return null;
         }
-        Require(store, stackId, name, layer, $"weighted QK norm ({kind})");
-        var spec = new NormSpec
+        int width = checked((int)store.ShapeOf(stackId, name)[0]);
+        int heads = role == TensorRoles.QNorm ? attnSurface.NumQHeads : attnSurface.NumKvHeads;
+        if (width != attnSurface.HeadDim && width != heads * attnSurface.HeadDim)
         {
-            Kind = NormType.RmsNorm,
-            Eps = normSurface.Pre.Eps,
-            WeightOffset = attnSurface.QkNormWeightOffset,
-        };
+            throw new ContainerException(
+                $"layer {layer}: '{name}' has width {width} — neither one head ({attnSurface.HeadDim}) nor the projection ({heads * attnSurface.HeadDim})");
+        }
         return new NormOp
         {
             Weight = new OperandRef(stackId, name),
-            Kind = spec.Kind,
-            Eps = spec.Eps,
-            WeightOffset = spec.WeightOffset,
-            Width = attnSurface.HeadDim, // per-head, one weight set shared by all heads
+            Kind = NormType.RmsNorm,
+            Eps = normSurface.Pre.Eps,
+            WeightOffset = attnSurface.QkNormWeightOffset,
+            Width = width,
         };
     }
 
@@ -412,7 +418,7 @@ public static class Planner
         };
     }
 
-    private static LayerFfn? BuildFfn(OperandStore store, string stackId, int layer, FfnSurface ffnSurface, int hiddenSize)
+    private static LayerFfn? BuildFfn(OperandStore store, string stackId, int layer, FfnSurface ffnSurface, LayerRoleMap roles, int hiddenSize)
     {
         if (ffnSurface.Moe is { } moe)
         {
@@ -439,27 +445,29 @@ public static class Planner
             return new LayerFfn { Routed = routed };
         }
 
-        bool gated = ffnSurface.FfnType == FfnType.Gated;
-        // Try canonical Qwen names first, then LFM2.5 variants
-        string gateName = gated
-            ? TryResolve(store, stackId, layer, "mlp.gate_proj.weight", "feed_forward.w1.weight")
-                ?? throw new UnsupportedOperatorException($"layer {layer}: no FFN gate found")
-            : null!;
-        string upName = TryResolve(store, stackId, layer, "mlp.up_proj.weight", "feed_forward.w3.weight")
-            ?? throw new UnsupportedOperatorException($"layer {layer}: no FFN up found");
-        string downName = TryResolve(store, stackId, layer, "mlp.down_proj.weight", "feed_forward.w2.weight")
-            ?? throw new UnsupportedOperatorException($"layer {layer}: no FFN down found");
-
-        if (gated) Require(store, stackId, gateName, layer, "ffn gate");
-        Require(store, stackId, upName, layer, "ffn up");
-        Require(store, stackId, downName, layer, "ffn down");
+        // Gated or plain is the checkpoint's shape: a gate projection exists or not.
+        var gate = RoleOperand(store, stackId, layer, roles, TensorRoles.Gate);
+        var up = RoleOperand(store, stackId, layer, roles, TensorRoles.Up);
+        var down = RoleOperand(store, stackId, layer, roles, TensorRoles.Down);
+        if (up is null && down is null && gate is null)
+        {
+            return null; // a layer with no FFN at all
+        }
+        if (up is null || down is null)
+        {
+            throw new UnsupportedOperatorException(
+                $"layer {layer}: the FFN is incomplete (up: {up is not null}, down: {down is not null})");
+        }
         return new LayerFfn
         {
             Dense = new DenseFfnOp
             {
-                Gate = gated ? new OperandRef(stackId, gateName) : null,
-                Up = new OperandRef(stackId, upName),
-                Down = new OperandRef(stackId, downName),
+                Gate = gate,
+                Up = up,
+                Down = down,
+                GateBias = RoleOperand(store, stackId, layer, roles, TensorRoles.Gate, "bias"),
+                UpBias = RoleOperand(store, stackId, layer, roles, TensorRoles.Up, "bias"),
+                DownBias = RoleOperand(store, stackId, layer, roles, TensorRoles.Down, "bias"),
                 Activation = ffnSurface.Activation,
                 IntermediateSize = ffnSurface.IntermediateSize,
                 HiddenSize = hiddenSize,
@@ -519,10 +527,10 @@ public static class Planner
         };
     }
 
-    private static NormOp BindNorm(OperandStore store, string objectId, string tensorName, NormSpec spec, int width)
+    private static OperandRef Bound(OperandStore store, string objectId, string tensorName)
     {
-        Require(store, objectId, tensorName, 0, "norm");
-        return NormOp.From(new OperandRef(objectId, tensorName), spec, width);
+        Require(store, objectId, tensorName, -1, "norm");
+        return new OperandRef(objectId, tensorName);
     }
 
     private static void Require(OperandStore store, string objectId, string tensorName, int layer, string what)
@@ -534,21 +542,5 @@ public static class Planner
                 $"operand closure: {layerLabel}surface implies '{objectId}/{tensorName}' ({what}) " +
                 "but the segment carries no such tensor");
         }
-    }
-
-    /// <summary>Tries multiple tensor name spellings and returns the first
-    /// that resolves. Used for cross-family compatibility (e.g., Qwen's
-    /// input_layernorm vs LFM2.5's operator_norm).</summary>
-    private static string? TryResolve(OperandStore store, string objectId, int layer, params string[] candidates)
-    {
-        foreach (var suffix in candidates)
-        {
-            string fullName = $"{layer}.{suffix}";
-            if (store.ContainsTensor(objectId, fullName))
-            {
-                return fullName;
-            }
-        }
-        return null;
     }
 }

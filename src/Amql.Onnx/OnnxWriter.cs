@@ -154,7 +154,10 @@ public static class OnnxWriter
         for (int i = 0; i < graph.Initializers.Count; i++)
         {
             offsets[i] = offset;
-            offset += graph.Initializers[i].RawData.Length;
+            if (!Inline(graph.Initializers[i]))
+            {
+                offset += graph.Initializers[i].RawData.Length;
+            }
         }
 
         using var fs = File.Create(path);
@@ -202,6 +205,8 @@ public static class OnnxWriter
     {
         foreach (var i in node.Inputs) w.String(1, i);
         foreach (var o in node.Outputs) w.String(2, o);
+        // A unique node name: graph optimisers derive fused-node names from it.
+        w.String(3, "node_" + node.Outputs[0]);
         w.String(4, node.OpType);
         foreach (var (name, value) in node.Attributes)
         {
@@ -229,6 +234,11 @@ public static class OnnxWriter
         }
     }
 
+    /// <summary>Small tensors (shape and index constants, scalars) stay in the
+    /// model file: shape inference has to read them, and runtimes do not load
+    /// external data for that.</summary>
+    private static bool Inline(OnnxInitializer init) => init.RawData.Length <= 1024;
+
     private static void WriteInitializer(ProtoWriter w, OnnxInitializer init,
         Stream? dataFile, string? dataFileName, long offset)
     {
@@ -236,7 +246,7 @@ public static class OnnxWriter
         w.Int32(2, init.DataType);
         w.String(8, init.Name);
 
-        if (dataFile is not null && dataFileName is not null)
+        if (dataFile is not null && dataFileName is not null && !Inline(init))
         {
             long length = init.RawData.Length;
             dataFile.Write(init.RawData);

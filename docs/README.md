@@ -5,6 +5,7 @@ Deeper technical reference for the VIndex3 model container format and AMQL's arc
 ## Contents
 
 - [VIndex3 Container Format](vindex3-overview.md) — The VINDEX3 specification: directory structure, `index.json` schema, `system_graph.json` semantic IR, segment file binary format, integrity model, and encoding support.
+- [Property-driven Model Support](property-driven-models.md) — How AMQL imports, runs and exports a model family it has no code for: tensor roles, config facts, the conventions table, the `hf` / `gguf` / `onnx` export formats, the 20-architecture zoo that measures it, and the limits.
 - [System Architecture](architecture.md) — Layered design, component responsibilities, data flow diagrams, execution surface, and key design decisions.
 - [Embedding Models — nomic-embed-text-v1.5](embedding-models-nomic-embed-text.md) — Ingesting encoder/embedding checkpoints into VIndex3, exporting an embedding model from any container, and the `embed` CLI command (task prefixes, Matryoshka truncation, mean pooling).
 - [Server — amql-server](server.md) — Serving containers over HTTP: TypeSafe `/v1/decisions`, OpenAI `/v1/embeddings`, `/v1/chat/completions` and `/v1/responses`, capability detection, routing, streaming, refusals, and how each was verified.

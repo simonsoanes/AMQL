@@ -14,7 +14,8 @@ public static class FfnKernel
     /// <summary>Dense FFN forward. When <c>gate</c> is null the FFN is the
     /// plain single-projection form.</summary>
     public static Tensor2D Dense(Tensor2D x, Tensor2D? gate, Tensor2D up, Tensor2D down,
-        Activation activation, bool gated)
+        Activation activation, bool gated,
+        float[]? gateBias = null, float[]? upBias = null, float[]? downBias = null)
     {
         var act = Activations.For(activation, gated);
         Tensor2D hidden;
@@ -39,6 +40,8 @@ public static class FfnKernel
             }
             var g = pair[0];
             var u = pair[1];
+            AddRowBias(g, gateBias);
+            AddRowBias(u, upBias);
             hidden = Tensor2D.Zeros(x.Rows, g.Cols);
             for (int r = 0; r < hidden.Rows; r++)
             {
@@ -51,6 +54,7 @@ public static class FfnKernel
         else
         {
             hidden = TensorOps.MatMulTransposedB(x, up);
+            AddRowBias(hidden, upBias);
             for (int r = 0; r < hidden.Rows; r++)
             {
                 for (int c = 0; c < hidden.Cols; c++)
@@ -59,7 +63,26 @@ public static class FfnKernel
                 }
             }
         }
-        return TensorOps.MatMulTransposedB(hidden, down);
+        var result = TensorOps.MatMulTransposedB(hidden, down);
+        AddRowBias(result, downBias);
+        return result;
+    }
+
+    /// <summary>Adds a per-column bias to every row, in place; no-op for null.</summary>
+    public static void AddRowBias(Tensor2D x, float[]? bias)
+    {
+        if (bias is null)
+        {
+            return;
+        }
+        for (int r = 0; r < x.Rows; r++)
+        {
+            var row = x.Row(r);
+            for (int c = 0; c < row.Length; c++)
+            {
+                row[c] += bias[c];
+            }
+        }
     }
 
     /// <summary>Routed MoE forward. <c>expertGate/Up/Down</c> are per-expert
