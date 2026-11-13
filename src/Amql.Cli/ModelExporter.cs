@@ -1099,22 +1099,28 @@ internal static class ExportConfig
     /// the stack.</summary>
     private static JsonNode? RopeParameters(PositionPolicy position) => position switch
     {
-        PositionRope rope => new JsonObject
+        PositionRope rope => Scaled(new JsonObject
         {
             ["rope_type"] = "default",
             ["rope_theta"] = rope.Theta,
-        },
-        PositionPartialRope partial => new JsonObject
+        }, rope.Scaling),
+        PositionPartialRope partial => Scaled(new JsonObject
         {
             ["rope_type"] = "default",
             ["rope_theta"] = partial.Theta,
             ["partial_rotary_factor"] = partial.RotaryFactor,
-        },
+        }, partial.Scaling),
         PositionNone => null,
         PositionUnresolved unresolved => throw new CliException(
             $"position policy '{unresolved.Kind}' is carried unjudged — cannot regenerate rope_parameters"),
         _ => throw new CliException("unsupported position policy — cannot regenerate rope_parameters"),
     };
+
+    private static JsonObject Scaled(JsonObject block, RopeScaling? scaling)
+    {
+        scaling?.WriteConfigKeys(block);
+        return block;
+    }
 
     private static long LinearField(JsonElement surface, string name)
     {

@@ -45,7 +45,12 @@ def rms(x, w):
 
 def rope(x, n):  # x [S, n*D]
     S = x.shape[0]; x = x.reshape(S, n, D).copy()
-    inv = 1.0 / theta ** (np.arange(0, D, 2) / D); ang = np.arange(S)[:, None] * inv[None]  # [S, D/2]
+    inv = 1.0 / theta ** (np.arange(0, D, 2) / D)
+    if val(f"{arch}.rope.scaling.type") == "linear":
+        inv = inv / val(f"{arch}.rope.scaling.factor")
+    if "rope_freqs.weight" in T:  # llama.cpp divides each pair's frequency by its factor
+        inv = inv / T["rope_freqs.weight"]
+    ang = np.arange(S)[:, None] * inv[None]  # [S, D/2]
     c, s = np.cos(ang)[:, None], np.sin(ang)[:, None]
     if neox:
         a, b = x[..., : D // 2].copy(), x[..., D // 2:].copy()

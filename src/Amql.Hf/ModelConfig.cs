@@ -119,6 +119,10 @@ public sealed record TextArchitectureFacts(
     /// or a sliding-window period) rather than leaving every layer implied full.</summary>
     public bool LayerTypesDeclared { get; init; }
 
+    /// <summary>Whether the config states <c>tie_word_embeddings</c> at all;
+    /// when it does not, the checkpoint's tensors decide (no head tensor = tied).</summary>
+    public bool TieDeclared { get; init; }
+
     /// <summary><c>use_sliding_window</c> when the config states it (Qwen2/3 set it
     /// false while still carrying a <c>sliding_window</c> size).</summary>
     public bool? UseSlidingWindow { get; init; }
@@ -333,7 +337,9 @@ public static class ModelConfig
                 HiddenAct: hiddenAct,
                 RmsNormEps: rmsNormEps,
                 VocabSize: Int(text, "vocab_size"),
-                TieWordEmbeddings: text.TryGetProperty("tie_word_embeddings", out var tie) && tie.GetBoolean(),
+                TieWordEmbeddings: (text.TryGetProperty("tie_word_embeddings", out var tie) ||
+                                    root.TryGetProperty("tie_word_embeddings", out tie)) &&
+                                   tie.ValueKind == JsonValueKind.True,
                 AttentionBias: text.TryGetProperty("attention_bias", out var ab) && ab.GetBoolean(),
                 AttentionOutputGate: text.TryGetProperty("attn_output_gate", out var og) && og.GetBoolean(),
                 MaxPositionEmbeddings: Long(text, "max_position_embeddings"),
@@ -370,6 +376,8 @@ public static class ModelConfig
                     : null,
                 MaskTokenId = ResolveMaskTokenId(root, Path.GetDirectoryName(Path.GetFullPath(configPath))!),
                 LayerTypesDeclared = layerTypesDeclared,
+                TieDeclared = text.TryGetProperty("tie_word_embeddings", out var td) && td.ValueKind is JsonValueKind.True or JsonValueKind.False ||
+                              root.TryGetProperty("tie_word_embeddings", out var rtd) && rtd.ValueKind is JsonValueKind.True or JsonValueKind.False,
                 UseSlidingWindow = text.TryGetProperty("use_sliding_window", out var usw) &&
                                    usw.ValueKind is JsonValueKind.True or JsonValueKind.False
                     ? usw.GetBoolean()
@@ -466,6 +474,23 @@ public static class ModelConfig
         if (text.TryGetProperty("rope_theta", out var theta) && theta.ValueKind == JsonValueKind.Number)
         {
             node["rope_theta"] = theta.GetDouble();
+        }
+        if (text.TryGetProperty("rope_local_base_freq", out var local) && local.ValueKind == JsonValueKind.Number)
+        {
+            // Older Gemma 3 configs: rope_theta and rope_scaling belong to the
+            // full-attention layers; the sliding layers rotate unscaled at
+            // rope_local_base_freq — transformers' own conversion, keyed by
+            // layer type so each layer resolves its own block.
+            var perType = new System.Text.Json.Nodes.JsonObject
+            {
+                ["full_attention"] = node,
+                ["sliding_attention"] = new System.Text.Json.Nodes.JsonObject
+                {
+                    ["rope_type"] = "default",
+                    ["rope_theta"] = local.GetDouble(),
+                },
+            };
+            return JsonDocument.Parse(perType.ToJsonString()).RootElement.Clone();
         }
         return JsonDocument.Parse(node.ToJsonString()).RootElement.Clone();
     }

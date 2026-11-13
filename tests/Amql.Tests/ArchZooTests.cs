@@ -90,9 +90,12 @@ public class ArchZooTests
     [InlineData("qwen3", "qwen3")]
     [InlineData("granite", "granite")]
     [InlineData("olmo2", "olmo2")]
-    [InlineData("gemma2", null)]
-    [InlineData("starcoder2", null)]
-    public void Gguf_Export_Chooses_Architecture_From_Properties(string family, string? arch)
+    [InlineData("llama-rope-linear", "llama")]
+    [InlineData("llama3-scaled", "llama")]
+    [InlineData("gemma2", null, "no llama.cpp architecture")]
+    [InlineData("starcoder2", null, "no llama.cpp architecture")]
+    [InlineData("qwen2-yarn", null, "rope scaling 'yarn'")]
+    public void Gguf_Export_Chooses_Architecture_From_Properties(string family, string? arch, string? refusal = null)
     {
         using var dir = new TempDir();
         string containerDir = Path.Combine(dir.Path, "c");
@@ -102,8 +105,8 @@ public class ArchZooTests
         using var container = Vindex3Container.Open(containerDir);
         if (arch is null)
         {
-            var refusal = Assert.ThrowsAny<Exception>(() => Amql.Cli.GgufExport.Export(container, gguf));
-            Assert.Contains("no llama.cpp architecture", refusal.Message);
+            var refused = Assert.ThrowsAny<Exception>(() => Amql.Cli.GgufExport.Export(container, gguf));
+            Assert.Contains(refusal!, refused.Message);
             return;
         }
         var report = Amql.Cli.GgufExport.Export(container, gguf);

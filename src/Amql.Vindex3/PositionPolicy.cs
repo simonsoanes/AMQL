@@ -34,6 +34,9 @@ public sealed class PositionNone : PositionPolicy
 public sealed class PositionRope : PositionPolicy
 {
     public double Theta { get; init; } = 10_000.0;
+
+    /// <summary>Frequency rescaling (linear, llama3, yarn); null is plain rope.</summary>
+    public RopeScaling? Scaling { get; init; }
 }
 
 /// <summary>
@@ -47,6 +50,9 @@ public sealed class PositionPartialRope : PositionPolicy
 {
     public double Theta { get; init; } = 10_000.0;
     public double RotaryFactor { get; init; } = 1.0;
+
+    /// <summary>Frequency rescaling over the rotary window; null is plain.</summary>
+    public RopeScaling? Scaling { get; init; }
 
     public int RotaryWidth(int headDim) => Math.Max(2, (int)(headDim * RotaryFactor));
 }
@@ -94,13 +100,13 @@ public sealed class PositionPolicyConverter : JsonConverter<PositionPolicy>
                 return new PositionNone();
             case "rope":
                 double theta = root.GetProperty("theta").GetDouble();
-                return new PositionRope { Theta = theta };
+                return new PositionRope { Theta = theta, Scaling = RopeScaling.Read(root) };
             case "partial_rope":
                 double partialTheta = root.GetProperty("theta").GetDouble();
                 double factor = root.TryGetProperty("rotary_factor", out var rf)
                     ? rf.GetDouble()
                     : throw new JsonException("partial_rope requires 'rotary_factor'");
-                return new PositionPartialRope { Theta = partialTheta, RotaryFactor = factor };
+                return new PositionPartialRope { Theta = partialTheta, RotaryFactor = factor, Scaling = RopeScaling.Read(root) };
             case "zero_tail_rope":
                 return new PositionZeroTailRope
                 {
@@ -128,6 +134,7 @@ public sealed class PositionPolicyConverter : JsonConverter<PositionPolicy>
                 writer.WriteStartObject();
                 writer.WriteString("kind", "rope");
                 writer.WriteNumber("theta", rope.Theta);
+                rope.Scaling?.Write(writer);
                 writer.WriteEndObject();
                 break;
             case PositionPartialRope partial:
@@ -135,6 +142,7 @@ public sealed class PositionPolicyConverter : JsonConverter<PositionPolicy>
                 writer.WriteString("kind", "partial_rope");
                 writer.WriteNumber("theta", partial.Theta);
                 writer.WriteNumber("rotary_factor", partial.RotaryFactor);
+                partial.Scaling?.Write(writer);
                 writer.WriteEndObject();
                 break;
             case PositionZeroTailRope zeroTail:

@@ -258,17 +258,18 @@ public static class OnnxExporter
         int d = attn.HeadDim;
         int width;
         double[] invFreq;
+        double attentionScale = 1.0;
         switch (attn.Position)
         {
             case PositionNone:
                 return x;
             case PositionRope rope:
                 width = d;
-                invFreq = Enumerable.Range(0, width / 2).Select(i => 1.0 / Math.Pow(rope.Theta, 2.0 * i / width)).ToArray();
+                (invFreq, attentionScale) = RopeScaling.Frequencies(rope.Theta, width, rope.Scaling);
                 break;
             case PositionPartialRope partial:
                 width = partial.RotaryWidth(d);
-                invFreq = Enumerable.Range(0, width / 2).Select(i => 1.0 / Math.Pow(partial.Theta, 2.0 * i / width)).ToArray();
+                (invFreq, attentionScale) = RopeScaling.Frequencies(partial.Theta, width, partial.Scaling);
                 break;
             case PositionZeroTailRope zeroTail when !attn.RopeInterleaved:
                 // Full-width half-split pairs; the tail frequencies are zero (identity).
@@ -284,6 +285,12 @@ public static class OnnxExporter
         string angles = g.Node("Mul", g.Node("Unsqueeze", new[] { posF, g.Int64s(1) }),
             g.Constant(invFreq.Select(f => (float)f).ToArray(), 1, half));
         string cos = g.Node("Cos", angles), sin = g.Node("Sin", angles);
+        if (attentionScale != 1.0)
+        {
+            // yarn's attention factor scales cos and sin alike.
+            cos = g.Node("Mul", cos, g.Float((float)attentionScale));
+            sin = g.Node("Mul", sin, g.Float((float)attentionScale));
+        }
         string rot = width == d ? x : g.Slice(x, 0, width, 3);
         string rest = width == d ? null! : g.Slice(x, width, d, 3);
         string rotated;

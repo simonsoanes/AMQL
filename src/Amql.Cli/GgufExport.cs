@@ -59,10 +59,39 @@ public static class GgufExport
 
         var first = plan.Layers[0].Attention!;
         int hidden = plan.HiddenSize;
-        var ropeTheta = plan.Layers.Select(l => l.Attention!.Position).OfType<PositionRope>().Select(p => p.Theta).Distinct().ToList();
+        var ropes = plan.Layers.Select(l => l.Attention!.Position).OfType<PositionRope>().ToList();
+        var ropeTheta = ropes.Select(p => p.Theta).Distinct().ToList();
         if (ropeTheta.Count > 1)
         {
             throw new CliException($"layers use {ropeTheta.Count} different rope bases — llama.cpp's '{arch}' has one");
+        }
+        // One rescaling for the whole stack, spelled the way llama.cpp reads it:
+        // linear as rope.scaling.*, llama3 as the rope_freqs divisor tensor
+        // (what convert_hf_to_gguf.py writes for Llama 3.1).
+        var scalings = ropes.Select(p => p.Scaling is null ? "none" : System.Text.Json.JsonSerializer.Serialize(p.Scaling)).Distinct().ToList();
+        if (scalings.Count > 1)
+        {
+            throw new CliException($"layers use {scalings.Count} different rope scalings — llama.cpp's '{arch}' has one");
+        }
+        var scaling = ropes.FirstOrDefault()?.Scaling;
+        float[]? ropeFreqs = null;
+        switch (scaling?.Type)
+        {
+            case null:
+                break;
+            case "linear":
+                break;
+            case "llama3" when arch == "llama":
+            {
+                var (baseFreq, _) = RopeScaling.Frequencies(ropeTheta[0], first.HeadDim, null);
+                var (scaled, _) = RopeScaling.Frequencies(ropeTheta[0], first.HeadDim, scaling);
+                ropeFreqs = baseFreq.Select((f, i) => (float)(f / scaled[i])).ToArray();
+                break;
+            }
+            default:
+                throw new CliException(
+                    $"rope scaling '{scaling.Type}' has no verified spelling for llama.cpp's '{arch}' in the generic GGUF export — " +
+                    "refusing rather than risk a mismatched rescale (linear: any arch; llama3: llama)");
         }
 
         using var stream = File.Create(outFile);
@@ -84,6 +113,11 @@ public static class GgufExport
         writer.Kv($"{arch}.rope.freq_base", GgufValue.Float32((float)(ropeTheta.FirstOrDefault() is var t and > 0 ? t : 10_000.0)));
         writer.Kv($"{arch}.rope.dimension_count", GgufValue.Uint32((uint)first.HeadDim));
         writer.Kv($"{arch}.vocab_size", GgufValue.Uint32((uint)head.VocabSize));
+        if (scaling is { Type: "linear" })
+        {
+            writer.Kv($"{arch}.rope.scaling.type", GgufValue.String("linear"));
+            writer.Kv($"{arch}.rope.scaling.factor", GgufValue.Float32((float)scaling.Factor));
+        }
         if (arch == "granite")
         {
             writer.Kv("granite.attention.scale", GgufValue.Float32((float)attention.ScoreScale));
@@ -95,7 +129,7 @@ public static class GgufExport
         WriteTokenizer(writer, container.Root, head.VocabSize, notes);
 
         // ── tensors, by role ────────────────────────────────────────────
-        var tensors = new List<(string Name, OperandRef Operand, long[] Shape, Func<float[], float[]>? Transform)>();
+        var tensors = new List<(string Name, OperandRef? Operand, long[] Shape, Func<float[], float[]>? Transform)>();
         void Add(string name, OperandRef? operand, Func<float[], long[], float[]>? transform = null)
         {
             if (operand is null)
@@ -140,10 +174,19 @@ public static class GgufExport
         {
             Add("output.weight", plan.Output.Projection);
         }
+        if (ropeFreqs is not null)
+        {
+            var freqs = ropeFreqs;
+            tensors.Add(("rope_freqs.weight", null, new long[] { freqs.Length }, _ => freqs));
+        }
 
         // Stored floats keep their precision; anything else widens to F32.
         var types = tensors.Select(t =>
         {
+            if (t.Operand is null)
+            {
+                return GgufType.F32;
+            }
             var dtype = store.Resolve(t.Operand).Dtype;
             return t.Transform is null && dtype is Dtype.F16 ? GgufType.F16
                 : t.Transform is null && dtype is Dtype.BF16 ? GgufType.BF16
@@ -160,14 +203,14 @@ public static class GgufExport
             var (_, operand, _, transform) = tensors[i];
             if (types[i] != GgufType.F32)
             {
-                foreach (var chunk in store.ReadPayloadChunks(operand.ObjectId, operand.TensorName))
+                foreach (var chunk in store.ReadPayloadChunks(operand!.ObjectId, operand.TensorName))
                 {
                     writer.Data.Write(chunk);
                 }
             }
             else
             {
-                var values = store.ResolveWidened(operand).Values;
+                var values = operand is null ? Array.Empty<float>() : store.ResolveWidened(operand).Values;
                 if (transform is not null)
                 {
                     values = transform(values);

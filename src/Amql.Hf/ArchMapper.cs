@@ -60,6 +60,8 @@ public static partial class ArchMapper
             throw new ModelConfigException(e.Message, e);
         }
         bool parallel = TensorRoles.IsParallelBlock(roles);
+        // Tied unless a head tensor exists, when the config does not say.
+        bool tied = facts.TieDeclared ? facts.TieWordEmbeddings : !HasOutputHead(inventory, prefix);
         bool gatedFfn = roles.Name(TensorRoles.Gate) is not null || facts.Moe is not null;
 
         // ── per-layer policy table ────────────────────────────────────────
@@ -192,7 +194,7 @@ public static partial class ArchMapper
             Head = new HeadSurface
             {
                 VocabSize = facts.VocabSize,
-                HeadReusesEmbedding = facts.TieWordEmbeddings,
+                HeadReusesEmbedding = tied,
                 // Granite's embedding_multiplier scales every looked-up row;
                 // Gemma's convention is sqrt(hidden_size).
                 EmbedScale = facts.EmbeddingMultiplier
@@ -255,7 +257,7 @@ public static partial class ArchMapper
         // lm_head tensor) or — as Qwen3.8 does — untied, with the 248k-row
         // lm_head named at the TOP level of the wrapper checkpoint, not
         // under the text prefix.
-        bool untied = !facts.TieWordEmbeddings;
+        bool untied = !tied;
         var objects = new List<LogicalObject>
         {
             TextObject("target.embedding", ObjectKind.Embedding, prefix, "embed_tokens", encoding),
@@ -591,7 +593,8 @@ public static partial class ArchMapper
         if (rope.ValueKind == JsonValueKind.Object && rope.TryGetProperty(layerType, out var block) &&
             block.ValueKind == JsonValueKind.Object)
         {
-            return RopeBlock(block, block.TryGetProperty("partial_rotary_factor", out var f) ? f.GetDouble() : 1.0, conventions);
+            return RopeBlock(block, block.TryGetProperty("partial_rotary_factor", out var f) ? f.GetDouble() : 1.0, conventions,
+                facts.MaxPositionEmbeddings);
         }
         return stackWide;
     }
@@ -599,21 +602,28 @@ public static partial class ArchMapper
     /// <summary>Judges one rope block (<c>rope_type</c>, <c>rope_theta</c>) at
     /// the given partial factor. A factor below 1 is served as the family's
     /// partial-rotary convention.</summary>
-    private static PositionPolicy RopeBlock(JsonElement block, double factor, FamilyConventions conventions)
+    private static PositionPolicy RopeBlock(JsonElement block, double factor, FamilyConventions conventions, long maxPositions)
     {
         string ropeType = block.TryGetProperty("rope_type", out var rt) ? rt.GetString() ?? "default" : "default";
+        RopeScaling? scaling = null;
         if (ropeType != "default")
         {
-            return new PositionUnresolved { Kind = $"rope_scaling({ropeType})", Payload = block.Clone() };
+            // linear, llama3 and yarn are served; anything else (dynamic,
+            // longrope, mrope…) is carried verbatim and refused by name.
+            scaling = RopeScaling.FromRopeBlock(block, maxPositions);
+            if (scaling is null || (factor < 1.0 && conventions.ZeroTailPartialRotary))
+            {
+                return new PositionUnresolved { Kind = $"rope_scaling({ropeType})", Payload = block.Clone() };
+            }
         }
         double theta = block.TryGetProperty("rope_theta", out var t) ? t.GetDouble() : 10_000.0;
         if (factor < 1.0)
         {
             return conventions.ZeroTailPartialRotary
                 ? new PositionZeroTailRope { Theta = theta, RotaryFactor = factor }
-                : new PositionPartialRope { Theta = theta, RotaryFactor = factor };
+                : new PositionPartialRope { Theta = theta, RotaryFactor = factor, Scaling = scaling };
         }
-        return PositionPolicy.CreateRope(theta);
+        return new PositionRope { Theta = theta, Scaling = scaling };
     }
 
     /// <summary>Judges whether the persisted rope facts are the served plain
@@ -632,7 +642,7 @@ public static partial class ArchMapper
         }
         // Text-only MRoPE carries identical positions across the streams,
         // which collapses to standard rotary over the partial width.
-        return RopeBlock(rope, facts.PartialRotaryFactor, conventions);
+        return RopeBlock(rope, facts.PartialRotaryFactor, conventions, facts.MaxPositionEmbeddings);
     }
 
     /// <summary>Judges the persisted <c>hidden_act</c> string against the
@@ -663,6 +673,22 @@ public static partial class ArchMapper
         if (inventory.CountUnder("encoder.layers.") > 0)
         {
             return "encoder";
+        }
+        // Any other wrapper layout (older multimodal checkpoints keep the text
+        // stack under "language_model.model"): the stack is whatever prefix
+        // owns the most "<prefix>.layers.N." tensors, towers and drafters aside.
+        var stacks = inventory.TensorNames
+            .Select(n => System.Text.RegularExpressions.Regex.Match(n, @"^(.+?)\.layers\.\d+\."))
+            .Where(m => m.Success)
+            .Select(m => m.Groups[1].Value)
+            .Where(p => !p.Contains("vision", StringComparison.Ordinal) && !p.Contains("visual", StringComparison.Ordinal) &&
+                        !p.StartsWith("mtp", StringComparison.Ordinal))
+            .GroupBy(p => p)
+            .OrderByDescending(g => g.Count())
+            .FirstOrDefault();
+        if (stacks is not null)
+        {
+            return stacks.Key;
         }
         throw new ModelConfigException(
             "no '*.*.layers.N' decoder tensors found in the inventory — this build refuses to guess the text prefix");
@@ -814,12 +840,19 @@ public static partial class ArchMapper
         return bound;
     }
 
+    private static bool HasOutputHead(HfInventory inventory, string prefix)
+    {
+        string parent = prefix.Contains('.') ? prefix[..prefix.LastIndexOf('.')] + "." : string.Empty;
+        return new[] { "lm_head.weight", $"{prefix}.lm_head.weight", $"{parent}lm_head.weight" }.Any(n => inventory.TryGet(n, out _));
+    }
+
     /// <summary>Binds an untied output head. The Qwen3.5 multimodal wrapper
     /// ships <c>lm_head.weight</c> at the TOP level of the checkpoint (no
     /// text prefix); the in-prefix spelling covers bare-text checkpoints.</summary>
     private static List<NamedTensorData> BindOutputHead(HfInventory inventory, string prefix)
     {
-        foreach (var fullName in new[] { "lm_head.weight", $"{prefix}.lm_head.weight" })
+        string parent = prefix.Contains('.') ? prefix[..prefix.LastIndexOf('.')] + "." : string.Empty;
+        foreach (var fullName in new[] { "lm_head.weight", $"{prefix}.lm_head.weight", $"{parent}lm_head.weight" })
         {
             if (inventory.TryGet(fullName, out _))
             {

@@ -76,12 +76,34 @@ softcap.
 | Import + run (`ArchZooTests.Encodes_And_Matches_Transformers_Logits`) | 20 / 20 match transformers (< 2e-3) |
 | HF export round trip (`ArchZooTests.Hf_Export_Round_Trips`): same tensor names, every original config key kept, re-imports to the same logits | 20 / 20 |
 | HF export loaded by transformers under its own class (`scripts/export/check_hf.py`) | 20 / 20 reproduce the original logits (to the goldens' 6-decimal rounding) |
-| ONNX export, run in onnxruntime (`scripts/export/check_onnx.py`) | 20 / 20, worst difference 1.7e-5 |
+| ONNX export, run in onnxruntime (`scripts/export/check_onnx.py`) | 20 / 20, worst difference 1.7e-5 (26 / 26 with the rope-scaling models below) |
 | GGUF export, read back with the `gguf` package under llama.cpp's rules (`scripts/export/check_gguf.py`) | 8 / 8 exported match (llama, mistral, helium, phi3, qwen2, qwen3, granite, olmo2); the other 12 are refused by property |
 | Real checkpoint: Phi-3-mini-4k-instruct | Encodes unchanged. 8 greedy tokens match transformers, including a step where the top two differ by 0.013. HF export re-fuses `qkv_proj` / `gate_up_proj` and reloads in transformers with identical logprobs. |
 
 `check_gguf.py` is an independent reading of the file, not llama.cpp.
 Loading the GGUFs in llama.cpp itself is still the final check.
+
+## Rope scaling
+
+A rope block's `rope_type` of `linear`, `llama3` or `yarn` is judged into
+the position policy's `scaling` object, alongside `factor`,
+`low_freq_factor` / `high_freq_factor`, `original_max_position_embeddings`,
+`beta_fast` / `beta_slow`, `attention_factor`, `mscale` / `mscale_all_dim`
+and `truncate`. Scaling attaches to full or partial rope, and per layer
+type: Gemma 3 scales only its full-attention layers.
+`RopeScaling.Frequencies` (`src/Amql.Vindex3/RopeScaling.cs`) is the one
+computation, and it mirrors transformers' `modeling_rope_utils`. The
+runtime, the ONNX export and the GGUF export all use it. Yarn's attention
+factor multiplies cos and sin. Older Gemma 3 configs (`rope_theta` +
+`rope_scaling` + `rope_local_base_freq`) are converted into per-layer-type
+blocks, as transformers does.
+
+| Check | Result |
+|---|---|
+| Frequencies against transformers' `ROPE_INIT_FUNCTIONS` (`RopeScalingTests`) | linear, llama3 and yarn (non-default betas, `truncate: false`) match to 1e-6 |
+| Zoo: `llama-rope-linear`, `llama3-scaled`, `qwen2-yarn`, `llama-yarn-tuned` (explicit attention factor), `glm4-linear` (partial + interleaved), `gemma3-scaled` (full layers only) | import, HF round trip and ONNX all match transformers. Without scaling, these logits move by 1 to 6. |
+| GGUF | linear is written as `rope.scaling.type/factor` and llama3 as the `rope_freqs` divisor tensor (llama arch); both match under llama.cpp's rules. yarn is refused: llama.cpp computes its ramp and attention factor in its own way, which is not verified here. |
+| Real Gemma 3 12B (QAT unquantized; linear ×8 on 8 full layers, base 10k on 40 sliding) | 8 greedy tokens identical to transformers, including steps with margins of 0.021 and 0.024 |
 
 ## Fixes made on the way
 
@@ -107,9 +129,9 @@ Loading the GGUFs in llama.cpp itself is still the final check.
   learned attention sinks, interleaved fused QKV, ALiBi or relative position
   biases. Each needs runtime code once. Every family using it then works
   through the same judging.
-- **Rope scaling.** `linear`, `llama3`, `yarn` and `longrope` are carried
-  unresolved and refused at plan time. Llama 3.1+, Phi-3-128k and Gemma 3's
-  global layers need this.
+- **Rope scaling.** `linear`, `llama3` and `yarn` are served (see below).
+  `dynamic`, `longrope` and MRoPE are still carried unresolved and refused
+  at plan time; Phi-3-128k needs `longrope`.
 - **GELU.** The runtime computes exact `gelu` with the tanh approximation,
   as it did before. ONNX mirrors the runtime.
 - **GGUF.** Only the five architectures above. llama.cpp's Gemma layouts

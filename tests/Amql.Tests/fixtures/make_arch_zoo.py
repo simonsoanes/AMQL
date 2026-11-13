@@ -51,6 +51,23 @@ FAMILIES = {
     "glm4": dict(partial_rotary_factor=0.5),
     "exaone4": dict(),
     "ministral": dict(sliding_window=4),
+    # Rope scaling (linear, llama3, yarn), including per-layer-type and partial rotary.
+    "llama-rope-linear": dict(model_type="llama", rope_parameters={"rope_type": "linear", "factor": 4.0, "rope_theta": 10000.0}),
+    "llama3-scaled": dict(model_type="llama", rope_parameters={
+        "rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0, "high_freq_factor": 4.0,
+        "original_max_position_embeddings": 64, "rope_theta": 500000.0}),
+    "qwen2-yarn": dict(model_type="qwen2", rope_parameters={
+        "rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 64, "rope_theta": 10000.0}),
+    "llama-yarn-tuned": dict(model_type="llama", rope_parameters={
+        "rope_type": "yarn", "factor": 8.0, "original_max_position_embeddings": 32, "rope_theta": 10000.0,
+        "beta_fast": 16.0, "beta_slow": 2.0, "truncate": False, "attention_factor": 1.2}),
+    "glm4-linear": dict(model_type="glm4", partial_rotary_factor=0.5, rope_parameters={
+        "rope_type": "linear", "factor": 2.0, "rope_theta": 10000.0, "partial_rotary_factor": 0.5}),
+    "gemma3-scaled": dict(model_type="gemma3_text", hidden_activation="gelu_pytorch_tanh", sliding_window=4,
+                          query_pre_attn_scalar=16, tie_word_embeddings=True,
+                          layer_types=["sliding_attention", "sliding_attention", "sliding_attention", "full_attention"],
+                          rope_parameters={"full_attention": {"rope_type": "linear", "factor": 8.0, "rope_theta": 1000000.0},
+                                           "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0}}),
     "olmo3": dict(sliding_window=4,
                   layer_types=["sliding_attention", "sliding_attention", "sliding_attention", "full_attention"]),
 }

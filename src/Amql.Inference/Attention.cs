@@ -25,6 +25,7 @@ public static class Rope
     {
         int rotaryWidth;
         double theta;
+        RopeScaling? scaling = null;
         switch (positionPolicy)
         {
             case PositionNone:
@@ -35,10 +36,12 @@ public static class Rope
             case PositionRope rope:
                 rotaryWidth = headDim;
                 theta = rope.Theta;
+                scaling = rope.Scaling;
                 break;
             case PositionPartialRope partial:
                 rotaryWidth = partial.RotaryWidth(headDim);
                 theta = partial.Theta;
+                scaling = partial.Scaling;
                 break;
             case PositionZeroTailRope:
                 throw new UnsupportedOperatorException("zero-tail rope with interleaved pairs has no managed implementation");
@@ -53,11 +56,9 @@ public static class Rope
         }
 
         int pairCount = rotaryWidth / 2;
-        var invFreq = new double[pairCount];
-        for (int i = 0; i < pairCount; i++)
-        {
-            invFreq[i] = 1.0 / Math.Pow(theta, 2.0 * i / rotaryWidth);
-        }
+        // Scaled families (linear, llama3, yarn) rescale the frequencies;
+        // yarn also multiplies cos/sin by its attention factor.
+        var (invFreq, attentionScale) = RopeScaling.Frequencies(theta, rotaryWidth, scaling);
 
         for (int r = 0; r < x.Rows; r++)
         {
@@ -74,8 +75,8 @@ public static class Rope
                     int a = interleaved ? rowStart + head + 2 * i : rowStart + head + i;
                     int b = interleaved ? a + 1 : a + pairCount;
                     double angle = position * invFreq[i];
-                    double cos = Math.Cos(angle);
-                    double sin = Math.Sin(angle);
+                    double cos = Math.Cos(angle) * attentionScale;
+                    double sin = Math.Sin(angle) * attentionScale;
                     double x1 = x.Data[a];
                     double x2 = x.Data[b];
                     x.Data[a] = (float)(x1 * cos - x2 * sin);
