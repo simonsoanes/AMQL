@@ -218,7 +218,7 @@ an aggregate-only mode keeps just the per-node reductions for very long runs.
   forward per traced layer plus two. On a 64-layer model that is 66 forwards.
 - **The logit lens costs a full head GEMM per layer per step**, so it is
   impractical on a large model. It is opt-in and the help text says so.
-- **No GUI tests.** `Amql.Tests` targets `net10.0` and cannot reference the
-  `net10.0-windows` GUI project, which is why every reduction, layout and
+- **No GUI tests.** `Amql.Tests` targets `net11.0` and cannot reference the
+  `net11.0-windows` GUI project, which is why every reduction, layout and
   comparison rule lives in `TraceMetrics` and `TraceRecorder` where it can be
   tested. The WPF layer is deliberately thin.

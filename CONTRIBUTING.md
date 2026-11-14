@@ -6,7 +6,7 @@ First off, thanks for taking the time to contribute — whether that's reporting
 
 ### Prerequisites
 
-- [.NET 10.0 SDK](https://dotnet.microsoft.com/download/dotnet/10.0) (latest LTS)
+- [.NET 11.0 SDK](https://dotnet.microsoft.com/download/dotnet/11.0)
 - Git
 
 ### Building
@@ -44,8 +44,8 @@ This is configured in `src/Directory.Build.props` and is deliberately scoped to
 `src/` — `tests/Amql.Tests` keeps its own output folder so xunit and its runner
 do not land in the directory people launch things from. It also means the GUI
 finds the CLI without configuration: `CliAutoDetect` looks beside itself first.
-Because the two target frameworks in play (`net10.0` and the GUI's
-`net10.0-windows`) share the folder, `AppendTargetFrameworkToOutputPath` is off;
+Because the two target frameworks in play (`net11.0` and the GUI's
+`net11.0-windows`) share the folder, `AppendTargetFrameworkToOutputPath` is off;
 each entry point still carries its own `runtimeconfig.json`.
 
 `bin/` is gitignored. If you have an older checkout, the stale per-project

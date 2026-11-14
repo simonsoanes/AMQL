@@ -13,10 +13,10 @@
     people actually launch things from.
 
     AppendTargetFrameworkToOutputPath is off because the two target frameworks
-    in play — net10.0 for the libraries and CLI, net10.0-windows for the GUI —
+    in play — net11.0 for the libraries and CLI, net11.0-windows for the GUI —
     would otherwise land in separate subfolders and defeat the point. Mixing
     them in one directory is safe: each entry point carries its own
-    runtimeconfig.json and deps.json, and the GUI's net10.0 dependencies belong
+    runtimeconfig.json and deps.json, and the GUI's net11.0 dependencies belong
     beside it anyway.
   -->
   <PropertyGroup>

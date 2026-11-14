@@ -3,13 +3,13 @@
 VIndex3 Model Container & Graph Database with transformation and R&D tools
 
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![.NET 10.0](https://img.shields.io/badge/.NET-10.0-purple.svg)](https://dotnet.microsoft.com/download/dotnet)
+[![.NET 11.0](https://img.shields.io/badge/.NET-11.0-purple.svg)](https://dotnet.microsoft.com/download/dotnet)
 [![Research — Pre 1.0](https://img.shields.io/badge/status-research%20%7C%20pre--1.0-orange.svg)
 
 AMQL turns LLMs into a queryable graph database — encode a checkpoint into a VINDEX3
 container, then probe token relationships, trace causal pathways, edit weights, generate
 LoRA adapters, merge models, prune layers, and export back to a standard checkpoint.
-Built in C# against .NET 10.0 with an optional CUDA backend and a WPF desktop GUI.
+Built in C# against .NET 11.0 with an optional CUDA backend and a WPF desktop GUI.
 
 Credit for the VIndex3 design: [Chris Hay](https://github.com/chrishay).
 
@@ -43,7 +43,7 @@ amql-cli generate demo-container --prompt "The capital of France is" --tokenizer
 amql-cli route demo-container France Paris --tokenizer demo-model --top 5
 ```
 
-**Prerequisites:** [.NET 10.0 SDK](https://dotnet.microsoft.com/download/dotnet/10.0) and Git.
+**Prerequisites:** [.NET 11.0 SDK](https://dotnet.microsoft.com/download/dotnet/11.0) and Git.
 
 ## Architecture
 

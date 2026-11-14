@@ -1,6 +1,6 @@
 # CUDA Backend Plan — AMQL
 
-Status: **partially implemented** · Target: net10.0 + native CUDA interop
+Status: **partially implemented** · Target: net11.0 + native CUDA interop
 
 ## 0. Implemented so far (this session)
 

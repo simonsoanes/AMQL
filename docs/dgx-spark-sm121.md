@@ -53,7 +53,7 @@ This produces `bin/libamql_cuda.so`.
 ### Step 2: Stage the library
 Copy `bin/libamql_cuda.so` next to the server or CLI binary:
 ```bash
-cp bin/libamql_cuda.so ../../src/Amql.Cli/bin/Release/net10.0/
+cp bin/libamql_cuda.so ../../src/Amql.Cli/bin/Release/net11.0/
 # or wherever the published output lives
 ```
 Or set `LD_LIBRARY_PATH` to include the `bin/` directory.

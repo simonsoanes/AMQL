@@ -19,7 +19,7 @@ jobs:
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '10.0.x'
+          dotnet-version: '11.0.x'
 
       - name: Publish amql-cli (self-contained win-x64)
         run: dotnet publish src/Amql.Cli -c Release -p:PublishProfile=win-x64 --nologo
@@ -32,8 +32,8 @@ jobs:
       - name: Collect release files
         run: |
           mkdir release\amql
-          copy src\Amql.Cli\bin\Release\net10.0\win-x64\publish\amql-cli.exe release\amql\
-          copy src\Amql.Gui\bin\Release\net10.0-windows\win-x64\publish\amql-gui.exe release\amql\
+          copy bin\Release\win-x64\publish\amql-cli.exe release\amql\
+          copy bin\Release\win-x64\publish\amql-gui.exe release\amql\
           copy README.md release\amql\
           copy CHANGELOG.md release\amql\
           copy LICENSE release\amql\
