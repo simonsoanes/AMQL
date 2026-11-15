@@ -56,7 +56,22 @@ internal static class GenericExport
         if (surface.Ffn is { } ffn)
         {
             Set("intermediate_size", ffn.IntermediateSize);
-            if (ffn.Moe is { } moe)
+            var expertKey = new[] { "num_experts", "num_local_experts", "n_routed_experts" }.FirstOrDefault(text.ContainsKey);
+            if (ffn.Moe is { } standard && expertKey is not null)
+            {
+                // The checkpoint's own MoE keys, kept in its own spelling.
+                Set(expertKey, standard.Experts);
+                Set("num_experts_per_tok", standard.TopK);
+                if (text.ContainsKey("moe_intermediate_size"))
+                {
+                    Set("moe_intermediate_size", standard.ExpertIntermediateSize);
+                }
+                if (text.ContainsKey("norm_topk_prob"))
+                {
+                    Set("norm_topk_prob", standard.RoutingPolicy == ExpertRoutingPolicy.NormalisedOverSelected);
+                }
+            }
+            else if (ffn.Moe is { } moe)
             {
                 Set("moe", new JsonObject
                 {

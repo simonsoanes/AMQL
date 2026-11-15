@@ -95,6 +95,8 @@ public class ArchZooTests
     [InlineData("gemma2", null, "no llama.cpp architecture")]
     [InlineData("starcoder2", null, "no llama.cpp architecture")]
     [InlineData("qwen2-yarn", null, "rope scaling 'yarn'")]
+    [InlineData("phi3-longrope-long", null, "rope scaling 'longrope'")]
+    [InlineData("llama-dynamic", null, "rope scaling 'dynamic'")]
     public void Gguf_Export_Chooses_Architecture_From_Properties(string family, string? arch, string? refusal = null)
     {
         using var dir = new TempDir();

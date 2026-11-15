@@ -22,9 +22,11 @@ public sealed record LinearAttentionFacts(
     int ValueHeads,
     int ValueHeadDim);
 
-/// <summary>The <c>moe</c> config block an MoE-ified export carries — the
-/// facts that make a re-encoded container judge its FFNs routed instead
-/// of dense.</summary>
+/// <summary>Routed-expert facts: AMQL's own <c>moe</c> block (an MoE-ified
+/// export), or a checkpoint's standard keys (<c>num_experts</c> /
+/// <c>num_local_experts</c>, <c>num_experts_per_tok</c>,
+/// <c>norm_topk_prob</c>). An expert intermediate size of 0 means "read it
+/// from the expert tensors".</summary>
 public sealed record MoeFacts(
     int Experts,
     int TopK,
@@ -269,6 +271,10 @@ public static class ModelConfig
                     : ExpertRoutingPolicy.SoftmaxThenSelect;
                 moe = new MoeFacts(expertsEl.GetInt32(), topKEl.GetInt32(), eisEl.GetInt32(), policy);
             }
+            else
+            {
+                moe = StandardMoe(text);
+            }
 
             VisionFacts? vision = null;
             if (root.TryGetProperty("vision_config", out var visionElement) &&
@@ -460,6 +466,49 @@ public static class ModelConfig
     /// <c>rope_type</c>). Both are folded into the grouped shape, so a
     /// Qwen3/Qwen2/Llama checkpoint in the old layout keeps its theta rather
     /// than reading as the 10 000 default.</summary>
+    /// <summary>A checkpoint's standard MoE keys. Softmax routing over the top
+    /// k is served, renormalised over the selected experts or not as
+    /// <c>norm_topk_prob</c> says (absent: renormalised, Mixtral's rule). Other
+    /// routers (sigmoid scores, grouped selection, a routed scale) are
+    /// refused by name.</summary>
+    private static MoeFacts? StandardMoe(JsonElement text)
+    {
+        int? Int(params string[] keys)
+        {
+            foreach (var key in keys)
+            {
+                if (text.TryGetProperty(key, out var v) && v.ValueKind == JsonValueKind.Number)
+                {
+                    return v.GetInt32();
+                }
+            }
+            return null;
+        }
+        if (Int("num_experts", "num_local_experts", "n_routed_experts") is not { } experts || experts <= 0 ||
+            Int("num_experts_per_tok", "num_experts_per_token", "moe_top_k") is not { } topK || topK <= 0)
+        {
+            return null;
+        }
+        if (text.TryGetProperty("scoring_func", out var scoring) && scoring.GetString() is { } func && func != "softmax")
+        {
+            throw new ModelConfigException($"MoE router scoring '{func}' is not served — this build routes by softmax over the experts");
+        }
+        if (Int("n_group") is > 1 || Int("topk_group") is > 1)
+        {
+            throw new ModelConfigException("grouped expert selection (n_group / topk_group) is not served");
+        }
+        if (text.TryGetProperty("routed_scaling_factor", out var scale) && scale.ValueKind == JsonValueKind.Number &&
+            scale.GetDouble() != 1.0)
+        {
+            throw new ModelConfigException($"routed_scaling_factor {scale.GetDouble()} is not served");
+        }
+        bool normalise = text.TryGetProperty("routing_policy", out var policy) && policy.ValueKind == JsonValueKind.String
+            ? policy.GetString() == "normalised_over_selected"
+            : !text.TryGetProperty("norm_topk_prob", out var norm) || norm.ValueKind != JsonValueKind.False;
+        return new MoeFacts(experts, topK, Int("moe_intermediate_size", "expert_intermediate_size") ?? 0,
+            normalise ? ExpertRoutingPolicy.NormalisedOverSelected : ExpertRoutingPolicy.SoftmaxThenSelect);
+    }
+
     private static JsonElement LegacyRopeParameters(JsonElement text)
     {
         var node = new System.Text.Json.Nodes.JsonObject();

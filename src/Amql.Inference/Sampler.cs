@@ -15,13 +15,74 @@ public sealed record SamplingConfig(
 /// are out of scope for this build.</summary>
 public static class Sampler
 {
-    public static int ArgMax(Tensor2D logits)
+    public static int ArgMax(Tensor2D logits) => ArgMax(logits.FirstRow());
+
+    /// <summary>The index of the largest value — the first one when several
+    /// tie — skipping NaNs unless the first value is one, exactly as a scalar
+    /// <c>values[i] &gt; values[best]</c> scan. Vectorised: over a 248k-token
+    /// vocabulary the scalar scan costs a noticeable share of a GPU decode
+    /// step.</summary>
+    public static int ArgMax(ReadOnlySpan<float> values)
     {
-        var row = logits.FirstRow();
-        int best = 0;
-        for (int i = 1; i < row.Length; i++)
+        int n = values.Length;
+        int width = System.Numerics.Vector<float>.Count;
+        if (n < 4 * width || float.IsNaN(values[0]))
         {
-            if (row[i] > row[best])
+            return ScalarArgMax(values);
+        }
+        var negInf = new System.Numerics.Vector<float>(float.NegativeInfinity);
+        var maxV = negInf;
+        int i = 0;
+        for (; i <= n - width; i += width)
+        {
+            var v = new System.Numerics.Vector<float>(values.Slice(i, width));
+            // NaN never wins the scalar scan, so it never enters the max.
+            v = System.Numerics.Vector.ConditionalSelect(System.Numerics.Vector.Equals(v, v), v, negInf);
+            maxV = System.Numerics.Vector.Max(maxV, v);
+        }
+        float max = float.NegativeInfinity;
+        for (int j = 0; j < width; j++)
+        {
+            max = Math.Max(max, maxV[j]);
+        }
+        for (; i < n; i++)
+        {
+            if (values[i] > max)
+            {
+                max = values[i];
+            }
+        }
+        var target = new System.Numerics.Vector<float>(max);
+        for (i = 0; i <= n - width; i += width)
+        {
+            var eq = System.Numerics.Vector.Equals(new System.Numerics.Vector<float>(values.Slice(i, width)), target);
+            if (!eq.Equals(System.Numerics.Vector<int>.Zero))
+            {
+                for (int j = i; j < i + width; j++)
+                {
+                    if (values[j] == max)
+                    {
+                        return j;
+                    }
+                }
+            }
+        }
+        for (; i < n; i++)
+        {
+            if (values[i] == max)
+            {
+                return i;
+            }
+        }
+        return ScalarArgMax(values);
+    }
+
+    private static int ScalarArgMax(ReadOnlySpan<float> values)
+    {
+        int best = 0;
+        for (int i = 1; i < values.Length; i++)
+        {
+            if (values[i] > values[best])
             {
                 best = i;
             }
@@ -332,16 +393,5 @@ public static class Sampler
         return probs.Length - 1;
     }
 
-    private static int ArgMaxOf(ReadOnlySpan<float> values)
-    {
-        int best = 0;
-        for (int i = 1; i < values.Length; i++)
-        {
-            if (values[i] > values[best])
-            {
-                best = i;
-            }
-        }
-        return best;
-    }
+    private static int ArgMaxOf(ReadOnlySpan<float> values) => ArgMax(values);
 }

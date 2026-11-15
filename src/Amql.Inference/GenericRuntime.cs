@@ -80,7 +80,11 @@ public sealed class GenericRuntime
     /// <c>appendKv</c> the freshly computed key/value rows are added to the
     /// cache before attention runs (prefill and decode both append; a
     /// caller replaying a layer never does).</summary>
-    public Tensor2D RunLayerInternal(Tensor2D x, int layer, int[] queryPositions, int[] kvPositions, bool appendKv)
+    /// <para><paramref name="positionStreams"/> gives an MRoPE layer its
+    /// per-row (t, h, w) positions; null means every stream is the row's
+    /// position, as for text.</para>
+    public Tensor2D RunLayerInternal(Tensor2D x, int layer, int[] queryPositions, int[] kvPositions, bool appendKv,
+        int[][]? positionStreams = null)
     {
         var layerPlan = _plan.Layers[layer];
         int hidden = _plan.HiddenSize;
@@ -112,7 +116,7 @@ public sealed class GenericRuntime
         else
         {
             long t = TraceStart;
-            mixerOut = RunSoftmaxAttention(h, layer, layerPlan, queryPositions, kvPositions, appendKv);
+            mixerOut = RunSoftmaxAttention(h, layer, layerPlan, queryPositions, kvPositions, appendKv, positionStreams);
             Report(layer, "softmax_attn", null, mixerOut, t);
         }
 
@@ -230,7 +234,8 @@ public sealed class GenericRuntime
 
     private List<(int Head, float[] Weights)>? _lastCapture;
 
-    private Tensor2D RunSoftmaxAttention(Tensor2D h, int layer, LayerPlan layerPlan, int[] queryPositions, int[] kvPositions, bool appendKv)
+    private Tensor2D RunSoftmaxAttention(Tensor2D h, int layer, LayerPlan layerPlan, int[] queryPositions, int[] kvPositions, bool appendKv,
+        int[][]? positionStreams = null)
     {
         var attn = layerPlan.Attention!;
         int hidden = _plan.HiddenSize;
@@ -257,9 +262,10 @@ public sealed class GenericRuntime
         }
         else
         {
-            qRaw = TensorOps.MatMulTransposedB(h, wQ);
-            k = TensorOps.MatMulTransposedB(h, wK);
-            v = TensorOps.MatMulTransposedB(h, wV);
+            var batch = TensorOps.MatMulTransposedBMany(h, wQ, wK, wV);
+            qRaw = batch[0];
+            k = batch[1];
+            v = batch[2];
         }
 
         // Sub-operator observations carry no duration: on the GPU path q, k and
@@ -290,13 +296,13 @@ public sealed class GenericRuntime
 
         // RoPE — position policy from the per-layer table; partial rotary
         // (text mrope) rotates the first head_dim × factor dims.
-        Rope.Apply(q, attn.NumQHeads, attn.HeadDim, attn.Position, queryPositions, attn.RopeInterleaved);
+        Rope.Apply(q, attn.NumQHeads, attn.HeadDim, attn.Position, queryPositions, attn.RopeInterleaved, positionStreams);
 
         int kvRows = k.Rows;
         var ropeKvPositions = kvRows == kvPositions.Length
             ? kvPositions
             : kvPositions[^kvRows..];
-        Rope.Apply(k, attn.NumKvHeads, attn.HeadDim, attn.Position, ropeKvPositions, attn.RopeInterleaved);
+        Rope.Apply(k, attn.NumKvHeads, attn.HeadDim, attn.Position, ropeKvPositions, attn.RopeInterleaved, positionStreams);
 
         if (attn.VFromK)
         {
@@ -308,13 +314,13 @@ public sealed class GenericRuntime
             AppendRows(layer, k, v);
         }
 
-        var kRows2 = Kv.Keys(layer);
-        var vRows = Kv.Values(layer);
-        int kvSeq = kRows2.Count;
-        var kMat = new Tensor2D(kRows2.SelectMany(r => r).ToArray(),
-            kvSeq, kvSeq == 0 ? attn.KvDim : kRows2[0].Length);
-        var vMat = new Tensor2D(vRows.SelectMany(r => r).ToArray(),
-            kvSeq, kvSeq == 0 ? attn.KvDim : vRows[0].Length);
+        // The cached rows in place (contiguous per layer, read without a copy).
+        var (kBuffer, kWidth, vBuffer, vWidth, kvSeq) = Kv.Buffers(layer);
+        if (kvSeq == 0)
+        {
+            kWidth = attn.KvDim;
+            vWidth = attn.KvDim;
+        }
 
         _lastCapture = AttentionTrace is not null
             ? new List<(int Head, float[] Weights)>(attn.NumQHeads)
@@ -332,10 +338,13 @@ public sealed class GenericRuntime
             var softCap = attn.LogitSoftcapping ?? 0f;
             var window = attn.Window is { } wv ? checked((int)wv) : 0;
             var gpuOut = new float[q.Rows * attn.QDim];
+            // The device path takes exact [kvSeq × width] arrays.
+            var kExact = kBuffer.AsSpan(0, kvSeq * kWidth).ToArray();
+            var vExact = vBuffer.AsSpan(0, kvSeq * vWidth).ToArray();
             if (CudaShim.TryAttentionGqa(
                     q.Data, q.Rows,
-                    kMat.Data, kvSeq,
-                    vMat.Data,
+                    kExact, kvSeq,
+                    vExact,
                     gpuOut,
                     attn.NumQHeads, attn.NumKvHeads, attn.HeadDim,
                     (float)attn.ScoreScale, softCap, window,
@@ -348,7 +357,7 @@ public sealed class GenericRuntime
             }
         }
         output = AttentionKernel.Execute(
-            q, kMat, vMat,
+            q, kBuffer, kWidth, vBuffer, vWidth, kvSeq,
             attn.NumQHeads, attn.NumKvHeads, attn.HeadDim,
             attn.ScoreScale, attn.LogitSoftcapping, null,
             attn.Window is { } windowValue ? checked((int)windowValue) : null,
@@ -372,9 +381,26 @@ public sealed class GenericRuntime
         // Hard output gate: attention output × sigmoid(gate).
         if (gate is not null && output.Rows == gate.Rows)
         {
-            for (int i = 0; i < output.Data.Length; i++)
+            var outData = output.Data;
+            var gateData = gate.Data;
+            int cols = output.Cols;
+            void GateRow(int r)
             {
-                output.Data[i] *= 1f / (1f + MathF.Exp(-gate.Data[i]));
+                for (int i = r * cols; i < (r + 1) * cols; i++)
+                {
+                    outData[i] *= 1f / (1f + MathF.Exp(-gateData[i]));
+                }
+            }
+            if (output.Rows >= 8)
+            {
+                KernelPool.For(output.Rows, GateRow);
+            }
+            else
+            {
+                for (int r = 0; r < output.Rows; r++)
+                {
+                    GateRow(r);
+                }
             }
         }
 
@@ -475,13 +501,25 @@ public sealed class GenericRuntime
 
     public static void ApplyPerHead(Tensor2D x, int heads, int headDim, float[] weight, double eps, float weightOffset)
     {
-        for (int r = 0; r < x.Rows; r++)
+        var data = x.Data;
+        int cols = x.Cols;
+        void Row(int r)
         {
-            var row = x.Row(r);
+            var row = data.AsSpan(r * cols, cols);
             for (int h = 0; h < heads; h++)
             {
                 Norms.ApplyRow(row.Slice(h * headDim, headDim), NormType.RmsNorm, eps, weight, weightOffset);
             }
+        }
+        // Rows (and heads within them) normalise independently.
+        if (x.Rows >= 8)
+        {
+            KernelPool.For(x.Rows, Row);
+            return;
+        }
+        for (int r = 0; r < x.Rows; r++)
+        {
+            Row(r);
         }
     }
 
@@ -513,7 +551,7 @@ public sealed class GenericRuntime
 
     public static Tensor2D ColRange(Tensor2D source, int start, int width)
     {
-        var result = new float[source.Rows * width];
+        var result = GC.AllocateUninitializedArray<float>(source.Rows * width);
         for (int r = 0; r < source.Rows; r++)
         {
             Array.Copy(source.Data, r * source.Cols + start, result, r * width, width);
@@ -562,10 +600,16 @@ public sealed class GenericRuntime
         int t = h.Rows;
         var state = StateFor(layer, op);
 
-        var mixed = TensorOps.MatMulTransposedB(h, _weights.Matrix(op.InProjQkv, op.ConvDim, op.HiddenSize));
-        var z = TensorOps.MatMulTransposedB(h, _weights.Matrix(op.InProjZ, op.ValueDim, op.HiddenSize));
-        var b = TensorOps.MatMulTransposedB(h, _weights.Matrix(op.InProjB, op.NumVHeads, op.HiddenSize));
-        var a = TensorOps.MatMulTransposedB(h, _weights.Matrix(op.InProjA, op.NumVHeads, op.HiddenSize));
+        // The four in-projections share h: one fused pass over their rows.
+        var projected = TensorOps.MatMulTransposedBMany(h,
+            _weights.Matrix(op.InProjQkv, op.ConvDim, op.HiddenSize),
+            _weights.Matrix(op.InProjZ, op.ValueDim, op.HiddenSize),
+            _weights.Matrix(op.InProjB, op.NumVHeads, op.HiddenSize),
+            _weights.Matrix(op.InProjA, op.NumVHeads, op.HiddenSize));
+        var mixed = projected[0];
+        var z = projected[1];
+        var b = projected[2];
+        var a = projected[3];
 
         // Three of every four layers in a Qwen3.5 model are linear-attention,
         // so reporting the mixer as one node left most of the map without an
@@ -578,18 +622,34 @@ public sealed class GenericRuntime
 
         // Depthwise causal conv over the qkv stream (columns → channels),
         // SiLU activated. A single position advances the conv state.
-        var stream = ToColumnMajor(mixed, t, op.ConvDim);
         var convWeight = _weights.Vector(op.Conv1d, op.ConvDim * op.ConvKernel);
-        float[,] walked = t == 1
-            ? GatedDeltaKernel.ConvStep(stream, convWeight, op.ConvKernel, silu: true, state)
-            : GatedDeltaKernel.ConvForward(stream, convWeight, op.ConvKernel, silu: true, state);
+        Tensor2D q, k, v;
+        if (t == 1)
+        {
+            // One position: the conv step reads the projected row directly and
+            // the q / k / v splits are contiguous ranges of its output — the
+            // same values the column-major route below produces.
+            var walkedRow = GatedDeltaKernel.ConvStepFlat(mixed.Data, convWeight, op.ConvKernel, silu: true, state);
+            q = new Tensor2D(walkedRow.AsSpan(0, op.KeyDim).ToArray(), 1, op.KeyDim);
+            k = new Tensor2D(walkedRow.AsSpan(op.KeyDim, op.KeyDim).ToArray(), 1, op.KeyDim);
+            v = new Tensor2D(walkedRow.AsSpan(2 * op.KeyDim, op.ValueDim).ToArray(), 1, op.ValueDim);
+        }
+        else
+        {
+            // Row-major throughout: the conv reads the projection as laid out
+            // and the q / k / v splits are column ranges of its output.
+            var walked = new Tensor2D(
+                GatedDeltaKernel.ConvForwardRows(mixed.Data, t, convWeight, op.ConvKernel, silu: true, state),
+                t, op.ConvDim);
 
-        // Split q / k / v (the reference splits [key, key, value]) and
-        // reshape into heads; expand key heads to the value-head count
-        // when the ratio > 1 (repeat_interleave).
-        var q = SliceFromChannels(walked, 0, op.KeyDim, t);
-        var k = SliceFromChannels(walked, op.KeyDim, op.KeyDim, t);
-        var v = SliceFromChannels(walked, 2 * op.KeyDim, op.ValueDim, t);
+            // Split q / k / v (the reference splits [key, key, value]) and
+            // reshape into heads.
+            q = ColRange(walked, 0, op.KeyDim);
+            k = ColRange(walked, op.KeyDim, op.KeyDim);
+            v = ColRange(walked, 2 * op.KeyDim, op.ValueDim);
+        }
+        // Expand key heads to the value-head count when the ratio > 1
+        // (repeat_interleave).
         int ratio = op.NumVHeads / op.NumKHeads;
         if (ratio > 1)
         {
@@ -699,17 +759,16 @@ public sealed class GenericRuntime
         string stackId = routed.Router.ObjectId;
         for (int e = 0; e < routed.NumExperts; e++)
         {
-            var stem = $"{routed.ExpertGatePrefix}{e}.";
-            gates[e] = _weights.Matrix(new OperandRef(stackId, stem + "gate_proj.weight"), routed.ExpertIntermediateSize, hidden);
-            ups[e] = _weights.Matrix(new OperandRef(stackId, stem + "up_proj.weight"), routed.ExpertIntermediateSize, hidden);
-            downs[e] = _weights.Matrix(new OperandRef(stackId, stem + "down_proj.weight"), hidden, routed.ExpertIntermediateSize);
+            gates[e] = _weights.Matrix(new OperandRef(stackId, $"{routed.ExpertGatePrefix}{e}.{routed.ExpertGateStem}"), routed.ExpertIntermediateSize, hidden);
+            ups[e] = _weights.Matrix(new OperandRef(stackId, $"{routed.ExpertUpPrefix}{e}.{routed.ExpertUpStem}"), routed.ExpertIntermediateSize, hidden);
+            downs[e] = _weights.Matrix(new OperandRef(stackId, $"{routed.ExpertDownPrefix}{e}.{routed.ExpertDownStem}"), hidden, routed.ExpertIntermediateSize);
         }
 
         // Only the last row's routing is reported, matching Report's convention
         // — it is the row that decides the next token, and capturing every
         // prefill row would dwarf the rest of the trace.
         int lastRow = h.Rows - 1;
-        return FfnKernel.Routed(h, router, gates, ups, downs,
+        var mixture = FfnKernel.Routed(h, router, gates, ups, downs,
             routed.TopK, routed.RoutingPolicy, routed.Activation,
             onExpertsRouted: ExpertRoutingTrace is null
                 ? null
@@ -720,6 +779,38 @@ public sealed class GenericRuntime
                         ExpertRoutingTrace(layer, selected);
                     }
                 });
+        if (routed.SharedExpert is { } shared)
+        {
+            // Every token also passes through the shared expert, scaled by
+            // sigmoid(gate·x) where the layer carries that gate.
+            var sharedOut = FfnKernel.Dense(h,
+                shared.Gate is null ? null : _weights.Matrix(shared.Gate, shared.IntermediateSize, hidden),
+                _weights.Matrix(shared.Up, shared.IntermediateSize, hidden),
+                _weights.Matrix(shared.Down, hidden, shared.IntermediateSize),
+                shared.Activation, shared.IsGated);
+            float[]? gate = routed.SharedExpertGate is { } g ? _weights.Vector(g, hidden) : null;
+            for (int r = 0; r < h.Rows; r++)
+            {
+                float scale = 1f;
+                if (gate is not null)
+                {
+                    double dot = 0;
+                    var row = h.Row(r);
+                    for (int c = 0; c < hidden; c++)
+                    {
+                        dot += row[c] * gate[c];
+                    }
+                    scale = (float)(1 / (1 + Math.Exp(-dot)));
+                }
+                var outRow = mixture.Data.AsSpan(r * hidden, hidden);
+                var add = sharedOut.Row(r);
+                for (int c = 0; c < hidden; c++)
+                {
+                    outRow[c] += scale * add[c];
+                }
+            }
+        }
+        return mixture;
     }
 
     // ── conv layer (LFM2/LFM3 gated short convolution) ──────────────────
@@ -998,6 +1089,15 @@ public sealed class GenericRuntime
     /// <summary>Schedules a residual-stream patch (applied after the layer
     /// completes). Cleared per session reset.</summary>
     public void SetPatch(int layer, int row, float[] values) => _patches.Add(new ResidualPatch(layer, row, values));
+
+    /// <summary>Whether anything watches or alters the layer loop — a trace, a
+    /// capture or a residual patch. The device engine runs the whole pass on
+    /// the GPU and has none of these seams, so a session with any of them runs
+    /// here instead.</summary>
+    internal bool HasObservers =>
+        OpTrace is not null || AttentionTrace is not null || FfnInputCapture is not null ||
+        AttentionContextCapture is not null || LayerNormTrace is not null || LogitLensTrace is not null ||
+        ExpertRoutingTrace is not null || _patches.Count > 0;
 
     public void ClearPatches() => _patches.Clear();
 

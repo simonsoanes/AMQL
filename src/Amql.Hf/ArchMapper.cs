@@ -60,9 +60,33 @@ public static partial class ArchMapper
             throw new ModelConfigException(e.Message, e);
         }
         bool parallel = TensorRoles.IsParallelBlock(roles);
+        // Routed experts: the count and top-k come from the config, the
+        // expert width from the expert tensors themselves.
+        MoeFacts? moeFacts = facts.Moe;
+        if (roles.Experts is { } experts)
+        {
+            if (moeFacts is null)
+            {
+                throw new ModelConfigException(
+                    $"layers carry routed experts ('{experts.Prefix}N.') but the config states no expert count and top-k");
+            }
+            if (roles.Name(TensorRoles.Router, "bias") is { } routerBias)
+            {
+                throw new ModelConfigException($"router bias '{routerBias}' is not served — this build routes by the router's weights alone");
+            }
+            var upTensor = stackTensors.FirstOrDefault(t => t.Name.EndsWith("." + experts.Name(0, experts.Up), StringComparison.Ordinal))
+                ?? throw new ModelConfigException($"no '{experts.Name(0, experts.Up)}' tensor in any layer");
+            moeFacts = moeFacts with { ExpertIntermediateSize = (int)upTensor.Shape[0] };
+        }
+        else
+        {
+            // Expert keys over a stack without expert tensors (an export that
+            // writes num_experts: 0, or a dense sibling's config): dense.
+            moeFacts = null;
+        }
         // Tied unless a head tensor exists, when the config does not say.
         bool tied = facts.TieDeclared ? facts.TieWordEmbeddings : !HasOutputHead(inventory, prefix);
-        bool gatedFfn = roles.Name(TensorRoles.Gate) is not null || facts.Moe is not null;
+        bool gatedFfn = roles.Name(TensorRoles.Gate) is not null || moeFacts is not null;
 
         // ── per-layer policy table ────────────────────────────────────────
         // Position policy: plain or partial rope (and per-layer-type rope
@@ -174,7 +198,7 @@ public static partial class ArchMapper
                 IntermediateSize = facts.IntermediateSize,
                 Activation = MapActivation(facts.HiddenAct),
                 FfnType = gatedFfn ? FfnType.Gated : FfnType.Dense,
-                Moe = facts.Moe is { } moe
+                Moe = moeFacts is { } moe
                     ? new MoeSurface
                     {
                         Experts = moe.Experts,
@@ -605,11 +629,17 @@ public static partial class ArchMapper
     private static PositionPolicy RopeBlock(JsonElement block, double factor, FamilyConventions conventions, long maxPositions)
     {
         string ropeType = block.TryGetProperty("rope_type", out var rt) ? rt.GetString() ?? "default" : "default";
+        // Qwen2-VL's legacy spelling: "mrope" names the sections, not a rescale.
+        if (ropeType == "mrope")
+        {
+            ropeType = "default";
+        }
+        var mrope = RopeMultimodal.FromRopeBlock(block);
         RopeScaling? scaling = null;
         if (ropeType != "default")
         {
-            // linear, llama3 and yarn are served; anything else (dynamic,
-            // longrope, mrope…) is carried verbatim and refused by name.
+            // linear, llama3, yarn, longrope and dynamic are served; any other
+            // type is carried verbatim and refused by name.
             scaling = RopeScaling.FromRopeBlock(block, maxPositions);
             if (scaling is null || (factor < 1.0 && conventions.ZeroTailPartialRotary))
             {
@@ -619,11 +649,15 @@ public static partial class ArchMapper
         double theta = block.TryGetProperty("rope_theta", out var t) ? t.GetDouble() : 10_000.0;
         if (factor < 1.0)
         {
+            if (conventions.ZeroTailPartialRotary && mrope is not null)
+            {
+                return new PositionUnresolved { Kind = "mrope(zero_tail)", Payload = block.Clone() };
+            }
             return conventions.ZeroTailPartialRotary
                 ? new PositionZeroTailRope { Theta = theta, RotaryFactor = factor }
-                : new PositionPartialRope { Theta = theta, RotaryFactor = factor, Scaling = scaling };
+                : new PositionPartialRope { Theta = theta, RotaryFactor = factor, Scaling = scaling, Mrope = mrope };
         }
-        return new PositionRope { Theta = theta, Scaling = scaling };
+        return new PositionRope { Theta = theta, Scaling = scaling, Mrope = mrope };
     }
 
     /// <summary>Judges whether the persisted rope facts are the served plain
@@ -660,7 +694,7 @@ public static partial class ArchMapper
     /// <summary>Finds the tensor prefix the text decoder actually lives
     /// under ("model.language_model" for multimodal wrappers, "model" for
     /// bare text checkpoints). Never assumed.</summary>
-    private static string DetectTextPrefix(HfInventory inventory)
+    public static string DetectTextPrefix(HfInventory inventory)
     {
         foreach (var candidate in new[] { "model.language_model", "model", "language_model", "encoder" })
         {

@@ -68,6 +68,25 @@ FAMILIES = {
                           layer_types=["sliding_attention", "sliding_attention", "sliding_attention", "full_attention"],
                           rope_parameters={"full_attention": {"rope_type": "linear", "factor": 8.0, "rope_theta": 1000000.0},
                                            "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0}}),
+    # Length-dependent rope: longrope in both regimes (12 ids against an
+    # original length of 8, and of 64), and dynamic NTK past a maximum of 8.
+    "phi3-longrope-long": dict(model_type="phi3", max_position_embeddings=32, original_max_position_embeddings=8, rope_parameters={
+        "rope_type": "longrope", "rope_theta": 10000.0, "original_max_position_embeddings": 8,
+        "short_factor": [1.0, 1.1, 1.3, 1.6, 2.0, 2.5, 3.1, 3.8], "long_factor": [1.0, 1.5, 2.2, 3.0, 4.5, 6.0, 8.0, 11.0]}),
+    "phi3-longrope-short": dict(model_type="phi3", max_position_embeddings=256, original_max_position_embeddings=64, rope_parameters={
+        "rope_type": "longrope", "rope_theta": 10000.0, "original_max_position_embeddings": 64,
+        "short_factor": [1.0, 1.1, 1.3, 1.6, 2.0, 2.5, 3.1, 3.8], "long_factor": [1.0, 1.5, 2.2, 3.0, 4.5, 6.0, 8.0, 11.0]}),
+    "llama-dynamic": dict(model_type="llama", max_position_embeddings=8, rope_parameters={
+        "rope_type": "dynamic", "factor": 2.0, "rope_theta": 10000.0}),
+    # Mixture of experts: Mixtral (renormalised top-2), Qwen2-MoE (a shared
+    # expert behind a sigmoid gate), Qwen3-MoE (dense first layer, renormalised),
+    # OLMoE (not renormalised, whole-projection QK norm).
+    "mixtral": dict(num_local_experts=4, num_experts_per_tok=2, sliding_window=None),
+    "qwen2_moe": dict(num_experts=4, num_experts_per_tok=2, moe_intermediate_size=32,
+                      shared_expert_intermediate_size=48, norm_topk_prob=False),
+    "qwen3_moe": dict(num_experts=4, num_experts_per_tok=2, moe_intermediate_size=32, norm_topk_prob=True,
+                      mlp_only_layers=[0]),
+    "olmoe": dict(num_experts=4, num_experts_per_tok=2, norm_topk_prob=False),
     "olmo3": dict(sliding_window=4,
                   layer_types=["sliding_attention", "sliding_attention", "sliding_attention", "full_attention"]),
 }

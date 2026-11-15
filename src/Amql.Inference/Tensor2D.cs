@@ -1,4 +1,5 @@
 using System.Numerics;
+using Amql.Safetensors;
 
 namespace Amql.Inference;
 
@@ -6,7 +7,28 @@ namespace Amql.Inference;
 /// generic ops need; deliberately no external numerics dependency.</summary>
 public sealed class Tensor2D
 {
-    public float[] Data { get; }
+    private float[]? _data;
+    private ushort[]? _bf16;
+
+    /// <summary>The values as f32, row-major. A tensor built over BF16 bits
+    /// (<see cref="FromBf16"/>) widens them here on first access — exact, BF16
+    /// being the top half of an f32 — and from then on this array is the
+    /// tensor: <see cref="Bf16Bits"/> turns null so the kernels read it too,
+    /// and an in-place edit through it is seen by every later operation.</summary>
+    public float[] Data => _data ?? Materialize();
+
+    /// <summary>The BF16 bit patterns this tensor is held as, while
+    /// <see cref="Data"/> has not been touched; null otherwise. The GEMV
+    /// kernels widen these in registers, streaming half the bytes of the f32
+    /// array for the same (bit-identical) result.</summary>
+    public ushort[]? Bf16Bits
+    {
+        get
+        {
+            var bits = _bf16;
+            return Volatile.Read(ref _data) is null ? bits : null;
+        }
+    }
 
     public int Rows { get; }
     public int Cols { get; }
@@ -23,9 +45,48 @@ public sealed class Tensor2D
         {
             throw new ArgumentException($"data length {data.Length} != {rows}x{cols}", nameof(data));
         }
-        Data = data;
+        _data = data;
         Rows = rows;
         Cols = cols;
+    }
+
+    private Tensor2D(ushort[] bf16, int rows, int cols)
+    {
+        if (bf16.Length != checked(rows * cols))
+        {
+            throw new ArgumentException($"data length {bf16.Length} != {rows}x{cols}", nameof(bf16));
+        }
+        _bf16 = bf16;
+        Rows = rows;
+        Cols = cols;
+    }
+
+    /// <summary>A tensor held as BF16 bit patterns (see <see cref="Bf16Bits"/>).</summary>
+    public static Tensor2D FromBf16(ushort[] bits, int rows, int cols) => new(bits, rows, cols);
+
+    private float[] Materialize()
+    {
+        var bits = _bf16!;
+        var widened = GC.AllocateUninitializedArray<float>(bits.Length);
+        BitPattern.WidenInto(Dtype.BF16,
+            System.Runtime.InteropServices.MemoryMarshal.AsBytes(bits.AsSpan()), widened);
+        var winner = Interlocked.CompareExchange(ref _data, widened, null) ?? widened;
+        _bf16 = null;
+        return winner;
+    }
+
+    /// <summary>Copies one row as f32 into <paramref name="target"/> without
+    /// widening the whole tensor (an embedding lookup over a BF16 table).</summary>
+    public void CopyRowTo(int row, Span<float> target)
+    {
+        var bits = Bf16Bits;
+        if (bits is null)
+        {
+            Data.AsSpan(row * Cols, Cols).CopyTo(target);
+            return;
+        }
+        BitPattern.WidenInto(Dtype.BF16,
+            System.Runtime.InteropServices.MemoryMarshal.AsBytes(bits.AsSpan(row * Cols, Cols)), target.Slice(0, Cols));
     }
 
     public static Tensor2D Zeros(int rows, int cols) => new(new float[rows * cols], rows, cols);
@@ -39,7 +100,9 @@ public sealed class Tensor2D
 
     public Span<float> Row(int row) => Data.AsSpan(row * Cols, Cols);
 
-    public Tensor2D Clone() => new((float[])Data.Clone(), Rows, Cols);
+    public Tensor2D Clone() => Bf16Bits is { } bits
+        ? FromBf16((ushort[])bits.Clone(), Rows, Cols)
+        : new((float[])Data.Clone(), Rows, Cols);
 
     /// <summary>First row (used for single-row outputs like logits).</summary>
     public ReadOnlySpan<float> FirstRow() => Row(0);
@@ -51,13 +114,36 @@ public static class TensorOps
 {
     /// <summary>The dot-product parallelism floor: below this many
     /// multiply-accumulates the matmul runs single-threaded (thread
-    /// setup would dominate).</summary>
+    /// setup would dominate). <see cref="MatMul"/> keeps the old 4M floor:
+    /// it still runs on <see cref="Parallel.For(int,int,Action{int})"/>.</summary>
     private const long ParallelFloorMacs = 4L << 20; // 4M MACs
+
+    /// <summary>The floor for <see cref="MatMulTransposedB"/>, which runs on
+    /// <see cref="KernelPool"/>: a loop there costs a few microseconds, so a
+    /// projection is worth splitting once its weights are about a megabyte
+    /// (one thread streams that in roughly 30 µs). Below the old 4M floor sat
+    /// every FFN and linear-attention projection of a 1B-class model, which
+    /// therefore ran on one core.</summary>
+    private const long PoolFloorMacs = 256L << 10; // 256K MACs
 
     /// <summary>The CUDA dispatch floor: below this many
     /// multiply-accumulates the GEMM stays on the managed path (launch
     /// and copy-back would dominate the work).</summary>
     private const long CudaMinimumMacs = 8L << 20; // 8M MACs
+
+    /// <summary>Activation rows per GEMM tile (see <see cref="MatMulTransposedBCpu"/>):
+    /// one micro-kernel's height. Four rows of activation sit in L1 while a
+    /// long run of weight rows streams past, which measured fastest on a
+    /// Zen 5 Threadripper (1.6 TFLOP/s at 512 rows, against 0.45 for
+    /// weight-only splitting) — and the most tiles for load balance.</summary>
+    private const int RowTile = 4;
+
+    /// <summary>Weight rows per cache block inside a tile, in bytes.</summary>
+    private const int BlockBytes = 128 * 1024;
+
+    /// <summary>Tasks per thread a GEMV/GEMM is split into, so uneven progress
+    /// (a core busy with other work) balances out. Finer splits measured slower.</summary>
+    private const int ChunksPerThread = 4;
 
     /// <summary>c = a @ b. Row-major, i-k-j accumulation for cache
     /// locality; `Vector<float>`-accelerated along j when the inner dim
@@ -172,69 +258,464 @@ public static class TensorOps
             return new Tensor2D(gpuResult!, m, n);
         }
 
-        if (macs < ParallelFloorMacs)
-        {
-            var result = new float[m * n];
-            for (int i = 0; i < m; i++)
-            {
-                var xRow = x.Data.AsSpan(i * k, k);
-                var cRow = result.AsSpan(i * n, n);
-                for (int j = 0; j < n; j++)
-                {
-                    cRow[j] = Dot(xRow, w.Data.AsSpan(j * k, k));
-                }
-            }
-            return new Tensor2D(result, m, n);
-        }
-
-        int workers = Math.Min(ComputeBudget.Cores, Math.Max(1, n / 32));
-        if (workers <= 1)
-        {
-            var result = new float[m * n];
-            for (int i = 0; i < m; i++)
-            {
-                var xRow = x.Data.AsSpan(i * k, k);
-                var cRow = result.AsSpan(i * n, n);
-                for (int j = 0; j < n; j++)
-                {
-                    cRow[j] = Dot(xRow, w.Data.AsSpan(j * k, k));
-                }
-            }
-            return new Tensor2D(result, m, n);
-        }
-
-        var output = new float[m * n];
-        int colsPerWorker = (n + workers - 1) / workers;
-        Parallel.For(0, workers, worker =>
-        {
-            int j0 = worker * colsPerWorker;
-            int j1 = Math.Min(n, j0 + colsPerWorker);
-            if (j0 >= j1)
-            {
-                return;
-            }
-            // Weight rows outer, in cache-sized blocks, activation rows inner:
-            // a many-row GEMM (prefill, an encoder pass) then streams each
-            // weight block from memory once instead of once per activation
-            // row. Every output is still the same single Dot, so the result
-            // is bit-identical to the untiled order.
-            int block = Math.Max(1, (64 * 1024) / (k * sizeof(float)));
-            for (int jb = j0; jb < j1; jb += block)
-            {
-                int jEnd = Math.Min(j1, jb + block);
-                for (int i = 0; i < m; i++)
-                {
-                    var xRow = x.Data.AsSpan(i * k, k);
-                    var cRow = output.AsSpan(i * n, n);
-                    for (int j = jb; j < jEnd; j++)
-                    {
-                        cRow[j] = Dot(xRow, w.Data.AsSpan(j * k, k));
-                    }
-                }
-            }
-        });
-        return new Tensor2D(output, m, n);
+        return MatMulTransposedBCpu(x, new[] { w })[0];
     }
+
+    /// <summary>
+    /// x @ Wᵢᵀ for several weights that share the input — a layer's q/k/v,
+    /// an FFN's gate and up, the linear-attention in-projections. On the CPU
+    /// the row chunks of every weight go out as ONE pool loop, so a decode
+    /// step pays one dispatch and one ramp-up instead of one per projection;
+    /// every output is the same per-row dot as <see cref="MatMulTransposedB"/>
+    /// computes, so the results are bit-identical to calling it per weight.
+    /// A weight with a device copy (the CUDA path) is computed on its own.
+    /// </summary>
+    public static Tensor2D[] MatMulTransposedBMany(Tensor2D x, params Tensor2D[] weights)
+    {
+        foreach (var w in weights)
+        {
+            if (x.Cols != w.Cols)
+            {
+                throw new ArgumentException($"shape mismatch: x {x.Rows}x{x.Cols}, weight {w.Rows}x{w.Cols} (weight rows are output)");
+            }
+            if (w.DeviceWeightF16 != IntPtr.Zero)
+            {
+                var single = new Tensor2D[weights.Length];
+                for (int i = 0; i < weights.Length; i++)
+                {
+                    single[i] = MatMulTransposedB(x, weights[i]);
+                }
+                return single;
+            }
+        }
+        return MatMulTransposedBCpu(x, weights);
+    }
+
+    /// <summary>The managed GEMV/GEMM over one or more weights (see
+    /// <see cref="MatMulTransposedBMany"/>). A BF16-held weight streams its
+    /// bits and widens in registers; an f32 one (or one whose Data has been
+    /// touched) streams the floats. The two kernels are bit-identical.</summary>
+    private static Tensor2D[] MatMulTransposedBCpu(Tensor2D x, Tensor2D[] weights)
+    {
+        int m = x.Rows, k = x.Cols;
+        int count = weights.Length;
+        var outputs = new float[count][];
+        var bits = new ushort[]?[count];
+        var data = new float[]?[count];
+        long macs = 0;
+        int totalRows = 0;
+        for (int wi = 0; wi < count; wi++)
+        {
+            var w = weights[wi];
+            // Every element is written by exactly one dot below.
+            outputs[wi] = GC.AllocateUninitializedArray<float>(m * w.Rows);
+            bits[wi] = w.Bf16Bits;
+            data[wi] = bits[wi] is null ? w.Data : null;
+            macs += (long)m * k * w.Rows;
+            totalRows += w.Rows;
+        }
+        var xData = x.Data;
+
+        if (macs < PoolFloorMacs)
+        {
+            for (int wi = 0; wi < count; wi++)
+            {
+                RowRange(xData, 0, m, k, weights[wi].Rows, bits[wi], data[wi], outputs[wi], 0, weights[wi].Rows, weights[wi].Rows);
+            }
+            return Wrap(outputs, weights, m);
+        }
+
+        // Output columns (weight rows) split into chunks, several per thread so
+        // uneven progress balances out; a multiple of the kernel's four-row group.
+        int threads = Math.Min(ComputeBudget.Cores, KernelPool.Parallelism);
+        int per = ChunksPerThread;
+        // A many-row batch is also split by activation rows (see below), so the
+        // weight chunks only need to supply the rest of the parallelism — and
+        // the wider each chunk, the more weight rows reuse an activation tile.
+        int rowTile = m <= RowTile ? m : RowTile;
+        int rowTiles = (m + rowTile - 1) / rowTile;
+        int targetChunks = Math.Max(1, (threads * per + rowTiles - 1) / rowTiles);
+        int chunkRows = Math.Max(4, (totalRows + targetChunks - 1) / targetChunks);
+        chunkRows = (chunkRows + 3) & ~3;
+        // chunkStart[wi] = index of weight wi's first chunk.
+        var chunkStart = new int[count + 1];
+        for (int wi = 0; wi < count; wi++)
+        {
+            chunkStart[wi + 1] = chunkStart[wi] + (weights[wi].Rows + chunkRows - 1) / chunkRows;
+        }
+        // Weight rows outer, in cache-sized blocks, activation rows inner: a
+        // many-row GEMM (prefill, an encoder pass) then streams each weight
+        // block from memory once instead of once per activation row. Every
+        // output is still the same single Dot, so the result is bit-identical
+        // to the untiled order.
+        var blocks = new int[count];
+        for (int wi = 0; wi < count; wi++)
+        {
+            int elementBytes = bits[wi] is null ? sizeof(float) : sizeof(ushort);
+            blocks[wi] = Math.Max(4, (BlockBytes / (k * elementBytes)) & ~3);
+        }
+        // A many-row batch also splits its activation rows: each task is an
+        // [rowTile × chunkRows] tile whose activation rows stay in L2 while the
+        // weight rows stream past, instead of every task re-reading the whole
+        // activation matrix. Which tile a thread computes does not change any
+        // output value.
+        int weightChunks = chunkStart[count];
+        KernelPool.For(weightChunks * rowTiles, task =>
+        {
+            int chunk = task % weightChunks;
+            int tile = task / weightChunks;
+            int wi = 0;
+            while (chunk >= chunkStart[wi + 1])
+            {
+                wi++;
+            }
+            int n = weights[wi].Rows;
+            int j0 = (chunk - chunkStart[wi]) * chunkRows;
+            int j1 = Math.Min(n, j0 + chunkRows);
+            int i0 = tile * rowTile;
+            int i1 = Math.Min(m, i0 + rowTile);
+            RowRange(xData, i0, i1, k, n, bits[wi], data[wi], outputs[wi], j0, j1, blocks[wi]);
+        });
+        return Wrap(outputs, weights, m);
+    }
+
+    /// <summary>Weight rows [j0, j1) against every activation row, in blocks
+    /// of <paramref name="block"/> weight rows.</summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveOptimization)]
+    private static void RowRange(float[] xData, int i0, int i1, int k, int n, ushort[]? bits, float[]? data,
+        float[] output, int j0, int j1, int block)
+    {
+        int vw = Vector<float>.Count;
+        bool micro = i1 - i0 >= 4 && k >= 2 * vw && k % (bits is not null ? 2 * vw : vw) == 0;
+        for (int jb = j0; jb < j1; jb += block)
+        {
+            int jEnd = Math.Min(j1, jb + block);
+            int i = i0;
+            if (micro)
+            {
+                for (; i + 4 <= i1; i += 4)
+                {
+                    Micro4x4(xData, i, k, bits, data, jb, jEnd, output, n);
+                }
+            }
+            for (; i < i1; i++)
+            {
+                if (bits is not null)
+                {
+                    DotRowsBf16(xData.AsSpan(i * k, k), bits, k, jb, jEnd, output.AsSpan(i * n + jb, jEnd - jb));
+                }
+                else
+                {
+                    DotRows(xData.AsSpan(i * k, k), data!, k, jb, jEnd, output.AsSpan(i * n + jb, jEnd - jb));
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Four activation rows × four weight rows at once — sixteen accumulators,
+    /// each weight run loaded (and for BF16 widened) once per four activation
+    /// rows instead of once per row. Every accumulator is still one (i, j)
+    /// dot accumulated in increasing k, multiply then add, folded with
+    /// <see cref="Vector.Dot{T}"/>: bit-identical to <see cref="Dot"/>. Needs
+    /// k to be a whole number of vector runs (2·Count for BF16), which every
+    /// transformer width is; callers fall back to <see cref="DotRows"/>
+    /// otherwise. Writes output[(i0+ii)·n + j] for weight rows [j0, j1).
+    /// </summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveOptimization)]
+    private static void Micro4x4(float[] xData, int i0, int k, ushort[]? bits, float[]? data,
+        int j0, int j1, float[] output, int n)
+    {
+        int vw = Vector<float>.Count;
+        ref float x0 = ref System.Runtime.InteropServices.MemoryMarshal.GetArrayDataReference(xData);
+        x0 = ref System.Runtime.CompilerServices.Unsafe.Add(ref x0, (nint)i0 * k);
+        ref float x1 = ref System.Runtime.CompilerServices.Unsafe.Add(ref x0, k);
+        ref float x2 = ref System.Runtime.CompilerServices.Unsafe.Add(ref x1, k);
+        ref float x3 = ref System.Runtime.CompilerServices.Unsafe.Add(ref x2, k);
+        int j = j0;
+        for (; j + 4 <= j1; j += 4)
+        {
+            Vector<float> a00 = default, a01 = default, a02 = default, a03 = default;
+            Vector<float> a10 = default, a11 = default, a12 = default, a13 = default;
+            Vector<float> a20 = default, a21 = default, a22 = default, a23 = default;
+            Vector<float> a30 = default, a31 = default, a32 = default, a33 = default;
+            if (bits is not null)
+            {
+                ref ushort wb = ref System.Runtime.InteropServices.MemoryMarshal.GetArrayDataReference(bits);
+                ref ushort w0 = ref System.Runtime.CompilerServices.Unsafe.Add(ref wb, (nint)j * k);
+                ref ushort w1 = ref System.Runtime.CompilerServices.Unsafe.Add(ref w0, k);
+                ref ushort w2 = ref System.Runtime.CompilerServices.Unsafe.Add(ref w1, k);
+                ref ushort w3 = ref System.Runtime.CompilerServices.Unsafe.Add(ref w2, k);
+                for (int i = 0; i < k; i += 2 * vw)
+                {
+                    var x0l = Vector.LoadUnsafe(ref x0, (nuint)i);
+                    var x1l = Vector.LoadUnsafe(ref x1, (nuint)i);
+                    var x2l = Vector.LoadUnsafe(ref x2, (nuint)i);
+                    var x3l = Vector.LoadUnsafe(ref x3, (nuint)i);
+                    var x0h = Vector.LoadUnsafe(ref x0, (nuint)(i + vw));
+                    var x1h = Vector.LoadUnsafe(ref x1, (nuint)(i + vw));
+                    var x2h = Vector.LoadUnsafe(ref x2, (nuint)(i + vw));
+                    var x3h = Vector.LoadUnsafe(ref x3, (nuint)(i + vw));
+                    Widen(Vector.LoadUnsafe(ref w0, (nuint)i), out var lo, out var hi);
+                    a00 += x0l * lo; a10 += x1l * lo; a20 += x2l * lo; a30 += x3l * lo;
+                    a00 += x0h * hi; a10 += x1h * hi; a20 += x2h * hi; a30 += x3h * hi;
+                    Widen(Vector.LoadUnsafe(ref w1, (nuint)i), out lo, out hi);
+                    a01 += x0l * lo; a11 += x1l * lo; a21 += x2l * lo; a31 += x3l * lo;
+                    a01 += x0h * hi; a11 += x1h * hi; a21 += x2h * hi; a31 += x3h * hi;
+                    Widen(Vector.LoadUnsafe(ref w2, (nuint)i), out lo, out hi);
+                    a02 += x0l * lo; a12 += x1l * lo; a22 += x2l * lo; a32 += x3l * lo;
+                    a02 += x0h * hi; a12 += x1h * hi; a22 += x2h * hi; a32 += x3h * hi;
+                    Widen(Vector.LoadUnsafe(ref w3, (nuint)i), out lo, out hi);
+                    a03 += x0l * lo; a13 += x1l * lo; a23 += x2l * lo; a33 += x3l * lo;
+                    a03 += x0h * hi; a13 += x1h * hi; a23 += x2h * hi; a33 += x3h * hi;
+                }
+            }
+            else
+            {
+                ref float wb = ref System.Runtime.InteropServices.MemoryMarshal.GetArrayDataReference(data!);
+                ref float w0 = ref System.Runtime.CompilerServices.Unsafe.Add(ref wb, (nint)j * k);
+                ref float w1 = ref System.Runtime.CompilerServices.Unsafe.Add(ref w0, k);
+                ref float w2 = ref System.Runtime.CompilerServices.Unsafe.Add(ref w1, k);
+                ref float w3 = ref System.Runtime.CompilerServices.Unsafe.Add(ref w2, k);
+                for (int i = 0; i < k; i += vw)
+                {
+                    var xv0 = Vector.LoadUnsafe(ref x0, (nuint)i);
+                    var xv1 = Vector.LoadUnsafe(ref x1, (nuint)i);
+                    var xv2 = Vector.LoadUnsafe(ref x2, (nuint)i);
+                    var xv3 = Vector.LoadUnsafe(ref x3, (nuint)i);
+                    var wv = Vector.LoadUnsafe(ref w0, (nuint)i);
+                    a00 += xv0 * wv; a10 += xv1 * wv; a20 += xv2 * wv; a30 += xv3 * wv;
+                    wv = Vector.LoadUnsafe(ref w1, (nuint)i);
+                    a01 += xv0 * wv; a11 += xv1 * wv; a21 += xv2 * wv; a31 += xv3 * wv;
+                    wv = Vector.LoadUnsafe(ref w2, (nuint)i);
+                    a02 += xv0 * wv; a12 += xv1 * wv; a22 += xv2 * wv; a32 += xv3 * wv;
+                    wv = Vector.LoadUnsafe(ref w3, (nuint)i);
+                    a03 += xv0 * wv; a13 += xv1 * wv; a23 += xv2 * wv; a33 += xv3 * wv;
+                }
+            }
+            var one = Vector<float>.One;
+            int r0 = i0 * n + j, r1 = r0 + n, r2 = r1 + n, r3 = r2 + n;
+            output[r0] = Vector.Dot(a00, one); output[r0 + 1] = Vector.Dot(a01, one); output[r0 + 2] = Vector.Dot(a02, one); output[r0 + 3] = Vector.Dot(a03, one);
+            output[r1] = Vector.Dot(a10, one); output[r1 + 1] = Vector.Dot(a11, one); output[r1 + 2] = Vector.Dot(a12, one); output[r1 + 3] = Vector.Dot(a13, one);
+            output[r2] = Vector.Dot(a20, one); output[r2 + 1] = Vector.Dot(a21, one); output[r2 + 2] = Vector.Dot(a22, one); output[r2 + 3] = Vector.Dot(a23, one);
+            output[r3] = Vector.Dot(a30, one); output[r3 + 1] = Vector.Dot(a31, one); output[r3 + 2] = Vector.Dot(a32, one); output[r3 + 3] = Vector.Dot(a33, one);
+        }
+        if (j < j1)
+        {
+            for (int ii = 0; ii < 4; ii++)
+            {
+                var xRow = xData.AsSpan((i0 + ii) * k, k);
+                var dst = output.AsSpan((i0 + ii) * n + j, j1 - j);
+                if (bits is not null)
+                {
+                    DotRowsBf16(xRow, bits, k, j, j1, dst);
+                }
+                else
+                {
+                    DotRows(xRow, data!, k, j, j1, dst);
+                }
+            }
+        }
+    }
+
+    private static Tensor2D[] Wrap(float[][] outputs, Tensor2D[] weights, int m)
+    {
+        var result = new Tensor2D[outputs.Length];
+        for (int wi = 0; wi < outputs.Length; wi++)
+        {
+            result[wi] = new Tensor2D(outputs[wi], m, weights[wi].Rows);
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// <c>dst[j - j0] = Dot(x, w[j·k .. j·k+k))</c> for every weight row j in
+    /// [j0, j1). Four rows run interleaved, each with its own accumulator, so
+    /// the add latency is hidden and the activation is loaded once per four
+    /// rows. Each row's arithmetic — one <see cref="Vector{T}"/> accumulator,
+    /// multiply then add, <see cref="Vector.Dot{T}"/> fold, scalar tail — is
+    /// exactly <see cref="Dot"/>'s, so the results are bit-identical to it.
+    /// </summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveOptimization)]
+    public static void DotRows(ReadOnlySpan<float> x, float[] w, int k, int j0, int j1, Span<float> dst)
+    {
+        int vw = Vector<float>.Count;
+        int vecEnd = k >= vw ? k - k % vw : 0;
+        ref float xRef = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(x);
+        ref float wBase = ref System.Runtime.InteropServices.MemoryMarshal.GetArrayDataReference(w);
+        if ((long)j1 * k > w.Length)
+        {
+            throw new ArgumentOutOfRangeException(nameof(j1));
+        }
+        int j = j0;
+        for (; j + 4 <= j1; j += 4)
+        {
+            ref float r0 = ref System.Runtime.CompilerServices.Unsafe.Add(ref wBase, (nint)j * k);
+            ref float r1 = ref System.Runtime.CompilerServices.Unsafe.Add(ref r0, k);
+            ref float r2 = ref System.Runtime.CompilerServices.Unsafe.Add(ref r1, k);
+            ref float r3 = ref System.Runtime.CompilerServices.Unsafe.Add(ref r2, k);
+            var a0 = Vector<float>.Zero;
+            var a1 = Vector<float>.Zero;
+            var a2 = Vector<float>.Zero;
+            var a3 = Vector<float>.Zero;
+            for (int i = 0; i < vecEnd; i += vw)
+            {
+                var xv = Vector.LoadUnsafe(ref xRef, (nuint)i);
+                a0 += xv * Vector.LoadUnsafe(ref r0, (nuint)i);
+                a1 += xv * Vector.LoadUnsafe(ref r1, (nuint)i);
+                a2 += xv * Vector.LoadUnsafe(ref r2, (nuint)i);
+                a3 += xv * Vector.LoadUnsafe(ref r3, (nuint)i);
+            }
+            float s0 = 0f, s1 = 0f, s2 = 0f, s3 = 0f;
+            if (k >= vw)
+            {
+                s0 = Vector.Dot(a0, Vector<float>.One);
+                s1 = Vector.Dot(a1, Vector<float>.One);
+                s2 = Vector.Dot(a2, Vector<float>.One);
+                s3 = Vector.Dot(a3, Vector<float>.One);
+            }
+            for (int i = vecEnd; i < k; i++)
+            {
+                float xs = System.Runtime.CompilerServices.Unsafe.Add(ref xRef, i);
+                s0 += xs * System.Runtime.CompilerServices.Unsafe.Add(ref r0, i);
+                s1 += xs * System.Runtime.CompilerServices.Unsafe.Add(ref r1, i);
+                s2 += xs * System.Runtime.CompilerServices.Unsafe.Add(ref r2, i);
+                s3 += xs * System.Runtime.CompilerServices.Unsafe.Add(ref r3, i);
+            }
+            dst[j - j0] = s0;
+            dst[j - j0 + 1] = s1;
+            dst[j - j0 + 2] = s2;
+            dst[j - j0 + 3] = s3;
+        }
+        for (; j < j1; j++)
+        {
+            dst[j - j0] = Dot(x.Slice(0, k), w.AsSpan(j * k, k));
+        }
+    }
+
+    /// <summary>
+    /// <see cref="DotRows"/> over a BF16-held weight: each run of
+    /// 2·<c>Vector&lt;float&gt;.Count</c> bit patterns is loaded once, widened to
+    /// two f32 vectors (a zero-extend and a 16-bit shift, which is exact), and
+    /// fed to the accumulator in element order. The accumulator therefore sees
+    /// the same products in the same order as <see cref="Dot"/> over the
+    /// widened row: bit-identical, from half the memory traffic.
+    /// </summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveOptimization)]
+    public static void DotRowsBf16(ReadOnlySpan<float> x, ushort[] w, int k, int j0, int j1, Span<float> dst)
+    {
+        int vw = Vector<float>.Count;
+        int pair = 2 * vw;
+        int vecEnd = k >= vw ? k - k % vw : 0;
+        int pairEnd = vecEnd - vecEnd % pair;
+        if ((long)j1 * k > w.Length)
+        {
+            throw new ArgumentOutOfRangeException(nameof(j1));
+        }
+        ref float xRef = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(x);
+        ref ushort wBase = ref System.Runtime.InteropServices.MemoryMarshal.GetArrayDataReference(w);
+        Span<float> rowTail = stackalloc float[vw];
+        int j = j0;
+        for (; j + 4 <= j1; j += 4)
+        {
+            ref ushort r0 = ref System.Runtime.CompilerServices.Unsafe.Add(ref wBase, (nint)j * k);
+            ref ushort r1 = ref System.Runtime.CompilerServices.Unsafe.Add(ref r0, k);
+            ref ushort r2 = ref System.Runtime.CompilerServices.Unsafe.Add(ref r1, k);
+            ref ushort r3 = ref System.Runtime.CompilerServices.Unsafe.Add(ref r2, k);
+            var a0 = Vector<float>.Zero;
+            var a1 = Vector<float>.Zero;
+            var a2 = Vector<float>.Zero;
+            var a3 = Vector<float>.Zero;
+            for (int i = 0; i < pairEnd; i += pair)
+            {
+                var xLo = Vector.LoadUnsafe(ref xRef, (nuint)i);
+                var xHi = Vector.LoadUnsafe(ref xRef, (nuint)(i + vw));
+                Widen(Vector.LoadUnsafe(ref r0, (nuint)i), out var w0Lo, out var w0Hi);
+                Widen(Vector.LoadUnsafe(ref r1, (nuint)i), out var w1Lo, out var w1Hi);
+                Widen(Vector.LoadUnsafe(ref r2, (nuint)i), out var w2Lo, out var w2Hi);
+                Widen(Vector.LoadUnsafe(ref r3, (nuint)i), out var w3Lo, out var w3Hi);
+                a0 += xLo * w0Lo;
+                a1 += xLo * w1Lo;
+                a2 += xLo * w2Lo;
+                a3 += xLo * w3Lo;
+                a0 += xHi * w0Hi;
+                a1 += xHi * w1Hi;
+                a2 += xHi * w2Hi;
+                a3 += xHi * w3Hi;
+            }
+            if (pairEnd < vecEnd)
+            {
+                // One single-width run left (k is an odd multiple of Count).
+                var xv = Vector.LoadUnsafe(ref xRef, (nuint)pairEnd);
+                a0 += xv * WidenRun(ref r0, pairEnd, rowTail);
+                a1 += xv * WidenRun(ref r1, pairEnd, rowTail);
+                a2 += xv * WidenRun(ref r2, pairEnd, rowTail);
+                a3 += xv * WidenRun(ref r3, pairEnd, rowTail);
+            }
+            float s0 = 0f, s1 = 0f, s2 = 0f, s3 = 0f;
+            if (k >= vw)
+            {
+                s0 = Vector.Dot(a0, Vector<float>.One);
+                s1 = Vector.Dot(a1, Vector<float>.One);
+                s2 = Vector.Dot(a2, Vector<float>.One);
+                s3 = Vector.Dot(a3, Vector<float>.One);
+            }
+            for (int i = vecEnd; i < k; i++)
+            {
+                float xs = System.Runtime.CompilerServices.Unsafe.Add(ref xRef, i);
+                s0 += xs * Bf16(System.Runtime.CompilerServices.Unsafe.Add(ref r0, i));
+                s1 += xs * Bf16(System.Runtime.CompilerServices.Unsafe.Add(ref r1, i));
+                s2 += xs * Bf16(System.Runtime.CompilerServices.Unsafe.Add(ref r2, i));
+                s3 += xs * Bf16(System.Runtime.CompilerServices.Unsafe.Add(ref r3, i));
+            }
+            dst[j - j0] = s0;
+            dst[j - j0 + 1] = s1;
+            dst[j - j0 + 2] = s2;
+            dst[j - j0 + 3] = s3;
+        }
+        for (; j < j1; j++)
+        {
+            // The single-row form of the loop above, in the same order.
+            ref ushort r = ref System.Runtime.CompilerServices.Unsafe.Add(ref wBase, (nint)j * k);
+            var a = Vector<float>.Zero;
+            for (int i = 0; i < pairEnd; i += pair)
+            {
+                Widen(Vector.LoadUnsafe(ref r, (nuint)i), out var lo, out var hi);
+                a += Vector.LoadUnsafe(ref xRef, (nuint)i) * lo;
+                a += Vector.LoadUnsafe(ref xRef, (nuint)(i + vw)) * hi;
+            }
+            if (pairEnd < vecEnd)
+            {
+                a += Vector.LoadUnsafe(ref xRef, (nuint)pairEnd) * WidenRun(ref r, pairEnd, rowTail);
+            }
+            float sum = k >= vw ? Vector.Dot(a, Vector<float>.One) : 0f;
+            for (int i = vecEnd; i < k; i++)
+            {
+                sum += System.Runtime.CompilerServices.Unsafe.Add(ref xRef, i) * Bf16(System.Runtime.CompilerServices.Unsafe.Add(ref r, i));
+            }
+            dst[j - j0] = sum;
+        }
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private static void Widen(Vector<ushort> bits, out Vector<float> lo, out Vector<float> hi)
+    {
+        Vector.Widen(bits, out Vector<uint> l, out Vector<uint> h);
+        lo = Vector.AsVectorSingle(Vector.ShiftLeft(l, 16));
+        hi = Vector.AsVectorSingle(Vector.ShiftLeft(h, 16));
+    }
+
+    private static Vector<float> WidenRun(ref ushort row, int offset, Span<float> scratch)
+    {
+        for (int e = 0; e < scratch.Length; e++)
+        {
+            scratch[e] = Bf16(System.Runtime.CompilerServices.Unsafe.Add(ref row, offset + e));
+        }
+        return new Vector<float>(scratch);
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private static float Bf16(ushort bits) => BitConverter.Int32BitsToSingle(bits << 16);
 
     /// <summary>
     /// GPU-batched transposed-B GEMM: a single activation <c>x</c> against
@@ -359,7 +840,7 @@ public static class TensorOps
         var result = new float[indices.Length * table.Cols];
         for (int r = 0; r < indices.Length; r++)
         {
-            table.Row(indices[r]).CopyTo(result.AsSpan(r * table.Cols, table.Cols));
+            table.CopyRowTo(indices[r], result.AsSpan(r * table.Cols, table.Cols));
         }
         return new Tensor2D(result, indices.Length, table.Cols);
     }

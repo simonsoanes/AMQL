@@ -64,20 +64,21 @@ roles existed, it judges the map from the segment with the same rules.
 ## How it is measured
 
 `tests/Amql.Tests/fixtures/make_arch_zoo.py` builds a tiny random model for
-each of 20 transformers architectures that no AMQL code names: Llama (with
+each of 24 transformers architectures that no AMQL code names: Llama (with
 and without biases), Mistral, Ministral, Qwen2, Qwen3, Phi-3, Gemma, Gemma 2,
 Gemma 3, OLMo 2, OLMo 3, Granite, SmolLM3, StableLM, Starcoder2, Cohere,
-Helium, GLM-4 and EXAONE 4. Each one stores transformers' own logits,
-computed with eager attention: SDPA silently drops Gemma 2's attention
-softcap.
+Helium, GLM-4, EXAONE 4, and the MoE families Mixtral, Qwen2-MoE, Qwen3-MoE
+and OLMoE. Nine more vary the rope (see [Rope scaling](#rope-scaling)), for 33
+in all. Each one stores transformers' own logits, computed with eager
+attention: SDPA silently drops Gemma 2's attention softcap.
 
 | Check | Result |
 |---|---|
-| Import + run (`ArchZooTests.Encodes_And_Matches_Transformers_Logits`) | 20 / 20 match transformers (< 2e-3) |
-| HF export round trip (`ArchZooTests.Hf_Export_Round_Trips`): same tensor names, every original config key kept, re-imports to the same logits | 20 / 20 |
-| HF export loaded by transformers under its own class (`scripts/export/check_hf.py`) | 20 / 20 reproduce the original logits (to the goldens' 6-decimal rounding) |
-| ONNX export, run in onnxruntime (`scripts/export/check_onnx.py`) | 20 / 20, worst difference 1.7e-5 (26 / 26 with the rope-scaling models below) |
-| GGUF export, read back with the `gguf` package under llama.cpp's rules (`scripts/export/check_gguf.py`) | 8 / 8 exported match (llama, mistral, helium, phi3, qwen2, qwen3, granite, olmo2); the other 12 are refused by property |
+| Import + run (`ArchZooTests.Encodes_And_Matches_Transformers_Logits`) | 33 / 33 match transformers (< 2e-3) |
+| HF export round trip (`ArchZooTests.Hf_Export_Round_Trips`): same tensor names, every original config key kept, re-imports to the same logits | 33 / 33 |
+| HF export loaded by transformers under its own class (`scripts/export/check_hf.py`) | 33 / 33 reproduce the original logits (to the goldens' 6-decimal rounding) |
+| ONNX export, run in onnxruntime (`scripts/export/check_onnx.py`) | 29 / 29 dense models, worst difference 1.7e-5; the 4 MoE models are refused |
+| GGUF export, read back with the `gguf` package under llama.cpp's rules (`scripts/export/check_gguf.py`) | 8 / 8 exported match (llama, mistral, helium, phi3, qwen2, qwen3, granite, olmo2); the rest are refused by property |
 | Real checkpoint: Phi-3-mini-4k-instruct | Encodes unchanged. 8 greedy tokens match transformers, including a step where the top two differ by 0.013. HF export re-fuses `qkv_proj` / `gate_up_proj` and reloads in transformers with identical logprobs. |
 
 `check_gguf.py` is an independent reading of the file, not llama.cpp.
@@ -105,6 +106,61 @@ blocks, as transformers does.
 | GGUF | linear is written as `rope.scaling.type/factor` and llama3 as the `rope_freqs` divisor tensor (llama arch); both match under llama.cpp's rules. yarn is refused: llama.cpp computes its ramp and attention factor in its own way, which is not verified here. |
 | Real Gemma 3 12B (QAT unquantized; linear ×8 on 8 full layers, base 10k on 40 sliding) | 8 greedy tokens identical to transformers, including steps with margins of 0.021 and 0.024 |
 
+### Length-dependent rope and MRoPE
+
+`longrope` (Phi-3-128k, Phi-3.5, Phi-4-mini) divides each pair's frequency by
+its own `short_factor` entry, or by its `long_factor` entry once the sequence
+is longer than `original_max_position_embeddings`, and multiplies cos and sin
+by `sqrt(1 + ln(factor)/ln(original))`. Early Phi-3 configs call it `su`.
+`dynamic` (NTK) grows the base to `theta·(factor·len/max − (factor − 1))^(d/(d−2))`
+once the sequence is longer than `max_position_embeddings`. Both depend on
+the sequence length, which transformers takes as the largest position in the
+forward pass plus one, and so does AMQL. Keys already in a cache keep the
+rotation they were given, as they do in transformers. The ONNX graph is one
+forward pass, so it picks the regime from its own length; GGUF refuses both,
+because llama.cpp fixes the regime from the context size at load.
+
+MRoPE (Qwen2-VL onward, Qwen3.5) gives each rotary pair its position from one
+of three streams: temporal, height and width. Qwen2-VL and Qwen2.5-VL split
+the pairs into contiguous sections (`mrope_section`); Qwen3-VL and Qwen3.5
+interleave them (`mrope_interleaved`). The legacy `rope_scaling.type: mrope`
+spelling is read too. A text token carries one position in every stream,
+which is plain rotary. `GenericRuntime.RunLayerInternal` takes per-row
+`positionStreams` for the rest, so an image grid's (t, h, w) positions rotate
+as transformers rotates them. The policy carries the sections (`mrope`), so
+nothing is lost on export; ONNX and GGUF exports carry text positions only.
+
+| Check | Result |
+|---|---|
+| Frequencies against transformers' `ROPE_INIT_FUNCTIONS` (`RopeScalingTests`) | longrope in both regimes and dynamic below and above the maximum match to 1e-6 |
+| Zoo: `phi3-longrope-long` (12 ids past an original length of 8), `phi3-longrope-short`, `llama-dynamic` (past a maximum of 8) | import, HF round trip and ONNX match transformers. With the short factors in the long-regime model, transformers' logits move by 4.4 |
+| `MropeTests`: tiny Qwen2-VL (sections) and Qwen3-VL (interleaved) text decoders | match transformers with text positions, and with (t, h, w) streams laid out around a 2×3 image grid, which move the logits by 7.6 and 4.2 |
+
+## Mixture of experts
+
+Experts are judged from their tensors: `<block>.experts.N.<stem>` with the
+projections named by role (`gate_proj`/`up_proj`/`down_proj`, Mixtral's
+`w1`/`w3`/`w2`), the router (`mlp.gate`, `block_sparse_moe.gate`,
+`mlp.router`), and an always-on shared expert with its optional sigmoid gate
+(`mlp.shared_expert`, `mlp.shared_expert_gate`). The count and top-k come from
+the config (`num_experts` / `num_local_experts`, `num_experts_per_tok`). The
+routing rule comes from `norm_topk_prob`: renormalise the softmax over the
+selected experts or not, and renormalise when the config is silent, as Mixtral
+does. A layer is routed when its own tensors include the router, so a stack
+with dense layers (Qwen3-MoE's `mlp_only_layers`) runs each layer as it is.
+The expert width is read from the expert tensors. HF export keeps the
+checkpoint's own MoE keys and expert names.
+
+Refused by name: sigmoid router scores, grouped selection (`n_group` /
+`topk_group`) and `routed_scaling_factor` (DeepSeek-V3, GLM-4.5), a router
+bias (gpt-oss), and experts packed into one 3-D tensor (GraniteMoE,
+Llama 4), whose axis order differs between families.
+
+| Check | Result |
+|---|---|
+| Zoo: Mixtral (renormalised top-2), Qwen2-MoE (shared expert behind its gate), Qwen3-MoE (a dense first layer), OLMoE (not renormalised) | import, HF round trip and transformers reload all match |
+| ONNX, GGUF | refused: neither generic exporter writes routed FFNs yet |
+
 ## Fixes made on the way
 
 - **Granite's residual multiplier** was applied to the residual stream
@@ -129,9 +185,13 @@ blocks, as transformers does.
   learned attention sinks, interleaved fused QKV, ALiBi or relative position
   biases. Each needs runtime code once. Every family using it then works
   through the same judging.
-- **Rope scaling.** `linear`, `llama3` and `yarn` are served (see below).
-  `dynamic`, `longrope` and MRoPE are still carried unresolved and refused
-  at plan time; Phi-3-128k needs `longrope`.
+- **Rope scaling.** `linear`, `llama3`, `yarn`, `longrope` and `dynamic` are
+  served, and MRoPE with text or explicit (t, h, w) positions. Any other
+  `rope_type` is carried unresolved and refused at plan time. AMQL has no
+  vision tower runtime, so image positions come from the caller.
+- **MoE.** Softmax routing over experts stored one per tensor. The routers
+  and layouts listed under [Mixture of experts](#mixture-of-experts) are
+  refused, and MoE models export to HF only.
 - **GELU.** The runtime computes exact `gelu` with the tanh approximation,
   as it did before. ONNX mirrors the runtime.
 - **GGUF.** Only the five architectures above. llama.cpp's Gemma layouts

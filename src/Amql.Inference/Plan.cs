@@ -138,11 +138,23 @@ public sealed class RoutedFfnOp
     public required Activation Activation { get; init; }
     public required ExpertRoutingPolicy RoutingPolicy { get; init; }
 
-    /// <summary>Per-expert operand names (gate is null when the expert
-    /// shape is ungated — not typical).</summary>
+    /// <summary>Per-expert operand names: expert <c>e</c>'s up projection is
+    /// <c>{ExpertUpPrefix}{e}.{ExpertUpStem}</c>. The stems are the
+    /// checkpoint's own (<c>up_proj.weight</c>, Mixtral's <c>w3.weight</c>).</summary>
     public required string ExpertGatePrefix { get; init; }
     public required string ExpertUpPrefix { get; init; }
     public required string ExpertDownPrefix { get; init; }
+    public string ExpertGateStem { get; init; } = "gate_proj.weight";
+    public string ExpertUpStem { get; init; } = "up_proj.weight";
+    public string ExpertDownStem { get; init; } = "down_proj.weight";
+
+    /// <summary>An expert every token passes through, added to the routed
+    /// mixture (Qwen2-MoE); null when the layer has none.</summary>
+    public DenseFfnOp? SharedExpert { get; init; }
+
+    /// <summary>[1, hidden]: the shared expert's output is scaled by
+    /// <c>sigmoid(gate·x)</c>; null adds it unscaled.</summary>
+    public OperandRef? SharedExpertGate { get; init; }
 }
 
 public sealed class LayerFfn

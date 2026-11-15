@@ -32,22 +32,36 @@ public static class FfnKernel
             }
             else
             {
-                pair = new[]
-                {
-                    TensorOps.MatMulTransposedB(x, gate),
-                    TensorOps.MatMulTransposedB(x, up),
-                };
+                pair = TensorOps.MatMulTransposedBMany(x, gate, up);
             }
             var g = pair[0];
             var u = pair[1];
             AddRowBias(g, gateBias);
             AddRowBias(u, upBias);
             hidden = Tensor2D.Zeros(x.Rows, g.Cols);
-            for (int r = 0; r < hidden.Rows; r++)
+            var gData = g.Data;
+            var uData = u.Data;
+            var hData = hidden.Data;
+            // Element-wise act(g)·u: independent elements, split across the
+            // pool when wide. The same scalar function per element.
+            const int Span = 1024;
+            int spans = (hData.Length + Span - 1) / Span;
+            if (spans > 1)
             {
-                for (int c = 0; c < hidden.Cols; c++)
+                KernelPool.For(spans, sIdx =>
                 {
-                    hidden.Set(r, c, act(g[r, c]) * u[r, c]);
+                    int end = Math.Min(hData.Length, (sIdx + 1) * Span);
+                    for (int i = sIdx * Span; i < end; i++)
+                    {
+                        hData[i] = act(gData[i]) * uData[i];
+                    }
+                });
+            }
+            else
+            {
+                for (int i = 0; i < hData.Length; i++)
+                {
+                    hData[i] = act(gData[i]) * uData[i];
                 }
             }
         }

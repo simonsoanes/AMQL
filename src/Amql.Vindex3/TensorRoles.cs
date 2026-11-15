@@ -23,8 +23,28 @@ public sealed class LayerRoleMap
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public List<FusedTensor>? Fused { get; init; }
 
+    /// <summary>Routed experts, when the stack has any: where each expert's
+    /// three projections live. Layers whose own tensors include the router are
+    /// routed; the rest of the stack stays dense.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public ExpertLayout? Experts { get; init; }
+
     public string? Name(string role, string part = "weight") =>
         Roles.TryGetValue($"{role}.{part}", out var name) ? name : null;
+}
+
+/// <summary>Per-expert tensor names, layer-relative without the layer index:
+/// expert <c>e</c>'s gate is <c>{Prefix}{e}.{Gate}</c>
+/// (<c>mlp.experts.3.gate_proj.weight</c>, Mixtral's
+/// <c>block_sparse_moe.experts.3.w1.weight</c>).</summary>
+public sealed class ExpertLayout
+{
+    public required string Prefix { get; init; }
+    public string? Gate { get; init; }
+    public required string Up { get; init; }
+    public required string Down { get; init; }
+
+    public string Name(int expert, string stem) => $"{Prefix}{expert}.{stem}";
 }
 
 /// <summary>One fused checkpoint tensor: <see cref="Name"/> is the concatenation,
@@ -65,6 +85,23 @@ public static class TensorRoles
     public const string Up = "ffn_up";
     public const string Down = "ffn_down";
 
+    // Mixture of experts: the router, and an always-on shared expert with its
+    // optional scalar gate (Qwen2-MoE: sigmoid(shared_expert_gate·x)).
+    public const string Router = "moe_router";
+    public const string SharedGate = "shared_gate";
+    public const string SharedUp = "shared_up";
+    public const string SharedDown = "shared_down";
+    public const string SharedExpertGate = "shared_expert_gate";
+
+    /// <summary>Expert projection stems, by role, as each family spells them
+    /// inside <c>experts.N.</c>.</summary>
+    private static readonly (string Role, string[] Stems)[] ExpertStems =
+    {
+        (Gate, new[] { "gate_proj", "w1" }),
+        (Up, new[] { "up_proj", "w3" }),
+        (Down, new[] { "down_proj", "w2" }),
+    };
+
     /// <summary>Role → known module stems (layer-relative, no <c>.weight</c>).
     /// First match wins, so the most common spelling leads.</summary>
     public static readonly IReadOnlyDictionary<string, string[]> Aliases = new Dictionary<string, string[]>
@@ -78,6 +115,11 @@ public static class TensorRoles
         [Gate] = new[] { "mlp.gate_proj", "feed_forward.w1", "mlp.w1", "feed_forward.gate_proj" },
         [Up] = new[] { "mlp.up_proj", "feed_forward.w3", "mlp.w3", "feed_forward.up_proj", "mlp.c_fc", "mlp.fc1", "mlp.dense_h_to_4h" },
         [Down] = new[] { "mlp.down_proj", "feed_forward.w2", "mlp.w2", "feed_forward.down_proj", "mlp.c_proj", "mlp.fc2", "mlp.dense_4h_to_h" },
+        [Router] = new[] { "mlp.gate", "mlp.router", "block_sparse_moe.gate", "feed_forward.router", "feed_forward.gate" },
+        [SharedGate] = new[] { "mlp.shared_expert.gate_proj", "mlp.shared_experts.gate_proj", "feed_forward.shared_expert.gate_proj" },
+        [SharedUp] = new[] { "mlp.shared_expert.up_proj", "mlp.shared_experts.up_proj", "feed_forward.shared_expert.up_proj" },
+        [SharedDown] = new[] { "mlp.shared_expert.down_proj", "mlp.shared_experts.down_proj", "feed_forward.shared_expert.down_proj" },
+        [SharedExpertGate] = new[] { "mlp.shared_expert_gate", "feed_forward.shared_expert_gate" },
     };
 
     /// <summary>Fused spellings whose parts are contiguous row blocks — safe to
@@ -189,11 +231,77 @@ public static class TensorRoles
             Bind(FfnIn, new[] { "post_attention_layernorm", "ffn_norm", "ln_2", "ln_mlp" }.FirstOrDefault(Has));
         }
 
+        var experts = JudgeExperts(suffixes);
+        if (experts is not null && !roles.ContainsKey(Router + ".weight"))
+        {
+            throw new ContainerException(
+                $"layers carry experts under '{experts.Prefix}' but no router this build recognises " +
+                $"({string.Join(", ", Aliases[Router])})");
+        }
+        if (experts is null)
+        {
+            // A lone tensor spelled like a router is not one without experts.
+            roles.Remove(Router + ".weight");
+            roles.Remove(Router + ".bias");
+        }
+
         return new LayerRoleMap
         {
             Roles = roles,
             Fused = fused is { Count: > 0 } ? fused : null,
+            Experts = experts,
         };
+    }
+
+    /// <summary>Finds <c>&lt;block&gt;.experts.N.&lt;stem&gt;.weight</c> tensors and
+    /// names each expert projection by role. Packed experts (one 3-D tensor
+    /// for all of them) are refused by name: their axis order differs between
+    /// families and is not stated in the checkpoint.</summary>
+    private static ExpertLayout? JudgeExperts(HashSet<string> suffixes)
+    {
+        var pattern = new System.Text.RegularExpressions.Regex(@"^(.+\.experts\.)(\d+)\.(.+)$");
+        var stemsByPrefix = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
+        foreach (var suffix in suffixes)
+        {
+            var m = pattern.Match(suffix);
+            if (m.Success)
+            {
+                if (!stemsByPrefix.TryGetValue(m.Groups[1].Value, out var set))
+                {
+                    stemsByPrefix[m.Groups[1].Value] = set = new HashSet<string>(StringComparer.Ordinal);
+                }
+                set.Add(m.Groups[3].Value);
+            }
+        }
+        if (stemsByPrefix.Count == 0)
+        {
+            foreach (var packed in new[] { "block_sparse_moe.input_linear.weight", "mlp.experts.gate_up_proj", "feed_forward.experts.gate_up_proj" })
+            {
+                if (suffixes.Contains(packed))
+                {
+                    throw new ContainerException(
+                        $"layer tensor '{packed}' packs every expert into one tensor — this build reads experts stored one per tensor");
+                }
+            }
+            return null;
+        }
+        if (stemsByPrefix.Count > 1)
+        {
+            throw new ContainerException($"layers carry experts under {stemsByPrefix.Count} prefixes ({string.Join(", ", stemsByPrefix.Keys)})");
+        }
+        var (prefix, stems) = stemsByPrefix.First();
+        string? Find(string role) => ExpertStems.First(s => s.Role == role).Stems
+            .Select(s => s + ".weight").FirstOrDefault(stems.Contains);
+        string up = Find(Up) ?? throw new ContainerException($"experts under '{prefix}' have no up projection this build recognises");
+        string down = Find(Down) ?? throw new ContainerException($"experts under '{prefix}' have no down projection this build recognises");
+        var known = new[] { Find(Gate), up, down }.Where(s => s is not null).ToHashSet();
+        var other = stems.Where(s => !known.Contains(s)).ToList();
+        if (other.Count > 0)
+        {
+            throw new ContainerException(
+                $"experts under '{prefix}' carry tensors this build does not run ({string.Join(", ", other)})");
+        }
+        return new ExpertLayout { Prefix = prefix, Gate = Find(Gate), Up = up, Down = down };
     }
 
     /// <summary>A block with one norm feeding both the attention and the FFN

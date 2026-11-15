@@ -149,6 +149,22 @@ public sealed class WeightLoader
                 : MatrixMxfp4(operand, rows, cols);
             CacheBounded(key, matrix);
         }
+        else if (HoldAsBf16(operand))
+        {
+            // Stored BF16 and nothing to add to it: keep the bits. The GEMV
+            // kernels widen them in registers (bit-identical results, half the
+            // bytes streamed per token); Data widens on first touch.
+            ChargeWidened(operand, ((long)rows * cols + 1) / 2);
+            var (bf16Shape, bits) = _store.ResolveBf16(operand.ObjectId, operand.TensorName);
+            if (bf16Shape.Length == 0 || ElementCount(bf16Shape) != (long)rows * cols)
+            {
+                throw new ContainerException(
+                    $"operand '{operand.ObjectId}/{operand.TensorName}' resolves to shape " +
+                    $"[{string.Join(",", bf16Shape)}] — expected [{rows} x {cols}]");
+            }
+            matrix = Tensor2D.FromBf16(bits, rows, cols);
+            _matrices[key] = matrix;
+        }
         else
         {
             // Charge before the widened array exists so an over-budget load
@@ -430,6 +446,7 @@ public sealed class WeightLoader
     /// </summary>
     public void AddDelta(OperandRef operand, int rows, int cols, float[] delta)
     {
+        Version++;
         if (delta.Length != (long)rows * cols)
         {
             throw new ArgumentException(
@@ -475,6 +492,72 @@ public sealed class WeightLoader
     /// weight, in place. A delta whose element count differs from the
     /// widened tensor cannot be the same weight — the patch was made for a
     /// different container or tensor.</summary>
+    /// <summary>
+    /// Whether a resident matrix can stay as its stored BF16 bits: the
+    /// storage is BF16 and no patch or in-memory delta changes it (a delta is
+    /// rarely BF16-representable). Any code that reads
+    /// <see cref="Tensor2D.Data"/> still gets the exact f32 values — the
+    /// tensor widens itself on first touch — so this only changes what the
+    /// GEMV kernels stream. <c>AMQL_RESIDENT_BF16=0</c> turns it off, widening
+    /// every matrix up front as before.
+    /// </summary>
+    /// <summary>Bumped by every <see cref="AddDelta"/>, so a copy of the weights
+    /// held elsewhere (the device engine's) can tell it has gone stale.</summary>
+    internal int Version { get; private set; }
+
+    /// <summary>A matrix's values for a copy held outside this loader (the
+    /// device engine uploads them once): the stored BF16 bits when the matrix
+    /// would be held as BF16 here, otherwise the f32 values with any patch and
+    /// added delta applied. Nothing is cached or charged to the session's
+    /// budget, so the host does not keep a second copy of what the device
+    /// holds.</summary>
+    internal (ushort[]? Bf16, float[]? F32) DeviceSource(OperandRef operand, int rows, int cols)
+    {
+        var key = (operand.ObjectId, operand.TensorName);
+        if (_matrices.TryGetValue(key, out var cached) && cached.Bf16Bits is null)
+        {
+            return (null, cached.Data);
+        }
+        if (HoldAsBf16(operand))
+        {
+            var (shape, bits) = _store.ResolveBf16(operand.ObjectId, operand.TensorName);
+            if (shape.Length == 0 || ElementCount(shape) != (long)rows * cols)
+            {
+                throw new ContainerException(
+                    $"operand '{operand.ObjectId}/{operand.TensorName}' resolves to shape " +
+                    $"[{string.Join(",", shape)}] — expected [{rows} x {cols}]");
+            }
+            return (bits, null);
+        }
+        var resolution = _store.ResolveWidened(operand);
+        if (resolution.Shape.Length == 0 || ElementCount(resolution.Shape) != (long)rows * cols)
+        {
+            throw new ContainerException(
+                $"operand '{operand.ObjectId}/{operand.TensorName}' resolves to shape " +
+                $"[{string.Join(",", resolution.Shape)}] — expected [{rows} x {cols}]");
+        }
+        var data = resolution.Values;
+        ApplyPatch(operand, data);
+        return (null, data);
+    }
+
+    private bool HoldAsBf16(OperandRef operand)
+    {
+        if (!ResidentBf16Enabled)
+        {
+            return false;
+        }
+        var key = (operand.ObjectId, operand.TensorName);
+        if (_added.ContainsKey(key) || (_patch is not null && _patch.TryGet(operand.ObjectId, operand.TensorName, out _)))
+        {
+            return false;
+        }
+        return _store.DtypeOf(operand.ObjectId, operand.TensorName) == Dtype.BF16;
+    }
+
+    private static readonly bool ResidentBf16Enabled =
+        Environment.GetEnvironmentVariable("AMQL_RESIDENT_BF16")?.Trim() is not ("0" or "false" or "off");
+
     private void ApplyPatch(OperandRef operand, float[] widened)
     {
         if (_added.TryGetValue((operand.ObjectId, operand.TensorName), out var added) &&

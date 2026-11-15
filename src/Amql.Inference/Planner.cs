@@ -420,8 +420,68 @@ public static class Planner
 
     private static LayerFfn? BuildFfn(OperandStore store, string stackId, int layer, FfnSurface ffnSurface, LayerRoleMap roles, int hiddenSize)
     {
-        if (ffnSurface.Moe is { } moe)
+        if (ffnSurface.Moe is { } routedMoe && roles.Experts is { } experts)
         {
+            // Routed where this layer's own tensors include the router; a
+            // dense layer in the same stack (Qwen3-MoE's mlp_only_layers)
+            // falls through to the dense FFN below.
+            string routerName = $"{layer}.{roles.Name(TensorRoles.Router)}";
+            if (store.ContainsTensor(stackId, routerName))
+            {
+                for (int e = 0; e < routedMoe.Experts; e++)
+                {
+                    if (experts.Gate is { } g)
+                    {
+                        Require(store, stackId, $"{layer}.{experts.Name(e, g)}", layer, $"expert {e} gate");
+                    }
+                    Require(store, stackId, $"{layer}.{experts.Name(e, experts.Up)}", layer, $"expert {e} up");
+                    Require(store, stackId, $"{layer}.{experts.Name(e, experts.Down)}", layer, $"expert {e} down");
+                }
+                if (experts.Gate is null)
+                {
+                    throw new UnsupportedOperatorException($"layer {layer}: ungated experts have no managed implementation");
+                }
+                var sharedUp = RoleOperand(store, stackId, layer, roles, TensorRoles.SharedUp);
+                var sharedDown = RoleOperand(store, stackId, layer, roles, TensorRoles.SharedDown);
+                DenseFfnOp? shared = null;
+                if (sharedUp is not null && sharedDown is not null)
+                {
+                    shared = new DenseFfnOp
+                    {
+                        Gate = RoleOperand(store, stackId, layer, roles, TensorRoles.SharedGate),
+                        Up = sharedUp,
+                        Down = sharedDown,
+                        Activation = ffnSurface.Activation,
+                        IntermediateSize = (int)store.ShapeOf(stackId, sharedUp.TensorName)[0],
+                        HiddenSize = hiddenSize,
+                    };
+                }
+                return new LayerFfn
+                {
+                    Routed = new RoutedFfnOp
+                    {
+                        Router = new OperandRef(stackId, routerName),
+                        NumExperts = routedMoe.Experts,
+                        TopK = routedMoe.TopK,
+                        ExpertIntermediateSize = routedMoe.ExpertIntermediateSize,
+                        HiddenSize = hiddenSize,
+                        Activation = ffnSurface.Activation,
+                        RoutingPolicy = routedMoe.RoutingPolicy,
+                        ExpertGatePrefix = $"{layer}.{experts.Prefix}",
+                        ExpertUpPrefix = $"{layer}.{experts.Prefix}",
+                        ExpertDownPrefix = $"{layer}.{experts.Prefix}",
+                        ExpertGateStem = experts.Gate,
+                        ExpertUpStem = experts.Up,
+                        ExpertDownStem = experts.Down,
+                        SharedExpert = shared,
+                        SharedExpertGate = shared is null ? null : RoleOperand(store, stackId, layer, roles, TensorRoles.SharedExpertGate),
+                    },
+                };
+            }
+        }
+        else if (ffnSurface.Moe is { } moe)
+        {
+            // Containers judged before expert roles existed name the AMQL layout.
             Require(store, stackId, $"{layer}.mlp.router.weight", layer, "moe router");
             var routed = new RoutedFfnOp
             {

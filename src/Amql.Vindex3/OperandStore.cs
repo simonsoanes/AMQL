@@ -213,6 +213,74 @@ public sealed class OperandStore : IDisposable
     public WidenedResolution ResolveWidened(OperandRef operand) =>
         ResolveWidened(operand.ObjectId, operand.TensorName);
 
+    /// <summary>A tensor's storage dtype from its segment header alone — no payload read.</summary>
+    public Dtype DtypeOf(string objectId, string tensorName)
+    {
+        ThrowIfDisposed();
+        var representationId = _container.CanonicalRepresentationId(objectId);
+        if (!_container.Index.Representations.TryGetValue(representationId, out var entry))
+        {
+            throw new ContainerException(
+                $"object '{objectId}' has no representation entry '{representationId}' in index.representations");
+        }
+        return DtypeExtensions.FromLabel(OpenSegment(entry.Segment).GetTensor(tensorName).Dtype);
+    }
+
+    /// <summary>A BF16 tensor's stored bit patterns as one <c>ushort[]</c>, read
+    /// a chunk at a time on every core — the same reading as
+    /// <see cref="ResolveWidened(string,string)"/> without the widening, so a
+    /// kernel that widens in registers can stream half the bytes. Element
+    /// counts up to the array ceiling are legal even when the payload exceeds
+    /// 2 GiB.</summary>
+    public (long[] Shape, ushort[] Bits) ResolveBf16(string objectId, string tensorName)
+    {
+        ThrowIfDisposed();
+        var representationId = _container.CanonicalRepresentationId(objectId);
+        if (!_container.Index.Representations.TryGetValue(representationId, out var entry))
+        {
+            throw new ContainerException(
+                $"object '{objectId}' has no representation entry '{representationId}' in index.representations");
+        }
+        var segment = OpenSegment(entry.Segment);
+        var tensor = segment.GetTensor(tensorName);
+        if (DtypeExtensions.FromLabel(tensor.Dtype) != Dtype.BF16)
+        {
+            throw new ContainerException($"operand '{objectId}/{tensorName}' is {tensor.Dtype}, not BF16");
+        }
+        long elements = 1;
+        foreach (var dim in tensor.Shape)
+        {
+            elements = checked(elements * dim);
+        }
+        if (tensor.Len != elements * 2)
+        {
+            throw new ContainerException(
+                $"operand '{objectId}/{tensorName}' holds {tensor.Len} bytes, not {elements} BF16 values");
+        }
+        var bits = GC.AllocateUninitializedArray<ushort>(checked((int)elements));
+        long chunks = (elements + WidenChunkElements - 1) / WidenChunkElements;
+        Parallel.For(0L, chunks, chunk =>
+        {
+            long first = chunk * WidenChunkElements;
+            int count = (int)Math.Min(WidenChunkElements, elements - first);
+            var buffer = System.Buffers.ArrayPool<byte>.Shared.Rent(count * 2);
+            try
+            {
+                segment.ReadInto(tensorName, first * 2, buffer, count * 2);
+                System.Runtime.InteropServices.MemoryMarshal.Cast<byte, ushort>(buffer.AsSpan(0, count * 2))
+                    .CopyTo(bits.AsSpan((int)first, count));
+            }
+            finally
+            {
+                System.Buffers.ArrayPool<byte>.Shared.Return(buffer);
+            }
+        });
+
+        _touched.Add(objectId);
+        Loads++;
+        return (tensor.Shape, bits);
+    }
+
     /// <summary>Elements widened per chunk (4 MiB of f32).</summary>
     private const long WidenChunkElements = 1L << 20;
 

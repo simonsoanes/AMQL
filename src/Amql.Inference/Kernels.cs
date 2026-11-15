@@ -47,6 +47,16 @@ public static class Norms
                 return;
             }
         }
+        // Rows normalise independently; a batch of them splits across the
+        // pool (the weight is copied once so the lambda can hold it).
+        if (x.Rows >= 16 && (long)x.Rows * x.Cols >= 16384)
+        {
+            var w = weight.ToArray();
+            var data = x.Data;
+            int cols = x.Cols;
+            KernelPool.For(x.Rows, r => ApplyRow(data.AsSpan(r * cols, cols), kind, eps, w, weightOffset));
+            return;
+        }
         for (int r = 0; r < x.Rows; r++)
         {
             var row = x.Row(r);

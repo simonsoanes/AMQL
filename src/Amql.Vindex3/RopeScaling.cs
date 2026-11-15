@@ -15,12 +15,23 @@ namespace Amql.Vindex3;
 /// <item><c>yarn</c> — interpolated (÷factor) and extrapolated frequencies
 /// blended over a ramp between the <c>beta_fast</c>/<c>beta_slow</c>
 /// correction dims, with cos/sin multiplied by an attention factor.</item>
+/// <item><c>longrope</c> — each pair's frequency divided by its own
+/// <c>short_factor</c> entry, or its <c>long_factor</c> entry once the
+/// sequence is longer than <c>original_max_position_embeddings</c>; cos/sin
+/// multiplied by <c>sqrt(1 + ln(factor)/ln(original))</c>.</item>
+/// <item><c>dynamic</c> — NTK: once the sequence is longer than
+/// <c>max_position_embeddings</c>, the base grows to
+/// <c>theta·(factor·len/max − (factor − 1))^(d/(d−2))</c>.</item>
 /// </list>
+/// The last two depend on the sequence length, which transformers takes as
+/// the largest position in the forward pass plus one; <see cref="Frequencies"/>
+/// takes it the same way. Keys already in a cache keep the rotation they were
+/// given, as transformers' do.
 /// Serialised as the position policy's <c>scaling</c> object.
 /// </summary>
 public sealed class RopeScaling
 {
-    public static readonly IReadOnlyList<string> Types = new[] { "linear", "llama3", "yarn" };
+    public static readonly IReadOnlyList<string> Types = new[] { "linear", "llama3", "yarn", "longrope", "dynamic" };
 
     public required string Type { get; init; }
     public required double Factor { get; init; }
@@ -33,25 +44,64 @@ public sealed class RopeScaling
     public double? Mscale { get; init; }
     public double? MscaleAllDim { get; init; }
     public bool Truncate { get; init; } = true;
+    /// <summary>longrope: per-pair divisors at or under the original length.</summary>
+    public double[]? ShortFactor { get; init; }
+    /// <summary>longrope: per-pair divisors beyond the original length.</summary>
+    public double[]? LongFactor { get; init; }
+
+    /// <summary>Whether the frequencies change with the sequence length.</summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public bool DependsOnLength => Type is "longrope" or "dynamic";
+
+    /// <summary>The sequence length past which a length-dependent scaling
+    /// changes regime (longrope: the original length; dynamic: the model's
+    /// maximum).</summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public long Threshold => OriginalMaxPositions ?? throw Missing("original_max_position_embeddings");
 
     /// <summary>Inverse frequencies for a rotary window of <paramref name="width"/>
     /// dims at base <paramref name="theta"/>, and the factor cos/sin are
-    /// multiplied by (1 except for yarn).</summary>
-    public static (double[] InvFreq, double AttentionScale) Frequencies(double theta, int width, RopeScaling? scaling)
+    /// multiplied by (1 except for yarn and longrope). <paramref name="sequenceLength"/>
+    /// (largest position + 1) matters only to longrope and dynamic; 0 means
+    /// "within the original length".</summary>
+    public static (double[] InvFreq, double AttentionScale) Frequencies(double theta, int width, RopeScaling? scaling,
+        long sequenceLength = 0)
     {
+        if (scaling is { Type: "dynamic" })
+        {
+            double max = scaling.Threshold;
+            double length = Math.Max(sequenceLength, max);
+            theta *= Math.Pow(scaling.Factor * length / max - (scaling.Factor - 1), width / (width - 2.0));
+            scaling = null;
+        }
         int pairs = width / 2;
         var inv = new double[pairs];
         for (int i = 0; i < pairs; i++)
         {
             inv[i] = 1.0 / Math.Pow(theta, 2.0 * i / width);
         }
-        return scaling is null ? (inv, 1.0) : scaling.Apply(inv, theta, width);
+        return scaling is null ? (inv, 1.0) : scaling.Apply(inv, theta, width, sequenceLength);
     }
 
-    private (double[], double) Apply(double[] inv, double theta, int width)
+    private (double[], double) Apply(double[] inv, double theta, int width, long sequenceLength)
     {
         switch (Type)
         {
+            case "longrope":
+            {
+                double original = Threshold;
+                var factors = sequenceLength > original
+                    ? LongFactor ?? throw Missing("long_factor")
+                    : ShortFactor ?? throw Missing("short_factor");
+                if (factors.Length != inv.Length)
+                {
+                    throw new InvalidOperationException(
+                        $"rope scaling 'longrope' has {factors.Length} factors for {inv.Length} rotary pairs");
+                }
+                double attention = AttentionFactor
+                    ?? (Factor <= 1 ? 1.0 : Math.Sqrt(1 + Math.Log(Factor) / Math.Log(original)));
+                return (inv.Select((f, i) => f / factors[i]).ToArray(), attention);
+            }
             case "linear":
                 return (inv.Select(f => f / Factor).ToArray(), 1.0);
             case "llama3":
@@ -121,15 +171,23 @@ public sealed class RopeScaling
     {
         string type = block.TryGetProperty("rope_type", out var rt) ? rt.GetString() ?? "default"
             : block.TryGetProperty("type", out var t) ? t.GetString() ?? "default" : "default";
+        // Early Phi-3 configs call longrope "su".
+        type = type == "su" ? "longrope" : type;
         if (!Types.Contains(type))
         {
             return null;
         }
         double? Num(string key) => block.TryGetProperty(key, out var v) && v.ValueKind == JsonValueKind.Number ? v.GetDouble() : null;
-        long? original = block.TryGetProperty("original_max_position_embeddings", out var o) && o.ValueKind == JsonValueKind.Number
-            ? o.GetInt64()
-            : type == "linear" ? null : maxPositionEmbeddings;
-        double factor = Num("factor") ?? (type == "yarn" && original is { } orig && orig > 0
+        long? original = type == "dynamic"
+            // transformers' dynamic NTK measures against max_position_embeddings itself.
+            ? maxPositionEmbeddings
+            : block.TryGetProperty("original_max_position_embeddings", out var o) && o.ValueKind == JsonValueKind.Number
+                ? o.GetInt64()
+                : type == "linear" ? null : maxPositionEmbeddings;
+        double[]? List(string key) => block.TryGetProperty(key, out var v) && v.ValueKind == JsonValueKind.Array
+            ? v.EnumerateArray().Select(e => e.GetDouble()).ToArray()
+            : null;
+        double factor = Num("factor") ?? (type is "yarn" or "longrope" && original is { } orig && orig > 0
             ? (double)maxPositionEmbeddings / orig
             : throw new InvalidOperationException($"rope scaling '{type}' declares no factor"));
         return new RopeScaling
@@ -145,6 +203,8 @@ public sealed class RopeScaling
             Mscale = Num("mscale"),
             MscaleAllDim = Num("mscale_all_dim"),
             Truncate = !block.TryGetProperty("truncate", out var tr) || tr.ValueKind != JsonValueKind.False,
+            ShortFactor = List("short_factor"),
+            LongFactor = List("long_factor"),
         };
     }
 
@@ -162,6 +222,8 @@ public sealed class RopeScaling
         if (Mscale is { } m) block["mscale"] = m;
         if (MscaleAllDim is { } ma) block["mscale_all_dim"] = ma;
         if (!Truncate) block["truncate"] = false;
+        if (ShortFactor is { } sf) block["short_factor"] = new System.Text.Json.Nodes.JsonArray(sf.Select(x => (System.Text.Json.Nodes.JsonNode?)x).ToArray());
+        if (LongFactor is { } lf2) block["long_factor"] = new System.Text.Json.Nodes.JsonArray(lf2.Select(x => (System.Text.Json.Nodes.JsonNode?)x).ToArray());
     }
 
     internal void Write(Utf8JsonWriter writer)
@@ -178,7 +240,23 @@ public sealed class RopeScaling
         if (Mscale is { } m) writer.WriteNumber("mscale", m);
         if (MscaleAllDim is { } ma) writer.WriteNumber("mscale_all_dim", ma);
         if (!Truncate) writer.WriteBoolean("truncate", false);
+        WriteList(writer, "short_factor", ShortFactor);
+        WriteList(writer, "long_factor", LongFactor);
         writer.WriteEndObject();
+    }
+
+    private static void WriteList(Utf8JsonWriter writer, string name, double[]? values)
+    {
+        if (values is null)
+        {
+            return;
+        }
+        writer.WriteStartArray(name);
+        foreach (var v in values)
+        {
+            writer.WriteNumberValue(v);
+        }
+        writer.WriteEndArray();
     }
 
     internal static RopeScaling? Read(JsonElement policy)
@@ -201,6 +279,90 @@ public sealed class RopeScaling
             Mscale = Num("mscale"),
             MscaleAllDim = Num("mscale_all_dim"),
             Truncate = !s.TryGetProperty("truncate", out var tr) || tr.ValueKind != JsonValueKind.False,
+            ShortFactor = s.TryGetProperty("short_factor", out var sf) ? sf.EnumerateArray().Select(e => e.GetDouble()).ToArray() : null,
+            LongFactor = s.TryGetProperty("long_factor", out var lf2) ? lf2.EnumerateArray().Select(e => e.GetDouble()).ToArray() : null,
         };
     }
+}
+
+/// <summary>
+/// Multimodal rotary (MRoPE, Qwen2-VL onward): each rotary pair takes its
+/// position from one of three streams: temporal, height, width. Contiguous
+/// sections (Qwen2-VL, Qwen2.5-VL: the first <c>section[0]</c> pairs read t,
+/// the next <c>section[1]</c> read h, …) or interleaved (Qwen3-VL, Qwen3.5:
+/// pairs cycle t, h, w until a stream's share is spent, the rest read t).
+/// With identical streams, as for every text token, it is plain rotary.
+/// Serialised as the position policy's <c>mrope</c> object.
+/// </summary>
+public sealed class RopeMultimodal
+{
+    public required int[] Section { get; init; }
+    public bool Interleaved { get; init; }
+
+    /// <summary>The stream (0 = t, 1 = h, 2 = w) rotary pair
+    /// <paramref name="pair"/> reads its position from.</summary>
+    public int StreamOf(int pair)
+    {
+        if (Interleaved)
+        {
+            // transformers' apply_interleaved_mrope: h takes pairs 1, 4, 7, …
+            // below 3·section[1]; w takes 2, 5, 8, … below 3·section[2].
+            for (int stream = 1; stream < Section.Length; stream++)
+            {
+                if (pair % 3 == stream && pair < 3 * Section[stream])
+                {
+                    return stream;
+                }
+            }
+            return 0;
+        }
+        int end = 0;
+        for (int stream = 0; stream < Section.Length; stream++)
+        {
+            end += Section[stream];
+            if (pair < end)
+            {
+                return stream;
+            }
+        }
+        return Section.Length - 1;
+    }
+
+    /// <summary>Judges a rope block's <c>mrope_section</c> /
+    /// <c>mrope_interleaved</c>; null when it has none.</summary>
+    public static RopeMultimodal? FromRopeBlock(JsonElement block)
+    {
+        if (block.ValueKind != JsonValueKind.Object ||
+            !block.TryGetProperty("mrope_section", out var section) || section.ValueKind != JsonValueKind.Array)
+        {
+            return null;
+        }
+        return new RopeMultimodal
+        {
+            Section = section.EnumerateArray().Select(e => e.GetInt32()).ToArray(),
+            Interleaved = block.TryGetProperty("mrope_interleaved", out var i) && i.ValueKind == JsonValueKind.True,
+        };
+    }
+
+    internal void Write(Utf8JsonWriter writer)
+    {
+        writer.WriteStartObject("mrope");
+        writer.WriteStartArray("section");
+        foreach (var n in Section)
+        {
+            writer.WriteNumberValue(n);
+        }
+        writer.WriteEndArray();
+        if (Interleaved) writer.WriteBoolean("interleaved", true);
+        writer.WriteEndObject();
+    }
+
+    internal static RopeMultimodal? Read(JsonElement policy) =>
+        policy.TryGetProperty("mrope", out var m) && m.ValueKind == JsonValueKind.Object
+            ? new RopeMultimodal
+            {
+                Section = m.GetProperty("section").EnumerateArray().Select(e => e.GetInt32()).ToArray(),
+                Interleaved = m.TryGetProperty("interleaved", out var i) && i.ValueKind == JsonValueKind.True,
+            }
+            : null;
 }

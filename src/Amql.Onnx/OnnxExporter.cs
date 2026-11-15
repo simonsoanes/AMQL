@@ -259,16 +259,20 @@ public static class OnnxExporter
         int width;
         double[] invFreq;
         double attentionScale = 1.0;
+        double theta = 0;
+        RopeScaling? scaling = null;
         switch (attn.Position)
         {
             case PositionNone:
                 return x;
             case PositionRope rope:
                 width = d;
+                (theta, scaling) = (rope.Theta, rope.Scaling);
                 (invFreq, attentionScale) = RopeScaling.Frequencies(rope.Theta, width, rope.Scaling);
                 break;
             case PositionPartialRope partial:
                 width = partial.RotaryWidth(d);
+                (theta, scaling) = (partial.Theta, partial.Scaling);
                 (invFreq, attentionScale) = RopeScaling.Frequencies(partial.Theta, width, partial.Scaling);
                 break;
             case PositionZeroTailRope zeroTail when !attn.RopeInterleaved:
@@ -281,9 +285,33 @@ public static class OnnxExporter
                 throw new NotSupportedException($"position policy '{attn.Position.GetType().Name}' has no ONNX rotary implementation");
         }
         int half = width / 2;
+        // The graph is one forward pass over positions 0..seq-1, so the
+        // sequence length the length-dependent kinds read is seq itself.
+        // (MRoPE: every stream of a text token is its position, plain rotary.)
+        string inv = scaling is { Type: "dynamic" } ? null! : g.Constant(invFreq.Select(f => (float)f).ToArray(), 1, half);
+        if (scaling is { DependsOnLength: true })
+        {
+            string seqF = g.Node("Cast", new[] { g.Node("Shape", posF) }, ("to", (long)OnnxTypes.Float));
+            if (scaling.Type == "longrope")
+            {
+                // Short factors up to the original length, long factors past it.
+                var (longInv, _) = RopeScaling.Frequencies(theta, width, scaling, scaling.Threshold + 1);
+                string isLong = g.Node("Greater", seqF, g.Float(scaling.Threshold));
+                inv = g.Node("Where", isLong, g.Constant(longInv.Select(f => (float)f).ToArray(), 1, half), inv);
+            }
+            else
+            {
+                // dynamic NTK: base·(factor·L/max − (factor−1))^(w/(w−2)), L = max(seq, max).
+                double max = scaling.Threshold;
+                string length = g.Node("Max", seqF, g.Float((float)max));
+                string growth = g.Node("Sub", g.Node("Mul", length, g.Float((float)(scaling.Factor / max))), g.Float((float)(scaling.Factor - 1)));
+                string newBase = g.Node("Mul", g.Float((float)theta), g.Node("Pow", growth, g.Float((float)(width / (width - 2.0)))));
+                var exponents = Enumerable.Range(0, half).Select(i => (float)(-2.0 * i / width)).ToArray();
+                inv = g.Node("Pow", newBase, g.Constant(exponents, 1, half));
+            }
+        }
         // angles [seq, half]
-        string angles = g.Node("Mul", g.Node("Unsqueeze", new[] { posF, g.Int64s(1) }),
-            g.Constant(invFreq.Select(f => (float)f).ToArray(), 1, half));
+        string angles = g.Node("Mul", g.Node("Unsqueeze", new[] { posF, g.Int64s(1) }), inv);
         string cos = g.Node("Cos", angles), sin = g.Node("Sin", angles);
         if (attentionScale != 1.0)
         {
