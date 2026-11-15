@@ -2,6 +2,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\Amql.Safetensors\Amql.Safetensors.csproj" />
+    <ProjectReference Include="..\Amql.Hf\Amql.Hf.csproj" />
   </ItemGroup>
 
   <PropertyGroup>

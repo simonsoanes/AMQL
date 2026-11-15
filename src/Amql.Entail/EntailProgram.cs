@@ -147,16 +147,19 @@ public static class EntailCompiler
     /// fact a few percent off its height still gates a value exactly.</summary>
     public const double Lift = 2;
 
-    public static EntailProgram Compile(string source, int neuronsPerLayer = 3584)
+    /// <summary>Compiles and schedules a program: at most
+    /// <paramref name="neuronsPerLayer"/> neurons and <paramref name="headsPerLayer"/>
+    /// heads in any block layer (a graft passes its host's).</summary>
+    public static EntailProgram Compile(string source, int neuronsPerLayer = 3584, int headsPerLayer = EntailProgram.HeadsPerLayer)
     {
         var expander = new Expander();
         expander.Run(EntailParser.Parse(source));
         var program = expander.Program;
-        Schedule(program, neuronsPerLayer);
+        Schedule(program, neuronsPerLayer, headsPerLayer);
         return program;
     }
 
-    private static void Schedule(EntailProgram p, int capacity)
+    private static void Schedule(EntailProgram p, int capacity, int headCapacity)
     {
         var neurons = new Dictionary<int, int>();
         var heads = new Dictionary<int, int>();
@@ -202,7 +205,7 @@ public static class EntailCompiler
                 }
                 // The attention of layer L runs at time 2L, after `ready`.
                 int layer = ready < 0 ? 0 : ready / 2 + 1;
-                while (heads.GetValueOrDefault(layer) >= EntailProgram.HeadsPerLayer)
+                while (heads.GetValueOrDefault(layer) >= headCapacity)
                 {
                     layer++;
                 }

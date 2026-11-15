@@ -40,12 +40,12 @@ internal static partial class Program
         };
     }
 
-    private static EntailProgram LoadEntail(string[] args)
+    private static EntailProgram LoadEntail(string[] args, int? neuronsPerLayer = null, int headsPerLayer = EntailProgram.HeadsPerLayer)
     {
         var path = Arg(args, 0) ?? throw new CliException("entail needs a program file");
         try
         {
-            return EntailCompiler.Compile(File.ReadAllText(path), IntOption(args, "--neurons-per-layer", 3584));
+            return EntailCompiler.Compile(File.ReadAllText(path), IntOption(args, "--neurons-per-layer", neuronsPerLayer ?? 3584), headsPerLayer);
         }
         catch (EntailException e)
         {
@@ -127,14 +127,38 @@ internal static partial class Program
         return 0;
     }
 
+    /// <summary>Grafts into any host the importer can judge: the host is
+    /// judged first, so the program is scheduled for the host's own heads and
+    /// FFN width, and the block is written in the host's layer shape.</summary>
     private static int EntailGraft(string[] args)
     {
-        var p = LoadEntail(args);
         string host = OptionValue(args, "--host") ?? throw new CliException("entail graft requires '--host <checkpoint-dir>'");
         string outDir = OptionValue(args, "--out") ?? throw new CliException("entail graft requires '--out <checkpoint-dir>'");
+        EntailHost judged;
+        try
+        {
+            judged = EntailHost.Judge(host);
+        }
+        catch (EntailException e)
+        {
+            throw new CliException(e.Message);
+        }
+        var t = judged.Target;
+        var p = LoadEntail(args, Math.Min(3584, t.Intermediate), t.ProgramHeads);
         PrintEntail(p);
-        var report = EntailWeights.WriteGraft(p, host, outDir, IntOption(args, "--context", 8192));
-        PrintEntailBuild(report);
+        Console.WriteLine($"host:       {t.Heads} heads ({t.ProgramHeads} for the program) over {t.KvGroups} groups of {t.HeadDim}, " +
+                          $"{t.Intermediate} neurons per layer, {t.Ffn.ToString().ToLowerInvariant()} FFN" +
+                          (t.PostNorms ? ", post-norms" : string.Empty) + (t.QkNorm != QkNormKind.None ? $", q/k norm {t.QkNorm.ToString().ToLowerInvariant()}" : string.Empty));
+        try
+        {
+            var report = EntailWeights.WriteGraft(p, judged, outDir, IntOption(args, "--context", 8192),
+                DoubleOption(args, "--output-norm", EntailWeights.DefaultHostOutputNorm));
+            PrintEntailBuild(report);
+        }
+        catch (EntailException e)
+        {
+            throw new CliException(e.Message);
+        }
         return 0;
     }
 

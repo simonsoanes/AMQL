@@ -2,6 +2,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Amql.Safetensors;
+using Amql.Vindex3;
 
 namespace Amql.Entail;
 
@@ -11,11 +12,11 @@ public sealed record EntailBuildReport(
     int Neurons, int Heads, double MinAttentionGap, int TokensBound, IReadOnlyList<string> TokensMissing);
 
 /// <summary>
-/// Turns an <see cref="EntailProgram"/> into tensors, in the Qwen3.5 layer
-/// shape (RMSNorm with a 1+w weight, gated attention with per-head QK norm,
-/// partial RoPE, SwiGLU). The compiled block reads and writes only its own
-/// lanes, so it is the same set of layers whether it stands alone in an empty
-/// model or is grafted in front of a host's.
+/// Turns an <see cref="EntailProgram"/> into tensors in a target's layer
+/// shape (<see cref="EntailTarget"/>): the Qwen3.5 shape for the empty model
+/// and the adapter, the host's own shape for a graft. The compiled block reads
+/// and writes only its own lanes, so it is the same set of layers whether it
+/// stands alone in an empty model or is grafted in front of a host's.
 /// <para>
 /// Three facts make a stack of RMSNorms behave like exact integer logic. A
 /// constant "ballast", far larger than everything else, fixes the norm's
@@ -25,7 +26,10 @@ public sealed record EntailBuildReport(
 /// precisely the number written to it, and integers stay integers from layer
 /// to layer with no drift at all. And a lane's norm weight, also a power of
 /// two, undoes the divisor, while a host dimension's is zero, so nothing else
-/// can reach a lane.
+/// can reach a lane. A host whose layers normalise their sub-blocks' outputs
+/// too (Gemma's sandwich, OLMo 2's post-norms) gets a ballast in each
+/// sub-block's output as well, from a head and a neuron kept for it, so those
+/// norms divide by a power of two as well.
 /// </para>
 /// </summary>
 public static class EntailWeights
@@ -33,14 +37,12 @@ public static class EntailWeights
     /// <summary>Raw value of each ballast dimension; a power of two, so
     /// bf16-exact.</summary>
     public const double Ballast = 1048576;
-    private const int Rotary = 64;        // rotary dims of a head (256 × 0.25)
-    private const int Pairs = 16;         // frequency pairs an offset uses
-    private const double RopeTheta = 1e7;
-    private const double NormGain = 28;   // q/k norm weight: sharpens attention
+    /// <summary>Rotary pairs a lookup uses, at most.</summary>
+    private const int MaxPairs = 16;
+    /// <summary>The score a head gives the token at its own offset: in the
+    /// Qwen3.5 shape, a q/k norm gain of 28 over 16 of head_dim 256's pairs.</summary>
+    private const double ReferencePeak = 12544;
     private const double OutputGate = 30; // sigmoid(30) = 1
-    private const int QDim = EntailProgram.HeadsPerLayer * EntailProgram.HeadDim;
-    private const int KvDim = EntailProgram.KvGroups * EntailProgram.HeadDim;
-    private const int HeadsPerGroup = EntailProgram.HeadsPerLayer / EntailProgram.KvGroups;
 
     /// <summary>Lane → dimension assignment by liveness: a lane nothing reads
     /// any more is cleared by one neuron and its dimension is reused.</summary>
@@ -167,71 +169,143 @@ public static class EntailWeights
 
     // ── attention geometry ──────────────────────────────────────────────────
 
-    private static double Omega(int pair) => Math.Pow(RopeTheta, -2.0 * pair / Rotary);
+    /// <summary>The rotary pairs a target's heads look up with, and the
+    /// score they give their own offset.</summary>
+    private sealed class Lookup
+    {
+        public required RopePair[] Pairs { get; init; }
+        public required double Peak { get; init; }
+        public float? Softcap { get; init; }
+        public double Gap { get; set; }
+        /// <summary>|q|·|k| per pair, in the units attention sees, before the
+        /// score scale and the rope attention factor.</summary>
+        public double Amplitude(EntailTarget t) =>
+            Math.Sqrt(Peak / (t.ScoreScale * t.AttentionFactor * t.AttentionFactor * Pairs.Length));
+    }
 
     /// <summary>A query, before rotation, whose score against the constant
     /// key peaks at exactly <paramref name="offset"/> tokens back.</summary>
-    private static double[] OffsetQuery(int offset)
+    private static double[] OffsetQuery(Lookup look, int headDim, int offset)
     {
-        var q = new double[EntailProgram.HeadDim];
-        for (int i = 0; i < Pairs; i++)
+        var q = new double[headDim];
+        foreach (var pair in look.Pairs)
         {
-            double w = Omega(i);
-            q[i] = Math.Cos(w * offset);
-            q[i + Rotary / 2] = -Math.Sin(w * offset);
+            q[pair.A] = Math.Cos(pair.Omega * offset);
+            q[pair.B] = -Math.Sin(pair.Omega * offset);
         }
         return q;
     }
 
-    private static double Score(double[] q, int delta)
+    /// <summary>The score a head looking <paramref name="target"/> back gives
+    /// the token <paramref name="delta"/> back, softcapped as the host caps.</summary>
+    private static double Score(Lookup look, int target, int delta)
     {
-        // q·R(δ)k for the constant key k, in the units attention will see.
-        double qn = 0;
-        foreach (var v in q)
+        double sum = 0;
+        foreach (var pair in look.Pairs)
         {
-            qn += v * v;
+            sum += Math.Cos(pair.Omega * (delta - target));
         }
-        double kScale = Math.Sqrt(EntailProgram.HeadDim / (double)Pairs) * NormGain;
-        double qScale = Math.Sqrt(EntailProgram.HeadDim / qn) * NormGain;
-        double score = 0;
-        for (int i = 0; i < Pairs; i++)
-        {
-            double w = Omega(i) * delta;
-            score += q[i] * Math.Cos(w) - q[i + Rotary / 2] * Math.Sin(w);
-        }
-        return score * qScale * kScale / Math.Sqrt(EntailProgram.HeadDim);
+        double score = look.Peak * sum / look.Pairs.Length;
+        return look.Softcap is { } cap ? cap * Math.Tanh(score / cap) : score;
     }
 
-    /// <summary>The smallest margin by which any head's intended token beats
-    /// every other token, over the whole context. Compile-time proof that
-    /// attention is a lookup, not a blend.</summary>
-    public static double AttentionGap(EntailProgram p, int context)
+    private static double Gap(Lookup look, IEnumerable<int> offsets, int context)
     {
         double gap = double.MaxValue;
-        foreach (var head in p.Ops.OfType<Head>())
+        foreach (int target in offsets)
         {
-            var targets = head.Pointer?.Select(x => x.Offset).ToArray() ?? new[] { head.Offset };
-            foreach (int target in targets)
+            double peak = Score(look, target, target);
+            for (int delta = 0; delta < context; delta++)
             {
-                var q = OffsetQuery(target);
-                double peak = Score(q, target);
-                for (int delta = 0; delta < context; delta++)
+                if (delta != target)
                 {
-                    if (delta != target)
-                    {
-                        gap = Math.Min(gap, peak - Score(q, delta));
-                    }
+                    gap = Math.Min(gap, peak - Score(look, target, delta));
                 }
             }
         }
         return gap;
     }
 
+    private static IEnumerable<int> Offsets(EntailProgram p, bool ballastHead) =>
+        p.Ops.OfType<Head>()
+            .SelectMany(h => h.Pointer?.Select(x => x.Offset) ?? new[] { h.Offset })
+            .Concat(ballastHead ? new[] { 0 } : Array.Empty<int>())
+            .Distinct();
+
+    /// <summary>The smallest margin by which any head's intended token beats
+    /// every other token, over the whole context, in the empty model's shape.
+    /// Compile-time proof that attention is a lookup, not a blend.</summary>
+    public static double AttentionGap(EntailProgram p, int context) =>
+        ChooseLookup(EntailTarget.Fresh(0), p, context, strict: false).Gap;
+
+    /// <summary>Picks the rotary pairs and score scale the heads use. The
+    /// highest-frequency pairs are tried first (the empty model's choice);
+    /// pairs spread across the host's whole range next, for a host whose
+    /// first pairs repeat within the context. A pair is usable only if it
+    /// turns at the same rate in every regime the context reaches. With a
+    /// softcap, the peak is chosen to keep the most margin under it. A graft
+    /// refuses a host where no choice makes every head a lookup: the softmax
+    /// mass off the intended token must stay below float resolution.</summary>
+    private static Lookup ChooseLookup(EntailTarget t, EntailProgram p, int context, bool strict)
+    {
+        if (t.FrequenciesChangeAfter is { } after && context > after)
+        {
+            throw new EntailException(
+                $"the host's dynamic rope changes every frequency past {after} tokens, which would move every lookup: graft with --context {after} or less");
+        }
+        var regimes = t.SecondRegimeAfter is { } second && context <= second ? t.RopeRegimes.Take(1).ToList() : t.RopeRegimes;
+        var usable = regimes[0]
+            .Where((pair, i) => regimes.All(r => r.Count > i && r[i].Omega == pair.Omega))
+            .ToList();
+        if (usable.Count == 0)
+        {
+            throw new EntailException("the host has no rotary pair whose frequency stays fixed over the context");
+        }
+        int n = Math.Min(MaxPairs, usable.Count);
+        var selections = new List<RopePair[]> { usable.Take(n).ToArray() };
+        if (usable.Count > n)
+        {
+            selections.Add(Enumerable.Range(0, n).Select(k => usable[(int)Math.Round(k * (usable.Count - 1.0) / (n - 1))]).ToArray());
+        }
+        var peaks = t.Softcap is { } cap
+            ? new[] { 1.0, 1.5, 2, 3, 0.75, 0.5 }.Select(m => m * cap).ToArray()
+            : new[] { ReferencePeak };
+        var offsets = Offsets(p, t.PostNorms).ToList();
+        double required = Math.Log(Math.Max(2, context)) + 25 * Math.Log(2);
+        Lookup? best = null;
+        foreach (var pairs in selections)
+        {
+            foreach (var peak in peaks)
+            {
+                var look = new Lookup { Pairs = pairs, Peak = peak, Softcap = t.Softcap };
+                look.Gap = offsets.Count == 0 ? double.MaxValue : Gap(look, offsets, context);
+                // The empty model keeps its own pairs, whatever the margin: it is
+                // reported, not enforced, there.
+                if (look.Gap >= required || !strict)
+                {
+                    return look;
+                }
+                if (best is null || look.Gap > best.Gap)
+                {
+                    best = look;
+                }
+            }
+        }
+        if (strict)
+        {
+            throw new EntailException(
+                $"no choice of the host's rotary pairs makes every head a lookup over {context} tokens: the best margin is " +
+                $"{best!.Gap:F1} logits and float resolution needs {required:F1} (lower --context)");
+        }
+        return best!;
+    }
+
     // ── the block ───────────────────────────────────────────────────────────
 
     private sealed class Layer
     {
-        public required float[] Q, K, V, O, Gate, Up, Down, InNorm, PostNorm, QNorm, KNorm;
+        public required float[] Q, K, V, O, Gate, Up, Down;
+        public float[]? InNorm, FfnInNorm, AttnOutNorm, FfnOutNorm, QNorm, KNorm, SharedExpertGate;
     }
 
     private sealed class Geometry
@@ -240,6 +314,12 @@ public static class EntailWeights
         public required Allocation Lanes;
         public required double[] Scale;   // lane → raw per unit, this target
         public required bool[] HostDim;   // dims the block must not read
+        public required EntailTarget Target;
+        public required Lookup Look;
+        /// <summary>What a ballast dim reads as at a matrix input: the norm's
+        /// divisor undone (2^shift), or the raw ballast with no input norm.</summary>
+        public double BallastRead => Target.PreNorms ? Math.Pow(2, Shift) : EntailWeights.Ballast;
+        public double LaneGamma => EntailWeights.Ballast / Math.Pow(2, Shift);
     }
 
     /// <summary>Splits hidden = n · 4^shift with shift as large as possible:
@@ -257,9 +337,20 @@ public static class EntailWeights
     }
 
     /// <summary>The smallest width holding <paramref name="fixedDims"/> plus
-    /// its own ballast.</summary>
-    private static int WidthFor(int fixedDims)
+    /// its own ballast. With <paramref name="powerOfFour"/> the width is a
+    /// power of four, so sqrt(hidden), which a Gemma scales its embedding by,
+    /// is a power of two.</summary>
+    private static int WidthFor(int fixedDims, bool powerOfFour = false)
     {
+        if (powerOfFour)
+        {
+            int width = 4;
+            while (width < fixedDims + 1)
+            {
+                width *= 4;
+            }
+            return width;
+        }
         for (int hidden = RoundUp(fixedDims + 1, 64); ; hidden += 64)
         {
             if (fixedDims + BallastShape(hidden).Dims <= hidden)
@@ -272,7 +363,7 @@ public static class EntailWeights
     private static void ReadInto(float[] matrix, int row, int hidden, Lin form, Geometry g, double factor = 1)
     {
         int at = row * hidden;
-        matrix[at + g.Ballast] += (float)(form.Const * factor / Math.Pow(2, g.Shift));
+        matrix[at + g.Ballast] += (float)(form.Const * factor / g.BallastRead);
         foreach (var (lane, c) in form.Terms)
         {
             int dim = g.Lanes.Dim[lane];
@@ -283,81 +374,121 @@ public static class EntailWeights
         }
     }
 
-    private static float[] NormRow(Geometry g, double laneGamma)
+    /// <summary>A norm weight over the widened stream: <paramref name="laneGamma"/>
+    /// on lanes, <paramref name="ballastGamma"/> on the first ballast dim,
+    /// <paramref name="spareGamma"/> on the rest, zero on host dims.</summary>
+    private static float[] NormRow(Geometry g, double laneGamma, double ballastGamma = 1, double spareGamma = 0)
     {
         var w = new float[g.Hidden];
         for (int d = 0; d < g.Hidden; d++)
         {
             bool spare = d > g.Ballast && d < g.Ballast + g.BallastDims;
-            double gamma = g.HostDim[d] || spare ? 0 : d == g.Ballast ? 1 : laneGamma;
-            w[d] = (float)(gamma - 1);   // the family applies (1 + w)
+            double gamma = g.HostDim[d] ? 0 : spare ? spareGamma : d == g.Ballast ? ballastGamma : laneGamma;
+            w[d] = (float)(gamma - g.Target.NormOffset);
         }
         return w;
     }
 
     private static Layer BuildLayer(EntailProgram p, Geometry g, int index,
-        IEnumerable<(Lin Gate, Lin Up, int Dest, double Coef)> extra,
         IEnumerable<(double GateConst, int Lane, bool ClearBallast)> clears)
     {
-        int h = g.Hidden, inter = g.Intermediate;
+        var t = g.Target;
+        var look = g.Look;
+        int h = g.Hidden, inter = g.Intermediate, headDim = t.HeadDim;
+        var clearList = clears.ToList();
+        bool clearsBallast = clearList.Any(c => c.ClearBallast);
+        double lane = g.LaneGamma;
         var layer = new Layer
         {
-            Q = new float[2 * QDim * h],
-            K = new float[KvDim * h],
-            V = new float[KvDim * h],
-            O = new float[h * QDim],
+            Q = new float[(t.OutputGate ? 2 : 1) * t.QDim * h],
+            K = new float[t.KvDim * h],
+            V = new float[t.KvDim * h],
+            O = new float[h * t.QDim],
             Gate = new float[inter * h],
             Up = new float[inter * h],
             Down = new float[h * inter],
-            InNorm = NormRow(g, Ballast / Math.Pow(2, g.Shift)),
-            PostNorm = NormRow(g, Ballast / Math.Pow(2, g.Shift)),
-            QNorm = Enumerable.Repeat((float)(NormGain - 1), EntailProgram.HeadDim).ToArray(),
-            KNorm = Enumerable.Repeat((float)(NormGain - 1), EntailProgram.HeadDim).ToArray(),
+            InNorm = t.PreNorms ? NormRow(g, lane) : null,
+            FfnInNorm = t.PreNorms ? NormRow(g, lane) : null,
+            // A sub-block's output ballast fixes its post-norm's divisor and
+            // stays out of the stream; the layer that clears the ballast lets
+            // its FFN's −ballast through instead.
+            AttnOutNorm = t.PostNorms ? NormRow(g, lane, 0, 0) : null,
+            FfnOutNorm = t.PostNorms ? clearsBallast ? NormRow(g, lane, lane, lane) : NormRow(g, lane, 0, 0) : null,
         };
+        double amplitude = look.Amplitude(t);
+        double rotaryRms = Math.Sqrt(look.Pairs.Length / (double)headDim);
+        int qStride = t.OutputGate ? 2 * headDim : headDim;
+        bool normed = t.QkNorm != QkNormKind.None;
+
+        // Keys: each group's constant key, one per rotary pair. A q/k norm
+        // rescales it, so its height matters only without one.
+        float key = (float)(normed ? 1 : amplitude / g.BallastRead);
+        for (int group = 0; group < t.KvGroups; group++)
+        {
+            foreach (var pair in look.Pairs)
+            {
+                layer.K[(group * headDim + pair.A) * h + g.Ballast] = key;
+            }
+        }
 
         // Heads: each group shares one constant key and one value table.
         var heads = p.Ops.OfType<Head>().Where(x => x.Layer == index).ToList();
-        var slots = new[] { new Dictionary<string, int>(), new Dictionary<string, int>() };
-        var counts = new int[EntailProgram.KvGroups];
-        for (int group = 0; group < EntailProgram.KvGroups; group++)
+        var slots = Enumerable.Range(0, t.KvGroups).Select(_ => new Dictionary<string, int>()).ToArray();
+        var counts = new int[t.KvGroups];
+        int Capacity(int group) => t.PostNorms && group == t.KvGroups - 1 ? t.HeadsPerGroup - 1 : t.HeadsPerGroup;
+        int activeHeads = 0;
+        int Slot(int group, Lin source)
         {
-            for (int i = 0; i < Pairs; i++)
+            var slotKey = source.Key();
+            if (!slots[group].TryGetValue(slotKey, out int slot))
             {
-                layer.K[(group * EntailProgram.HeadDim + i) * h + g.Ballast] = 1f;
+                slot = slots[group].Count;
+                if (slot >= headDim)
+                {
+                    throw new EntailException($"layer {index}: more than {headDim} values in one attention group");
+                }
+                slots[group][slotKey] = slot;
+                ReadInto(layer.V, group * headDim + slot, h, source, g);
             }
+            return slot;
+        }
+        void Query(int qHead, IEnumerable<(int Dim, double Unit, int Offset)> parts)
+        {
+            int block = qHead * qStride;
+            if (t.OutputGate)
+            {
+                for (int d = 0; d < headDim; d++)
+                {
+                    layer.Q[(block + headDim + d) * h + g.Ballast] = (float)(OutputGate / g.BallastRead);
+                }
+            }
+            foreach (var (dim, unit, offset) in parts)
+            {
+                var q = OffsetQuery(look, headDim, offset);
+                for (int d = 0; d < headDim; d++)
+                {
+                    // A q/k norm sets the height; without one it is written in.
+                    layer.Q[(block + d) * h + dim] += (float)(normed ? q[d] : q[d] * amplitude / unit);
+                }
+            }
+            activeHeads++;
         }
         foreach (var head in heads)
         {
-            int group = counts[0] < HeadsPerGroup ? 0 : 1;
-            int qHead = group * HeadsPerGroup + counts[group]++;
-            int block = qHead * 2 * EntailProgram.HeadDim;
-            for (int d = 0; d < EntailProgram.HeadDim; d++)
+            int group = Enumerable.Range(0, t.KvGroups).FirstOrDefault(gr => counts[gr] < Capacity(gr), -1);
+            if (group < 0)
             {
-                layer.Q[(block + EntailProgram.HeadDim + d) * h + g.Ballast] = (float)(OutputGate / Math.Pow(2, g.Shift));
+                throw new EntailException($"layer {index}: more than {t.ProgramHeads} heads");
             }
+            int qHead = group * t.HeadsPerGroup + counts[group]++;
             if (head.Pointer is { } pointer)
             {
-                foreach (var (lane, offset) in pointer)
-                {
-                    int dim = g.Lanes.Dim[lane];
-                    if (dim < 0)
-                    {
-                        continue;
-                    }
-                    var q = OffsetQuery(offset);
-                    for (int d = 0; d < EntailProgram.HeadDim; d++)
-                    {
-                        layer.Q[(block + d) * h + dim] += (float)q[d];
-                    }
-                }
+                Query(qHead, pointer.Where(x => g.Lanes.Dim[x.Lane] >= 0)
+                    .Select(x => (g.Lanes.Dim[x.Lane], g.Scale[x.Lane], x.Offset)));
             }
             else
             {
-                var q = OffsetQuery(head.Offset);
-                for (int d = 0; d < EntailProgram.HeadDim; d++)
-                {
-                    layer.Q[(block + d) * h + g.Ballast] += (float)q[d];
-                }
+                Query(qHead, new[] { (g.Ballast, g.BallastRead, head.Offset) });
             }
             foreach (var (dest, source) in head.Copies)
             {
@@ -365,24 +496,46 @@ public static class EntailWeights
                 {
                     continue;
                 }
-                var key = source.Key();
-                if (!slots[group].TryGetValue(key, out int slot))
-                {
-                    slot = slots[group].Count;
-                    if (slot >= EntailProgram.HeadDim)
-                    {
-                        throw new EntailException($"layer {index}: more than {EntailProgram.HeadDim} values in one attention group");
-                    }
-                    slots[group][key] = slot;
-                    ReadInto(layer.V, group * EntailProgram.HeadDim + slot, h, source, g);
-                }
-                layer.O[g.Lanes.Dim[dest] * QDim + qHead * EntailProgram.HeadDim + slot] = (float)g.Scale[dest];
+                int slot = Slot(group, source);
+                layer.O[g.Lanes.Dim[dest] * t.QDim + qHead * headDim + slot] = (float)(g.Scale[dest] / t.ResidualScale);
+            }
+        }
+        if (t.PostNorms)
+        {
+            // The kept head reads a constant 1, so the attention output carries
+            // the ballast its post-norm divides by.
+            int group = t.KvGroups - 1;
+            int qHead = group * t.HeadsPerGroup + t.HeadsPerGroup - 1;
+            Query(qHead, new[] { (g.Ballast, g.BallastRead, 0) });
+            int slot = Slot(group, Lin.Of(1));
+            for (int d = 0; d < g.BallastDims; d++)
+            {
+                layer.O[(g.Ballast + d) * t.QDim + qHead * headDim + slot] = (float)Ballast;
+            }
+        }
+
+        // q/k norm weights: the height a lookup needs, whatever the width
+        // the norm divides over.
+        switch (t.QkNorm)
+        {
+            case QkNormKind.PerHead:
+                layer.QNorm = Enumerable.Repeat((float)(amplitude * rotaryRms - t.QkNormOffset), headDim).ToArray();
+                layer.KNorm = Enumerable.Repeat((float)(amplitude * rotaryRms - t.QkNormOffset), headDim).ToArray();
+                break;
+            case QkNormKind.Whole:
+            {
+                // Over all heads at once: the rms counts every head with a query.
+                double qRms = Math.Sqrt(Math.Max(1, activeHeads) * look.Pairs.Length / (double)t.QDim);
+                layer.QNorm = Enumerable.Repeat((float)(amplitude * qRms - t.QkNormOffset), t.QDim).ToArray();
+                layer.KNorm = Enumerable.Repeat((float)(amplitude * rotaryRms - t.QkNormOffset), t.KvDim).ToArray();
+                break;
             }
         }
 
         // Neurons.
         int at = 0;
-        void Place(Lin gate, Lin up, int destDim, double raw)
+        double ffnScale = t.ResidualScale * t.ExpertWeight;
+        void Place(Lin gate, Lin up, IEnumerable<(int Dim, double Raw)> dests)
         {
             if (at >= inter)
             {
@@ -390,7 +543,10 @@ public static class EntailWeights
             }
             ReadInto(layer.Gate, at, h, gate, g);
             ReadInto(layer.Up, at, h, up, g);
-            layer.Down[destDim * inter + at] = (float)raw;
+            foreach (var (dim, raw) in dests)
+            {
+                layer.Down[dim * inter + at] = (float)(raw / ffnScale);
+            }
             at++;
         }
         foreach (var n in p.Ops.OfType<Neuron>().Where(x => x.Layer == index))
@@ -398,45 +554,131 @@ public static class EntailWeights
             int dim = g.Lanes.Dim[n.Dest];
             if (dim >= 0)
             {
-                Place(n.Gate, n.Up, dim, n.Coef * g.Scale[n.Dest]);
+                Place(n.Gate, n.Up, new[] { (dim, n.Coef * g.Scale[n.Dest]) });
             }
         }
-        foreach (var (gate, up, dest, coef) in extra)
-        {
-            Place(gate, up, dest, coef);
-        }
-        foreach (var (gateConst, lane, clearBallast) in clears)
+        foreach (var (gateConst, laneIndex, clearBallast) in clearList)
         {
             var gate = Lin.Of(gateConst);
             if (clearBallast)
             {
                 for (int d = 0; d < g.BallastDims; d++)
                 {
-                    Place(gate, Lin.Of(1 / gateConst), g.Ballast + d, -Ballast);
+                    Place(gate, Lin.Of(1 / gateConst), new[] { (g.Ballast + d, -Ballast) });
                 }
             }
             else
             {
                 // Up reads the lane's meaning; the down weight restores raw.
-                Place(gate, Lin.OfLane(lane).Scaled(1 / gateConst), g.Lanes.Dim[lane], -g.Scale[lane]);
+                Place(gate, Lin.OfLane(laneIndex).Scaled(1 / gateConst), new[] { (g.Lanes.Dim[laneIndex], -g.Scale[laneIndex]) });
             }
+        }
+        if (t.PostNorms && !clearsBallast)
+        {
+            // The FFN output's ballast, for its post-norm.
+            Place(Lin.Of(EntailCompiler.G), Lin.Of(1 / EntailCompiler.G),
+                Enumerable.Range(0, g.BallastDims).Select(d => (g.Ballast + d, Ballast * ffnScale)));
+        }
+        if (t.Ffn == BlockFfn.SharedExpert && t.Names.ContainsKey($"{TensorRoles.SharedExpertGate}.weight"))
+        {
+            layer.SharedExpertGate = new float[h];
+            layer.SharedExpertGate[g.Ballast] = (float)(OutputGate / g.BallastRead);
         }
         return layer;
     }
 
-    private static IEnumerable<TensorPayload> LayerTensors(Layer l, string prefix, int h, int inter)
+    /// <summary>A block layer's tensors under the target's own names, fused
+    /// where the target stores them fused, with zero biases where it has them.</summary>
+    private static IEnumerable<TensorPayload> LayerTensors(Layer l, EntailTarget t, string prefix, int h, int inter)
     {
-        yield return F32($"{prefix}.input_layernorm.weight", l.InNorm, h);
-        yield return F32($"{prefix}.post_attention_layernorm.weight", l.PostNorm, h);
-        yield return F32($"{prefix}.self_attn.q_proj.weight", l.Q, 2 * QDim, h);
-        yield return F32($"{prefix}.self_attn.k_proj.weight", l.K, KvDim, h);
-        yield return F32($"{prefix}.self_attn.v_proj.weight", l.V, KvDim, h);
-        yield return F32($"{prefix}.self_attn.o_proj.weight", l.O, h, QDim);
-        yield return F32($"{prefix}.self_attn.q_norm.weight", l.QNorm, EntailProgram.HeadDim);
-        yield return F32($"{prefix}.self_attn.k_norm.weight", l.KNorm, EntailProgram.HeadDim);
-        yield return F32($"{prefix}.mlp.gate_proj.weight", l.Gate, inter, h);
-        yield return F32($"{prefix}.mlp.up_proj.weight", l.Up, inter, h);
-        yield return F32($"{prefix}.mlp.down_proj.weight", l.Down, h, inter);
+        var tensors = new List<(string Name, float[] Data, long[] Shape)>();
+        string? Name(string role, string part = "weight") => t.Names.TryGetValue($"{role}.{part}", out var n) ? n : null;
+        void Add(string role, float[] data, params long[] shape)
+        {
+            tensors.Add((Name(role) ?? throw new EntailException($"the target has no name for '{role}'"), data, shape));
+            if (Name(role, "bias") is { } bias)
+            {
+                tensors.Add((bias, new float[shape[0]], new[] { shape[0] }));
+            }
+        }
+        if (l.InNorm is not null)
+        {
+            Add(TensorRoles.AttnIn, l.InNorm, h);
+        }
+        if (l.AttnOutNorm is not null)
+        {
+            Add(TensorRoles.AttnOut, l.AttnOutNorm, h);
+        }
+        if (l.FfnInNorm is not null)
+        {
+            Add(TensorRoles.FfnIn, l.FfnInNorm, h);
+        }
+        if (l.FfnOutNorm is not null)
+        {
+            Add(TensorRoles.FfnOut, l.FfnOutNorm, h);
+        }
+        int qRows = l.Q.Length / h;
+        Add(TensorRoles.Q, l.Q, qRows, h);
+        Add(TensorRoles.K, l.K, t.KvDim, h);
+        Add(TensorRoles.V, l.V, t.KvDim, h);
+        Add(TensorRoles.O, l.O, h, t.QDim);
+        if (l.QNorm is not null)
+        {
+            Add(TensorRoles.QNorm, l.QNorm, l.QNorm.Length);
+            Add(TensorRoles.KNorm, l.KNorm!, l.KNorm!.Length);
+        }
+        switch (t.Ffn)
+        {
+            case BlockFfn.Dense:
+                Add(TensorRoles.Gate, l.Gate, inter, h);
+                Add(TensorRoles.Up, l.Up, inter, h);
+                Add(TensorRoles.Down, l.Down, h, inter);
+                break;
+            case BlockFfn.SharedExpert:
+            case BlockFfn.Experts:
+            {
+                var moe = t.ExpertNames!;
+                int experts = t.ExpertCount;
+                Add(TensorRoles.Router, new float[experts * h], experts, h);
+                bool shared = t.Ffn == BlockFfn.SharedExpert;
+                int expertInter = shared ? t.ExpertIntermediate : inter;
+                for (int e = 0; e < experts; e++)
+                {
+                    tensors.Add((moe.Name(e, moe.Gate!), shared ? new float[expertInter * h] : l.Gate, new long[] { expertInter, h }));
+                    tensors.Add((moe.Name(e, moe.Up), shared ? new float[expertInter * h] : l.Up, new long[] { expertInter, h }));
+                    tensors.Add((moe.Name(e, moe.Down), shared ? new float[h * expertInter] : l.Down, new long[] { h, expertInter }));
+                }
+                if (shared)
+                {
+                    Add(TensorRoles.SharedGate, l.Gate, inter, h);
+                    Add(TensorRoles.SharedUp, l.Up, inter, h);
+                    Add(TensorRoles.SharedDown, l.Down, h, inter);
+                    if (l.SharedExpertGate is not null)
+                    {
+                        Add(TensorRoles.SharedExpertGate, l.SharedExpertGate, 1, h);
+                    }
+                }
+                break;
+            }
+        }
+
+        // Fused spellings: concatenate the parts along the first axis.
+        foreach (var fused in t.Fused ?? Array.Empty<FusedTensor>())
+        {
+            var parts = fused.Parts.Select(part => tensors.FirstOrDefault(x => x.Name == part)).ToList();
+            if (parts.Any(x => x.Name is null))
+            {
+                continue;
+            }
+            var data = parts.SelectMany(x => x.Data).ToArray();
+            long rows = parts.Sum(x => x.Shape[0]);
+            tensors.RemoveAll(x => fused.Parts.Contains(x.Name));
+            tensors.Add((fused.Name, data, parts[0].Shape.Length == 1 ? new[] { rows } : new[] { rows, parts[0].Shape[1] }));
+        }
+        foreach (var (name, data, shape) in tensors)
+        {
+            yield return F32($"{prefix}.{name}", data, shape);
+        }
     }
 
     private static TensorPayload F32(string name, float[] data, params long[] shape)
@@ -445,8 +687,6 @@ public static class EntailWeights
         Buffer.BlockCopy(data, 0, bytes, 0, bytes.Length);
         return new TensorPayload { Name = name, Dtype = Dtype.F32, Shape = shape, Data = bytes };
     }
-
-    private static (Lin, Lin, int, double)[] NoExtra => Array.Empty<(Lin, Lin, int, double)>();
 
     private static IEnumerable<(double, int, bool)> ClearsFor(Allocation a, int layer) =>
         a.Clears.Where(c => c.Layer == layer).Select(c => (EntailCompiler.G, c.Lane, false));
@@ -557,10 +797,12 @@ public static class EntailWeights
             p.Ops.OfType<Neuron>().Count(n => n.Layer == l) + alloc.Clears.Count(c => c.Layer == l));
         int intermediate = RoundUp(clearPeak, 64);
         var scale = p.Lanes.Select(l => l.Scale).ToArray();
+        var target = EntailTarget.Fresh(intermediate);
+        var look = ChooseLookup(target, p, context, strict: false);
         var geometry = new Geometry
         {
             Hidden = hidden, Intermediate = intermediate, Ballast = 0, BallastDims = ballastDims, Shift = shift, Lanes = alloc,
-            Scale = scale, HostDim = new bool[hidden],
+            Scale = scale, HostDim = new bool[hidden], Target = target, Look = look,
         };
 
         var embed = new float[(long)vocab.Count * hidden];
@@ -594,10 +836,10 @@ public static class EntailWeights
         var tensors = new List<TensorPayload> { F32("model.embed_tokens.weight", embed, vocab.Count, hidden) };
         for (int l = 0; l < p.Layers; l++)
         {
-            var layer = BuildLayer(p, geometry, l, NoExtra, ClearsFor(alloc, l));
-            tensors.AddRange(LayerTensors(layer, $"model.layers.{l}", hidden, intermediate));
+            var layer = BuildLayer(p, geometry, l, ClearsFor(alloc, l));
+            tensors.AddRange(LayerTensors(layer, target, $"model.layers.{l}", hidden, intermediate));
         }
-        tensors.Add(F32("model.norm.weight", NormRow(geometry, Ballast / Math.Pow(2, shift)), hidden));
+        tensors.Add(F32("model.norm.weight", NormRow(geometry, geometry.LaneGamma), hidden));
         tensors.Add(F32("lm_head.weight", head, vocab.Count, hidden));
         SafetensorsWriter.Write(Path.Combine(outDir, "model.safetensors"), tensors);
 
@@ -622,7 +864,7 @@ public static class EntailWeights
             ["rope_parameters"] = new JsonObject
             {
                 ["rope_type"] = "default",
-                ["rope_theta"] = RopeTheta,
+                ["rope_theta"] = EntailTarget.FreshTheta,
                 ["partial_rotary_factor"] = 0.25,
             },
         };
@@ -631,7 +873,7 @@ public static class EntailWeights
         File.WriteAllText(Path.Combine(outDir, "generation_config.json"), "{ \"eos_token_id\": 1 }");
 
         return new EntailBuildReport(outDir, hidden, p.Layers, p.Layers, alloc.Used, alloc.Peak,
-            p.Ops.Count(o => o is Neuron), p.Ops.Count(o => o is Head), AttentionGap(p, context), inputs.Count, missing);
+            p.Ops.Count(o => o is Neuron), p.Ops.Count(o => o is Head), look.Gap, inputs.Count, missing);
     }
 
     private static string TokenizerJson(IReadOnlyList<string> vocab)
@@ -701,48 +943,56 @@ public static class EntailWeights
     /// column is both an input and an output, so the block clears it on the
     /// way in.</summary>
     private const double EmitRow = 1.0 / 1048576;
-    /// <summary>Residual norm the host reaches at its final norm, and how
-    /// many logits a set output lane adds at that norm.</summary>
-    private const double HostOutputNorm = 115;
+    /// <summary>Residual norm a host reaches at its final norm (measured on
+    /// Qwen 3.5 0.8B), and how many logits a set output lane adds at that norm.</summary>
+    public const double DefaultHostOutputNorm = 115;
     private const double OutputForce = 256;
 
     /// <summary>
-    /// Restructures a Qwen3.5-family text checkpoint around the program,
-    /// leaving every host weight's value in place:
+    /// Restructures a host checkpoint around the program, leaving every host
+    /// weight's value in place. The host is judged by the importer's rules
+    /// (<see cref="EntailHost.Judge"/>) and the block is written in its own
+    /// layer shape and spelling:
     /// <list type="bullet">
     /// <item>The hidden size widens; the new dimensions are the program's
-    /// lanes. Every host matrix gains zeros there, so no host weight can read
-    /// or write a lane, and its norm weights are rescaled so the wider mean
-    /// leaves them exactly where they were.</item>
+    /// lanes. Every host matrix gains zeros there, by the role of each axis,
+    /// so no host weight can read or write a lane, and its norm weights are
+    /// rescaled so the wider mean leaves them exactly where they were.</item>
     /// <item>The compiled layers go in front of the host's first layer. They
     /// read only lanes, so they compute a pure function of the tokens. They
     /// finish by clearing every lane and the ballast: the host then starts
     /// from its own unchanged embedding.</item>
-    /// <item>Each output lane is a column of the tied embedding, non-zero in
-    /// its own token's row alone, and the only lanes the final norm passes.
-    /// A set lane therefore raises exactly one logit; the end-of-answer lane
-    /// lowers the logits of the tokens an answer is made of.</item>
+    /// <item>Each output lane is a column of the output head, non-zero in its
+    /// own token's row alone, and the only lanes the final norm passes. A set
+    /// lane therefore raises exactly one logit; the end-of-answer lane lowers
+    /// the logits of the tokens an answer is made of.</item>
     /// </list>
     /// Wherever the program says nothing, the host's computation is unchanged.
     /// </summary>
-    public static EntailBuildReport WriteGraft(EntailProgram p, string hostDir, string outDir, int context = 8192)
+    public static EntailBuildReport WriteGraft(EntailProgram p, string hostDir, string outDir, int context = 8192,
+        double hostOutputNorm = DefaultHostOutputNorm) =>
+        WriteGraft(p, EntailHost.Judge(hostDir), outDir, context, hostOutputNorm);
+
+    public static EntailBuildReport WriteGraft(EntailProgram p, EntailHost hostFacts, string outDir, int context = 8192,
+        double hostOutputNorm = DefaultHostOutputNorm)
     {
         RefuseVotes(p);
-        Directory.CreateDirectory(outDir);
-        var hostConfig = JsonNode.Parse(File.ReadAllText(Path.Combine(hostDir, "config.json")))!.AsObject();
-        var text = hostConfig["text_config"]?.AsObject() ?? hostConfig;
-        int hostHidden = text["hidden_size"]!.GetValue<int>();
-        int hostLayers = text["num_hidden_layers"]!.GetValue<int>();
-        int inter = text["intermediate_size"]!.GetValue<int>();
-        int headDim = text["head_dim"]!.GetValue<int>();
-        if (headDim != EntailProgram.HeadDim ||
-            text["num_attention_heads"]!.GetValue<int>() != EntailProgram.HeadsPerLayer ||
-            text["num_key_value_heads"]!.GetValue<int>() != EntailProgram.KvGroups)
+        var t = hostFacts.Target;
+        if (p.Ops.OfType<Head>().GroupBy(h => h.Layer).Any(g => g.Count() > t.ProgramHeads))
         {
-            throw new EntailException("the graft target must have 8 query heads, 2 KV heads and head_dim 256");
+            throw new EntailException($"the host's layers hold {t.ProgramHeads} program heads: compile the program for this host");
         }
+        if (t.Window is { } window && window < context)
+        {
+            // Every layer is windowed (Mistral): a lookup reaches the window, no further.
+            context = (int)window;
+        }
+        Directory.CreateDirectory(outDir);
+        string hostDir = hostFacts.Directory;
+        int hostHidden = hostFacts.Hidden;
+        string root = hostFacts.Prefix;
 
-        int hidden = WidthFor(hostHidden + Allocate(p, firstDim: 0, keepEmitsLive: true).Used);
+        int hidden = WidthFor(hostHidden + Allocate(p, firstDim: 0, keepEmitsLive: true).Used, t.EmbedScaleSqrtHidden);
         var (ballastDims, shift) = BallastShape(hidden);
         var alloc = Allocate(p, firstDim: hostHidden + ballastDims, keepEmitsLive: true);
         int ballast = hostHidden;
@@ -752,44 +1002,47 @@ public static class EntailWeights
         {
             hostDim[d] = true;
         }
+        var look = ChooseLookup(t, p, context, strict: true);
+        int inter = t.Intermediate;
         var geometry = new Geometry
         {
             Hidden = hidden, Intermediate = inter, Ballast = ballast, BallastDims = ballastDims, Shift = shift, Lanes = alloc,
-            Scale = scale, HostDim = hostDim,
+            Scale = scale, HostDim = hostDim, Target = t, Look = look,
         };
+        // What the embedding is multiplied by, before and after widening. The
+        // block's entries are divided by the new one (a power of two); the
+        // host's are moved so the product is unchanged.
+        double embedOld = t.EmbedScaleSqrtHidden ? Math.Sqrt(hostHidden) : t.EmbedMultiplier;
+        double embedNew = t.EmbedScaleSqrtHidden ? Math.Sqrt(hidden) : t.EmbedMultiplier;
+        double hostEmbedFactor = embedOld / embedNew;
 
         // Everything below streams: the host is read through its memory map
         // and each output tensor goes to disk as it is made, so building a
         // graft needs one compiled layer and a few row blocks in memory, not
         // the whole widened model. A host larger than RAM grafts the same way.
         using var host = ModelDirectory.OpenCheckpoint(hostDir);
-        string Prefix(string name) => name.StartsWith("model.language_model.", StringComparison.Ordinal)
-            ? "model.language_model." : "model.";
-        string root = Prefix(host.TensorNames.First(n => n.Contains("embed_tokens", StringComparison.Ordinal)));
-        string embedName = root + "embed_tokens.weight";
+        string embedName = hostFacts.EmbeddingName;
         var hostNames = host.TensorNames
-            .Where(n => n.StartsWith(root, StringComparison.Ordinal) && n != embedName)
+            .Where(n => (n.StartsWith(root, StringComparison.Ordinal) || n == hostFacts.HeadName) && n != embedName)
             .Distinct(StringComparer.Ordinal)
             .ToList();
         int block = p.Layers + 2;
 
         var (vocabIds, missing) = BindTokens(p, hostDir);
         var (embedShard, embedInfo) = host.Get(embedName);
-        if (embedInfo.Dtype != Dtype.BF16)
-        {
-            throw new EntailException($"expected a bf16 host embedding, found {embedInfo.Dtype.Label()}");
-        }
         long vocab = embedInfo.Shape[0];
 
-        // Embedding writes, in the order they apply (a later write wins).
-        var rowWrites = new Dictionary<long, List<(int Dim, ushort Bits)>>();
-        void Put(long id, int dim, double value)
+        // Input writes go to the embedding; output writes to the output head,
+        // which is the embedding when tied. A later write wins.
+        var inputWrites = new Dictionary<long, List<(int Dim, double Value)>>();
+        var outputWrites = new Dictionary<long, List<(int Dim, double Value)>>();
+        void Put(Dictionary<long, List<(int, double)>> writes, long id, int dim, double value)
         {
-            if (!rowWrites.TryGetValue(id, out var list))
+            if (!writes.TryGetValue(id, out var list))
             {
-                rowWrites[id] = list = new List<(int, ushort)>();
+                writes[id] = list = new List<(int, double)>();
             }
-            list.Add((dim, Bf16(value)));
+            list.Add((dim, value));
         }
         foreach (var (textToken, id) in vocabIds)
         {
@@ -802,14 +1055,14 @@ public static class EntailWeights
             {
                 if (alloc.Dim[lane] >= 0)
                 {
-                    Put(id, alloc.Dim[lane], value * scale[lane]);
+                    Put(inputWrites, id, alloc.Dim[lane], value * scale[lane] / embedNew);
                 }
             }
         }
         var outputs = p.Emits.Where(e => e.Text is not null && vocabIds.ContainsKey(e.Text)).ToList();
         foreach (var (token, lane) in outputs)
         {
-            Put(vocabIds[token!], alloc.Dim[lane], EmitRow);
+            Put(outputWrites, vocabIds[token!], alloc.Dim[lane], EmitRow);
         }
         // "End of answer" has no token in a host, whose text simply goes on.
         // Its lane is a column too, negative in the rows of the tokens an
@@ -819,125 +1072,118 @@ public static class EntailWeights
         {
             foreach (var (token, _) in outputs.Where(o => o.Text != " "))
             {
-                Put(vocabIds[token!], alloc.Dim[lane], -EmitRow);
+                Put(outputWrites, vocabIds[token!], alloc.Dim[lane], -EmitRow);
             }
         }
         // A mask's lane is a column too, negative in the rows it rules out.
         // It can cover most of the vocabulary, so it is a rule per row.
         var masks = p.Masks
-            .Select(m => (m.Allow, Listed: m.Texts.Where(vocabIds.ContainsKey).Select(t => (long)vocabIds[t]).ToHashSet(),
+            .Select(m => (m.Allow, Listed: m.Texts.Where(vocabIds.ContainsKey).Select(x => (long)vocabIds[x]).ToHashSet(),
                 Dim: alloc.Dim[m.Lane]))
             .ToList();
         var outputLanes = outputs.Select(o => o.Lane).Concat(ends).Concat(p.Masks.Select(m => m.Lane)).ToList();
 
-        long reserve = 4096 + 192L * (hostNames.Count + 1 + block * 11);
+        long reserve = 4096 + 256L * (hostNames.Count + 1 + block * (16 + 3 * t.ExpertCount));
         using var writer = new SafetensorsStreamWriter(Path.Combine(outDir, "model.safetensors"), reserve);
 
-        // Embedding: host dims as they are, then ballast and token lanes,
-        // a block of rows at a time.
-        ushort ballastBits = Bf16(Ballast);
-        ushort negativeRow = Bf16(-EmitRow);
-        writer.Write(embedName, Dtype.BF16, new[] { vocab, (long)hidden }, stream =>
+        // Embedding: host dims (moved, if the embedding scale changes), then
+        // ballast and token lanes; the output columns too, when tied.
+        WriteRows(writer, host, embedName, embedName, hostHidden, hidden, hostEmbedFactor, (row, put) =>
         {
-            long rowsPerBlock = Math.Max(1, (32L << 20) / ((long)hidden * 2));
-            for (long first = 0; first < vocab; first += rowsPerBlock)
+            for (int d = 0; d < ballastDims; d++)
             {
-                int rows = (int)Math.Min(rowsPerBlock, vocab - first);
-                var source = embedShard.ReadBytes(embedInfo, first * hostHidden * 2, rows * hostHidden * 2);
-                var rowsOut = new byte[(long)rows * hidden * 2];
-                for (int r = 0; r < rows; r++)
+                put(ballast + d, Ballast / embedNew);
+            }
+            if (inputWrites.TryGetValue(row, out var list))
+            {
+                foreach (var (dim, value) in list)
                 {
-                    long t = first + r;
-                    Buffer.BlockCopy(source, r * hostHidden * 2, rowsOut, r * hidden * 2, hostHidden * 2);
-                    long at = (long)r * hidden;
-                    for (int d = 0; d < ballastDims; d++)
-                    {
-                        WriteU16(rowsOut, at + ballast + d, ballastBits);
-                    }
-                    if (rowWrites.TryGetValue(t, out var list))
-                    {
-                        foreach (var (dim, bits) in list)
-                        {
-                            WriteU16(rowsOut, at + dim, bits);
-                        }
-                    }
-                    foreach (var (allow, listed, dim) in masks)
-                    {
-                        if (listed.Contains(t) != allow)
-                        {
-                            WriteU16(rowsOut, at + dim, negativeRow);
-                        }
-                    }
+                    put(dim, value);
                 }
-                stream.Write(rowsOut);
+            }
+            if (hostFacts.Tied)
+            {
+                WriteOutputs(row, put);
             }
         });
+        void WriteOutputs(long row, Action<int, double> put)
+        {
+            if (outputWrites.TryGetValue(row, out var list))
+            {
+                foreach (var (dim, value) in list)
+                {
+                    put(dim, value);
+                }
+            }
+            foreach (var (allow, listed, dim) in masks)
+            {
+                if (listed.Contains(row) != allow)
+                {
+                    put(dim, -EmitRow);
+                }
+            }
+        }
 
         // The compiled block, then the two layers that hand over to the host,
-        // each written and dropped before the next is built.
+        // each written and dropped before the next is built. With a tied head
+        // the output columns are also input entries, cleared on the way in.
         for (int l = 0; l < p.Layers; l++)
         {
             var clears = ClearsFor(alloc, l);
-            if (l == 0)
+            if (l == 0 && hostFacts.Tied)
             {
                 clears = clears.Concat(outputLanes.Select(lane => (EntailCompiler.G, lane, false)));
             }
-            WriteLayer(writer, BuildLayer(p, geometry, l, NoExtra, clears), $"{root}layers.{l}", hidden, inter);
+            WriteLayer(writer, BuildLayer(p, geometry, l, clears), t, $"{root}layers.{l}", hidden, inter);
         }
         var finalClears = alloc.LiveAtEnd.Select(lane => (EntailCompiler.G, lane, false));
-        WriteLayer(writer, BuildLayer(p, geometry, -1, NoExtra, finalClears), $"{root}layers.{p.Layers}", hidden, inter);
-        WriteLayer(writer, BuildLayer(p, geometry, -1, NoExtra, new[] { (EntailCompiler.G, 0, true) }),
+        WriteLayer(writer, BuildLayer(p, geometry, -1, finalClears), t, $"{root}layers.{p.Layers}", hidden, inter);
+        WriteLayer(writer, BuildLayer(p, geometry, -1, new[] { (EntailCompiler.G, 0, true) }), t,
             $"{root}layers.{p.Layers + 1}", hidden, inter);
 
-        // The host's own tensors, widened.
+        // The host's own tensors, widened by the role of each axis.
         double shrink = Math.Sqrt(hostHidden / (double)hidden);
+        double headFactor = hostFacts.Tied ? hostEmbedFactor : 1;
+        var axes = HostAxes(hostFacts);
         foreach (var name in hostNames)
         {
-            var relative = name[root.Length..];
             string target = name;
-            if (relative.StartsWith("layers.", StringComparison.Ordinal))
+            string? relative = null;
+            if (name.StartsWith($"{root}layers.", StringComparison.Ordinal))
             {
-                int dot = relative.IndexOf('.', 7);
-                int index = int.Parse(relative[7..dot]);
-                target = $"{root}layers.{index + block}{relative[dot..]}";
+                string rest = name[$"{root}layers.".Length..];
+                int dot = rest.IndexOf('.');
+                int index = int.Parse(rest[..dot]);
+                relative = rest[(dot + 1)..];
+                target = $"{root}layers.{index + block}.{relative}";
             }
-            if (relative == "norm.weight")
+            if (name == hostFacts.FinalNormName)
             {
-                var widened = WidenNorm(host, name, hostHidden, hidden, shrink, isFinalNorm: true);
+                // A tied head reads the moved embedding: the host's logits move back here.
+                var widened = WidenNorm(host, name, hostHidden, hidden, shrink / headFactor, t.NormOffset, isFinalNorm: true);
                 // logit += EmitRow · gamma · lane/rms: OutputForce at the host's usual norm.
-                double gamma = OutputForce * HostOutputNorm / (EmitRow * EmitLaneHeight * Math.Sqrt(hidden));
+                double gamma = OutputForce * hostOutputNorm / (EmitRow * EmitLaneHeight * Math.Sqrt(hidden) * t.OutputMultiplier);
                 foreach (int lane in outputLanes)
                 {
-                    widened[alloc.Dim[lane]] = (float)(gamma - 1);
+                    widened[alloc.Dim[lane]] = (float)(gamma - t.NormOffset);
                 }
                 writer.WriteF32(target, widened, hidden);
                 continue;
             }
-            Widen(writer, host, name, target, hostHidden, hidden, shrink);
+            if (name == hostFacts.HeadName)
+            {
+                WriteRows(writer, host, name, name, hostHidden, hidden, 1, (row, put) => WriteOutputs(row, put));
+                continue;
+            }
+            var axis = relative is not null && axes.TryGetValue(relative, out var known) ? known : AxisByShape(host, name, hostHidden);
+            Widen(writer, host, name, target, hostHidden, hidden, shrink, axis, t.NormOffset);
         }
 
         writer.Complete();
 
-        var types = new JsonArray();
-        for (int i = 0; i < block; i++)
-        {
-            types.Add("full_attention");
-        }
-        foreach (var t in text["layer_types"]!.AsArray())
-        {
-            types.Add(t!.GetValue<string>());
-        }
-        var config = JsonNode.Parse(hostConfig.ToJsonString())!.AsObject();
-        var target2 = config["text_config"]?.AsObject() ?? config;
-        target2["hidden_size"] = hidden;
-        target2["num_hidden_layers"] = types.Count;
-        target2["layer_types"] = types;
-        // rms_norm_eps stays as it is: the same value serves the per-head
-        // norms of linear attention, which do not widen, and they are far more
-        // sensitive to it than the layer norms are.
-        config.Remove("vision_config");
-        File.WriteAllText(Path.Combine(outDir, "config.json"), config.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
-        foreach (var file in new[] { "tokenizer.json", "tokenizer_config.json", "chat_template.jinja", "generation_config.json" })
+        WriteGraftConfig(hostFacts, outDir, hidden, block);
+        foreach (var file in new[] { "tokenizer.json", "tokenizer_config.json", "chat_template.jinja", "generation_config.json",
+                     "special_tokens_map.json", "tokenizer.model", "vocab.json", "merges.txt" })
         {
             var source = Path.Combine(hostDir, file);
             if (File.Exists(source))
@@ -946,89 +1192,245 @@ public static class EntailWeights
             }
         }
 
-        return new EntailBuildReport(outDir, hidden, types.Count, block, alloc.Used, alloc.Peak,
-            p.Ops.Count(o => o is Neuron), p.Ops.Count(o => o is Head), AttentionGap(p, context),
+        return new EntailBuildReport(outDir, hidden, hostFacts.Layers + block, block, alloc.Used, alloc.Peak,
+            p.Ops.Count(o => o is Neuron), p.Ops.Count(o => o is Head), look.Gap,
             vocabIds.Count, missing);
     }
 
-    private static void WriteLayer(SafetensorsStreamWriter writer, Layer layer, string prefix, int hidden, int inter)
+    private static void WriteLayer(SafetensorsStreamWriter writer, Layer layer, EntailTarget t, string prefix, int hidden, int inter)
     {
-        foreach (var tensor in LayerTensors(layer, prefix, hidden, inter))
+        foreach (var tensor in LayerTensors(layer, t, prefix, hidden, inter))
         {
             writer.Write(tensor);
         }
     }
 
-    /// <summary>(1+w)·shrink keeps the host's normalised values where they
-    /// were under a mean over more dimensions. The final norm additionally
-    /// zeroes the lanes, so they never reach the output head.</summary>
+    /// <summary>How a host tensor meets the residual stream.</summary>
+    private enum Axis
+    {
+        /// <summary>Touches no residual axis: copied.</summary>
+        None,
+        /// <summary>A norm over the stream: rescaled, zero on new dims.</summary>
+        Norm,
+        /// <summary>Reads the stream (columns): new columns are zero.</summary>
+        Columns,
+        /// <summary>Writes the stream (rows, or a 1-D bias): new rows are zero.</summary>
+        Rows,
+    }
+
+    /// <summary>Each host layer tensor's residual axis, by its role — a
+    /// square projection (Llama's o_proj when heads × head_dim = hidden) has
+    /// two axes of the stream's width, and only its role says which is which.</summary>
+    private static Dictionary<string, Axis> HostAxes(EntailHost host)
+    {
+        var axes = new Dictionary<string, Axis>(StringComparer.Ordinal);
+        var roles = host.Roles;
+        void Set(string role, Axis weight, Axis bias)
+        {
+            if (roles.Name(role) is { } w)
+            {
+                axes[w] = weight;
+            }
+            if (roles.Name(role, "bias") is { } b)
+            {
+                axes[b] = bias;
+            }
+        }
+        foreach (var norm in new[] { TensorRoles.AttnIn, TensorRoles.AttnOut, TensorRoles.FfnIn, TensorRoles.FfnOut })
+        {
+            Set(norm, Axis.Norm, Axis.Rows);
+        }
+        foreach (var reads in new[] { TensorRoles.Q, TensorRoles.K, TensorRoles.V, TensorRoles.Gate, TensorRoles.Up, TensorRoles.Router,
+                     TensorRoles.SharedGate, TensorRoles.SharedUp, TensorRoles.SharedExpertGate })
+        {
+            Set(reads, Axis.Columns, Axis.None);
+        }
+        foreach (var writes in new[] { TensorRoles.O, TensorRoles.Down, TensorRoles.SharedDown })
+        {
+            Set(writes, Axis.Rows, Axis.Rows);
+        }
+        Set(TensorRoles.QNorm, Axis.None, Axis.None);
+        Set(TensorRoles.KNorm, Axis.None, Axis.None);
+        foreach (var fused in roles.Fused ?? new List<FusedTensor>())
+        {
+            // Every known fusion is of input projections (qkv, gate_up).
+            axes[fused.Name] = fused.Name.EndsWith(".bias", StringComparison.Ordinal) ? Axis.None : Axis.Columns;
+        }
+        if (roles.Experts is { } experts)
+        {
+            for (int e = 0; e < host.Target.ExpertCount; e++)
+            {
+                if (experts.Gate is { } g)
+                {
+                    axes[experts.Name(e, g)] = Axis.Columns;
+                }
+                axes[experts.Name(e, experts.Up)] = Axis.Columns;
+                axes[experts.Name(e, experts.Down)] = Axis.Rows;
+            }
+        }
+        return axes;
+    }
+
+    /// <summary>A tensor no role names: its axis of the stream's width, if
+    /// exactly one of its last two is.</summary>
+    private static Axis AxisByShape(ModelDirectory host, string name, int hostHidden)
+    {
+        var shape = host.Get(name).Info.Shape;
+        if (shape.Length == 1)
+        {
+            return shape[0] != hostHidden ? Axis.None
+                : name.Contains("norm", StringComparison.Ordinal) ? Axis.Norm : Axis.Rows;
+        }
+        bool rows = shape[^2] == hostHidden, columns = shape[^1] == hostHidden;
+        if (rows && columns)
+        {
+            throw new EntailException($"cannot graft into this host: '{name}' is {hostHidden}×{hostHidden} and no role says which side reads the residual stream");
+        }
+        return columns ? Axis.Columns : rows ? Axis.Rows : Axis.None;
+    }
+
+    /// <summary>A norm's weight over the wider stream: (offset+w)·shrink keeps
+    /// the host's normalised values where they were under a mean over more
+    /// dimensions. The final norm additionally zeroes the new dims, so lanes
+    /// never reach the output head.</summary>
     private static float[] WidenNorm(ModelDirectory host, string name, int hostHidden, int hidden, double shrink,
-        bool isFinalNorm)
+        float offset, bool isFinalNorm)
     {
         var (file, info) = host.Get(name);
         var widened = BitPattern.WidenToF32(info.Dtype, file.ReadBytes(info));
         var w = new float[hidden];
         for (int d = 0; d < hidden; d++)
         {
-            w[d] = d < hostHidden ? (float)((1 + (double)widened[d]) * shrink - 1) : isFinalNorm ? -1f : 0f;
+            w[d] = d < hostHidden ? (float)((offset + (double)widened[d]) * shrink - offset) : isFinalNorm ? -offset : 0f;
         }
         return w;
     }
 
-    /// <summary>Writes a host tensor with zeros in the new dimensions,
+    /// <summary>Writes a host tensor with zeros where the stream widened,
     /// streaming it from the host a block of rows at a time.</summary>
     private static void Widen(SafetensorsStreamWriter writer, ModelDirectory host, string name, string target,
-        int hostHidden, int hidden, double shrink)
+        int hostHidden, int hidden, double shrink, Axis axis, float offset)
     {
         var (file, info) = host.Get(name);
         const long BlockBytes = 32L << 20;
-        if (info.Shape.Length == 1 && info.Shape[0] == hostHidden)
-        {
-            writer.WriteF32(target, WidenNorm(host, name, hostHidden, hidden, shrink, isFinalNorm: false), hidden);
-            return;
-        }
         int element = (int)(info.DataLength / Math.Max(1, info.ElementCount));
-        if (info.Shape.Length == 2 && info.Shape[1] == hostHidden)
+        switch (axis)
         {
-            long rows = info.Shape[0];
-            writer.Write(target, info.Dtype, new[] { rows, (long)hidden }, stream =>
+            case Axis.Norm:
+                writer.WriteF32(target, WidenNorm(host, name, hostHidden, hidden, shrink, offset, isFinalNorm: false), hidden);
+                return;
+            case Axis.Columns:
             {
-                long rowsPerBlock = Math.Max(1, BlockBytes / ((long)hidden * element));
-                for (long first = 0; first < rows; first += rowsPerBlock)
+                // [.., rows, hostHidden] → [.., rows, hidden]
+                long rows = info.ElementCount / hostHidden;
+                var shape = (long[])info.Shape.Clone();
+                shape[^1] = hidden;
+                writer.Write(target, info.Dtype, shape, stream =>
                 {
-                    int count = (int)Math.Min(rowsPerBlock, rows - first);
-                    var source = file.ReadBytes(info, first * hostHidden * element, count * hostHidden * element);
-                    var data = new byte[(long)count * hidden * element];
-                    for (int r = 0; r < count; r++)
+                    long rowsPerBlock = Math.Max(1, BlockBytes / ((long)hidden * element));
+                    for (long first = 0; first < rows; first += rowsPerBlock)
                     {
-                        Buffer.BlockCopy(source, r * hostHidden * element, data, r * hidden * element, hostHidden * element);
+                        int count = (int)Math.Min(rowsPerBlock, rows - first);
+                        var source = file.ReadBytes(info, first * hostHidden * element, count * hostHidden * element);
+                        var data = new byte[(long)count * hidden * element];
+                        for (int r = 0; r < count; r++)
+                        {
+                            Buffer.BlockCopy(source, r * hostHidden * element, data, r * hidden * element, hostHidden * element);
+                        }
+                        stream.Write(data);
                     }
-                    stream.Write(data);
-                }
-            });
-            return;
-        }
-        if (info.Shape.Length == 2 && info.Shape[0] == hostHidden)
-        {
-            writer.Write(target, info.Dtype, new[] { (long)hidden, info.Shape[1] }, stream =>
+                });
+                return;
+            }
+            case Axis.Rows:
             {
-                host.CopyTo(name, stream);
-                long zeros = (long)(hidden - hostHidden) * info.Shape[1] * element;
-                var blank = new byte[(int)Math.Min(zeros, BlockBytes)];
-                for (long done = 0; done < zeros; done += blank.Length)
+                // [.., hostHidden, cols] → [.., hidden, cols]; a 1-D bias is cols = 1.
+                var shape = (long[])info.Shape.Clone();
+                int axisIndex = shape.Length == 1 ? 0 : shape.Length - 2;
+                long cols = shape.Length == 1 ? 1 : shape[^1];
+                long batches = info.ElementCount / (hostHidden * cols);
+                shape[axisIndex] = hidden;
+                writer.Write(target, info.Dtype, shape, stream =>
                 {
-                    stream.Write(blank, 0, (int)Math.Min(blank.Length, zeros - done));
-                }
-            });
-            return;
+                    long batchBytes = hostHidden * cols * element;
+                    long zeros = (hidden - hostHidden) * cols * element;
+                    var blank = new byte[(int)Math.Min(zeros, BlockBytes)];
+                    for (long b = 0; b < batches; b++)
+                    {
+                        for (long done = 0; done < batchBytes; done += BlockBytes)
+                        {
+                            stream.Write(file.ReadBytes(info, b * batchBytes + done, (int)Math.Min(BlockBytes, batchBytes - done)));
+                        }
+                        for (long done = 0; done < zeros; done += blank.Length)
+                        {
+                            stream.Write(blank, 0, (int)Math.Min(blank.Length, zeros - done));
+                        }
+                    }
+                });
+                return;
+            }
+            default:
+                writer.Write(target, info.Dtype, info.Shape, stream => host.CopyTo(name, stream));
+                return;
         }
-        writer.Write(target, info.Dtype, info.Shape, stream => host.CopyTo(name, stream));
     }
 
-    private static void WriteU16(byte[] data, long element, ushort value)
+    /// <summary>Writes a [vocab, hostHidden] host matrix at [vocab, hidden]:
+    /// the host's entries times <paramref name="hostFactor"/>, then whatever
+    /// <paramref name="extra"/> puts in each row. It stays in the host's dtype
+    /// when every value is exact there (bf16 and f32 hold the block's powers of
+    /// two and small integers), else it is written in f32.</summary>
+    private static void WriteRows(SafetensorsStreamWriter writer, ModelDirectory host, string name, string target,
+        int hostHidden, int hidden, double hostFactor, Action<long, Action<int, double>> extra)
     {
-        data[element * 2] = (byte)value;
-        data[element * 2 + 1] = (byte)(value >> 8);
+        var (file, info) = host.Get(name);
+        long vocab = info.Shape[0];
+        bool keep = hostFactor == 1 && info.Dtype is Dtype.BF16 or Dtype.F32;
+        var dtype = keep ? info.Dtype : Dtype.F32;
+        int inElement = (int)(info.DataLength / Math.Max(1, info.ElementCount));
+        int outElement = dtype == Dtype.BF16 ? 2 : 4;
+        writer.Write(target, dtype, new[] { vocab, (long)hidden }, stream =>
+        {
+            long rowsPerBlock = Math.Max(1, (32L << 20) / ((long)hidden * outElement));
+            for (long first = 0; first < vocab; first += rowsPerBlock)
+            {
+                int rows = (int)Math.Min(rowsPerBlock, vocab - first);
+                var source = file.ReadBytes(info, first * hostHidden * inElement, rows * hostHidden * inElement);
+                var rowsOut = new byte[(long)rows * hidden * outElement];
+                float[]? wide = keep ? null : BitPattern.WidenToF32(info.Dtype, source);
+                for (int r = 0; r < rows; r++)
+                {
+                    long at = (long)r * hidden;
+                    if (keep)
+                    {
+                        Buffer.BlockCopy(source, r * hostHidden * inElement, rowsOut, (int)(at * outElement), hostHidden * inElement);
+                    }
+                    else
+                    {
+                        for (int d = 0; d < hostHidden; d++)
+                        {
+                            WriteValue(rowsOut, at + d, dtype, wide![(long)r * hostHidden + d] * hostFactor);
+                        }
+                    }
+                    extra(first + r, (dim, value) => WriteValue(rowsOut, at + dim, dtype, value));
+                }
+                stream.Write(rowsOut);
+            }
+        });
+    }
+
+    private static void WriteValue(byte[] data, long element, Dtype dtype, double value)
+    {
+        if (dtype == Dtype.BF16)
+        {
+            ushort bits = Bf16(value);
+            data[element * 2] = (byte)bits;
+            data[element * 2 + 1] = (byte)(bits >> 8);
+        }
+        else
+        {
+            BitConverter.TryWriteBytes(data.AsSpan((int)(element * 4), 4), (float)value);
+        }
     }
 
     private static ushort Bf16(double value)
@@ -1037,13 +1439,109 @@ public static class EntailWeights
         return (ushort)((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16);
     }
 
-    /// <summary>Finds each program token in a byte-level BPE vocabulary. A
-    /// token the vocabulary does not hold as one piece is simply not part of
-    /// this model's alphabet.</summary>
+    /// <summary>
+    /// The host's config with the block's layers in front: the widened
+    /// hidden size and layer count, and every per-layer fact shifted —
+    /// <c>layer_types</c> (written out when the host gives only a period),
+    /// <c>no_rope_layers</c>, Qwen2's <c>max_window_layers</c> and Qwen-MoE's
+    /// <c>mlp_only_layers</c>. Any other per-layer table refuses: the build
+    /// cannot tell what a block layer's entry should be.
+    /// </summary>
+    private static void WriteGraftConfig(EntailHost host, string outDir, int hidden, int block)
+    {
+        var config = JsonNode.Parse(File.ReadAllText(Path.Combine(host.Directory, "config.json")))!.AsObject();
+        var text = config["text_config"] as JsonObject ?? config;
+        var t = host.Target;
+        int layers = host.Layers;
+        text["hidden_size"] = hidden;
+        text["num_hidden_layers"] = layers + block;
+        // A config that leaves head_dim to hidden_size / heads would derive a
+        // new one from the wider stream: state the host's.
+        text["head_dim"] ??= t.HeadDim;
+
+        foreach (var key in new[] { "no_rope_layer_interval", "interleave_moe_layer_step", "first_k_dense_replace", "global_attn_every_n_layers" })
+        {
+            // An explicit no_rope_layers list wins over its interval (SmolLM3).
+            if (text.ContainsKey(key) && !(key == "no_rope_layer_interval" && text["no_rope_layers"] is JsonArray))
+            {
+                throw new EntailException($"cannot graft into this host: config key '{key}' sets layers by position, and the block's layers would shift it");
+            }
+        }
+        if (text["decoder_sparse_step"] is JsonValue step && step.GetValue<int>() != 1)
+        {
+            throw new EntailException("cannot graft into this host: decoder_sparse_step routes layers by position, and the block's layers would shift it");
+        }
+
+        var blockTypes = Enumerable.Range(0, block).Select(_ => (JsonNode?)JsonValue.Create(t.LayerType)).ToList();
+        if (text["layer_types"] is JsonArray declared)
+        {
+            text["layer_types"] = new JsonArray(blockTypes.Concat(declared.Select(x => x?.DeepClone())).ToArray());
+        }
+        else if (host.Policies.Select(PolicyType).Distinct().Count() > 1)
+        {
+            // A period (sliding_window_pattern) would shift: spell each layer out.
+            text["layer_types"] = new JsonArray(blockTypes.Concat(host.Policies.Select(p => (JsonNode?)PolicyType(p))).ToArray());
+        }
+        if (text["no_rope_layers"] is JsonArray noRope)
+        {
+            text["no_rope_layers"] = new JsonArray(Enumerable.Range(0, block).Select(_ => (JsonNode?)JsonValue.Create(1)).Concat(noRope.Select(x => x?.DeepClone())).ToArray());
+        }
+        if (text["use_sliding_window"] is JsonValue sliding && sliding.GetValue<bool>() && text["max_window_layers"] is JsonValue mwl)
+        {
+            text["max_window_layers"] = mwl.GetValue<int>() + block;
+        }
+        if (text["mlp_only_layers"] is JsonArray dense)
+        {
+            var shifted = dense.Select(x => x!.GetValue<int>() + block);
+            // Only an MoE stack reads it: there the block's dense layers are listed.
+            var blockDense = t.Ffn == BlockFfn.Dense && t.ExpertCount > 0 ? Enumerable.Range(0, block) : Enumerable.Empty<int>();
+            text["mlp_only_layers"] = new JsonArray(blockDense.Concat(shifted).Select(x => (JsonNode?)x).ToArray());
+        }
+        foreach (var (key, value) in text.ToList())
+        {
+            if (value is JsonArray array && array.Count == layers && key is not "layer_types" and not "no_rope_layers" and not "mlp_only_layers")
+            {
+                throw new EntailException($"cannot graft into this host: config key '{key}' holds one entry per layer and the build cannot tell a block layer's");
+            }
+        }
+        // rms_norm_eps stays as it is: the same value serves norms that do not
+        // widen (per-head norms, linear attention's), which are far more
+        // sensitive to it than the layer norms are.
+        config.Remove("vision_config");
+        File.WriteAllText(Path.Combine(outDir, "config.json"), config.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+    }
+
+    private static string PolicyType(AttentionLayerPolicy p) => p.Operator switch
+    {
+        LayerOperators.LinearAttention => "linear_attention",
+        LayerOperators.Conv => "conv",
+        _ => p.Span == AttentionSpan.Sliding ? "sliding_attention" : "full_attention",
+    };
+
+    /// <summary>Finds each program token in the host's vocabulary: byte-level
+    /// BPE (GPT-2, Llama 3, Qwen), metaspace (SentencePiece, ▁ for a space),
+    /// or a byte-fallback piece (<c>&lt;0x41&gt;</c>), in a dictionary or
+    /// Unigram-list vocabulary. A token the vocabulary does not hold as one
+    /// piece is simply not part of this model's alphabet.</summary>
     private static (Dictionary<string, int> Ids, List<string> Missing) BindTokens(EntailProgram p, string hostDir)
     {
         var root = JsonNode.Parse(File.ReadAllText(Path.Combine(hostDir, "tokenizer.json")))!.AsObject();
-        var vocab = root["model"]!["vocab"]!.AsObject();
+        var vocab = new Dictionary<string, int>(StringComparer.Ordinal);
+        switch (root["model"]!["vocab"])
+        {
+            case JsonObject map:
+                foreach (var (piece, id) in map)
+                {
+                    vocab[piece] = id!.GetValue<int>();
+                }
+                break;
+            case JsonArray list:
+                for (int i = 0; i < list.Count; i++)
+                {
+                    vocab.TryAdd(list[i]![0]!.GetValue<string>(), i);
+                }
+                break;
+        }
         var byteMap = ByteLevelMap();
         var added = (root["added_tokens"]?.AsArray() ?? new JsonArray()).ToDictionary(
             t => t!["content"]!.GetValue<string>(), t => t!["id"]!.GetValue<int>(), StringComparer.Ordinal);
@@ -1052,10 +1550,20 @@ public static class EntailWeights
         foreach (var token in p.Tokens.Keys.Concat(p.Emits.Where(e => e.Text is not null).Select(e => e.Text!))
             .Concat(p.Masks.SelectMany(m => m.Texts)).Distinct())
         {
-            var encoded = string.Concat(Encoding.UTF8.GetBytes(token).Select(b => byteMap[b]));
-            if (vocab.TryGetPropertyValue(encoded, out var id) && id is not null)
+            var bytes = Encoding.UTF8.GetBytes(token);
+            var spellings = new List<string>
             {
-                ids[token] = id.GetValue<int>();
+                string.Concat(bytes.Select(b => byteMap[b])),
+                token.Replace(' ', '▁'),
+            };
+            if (bytes.Length == 1)
+            {
+                spellings.Add($"<0x{bytes[0]:X2}>");
+            }
+            int? found = spellings.Select(s => vocab.TryGetValue(s, out int id) ? id : (int?)null).FirstOrDefault(id => id is not null);
+            if (found is { } id)
+            {
+                ids[token] = id;
             }
             else if (added.TryGetValue(token, out int special))
             {

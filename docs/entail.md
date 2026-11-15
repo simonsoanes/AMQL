@@ -89,6 +89,67 @@ weight's value:
 Wherever the program says nothing, the host's computation is unchanged. The same
 compiled layers serve the empty model and the graft.
 
+### Any host the importer can judge
+
+`graft` judges the host with the importer's own rules (`EntailHost.Judge`,
+through `ArchMapper`), then compiles the program for the host's heads and FFN
+width, and writes the block in the host's own layer shape and tensor names.
+Nothing in it names a family:
+
+- **Attention.** The host's head count, KV groups and head dim. Lookups use up
+  to 16 of the host's own rotary pairs, half-split, interleaved, partial or
+  zero-tail, at its own frequencies, including linear, llama3, yarn and
+  longrope scaling. The highest frequencies are tried first; pairs spread over
+  the whole range come next, for a host whose first pairs repeat within the
+  context. The score is set for the host's score scale (`query_pre_attn_scalar`,
+  Granite's multiplier), rope attention factor and softcap. q and k carry their
+  height through the host's q/k norm, per head or across the whole projection,
+  or directly when there is none. An output gate is held open.
+- **Norms.** `w` or `1 + w`. When the host also normalises each sub-block's
+  output (Gemma's sandwich, OLMo 2's post-norms), the block keeps one head and
+  one neuron back to put a ballast in that output too, so those norms divide by
+  a power of two as well.
+- **FFN.** The block's neurons go in the dense FFN. In an MoE layer they go in
+  the shared expert, with the routed experts zero, or else in every expert
+  alike, with the down weights divided by the routing weight an even split
+  gives. Biases are zero. Fused `qkv_proj` / `gate_up_proj` are written fused.
+- **Scales.** A residual or embedding multiplier must be a power of two. A
+  host that scales its embedding by √hidden (Gemma) gets a width that is a
+  power of four, so the scale stays a power of two; its own embedding rows move
+  to keep their product, written in f32.
+- **Outputs.** With a tied head, the output columns live in the embedding and
+  the block clears them on the way in. Otherwise they go in `lm_head`, and the
+  logits multiplier is divided out. `--output-norm` sets the residual norm the
+  force is sized for (115, measured on Qwen 3.5 0.8B).
+- **Widening.** Each host tensor gains zeros on its residual axis, found by its
+  role. A square projection (Llama's `o_proj` when heads × head_dim = hidden)
+  has two axes of that width, and only its role says which one is the stream.
+- **Config.** Layer counts and every per-layer fact move with the inserted
+  layers: `layer_types` (spelled out when the host gives only a period),
+  `no_rope_layers`, `max_window_layers` and `mlp_only_layers`. `head_dim` is
+  stated, because hidden ÷ heads no longer gives it. Any other per-layer table
+  is refused.
+- **Tokens.** Byte-level BPE, metaspace (`▁`) and byte-fallback pieces, in
+  dictionary or Unigram vocabularies.
+
+What a block cannot be exact in is refused, naming the property: LayerNorm
+hosts (the mean subtraction moves every lane), parallel blocks, an ungated FFN,
+multipliers that are not powers of two, uneven MoE splits, dynamic rope past
+its maximum, and a host where no choice of pairs makes every head a lookup over
+the context. The last includes Gemma 2: its softcap of 50 cannot separate
+neighbouring offsets.
+
+| Check | Result |
+|---|---|
+| Qwen 3.5 0.8B, `mathematics.entail.txt`, against the Qwen-only graft it replaces | all 705 tensors and the config identical |
+| `EntailGraftTests`: 16 zoo hosts (Llama with and without biases, Qwen3, yarn Qwen2, Phi-3, longrope Phi-3, GLM-4, Gemma 3, OLMo 2, SmolLM3, OLMo 3, Ministral, Mixtral, OLMoE, Qwen2-MoE, Qwen3-MoE), run by AMQL | silent text within 1e-3 of the host's logit scale, every other position likewise; the program's token wins by over 100 logits |
+| The same grafts loaded by transformers under each host's own class (`scripts/entail/check_graft.py`) | 14 of 16 behave as in AMQL. Two cannot be reloaded there, though AMQL runs both: Phi-3's longrope validation derives head_dim from hidden_size, and OLMoE sizes its q/k norms by hidden_size |
+| Refused by name | StableLM, Cohere, Starcoder2 (LayerNorm), Granite (embedding × 3), dynamic rope past its maximum, Gemma 2's softcap, longrope past its original length (its two regimes share one pair) |
+
+Silent text moves a little in every graft, by the same mechanism as on Qwen. A
+host norm's epsilon stays the same while the mean it is added to shrinks with
+the wider stream, so it acts like an epsilon h'/h times larger.
+
 A program can also run beside a model instead of inside it, which leaves the model
 untouched at its own precision: see [entail-adapter.md](entail-adapter.md).
 
@@ -142,5 +203,7 @@ reasoning and hard arithmetic, not a general reasoning benchmark.
   `--weights disk`: exact f32 on the CPU, keeping what fits in memory and reading
   the rest from the container on every pass. It picks this mode by itself when
   the weights don't fit.
-- Targets are the Qwen3.5 layer shape with 8 query heads, 2 KV heads, head_dim 256
-  and a bf16 tied embedding.
+- A host must be one the importer can judge, with RMSNorm, gated FFNs and rotary
+  attention; see [Any host the importer can judge](#any-host-the-importer-can-judge)
+  for what is refused. Hosts other than Qwen 3.5 are verified on the tiny zoo
+  models, not yet on real checkpoints.
