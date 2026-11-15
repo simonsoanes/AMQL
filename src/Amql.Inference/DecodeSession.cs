@@ -11,9 +11,17 @@ namespace Amql.Inference;
 /// sequentially. Both modes expose the same
 /// <c>prefill → step → position</c> contract.
 /// </summary>
-public sealed class DecodeSession
+public sealed class DecodeSession : IDisposable
 {
     private readonly GenericRuntime _runtime;
+
+    // The device engine (see GpuEngine): built on the first prefill that can
+    // use it, kept for the session's life. _onGpu says whether the current
+    // sequence is running there — decided at prefill, so a sequence never
+    // splits between the two paths.
+    private GpuEngine? _gpu;
+    private bool _gpuRefused;
+    private bool _onGpu;
 
     public DecodeSession(ComponentOpPlan plan, OperandStore store, WeightPatch? patch = null, WeightWorkingSet? workingSet = null)
     {
@@ -64,11 +72,22 @@ public sealed class DecodeSession
     /// </summary>
     public Tensor2D Prefill(int[] tokens)
     {
+        if (tokens.Length > 0 && _runtime.SessionPosition == 0 && Gpu() is { } gpu)
+        {
+            LastLogits = new Tensor2D(gpu.Prefill(tokens), 1, _runtime.Plan.Output!.VocabSize);
+            _runtime.SessionPosition = tokens.Length;
+            _onGpu = true;
+            return LastLogits;
+        }
         var lastHidden = RunPrefill(tokens);
         // The logits-session contract (mirroring the reference) returns the
-        // last position's row — the one `Step` continues from.
-        var allLogits = _runtime.FinalNormAndHead(lastHidden);
-        LastLogits = SliceLastRow(allLogits);
+        // last position's row — the one `Step` continues from. Only that row
+        // goes through the final norm and head: each row's norm and logits are
+        // independent of the others, so this is the same row as slicing the
+        // full [T × vocabulary] result, without computing the other T − 1.
+        var last = new float[lastHidden.Cols];
+        lastHidden.Row(lastHidden.Rows - 1).CopyTo(last);
+        LastLogits = _runtime.FinalNormAndHead(new Tensor2D(last, 1, lastHidden.Cols));
         return LastLogits;
     }
 
@@ -176,6 +195,12 @@ public sealed class DecodeSession
     /// </summary>
     public Tensor2D Step(int token)
     {
+        if (_onGpu)
+        {
+            LastLogits = new Tensor2D(_gpu!.Step(token), 1, _runtime.Plan.Output!.VocabSize);
+            _runtime.SessionPosition++;
+            return LastLogits;
+        }
         var hidden = _runtime.StepForward(token);
         LastLogits = _runtime.FinalNormAndHead(hidden);
         return LastLogits;
@@ -188,5 +213,82 @@ public sealed class DecodeSession
         _runtime.Kv.Reset();
         _runtime.ResetSession();
         LastLogits = null!;
+        if (_onGpu)
+        {
+            _gpu!.Reset();
+            _onGpu = false;
+        }
+    }
+
+    /// <summary>Which path the current sequence runs on: <c>gpu</c> for the
+    /// device engine, <c>cpu</c> otherwise.</summary>
+    public string Backend => _onGpu ? "gpu" : "cpu";
+
+    /// <summary>Why the device engine is not in use, once a prefill has
+    /// decided; null when it is.</summary>
+    public string? GpuRefusal { get; private set; }
+
+    /// <summary>The device engine for a new sequence, or null to run it on the
+    /// managed path: no CUDA device, <c>AMQL_GPU_ENGINE=0</c>, a compact
+    /// working set (MXFP4, disk), a plan the engine does not cover, or a trace,
+    /// capture or patch on the runtime, which only the managed path has.</summary>
+    private GpuEngine? Gpu()
+    {
+        if (_runtime.HasObservers)
+        {
+            return null;
+        }
+        if (_gpu is not null && _gpu.WeightsVersion != _runtime.Weights.Version)
+        {
+            // A delta was added since the upload: the device copy is stale.
+            _gpu.Dispose();
+            _gpu = null;
+        }
+        if (_gpu is not null || _gpuRefused)
+        {
+            return _gpu;
+        }
+        GpuRefusal = EngineRefusal();
+        if (GpuRefusal is null)
+        {
+            _gpu = GpuEngine.TryCreate(_runtime.Plan, _runtime.Weights, out var reason);
+            GpuRefusal = reason;
+        }
+        _gpuRefused = _gpu is null;
+        return _gpu;
+    }
+
+    /// <summary>False keeps this session on the managed path even where the
+    /// device engine could run it (a reference to compare the engine with).</summary>
+    public bool AllowGpuEngine { get; set; } = true;
+
+    private string? EngineRefusal()
+    {
+        if (!AllowGpuEngine)
+        {
+            return "disabled for this session";
+        }
+        string? mode = Environment.GetEnvironmentVariable("AMQL_GPU_ENGINE")?.Trim().ToLowerInvariant();
+        if (mode is "0" or "off" or "false")
+        {
+            return "AMQL_GPU_ENGINE=0";
+        }
+        if (!CudaShim.Enabled)
+        {
+            return "no CUDA device";
+        }
+        if (_runtime.Weights.WorkingSet is not (WeightWorkingSet.ResidentF32 or WeightWorkingSet.OnDemandBf16))
+        {
+            return $"{_runtime.Weights.WorkingSet} working set";
+        }
+        return null;
+    }
+
+    /// <summary>Releases the device engine's memory.</summary>
+    public void Dispose()
+    {
+        _gpu?.Dispose();
+        _gpu = null;
+        _onGpu = false;
     }
 }

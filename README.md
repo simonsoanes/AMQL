@@ -137,10 +137,19 @@ Four weight working-set modes, selected by `AMQL_WEIGHTS` (or `--weights` on `ge
 
 | Mode | Resident size | Description |
 |------|-------------|-------------|
-| `f32` | All weights widened to f32 | Byte-exact reference |
+| `f32` | f32 values; a BF16-stored matrix is held as its BF16 bits and widened in the kernels | Byte-exact reference |
 | `bf16` | Stored BF16, widened on access into LRU cache | ~2× smaller |
 | `mxfp4` | MXFP4 packs dequantised into LRU cache | ~4× smaller |
 | `disk` | Only what fits the cache; the rest is widened from the container on every pass | Exact f32 on the CPU for a model larger than RAM |
+
+With the CUDA backend built (`native/amql_cuda/build-cuda.cmd`) and a CUDA device present,
+`DecodeSession` runs a whole sequence on the device engine. Weights are uploaded once as BF16,
+activations, the KV cache and the recurrent state stay on the GPU, and each decode step is one
+CUDA graph. On Qwen 3.5 0.8B (RTX 5090) it decodes at ~655 tok/s against llama.cpp's ~500 on
+the same weights in F16 and prefills 32 tokens at ~5,800 tok/s against ~2,200. A 512-token
+prompt is ~10% slower than llama.cpp (~20k against ~22k tok/s). It agrees with the
+managed path to rounding (not bit for bit). Routed experts, short convs, traces and patches stay
+on the managed path; see [docs/gpu-performance.md](docs/gpu-performance.md).
 
 When `AMQL_GPU=1` and the CUDA backend is built (`native/amql_cuda/build-cuda.cmd`),
 MXFP4 packs are dequantised to FP16 on-device and GEMMs run on tensor cores with FP32
@@ -151,6 +160,12 @@ and the output head stay f32 in every mode (in `disk`, only while they fit the c
 merge normal-equation solves.
 
 Tune memory with `AMQL_MEMORY_GB`, `AMQL_F32_CACHE_GB`, and `AMQL_CORES`.
+
+`amql-cli bench <container>` measures single-request prefill and decode speed once the model is
+loaded, and prints a checksum of the logits' bit patterns so a change to the kernels can be shown
+not to change the numerics. On Qwen 3.5 0.8B (CPU, Threadripper 9970X, two DDR5 channels) decode
+runs at ~44 tok/s against llama.cpp's ~39 on the same weights in F16; see
+[docs/cpu-performance.md](docs/cpu-performance.md).
 
 `entail graft` and `encode` stream: they read the host through its memory map and write each tensor as
 it is made, so neither holds a model in memory, and a sharded host (`model.safetensors.index.json`)
@@ -391,6 +406,8 @@ multi-million-element matrix is too small to measure downstream. See
 | `AMQL_MEMORY_GB` | auto | Total memory budget for LRU cache |
 | `AMQL_F32_CACHE_GB` | ¼ of budget (½ for `disk`) | F32 cache cap |
 | `AMQL_CORES` | auto | CPU core budget for parallel work |
+| `AMQL_GPU_ENGINE` | `1` | `0` keeps sessions off the device engine (the managed path then runs, with per-operator CUDA offload where enabled) |
+| `AMQL_RESIDENT_BF16` | `1` | `0` widens BF16 matrices to f32 at load in the `f32` mode instead of keeping their BF16 bits (same results, twice the memory traffic) |
 | `AMQL_MERGE_GPU` | `0` | Enable GPU-accelerated merge GEMM |
 
 ## Documentation

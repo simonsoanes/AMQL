@@ -41,7 +41,7 @@ echo "[amql-cuda] compiling amql_cuda.cu -arch=$CUDA_ARCH ..."
     -Xcompiler -fPIC \
     --shared \
     -o bin/libamql_cuda.so \
-    amql_cuda.cu \
+    amql_cuda.cu amql_engine.cu \
     -lcublas -lcudart
 
 echo "[amql-cuda] built bin/libamql_cuda.so"

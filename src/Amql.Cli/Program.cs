@@ -83,6 +83,7 @@ internal static partial class Program
                 "route" => Route(args[1..]),
                 "path" => PathCmd(args[1..]),
                 "generate" => Generate(args[1..]),
+                "bench" => Bench(args[1..]),
                 "inspect-token" => InspectToken(args[1..]),
                 "change-tensor" => ChangeTensor(args[1..]),
                 "edit-tensor" => EditTensor(args[1..]),
@@ -2696,6 +2697,11 @@ internal static partial class Program
                               [--chat] [--think] [--gen 128] [--steps <gen>] [--block 32]
                               [--remasking low_confidence|random] [--temperature 0]
                               [--seed 42] [--show-steps] [--no-early-stop] [--weights f32|bf16|mxfp4|disk]
+              amql-cli bench <container-dir>
+                              [--prompt-tokens 32] [--steps 64] [--repeat 3]
+                              [--weights f32|bf16|mxfp4|disk] [--profile]
+                            single-request prefill and decode tokens/s after a warm-up,
+                            with a checksum of the logits' bit patterns
               amql-cli inspect-token <container-dir> <token>
                               [--tokens ctx,ids] [--neighbors 5] [--logits K]
                               [--tokenizer <checkpoint-dir>] [--component target]
@@ -2744,7 +2750,7 @@ internal static partial class Program
                               [--lr 1e-4] [--epochs 1]
               amql-cli entail check|run <program.entail.txt> [--expr "12+34="]
               amql-cli entail compile <program.entail.txt> --out <checkpoint-dir>
-              amql-cli entail graft <program.entail.txt> --host <checkpoint-dir> --out <checkpoint-dir>
+              amql-cli entail graft <program.entail.txt> --host <checkpoint-dir> --out <checkpoint-dir> [--context 8192] [--output-norm 115]
               amql-cli entail adapter <program.entail.txt> --tokenizer <partner-dir> --out <dir> [--dense]
               amql-cli entail side <container-dir> --adapter <dir>[,<dir>] --prompt <text> [--chat] [--think] [--max-tokens N] [--weights f32|disk]
               amql-cli entail run <program> --expr <text>|--cases <cases.jsonl> [--tokenizer <dir>] [--report <json>]

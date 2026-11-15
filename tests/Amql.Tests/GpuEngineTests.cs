@@ -1,0 +1,134 @@
+using Amql.Hf;
+using Amql.Inference;
+using Amql.Vindex3;
+using Xunit;
+
+namespace Amql.Tests;
+
+/// <summary>
+/// The device engine against the managed path, over every arch-zoo family it
+/// takes on: the same prompt (short enough for the GEMV path, long enough for
+/// the batched GEMM path) and greedy steps, logits agreeing to rounding. The
+/// families it refuses must say why. Skips without a CUDA device.
+/// </summary>
+[Collection("gpu")]
+public class GpuEngineTests
+{
+    private static string Zoo => Path.Combine(AppContext.BaseDirectory, "fixtures", "arch-zoo");
+
+    /// <summary>Families whose plans need an operator the engine leaves to the
+    /// managed path (routed experts, length-dependent rope).</summary>
+    private static readonly HashSet<string> Refused = new(StringComparer.Ordinal)
+    {
+        "mixtral", "olmoe", "qwen2_moe", "qwen3_moe", "llama-dynamic", "phi3-longrope-long", "phi3-longrope-short",
+    };
+
+    private static bool GpuAvailable()
+    {
+        CudaShim.Reset();
+        return CudaShim.Enabled;
+    }
+
+    [Theory]
+    [MemberData(nameof(ArchZooTests.Families), MemberType = typeof(ArchZooTests))]
+    public void Engine_Matches_Managed_Path(string family)
+    {
+        if (!GpuAvailable())
+        {
+            return;
+        }
+        using var dir = new TempDir();
+        string containerDir = Path.Combine(dir.Path, "c");
+        ModelToContainer.Encode(Path.Combine(Zoo, family), containerDir, family,
+            new ArchMapper.EncodeOptions { IncludeVision = false, IncludeMtp = false });
+        using var container = Vindex3Container.Open(containerDir);
+        using var store = container.CreateOperandStore();
+        var plan = Planner.Plan(container, "target", store);
+
+        string? refusal = GpuEngine.Unsupported(plan);
+        if (Refused.Contains(family))
+        {
+            Assert.NotNull(refusal);
+            return;
+        }
+        Assert.True(refusal is null, $"{family}: engine refused — {refusal}");
+
+        var (ids, _) = ArchZooTests.Golden(family);
+        foreach (int length in new[] { 3, 21 })
+        {
+            var prompt = Enumerable.Range(0, length).Select(i => ids[i % ids.Length]).ToArray();
+            using var gpu = new DecodeSession(plan, store);
+            using var cpu = new DecodeSession(plan, store) { AllowGpuEngine = false };
+            var a = gpu.Prefill(prompt).FirstRow().ToArray();
+            var b = cpu.Prefill(prompt).FirstRow().ToArray();
+            Assert.Equal("gpu", gpu.Backend);
+            Assert.Equal("cpu", cpu.Backend);
+            for (int step = 0; ; step++)
+            {
+                AssertClose(a, b, $"{family}, {length}-token prompt, step {step}");
+                if (step == 4)
+                {
+                    break;
+                }
+                int next = Sampler.ArgMax(b);
+                a = gpu.Step(next).FirstRow().ToArray();
+                b = cpu.Step(next).FirstRow().ToArray();
+            }
+        }
+    }
+
+    /// <summary>A reset sequence on the engine reproduces the first one, and a
+    /// sequence long enough to grow the KV cache (and recapture the decode
+    /// graph) stays in step with the managed path.</summary>
+    [Fact]
+    public void Engine_Resets_And_Grows_The_Cache()
+    {
+        if (!GpuAvailable())
+        {
+            return;
+        }
+        using var dir = new TempDir();
+        string containerDir = Path.Combine(dir.Path, "c");
+        ModelToContainer.Encode(Path.Combine(Zoo, "qwen3"), containerDir, "qwen3",
+            new ArchMapper.EncodeOptions { IncludeVision = false, IncludeMtp = false });
+        using var container = Vindex3Container.Open(containerDir);
+        using var store = container.CreateOperandStore();
+        var plan = Planner.Plan(container, "target", store);
+        var (ids, _) = ArchZooTests.Golden("qwen3");
+        var prompt = Enumerable.Range(0, 1000).Select(i => ids[i % ids.Length]).ToArray();
+
+        using var gpu = new DecodeSession(plan, store);
+        var first = gpu.Prefill(prompt).FirstRow().ToArray();
+        gpu.Reset();
+        var again = gpu.Prefill(prompt).FirstRow().ToArray();
+        Assert.Equal(first, again);
+
+        using var cpu = new DecodeSession(plan, store) { AllowGpuEngine = false };
+        var b = cpu.Prefill(prompt).FirstRow().ToArray();
+        var a = again;
+        // 1000 + 40 crosses the initial 1024-row cache.
+        for (int step = 0; step < 40; step++)
+        {
+            int next = Sampler.ArgMax(b);
+            a = gpu.Step(next).FirstRow().ToArray();
+            b = cpu.Step(next).FirstRow().ToArray();
+        }
+        AssertClose(a, b, "after growing the cache");
+    }
+
+    private static void AssertClose(float[] actual, float[] expected, string where)
+    {
+        Assert.Equal(expected.Length, actual.Length);
+        double scale = 1.0;
+        foreach (var v in expected)
+        {
+            scale = Math.Max(scale, Math.Abs(v));
+        }
+        double worst = 0;
+        for (int i = 0; i < expected.Length; i++)
+        {
+            worst = Math.Max(worst, Math.Abs((double)actual[i] - expected[i]));
+        }
+        Assert.True(worst <= 1e-3 * scale, $"{where}: worst logit diff {worst:G4} (largest logit {scale:G4})");
+    }
+}

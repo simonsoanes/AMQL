@@ -40,3 +40,5 @@ native/amql_cuda/bin/
 native/amql_cuda/probe/out/
 
 .qwen/
+## Local exports (to-gguf / to-hf output)
+export/

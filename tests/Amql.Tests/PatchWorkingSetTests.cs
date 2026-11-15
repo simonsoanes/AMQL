@@ -34,11 +34,13 @@ public class PatchWorkingSetTests
     }
 
     private static float[] Prefill(Vindex3Container container, WeightWorkingSet mode, WeightPatch? patch,
-        bool expectDevice = false)
+        bool expectDevice = false, bool engine = false)
     {
         using var store = container.CreateOperandStore();
         var plan = Planner.Plan(container, "target", store);
-        var session = new DecodeSession(plan, store, patch, mode);
+        // The per-operator device path is what expectDevice checks; the device
+        // engine (which uploads its own weights) is asked for separately.
+        using var session = new DecodeSession(plan, store, patch, mode) { AllowGpuEngine = engine };
         var logits = session.Prefill(Tokens).FirstRow().ToArray();
         if (expectDevice)
             Assert.True(session.Runtime.Weights.AnyDeviceWeight, "the forward should have used device weights");
@@ -122,6 +124,13 @@ public class PatchWorkingSetTests
             double error = ChangeError(gpuPatched, bareBefore, managedPatched, managedBare);
             Assert.True(error < 0.2, $"GPU patch effect strays {error:P1} from the managed one");
             Assert.Equal(bareBefore, bareAfter);
+
+            // The device engine uploads the patched f32 values: it agrees with
+            // the managed patched run to rounding.
+            var enginePatched = Prefill(container, mode, patch, engine: true);
+            double scale = managedPatched.Max(v => Math.Abs(v));
+            double worst = enginePatched.Zip(managedPatched, (a, b) => Math.Abs(a - b)).Max();
+            Assert.True(worst <= 1e-3 * Math.Max(1, scale), $"engine with patch: worst logit diff {worst:G4}");
         }
         finally
         {
