@@ -54,18 +54,23 @@ public class GpuEngineTests
         Assert.True(refusal is null, $"{family}: engine refused — {refusal}");
 
         var (ids, _) = ArchZooTests.Golden(family);
+        // Exact prompts agree with the managed path to f32 rounding; the
+        // default rounds prompt activations to BF16 for the tensor cores (a
+        // 3-token prompt takes the GEMV path, f32 either way).
+        foreach (bool exact in new[] { true, false })
         foreach (int length in new[] { 3, 21 })
         {
             var prompt = Enumerable.Range(0, length).Select(i => ids[i % ids.Length]).ToArray();
-            using var gpu = new DecodeSession(plan, store);
+            using var gpu = new DecodeSession(plan, store) { ExactGpuPrefill = exact };
             using var cpu = new DecodeSession(plan, store) { AllowGpuEngine = false };
             var a = gpu.Prefill(prompt).FirstRow().ToArray();
             var b = cpu.Prefill(prompt).FirstRow().ToArray();
             Assert.Equal("gpu", gpu.Backend);
             Assert.Equal("cpu", cpu.Backend);
+            double tolerance = exact ? 1e-3 : 2e-2;
             for (int step = 0; ; step++)
             {
-                AssertClose(a, b, $"{family}, {length}-token prompt, step {step}");
+                AssertClose(a, b, $"{family}, {length}-token prompt, {(exact ? "exact" : "bf16")}, step {step}", tolerance);
                 if (step == 4)
                 {
                     break;
@@ -97,7 +102,9 @@ public class GpuEngineTests
         var (ids, _) = ArchZooTests.Golden("qwen3");
         var prompt = Enumerable.Range(0, 1000).Select(i => ids[i % ids.Length]).ToArray();
 
-        using var gpu = new DecodeSession(plan, store);
+        // Exact prompts, so the 512-row chunks (the second starting past
+        // position 0) are held to f32 agreement.
+        using var gpu = new DecodeSession(plan, store) { ExactGpuPrefill = true };
         var first = gpu.Prefill(prompt).FirstRow().ToArray();
         gpu.Reset();
         var again = gpu.Prefill(prompt).FirstRow().ToArray();
@@ -116,7 +123,7 @@ public class GpuEngineTests
         AssertClose(a, b, "after growing the cache");
     }
 
-    private static void AssertClose(float[] actual, float[] expected, string where)
+    private static void AssertClose(float[] actual, float[] expected, string where, double tolerance = 1e-3)
     {
         Assert.Equal(expected.Length, actual.Length);
         double scale = 1.0;
@@ -129,6 +136,6 @@ public class GpuEngineTests
         {
             worst = Math.Max(worst, Math.Abs((double)actual[i] - expected[i]));
         }
-        Assert.True(worst <= 1e-3 * scale, $"{where}: worst logit diff {worst:G4} (largest logit {scale:G4})");
+        Assert.True(worst <= tolerance * scale, $"{where}: worst logit diff {worst:G4} (largest logit {scale:G4})");
     }
 }

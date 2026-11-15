@@ -8,6 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- **perf:** device-engine prompts are 2–4× faster than llama.cpp's CUDA backend. On Qwen 3.5 0.8B (RTX 5090) prefill goes from ~5,800 to ~7,500 tok/s at 32 tokens (llama.cpp: 1,930), from ~20,000 to ~55,000 at 512 (20,700) and from ~15,000 to ~54,000 at 2,000 (26,500).
+  - Prompt projections run as BF16 tensor-core GEMMs on the weights as stored (`cublasGemmEx`, f32 accumulation), instead of widening the weights to f32 for SGEMM.
+  - Prompt attention runs as strided-batched GEMMs per KV-head group (TF32) around a masked softmax kernel, instead of a scalar tiled kernel.
+  - The Gated DeltaNet recurrence over a prompt has its own scan: 8 lanes per value column, 8 columns per block, and the next row's inputs loaded ahead.
+
+  Rounding prompt activations to BF16 moves logits by ~0.3% of the largest (greedy tokens agree at 32, 512 and 2,000 tokens). `AMQL_GPU_PREFILL=f32` or `DecodeSession.ExactGpuPrefill` keeps prompts at f32 (max logit diff ~2e-5), at ~28,000 tok/s for 512 tokens. `GpuEngineTests` checks both modes. The native library is now copied beside the binaries on build.
 - **perf:** a device-resident GPU engine (`GpuEngine`, `native/amql_cuda/amql_engine.cu`) that `DecodeSession` uses when CUDA is available and the plan is within reach. Single-request decode is faster than llama.cpp's CUDA backend: on Qwen 3.5 0.8B (RTX 5090) it goes from ~41 to ~655 tok/s (llama.cpp, F16, flash attention: ~500), and prefill reaches ~5,800 tok/s at 32 tokens (2,227). At 512 tokens prefill is ~20,000 tok/s, ~10% behind llama.cpp's 22,072. How it works:
   - Weights are uploaded once as BF16 and stacked where projections share an input. Activations, the KV cache and the Gated DeltaNet state stay on the device.
   - Each decode step is one CUDA graph, with kernels reading the position from a device counter.

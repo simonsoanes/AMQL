@@ -22,11 +22,13 @@ What the engine does:
   and the logits come back. The graph is captured once and replayed. Kernels read
   the position from a device counter, so the same graph serves every step. It is
   recaptured only when the KV cache grows.
-- **Prompts run in chunks of up to 512 rows.** Projections go through cuBLAS SGEMM
-  over the BF16 weights, widened to f32 into a scratch buffer. Attention is tiled
-  through shared memory, and the conv and q/k normalisation run in parallel over
-  rows. Only the recurrence runs position by position, one block per (value head,
-  32 columns).
+- **Prompts run in chunks of up to 512 rows.**
+  - Projections are BF16 tensor-core GEMMs (`cublasGemmEx`): the activations are
+    rounded to BF16, the weights are used as stored, and products accumulate in f32.
+  - Attention is two strided-batched GEMMs per KV-head group (S = Q·Kᵀ, O = P·V, in
+    TF32) around a masked softmax kernel.
+  - The conv and q/k normalisation run in parallel over rows. Only the recurrence
+    runs position by position, one 64-thread block per (value head, 8 columns).
 
 The engine covers:
 
@@ -52,11 +54,19 @@ The engine is also not used with the `mxfp4` or `disk` working sets, under `--cp
 or with `AMQL_GPU_ENGINE=0`. The session's `Backend` and `GpuRefusal` properties say
 which path ran and why (`bench` prints them).
 
-**Numerics:** f32 activations and accumulation, and the container's weights exactly.
-The reduction order differs from the managed kernels, so the two agree to rounding,
-not bit for bit. On Qwen 3.5 0.8B the largest logit difference is about 2e-5 (logits
-up to ~20), and greedy decoding agrees token for token over prompts of 3 to 2000
-tokens. `GpuEngineTests` checks every dense arch-zoo family against the managed path.
+**Numerics:** decode steps use f32 activations and accumulation and the container's
+weights exactly. The reduction order differs from the managed kernels, so the two
+agree to rounding, not bit for bit.
+
+Prompts, by default, round their activations to BF16 for the projections and use
+TF32 for attention. On Qwen 3.5 0.8B this moves the largest logit by ~0.04, about
+0.3% of the largest logit. Greedy decoding still agrees token for token after
+prompts of 32, 512 and 2,000 tokens.
+
+`AMQL_GPU_PREFILL=f32` (or `DecodeSession.ExactGpuPrefill = true`) keeps prompts at
+f32: FP32 SGEMM over widened weights and FP32 attention GEMMs. The largest logit
+difference is then about 2e-5 (logits up to ~20). `GpuEngineTests` checks every dense
+arch-zoo family against the managed path in both modes.
 
 ## Measuring
 
@@ -78,20 +88,22 @@ Qwen 3.5 0.8B (24 layers: 18 Gated DeltaNet + 6 gated softmax attention, a 248k
 vocabulary, tied head). RTX 5090 (170 SMs, ~1.79 TB/s), Windows 11, driver 617, CUDA
 13.3.
 
-| | prefill pp32 | prefill pp512 | decode tg128 |
-|---|---|---|---|
-| AMQL before (per-operator CUDA path) | — | — | ~41 tok/s |
-| **AMQL device engine** | **5,768 tok/s** | 20,022 tok/s | **657 tok/s** |
-| llama.cpp, CUDA, F16, flash attention | 2,227 tok/s | **22,072 tok/s** | 497 tok/s (459 after pp512) |
+| | prefill pp32 | prefill pp512 | prefill pp2000 | decode tg128 |
+|---|---|---|---|---|
+| AMQL before (per-operator CUDA path) | — | — | — | ~41 tok/s |
+| **AMQL device engine** (BF16 prompts, the default) | **7,472 tok/s** | **55,354 tok/s** | **53,755 tok/s** | **655 tok/s** |
+| AMQL device engine, `AMQL_GPU_PREFILL=f32` | 5,296 tok/s | 27,906 tok/s | 25,693 tok/s | 650 tok/s |
+| llama.cpp, CUDA, F16, flash attention | 1,930 tok/s | 20,728 tok/s | 26,491 tok/s | 438–497 tok/s |
 
 How to read this:
 
 - **Decode stays flat with context.** It is ~610 tok/s after a 512- or 2000-token
   prompt. llama.cpp drops to ~460 after 512.
-- **Long prompts are where llama.cpp still leads.** Its F16 tensor-core GEMMs prefill
-  512 tokens ~10% faster than the engine's FP32 SGEMM (see below).
-- **Measured on an idle machine.** Best of three runs each; the engine's decode
-  varies by about ±1% between runs.
+- **Exact prompts trade speed for f32.** At 2,000 tokens llama.cpp is ~3% ahead of
+  the f32 mode. The default is ~2× ahead of llama.cpp there.
+- **Measured on an idle machine.** Best of three runs each. The engine's decode
+  varies by about ±1% between runs and llama.cpp's by more (438 and 497 tok/s on
+  two sessions).
 - **Long prompts slow prefill a little.** It is ~15,000 tok/s at 2,000 tokens,
   because attention grows with the prompt.
 
@@ -127,6 +139,18 @@ launch, the logits copy and the argmax.
     comparison).
   - A separate prefetch stream was tried as well. It helped only at one block count
     and hurt once other kernels changed, so it was dropped.
+- **Tensor cores for prompts.** The projections read the BF16 weights straight into
+  `cublasGemmEx`, with no widened f32 copy written and read back per chunk. Attention
+  is two cuBLAS GEMMs per KV-head group rather than a scalar kernel, which took it
+  from ~50 ms to a few ms of a 2,000-token prompt.
+- **A prompt scan built for latency.** The recurrence is sequential in position, so
+  each step's latency is what counts.
+  - Eight lanes share a value column (16 key rows each), which halves the dependent
+    FMA chains.
+  - Eight columns per block puts four times the blocks on the SMs.
+  - The next row's q, k, v, decay and β are loaded before this row's arithmetic.
+
+  Together these make the scan ~2× faster.
 - **Decode attention split by key.** Each 32-key slice is a block, and a second pass
   merges their softmaxes. The grid is sized by the cache's capacity, so the graph
   stays valid as the sequence grows.
@@ -143,6 +167,9 @@ launch, the logits copy and the argmax.
   exactness.
 - **Device-side sampling.** It would skip the 1 MB logits copy per token. That would
   mean returning a token rather than logits from `Step`.
-- **Faster prompts.** Prefill uses FP32 SGEMM to keep f32 accuracy. BF16 tensor-core
-  GEMMs (as llama.cpp uses F16) would make long prompts several times faster, at the
-  cost of rounding activations to 16 bits.
+- **Chunked Gated DeltaNet.** The prompt recurrence is still one position at a time
+  and is now the largest prompt cost at 512 tokens. The chunked (WY) form would turn
+  most of it into GEMMs.
+- **Fused prompt attention.** The GEMM attention writes its scores to a scratch
+  buffer, falling back to the tiled kernel past a 1 GiB budget. A tensor-core flash
+  kernel would avoid both.

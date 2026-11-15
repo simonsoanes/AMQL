@@ -74,6 +74,10 @@ public sealed class DecodeSession : IDisposable
     {
         if (tokens.Length > 0 && _runtime.SessionPosition == 0 && Gpu() is { } gpu)
         {
+            if (gpu.ExactPrefill != ExactGpuPrefill)
+            {
+                gpu.ExactPrefill = ExactGpuPrefill;
+            }
             LastLogits = new Tensor2D(gpu.Prefill(tokens), 1, _runtime.Plan.Output!.VocabSize);
             _runtime.SessionPosition = tokens.Length;
             _onGpu = true;
@@ -261,6 +265,14 @@ public sealed class DecodeSession : IDisposable
     /// <summary>False keeps this session on the managed path even where the
     /// device engine could run it (a reference to compare the engine with).</summary>
     public bool AllowGpuEngine { get; set; } = true;
+
+    /// <summary>On the device engine, true keeps prompt projections at f32
+    /// (FP32 SGEMM); false, the default, rounds their activations to BF16 for
+    /// tensor-core GEMMs, which is several times faster on long prompts and
+    /// agrees with the managed path to BF16 rounding rather than f32.
+    /// <c>AMQL_GPU_PREFILL=f32</c> makes true the default.</summary>
+    public bool ExactGpuPrefill { get; set; } =
+        Environment.GetEnvironmentVariable("AMQL_GPU_PREFILL")?.Trim().ToLowerInvariant() is "f32" or "exact";
 
     private string? EngineRefusal()
     {

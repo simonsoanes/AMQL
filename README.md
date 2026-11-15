@@ -145,10 +145,11 @@ Four weight working-set modes, selected by `AMQL_WEIGHTS` (or `--weights` on `ge
 With the CUDA backend built (`native/amql_cuda/build-cuda.cmd`) and a CUDA device present,
 `DecodeSession` runs a whole sequence on the device engine. Weights are uploaded once as BF16,
 activations, the KV cache and the recurrent state stay on the GPU, and each decode step is one
-CUDA graph. On Qwen 3.5 0.8B (RTX 5090) it decodes at ~655 tok/s against llama.cpp's ~500 on
-the same weights in F16 and prefills 32 tokens at ~5,800 tok/s against ~2,200. A 512-token
-prompt is ~10% slower than llama.cpp (~20k against ~22k tok/s). It agrees with the
-managed path to rounding (not bit for bit). Routed experts, short convs, traces and patches stay
+CUDA graph. On Qwen 3.5 0.8B (RTX 5090) it decodes at ~655 tok/s against llama.cpp's ~440–500
+on the same weights in F16, and prefills 512 tokens at ~55k tok/s against ~21k. Prompts round
+their activations to BF16 for the tensor cores, so logits agree with the managed path to ~0.3%;
+`AMQL_GPU_PREFILL=f32` (or `DecodeSession.ExactGpuPrefill`) keeps them at f32, agreeing to
+rounding, at about half the prompt speed. Decode steps are f32 either way. Routed experts, short convs, traces and patches stay
 on the managed path; see [docs/gpu-performance.md](docs/gpu-performance.md).
 
 When `AMQL_GPU=1` and the CUDA backend is built (`native/amql_cuda/build-cuda.cmd`),
@@ -407,6 +408,7 @@ multi-million-element matrix is too small to measure downstream. See
 | `AMQL_F32_CACHE_GB` | ¼ of budget (½ for `disk`) | F32 cache cap |
 | `AMQL_CORES` | auto | CPU core budget for parallel work |
 | `AMQL_GPU_ENGINE` | `1` | `0` keeps sessions off the device engine (the managed path then runs, with per-operator CUDA offload where enabled) |
+| `AMQL_GPU_PREFILL` | `bf16` | `f32` runs the device engine's prompt projections as FP32 SGEMM and its prompt attention without TF32, so prompts agree with the managed path to f32 rounding instead of ~0.3% |
 | `AMQL_RESIDENT_BF16` | `1` | `0` widens BF16 matrices to f32 at load in the `f32` mode instead of keeping their BF16 bits (same results, twice the memory traffic) |
 | `AMQL_MERGE_GPU` | `0` | Enable GPU-accelerated merge GEMM |
 

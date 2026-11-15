@@ -68,6 +68,7 @@ public sealed class GpuEngine : IDisposable
 
     public int Position => _position;
 
+    private static readonly bool RowsAttention = Environment.GetEnvironmentVariable("AMQE_ATTN_ROWS") is not "0";
     private static readonly bool Timing = Environment.GetEnvironmentVariable("AMQL_GPU_ENGINE_TIMING") is "1";
     private long _launchTicks, _syncTicks, _copyTicks, _timedSteps;
 
@@ -358,6 +359,22 @@ public sealed class GpuEngine : IDisposable
         _position = 0;
     }
 
+    /// <summary>True runs prompt projections as FP32 SGEMM over widened
+    /// weights, keeping activations at f32; false (the default) rounds them to
+    /// BF16 for tensor-core GEMMs, accumulating in f32. Decode steps are f32
+    /// either way.</summary>
+    public bool ExactPrefill
+    {
+        get => _exactPrefill;
+        set
+        {
+            _exactPrefill = value;
+            Check(Native.amqe_set_prefill_f32(_engine, value ? 1 : 0), "prefill precision");
+        }
+    }
+
+    private bool _exactPrefill;
+
     /// <summary>Runs the tokens through every layer from the current position
     /// and returns the last token's logits.</summary>
     public float[] Prefill(ReadOnlySpan<int> tokens)
@@ -548,9 +565,24 @@ public sealed class GpuEngine : IDisposable
                     l.QNormRow ? IntPtr.Zero : l.QNormW, l.QNormOff, l.QNormEps,
                     l.KNormRow ? IntPtr.Zero : l.KNormW, l.KNormOff, l.KNormEps,
                     l.InvFreq, l.RopePairs, l.RopeScale, attn.RopeInterleaved ? 1 : 0, l.InvFreq != IntPtr.Zero ? 1 : 0), "attn prep");
-                Check(Native.amqe_attention(_engine, _q, l.KCache, l.VCache, attn.OutputGate ? _gate : IntPtr.Zero, _ctx, _pos,
-                    rows, attn.NumQHeads, attn.NumKvHeads, attn.HeadDim, (float)attn.ScoreScale,
-                    attn.LogitSoftcapping ?? 0f, attn.Window is { } w ? (int)w : 0, _attnPart, _attnSplits), "attention");
+                IntPtr gate = attn.OutputGate ? _gate : IntPtr.Zero;
+                float softcap = attn.LogitSoftcapping ?? 0f;
+                int window = attn.Window is { } w ? (int)w : 0;
+                // A prompt chunk goes through cuBLAS (its position is known on
+                // the host: prompts are never captured); decode steps, and
+                // chunks whose scores would pass the scratch budget, use the
+                // attention kernels.
+                int rc = rows > 8 && RowsAttention
+                    ? Native.amqe_attention_rows(_engine, _q, l.KCache, l.VCache, gate, _ctx, _position,
+                        rows, attn.NumQHeads, attn.NumKvHeads, attn.HeadDim, (float)attn.ScoreScale, softcap, window)
+                    : -200;
+                if (rc == -200)
+                {
+                    rc = Native.amqe_attention(_engine, _q, l.KCache, l.VCache, gate, _ctx, _pos,
+                        rows, attn.NumQHeads, attn.NumKvHeads, attn.HeadDim, (float)attn.ScoreScale,
+                        softcap, window, _attnPart, _attnSplits);
+                }
+                Check(rc, "attention");
                 Linear(l.O!, _ctx, attn.QDim, rows, mixerOut, hidden, l.OBias,
                     residual: mixerDirect ? _x : IntPtr.Zero, resScale: residualScale);
             }
@@ -898,6 +930,8 @@ public sealed class GpuEngine : IDisposable
         [DllImport(Lib)] public static extern int amqe_copy_async(IntPtr e, IntPtr dst, IntPtr src, nuint bytes, int kind);
         [DllImport(Lib)] public static extern int amqe_memset(IntPtr e, IntPtr dst, int value, nuint bytes);
         [DllImport(Lib)] public static extern int amqe_sync(IntPtr e);
+
+        [DllImport(Lib)] public static extern int amqe_set_prefill_f32(IntPtr e, int f32);
         [DllImport(Lib)] public static extern int amqe_capture_begin(IntPtr e);
         [DllImport(Lib)] public static extern int amqe_capture_end(IntPtr e);
         [DllImport(Lib)] public static extern int amqe_capture_drop(IntPtr e);
@@ -943,5 +977,10 @@ public sealed class GpuEngine : IDisposable
 
         [DllImport(Lib)] public static extern int amqe_advance(IntPtr e, IntPtr pos, int by);
         [DllImport(Lib)] public static extern int amqe_attention_split_keys();
+
+        [DllImport(Lib)]
+        public static extern int amqe_attention_rows(IntPtr e, IntPtr q, IntPtr kCache, IntPtr vCache,
+            IntPtr gate, IntPtr output, int pos0, int rows, int hq, int hkv, int d,
+            float scale, float softcap, int window);
     }
 }

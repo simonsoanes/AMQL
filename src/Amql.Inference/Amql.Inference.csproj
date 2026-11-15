@@ -12,4 +12,12 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
 
+  <!-- The locally built CUDA backend (native/amql_cuda, gitignored) beside the
+       binaries, so a rebuilt engine is the one that runs. Absent on CPU-only
+       machines, where the managed path serves everything. -->
+  <ItemGroup Condition="Exists('..\..\native\amql_cuda\bin\amql_cuda.dll')">
+    <None Include="..\..\native\amql_cuda\bin\amql_cuda.dll" Link="amql_cuda.dll"
+          CopyToOutputDirectory="PreserveNewest" Visible="false" />
+  </ItemGroup>
+
 </Project>

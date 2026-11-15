@@ -42,6 +42,11 @@ struct Engine
     cudaGraphExec_t exec = nullptr;
     float* widen = nullptr;     // f32 scratch a BF16 weight widens into for a GEMM
     size_t widenElems = 0;
+    __nv_bfloat16* xb = nullptr; // BF16 copy of a GEMM's activations
+    size_t xbElems = 0;
+    int prefillF32 = 0;          // 1: batched rows use FP32 SGEMM over widened weights
+    float* scores = nullptr;     // prompt attention's [group x rows x keys] scores
+    size_t scoresElems = 0;
 };
 
 static int ok(cudaError_t e) { return e == cudaSuccess ? 0 : -(int)e; }
@@ -65,6 +70,8 @@ AMQE_EXPORT void amqe_destroy(Engine* e)
     if (e->exec) cudaGraphExecDestroy(e->exec);
     if (e->graph) cudaGraphDestroy(e->graph);
     if (e->widen) cudaFree(e->widen);
+    if (e->xb) cudaFree(e->xb);
+    if (e->scores) cudaFree(e->scores);
     if (e->blas) cublasDestroy(e->blas);
     if (e->stream) cudaStreamDestroy(e->stream);
     delete e;
@@ -564,6 +571,18 @@ __global__ void widen_bf16_kernel(const __nv_bfloat16* src, float* dst, long lon
     }
 }
 
+// dst[r, c] = bf16(x[r, c]) — round to nearest even, packed [rows × k].
+__global__ void to_bf16_kernel(const float* x, int ldx, int rows, int k, __nv_bfloat16* dst)
+{
+    pdl_enter();
+    long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+    int k2 = k / 2;
+    if (idx >= (long long)rows * k2) return;
+    int r = (int)(idx / k2), c = (int)(idx % k2) * 2;
+    float2 v = *reinterpret_cast<const float2*>(x + (long long)r * ldx + c);
+    *reinterpret_cast<__nv_bfloat162*>(dst + (long long)r * k + c) = __floats2bfloat162_rn(v.x, v.y);
+}
+
 // out[r, j] = epilogue(raw[r, j]) — raw is the GEMM's [rows, n or 2n] output.
 __global__ void epilogue_kernel(const float* raw, int ldraw, int rows, int n,
     float* y, int ldy, const float* bias, const float* residual, int ldr, float resScale, int act, int glu)
@@ -608,6 +627,38 @@ AMQE_EXPORT int amqe_linear(Engine* e, const void* w, int wType, int n, int k,
     }
 
     int outRows = glu ? 2 * n : n;
+    bool direct = !glu && act == ACT_NONE && bias == nullptr &&
+                  ((residual == nullptr) || (residual == y && ldr == ldy && resScale == 1.f));
+    const float alpha = 1.f;
+    if (wType == 0 && !e->prefillF32 && (k % 8) == 0 && (ldx % 2) == 0)
+    {
+        // BF16 tensor cores: activations rounded to BF16, the weights as
+        // stored, products accumulated in f32.
+        size_t need = (size_t)rows * k;
+        if (need > e->xbElems)
+        {
+            if (e->xb) cudaFree(e->xb);
+            e->xb = nullptr;
+            e->xbElems = 0;
+            if (cudaMalloc(&e->xb, need * sizeof(__nv_bfloat16)) != cudaSuccess) return -2;
+            e->xbElems = need;
+        }
+        long long pairs = (long long)rows * (k / 2);
+        launch(to_bf16_kernel, (unsigned)((pairs + 255) / 256), 256, 0, e->stream, x, ldx, rows, k, e->xb);
+        const float beta = (direct && residual) ? 1.f : 0.f;
+        float* c = direct ? y : raw;
+        int ldc = direct ? ldy : outRows;
+        int m = direct ? n : outRows;
+        auto st = cublasGemmEx(e->blas, CUBLAS_OP_T, CUBLAS_OP_N, m, rows, k,
+            &alpha, w, CUDA_R_16BF, k, e->xb, CUDA_R_16BF, k, &beta, c, CUDA_R_32F, ldc,
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+        if (st != CUBLAS_STATUS_SUCCESS) return -(1000 + (int)st);
+        if (direct) return ok(cudaGetLastError());
+        long long total = (long long)rows * n;
+        launch(epilogue_kernel, (unsigned)((total + 255) / 256), 256, 0, e->stream,
+            raw, outRows, rows, n, y, ldy, bias, residual, ldr, resScale, act, glu);
+        return ok(cudaGetLastError());
+    }
     const float* wf = static_cast<const float*>(w);
     if (wType == 0)
     {
@@ -628,9 +679,6 @@ AMQE_EXPORT int amqe_linear(Engine* e, const void* w, int wType, int n, int k,
     }
 
     // Fast path: plain residual add straight out of the GEMM (beta = 1).
-    bool direct = !glu && act == ACT_NONE && bias == nullptr &&
-                  ((residual == nullptr) || (residual == y && ldr == ldy && resScale == 1.f));
-    const float alpha = 1.f;
     if (direct)
     {
         const float beta = residual ? 1.f : 0.f;
@@ -646,6 +694,14 @@ AMQE_EXPORT int amqe_linear(Engine* e, const void* w, int wType, int n, int k,
     launch(epilogue_kernel, (unsigned)((total + 255) / 256), 256, 0, e->stream, 
         raw, outRows, rows, n, y, ldy, bias, residual, ldr, resScale, act, glu);
     return ok(cudaGetLastError());
+}
+
+/// Batched rows (prompts): 0 = BF16 tensor cores (default), 1 = FP32 SGEMM
+/// over widened weights, which keeps activations at f32.
+AMQE_EXPORT int amqe_set_prefill_f32(Engine* e, int f32)
+{
+    e->prefillF32 = f32 ? 1 : 0;
+    return 0;
 }
 
 // ── embedding ──────────────────────────────────────────────────────────────
@@ -1102,6 +1158,105 @@ static int launch_attention(Engine* e, const float* q, const float* kCache, cons
     return ok(cudaGetLastError());
 }
 
+// ── prompt attention as GEMMs ──────────────────────────────────────────────
+//
+// For a chunk of query rows at positions pos0.. over keys kStart..pos0+rows-1:
+// per KV head, S = Q·Kᵀ for its group of query heads (one strided-batched
+// GEMM), a masked softmax over each score row, then O = P·V. Tensor cores
+// (TF32) unless the engine keeps prompts exact, where it is plain FP32.
+
+// One block per (row, head in group): scale, softcap, causal and window
+// mask, softmax, written back in place as probabilities.
+__global__ void attn_softmax_rows_kernel(float* scores, int rows, int keys, int kStart, int pos0,
+    float scale, float softcap, int window)
+{
+    pdl_enter();
+    __shared__ float red[32];
+    int r = blockIdx.x;
+    float* row = scores + ((long long)blockIdx.y * rows + r) * keys;
+    int qPos = pos0 + r;
+    float m = -INFINITY;
+    for (int j = threadIdx.x; j < keys; j += blockDim.x)
+    {
+        int key = kStart + j;
+        bool masked = key > qPos || (window > 0 && qPos - key >= window);
+        float v = masked ? -INFINITY : softcapped(row[j] * scale, softcap);
+        row[j] = v;
+        m = fmaxf(m, v);
+    }
+    m = block_max(m, red);
+    float sum = 0.f;
+    for (int j = threadIdx.x; j < keys; j += blockDim.x)
+    {
+        float v = row[j];
+        float ev = v == -INFINITY ? 0.f : __expf(v - m);
+        row[j] = ev;
+        sum += ev;
+    }
+    float inv = 1.f / block_sum(sum, red);
+    for (int j = threadIdx.x; j < keys; j += blockDim.x) row[j] *= inv;
+}
+
+__global__ void attn_gate_kernel(float* out, const float* gate, long long count)
+{
+    pdl_enter();
+    long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+    if (i < count) out[i] *= sigmoidf_(gate[i]);
+}
+
+/// Prompt attention through cuBLAS; pos0 is the chunk's first position (the
+/// host's copy of the device counter). Returns -200 when the score scratch
+/// would pass its budget, and the caller falls back to amqe_attention.
+AMQE_EXPORT int amqe_attention_rows(Engine* e, const float* q, const float* kCache, const float* vCache,
+    const float* gate, float* out, int pos0, int rows, int hq, int hkv, int d,
+    float scale, float softcap, int window)
+{
+    if (rows <= 0 || hkv <= 0 || hq % hkv != 0) return -100;
+    int g = hq / hkv;
+    int kvDim = hkv * d;
+    int last = pos0 + rows - 1;
+    int kStart = window > 0 ? max(0, pos0 - window + 1) : 0;
+    int keys = last + 1 - kStart;
+    size_t need = (size_t)g * rows * keys;
+    if (need * sizeof(float) > ((size_t)1 << 30)) return -200;
+    if (need > e->scoresElems)
+    {
+        if (e->scores) cudaFree(e->scores);
+        e->scores = nullptr;
+        e->scoresElems = 0;
+        if (cudaMalloc(&e->scores, need * sizeof(float)) != cudaSuccess) return -2;
+        e->scoresElems = need;
+    }
+    cublasComputeType_t ct = e->prefillF32 ? CUBLAS_COMPUTE_32F : CUBLAS_COMPUTE_32F_FAST_TF32;
+    const float one = 1.f, zero = 0.f;
+    long long strideS = (long long)rows * keys;
+    for (int kh = 0; kh < hkv; kh++)
+    {
+        const float* K = kCache + (long long)kStart * kvDim + kh * d;
+        const float* V = vCache + (long long)kStart * kvDim + kh * d;
+        const float* Q = q + (long long)kh * g * d;
+        float* O = out + (long long)kh * g * d;
+        // Column-major: S[keys x rows] = K^T . Q, per head of the group.
+        auto st = cublasGemmStridedBatchedEx(e->blas, CUBLAS_OP_T, CUBLAS_OP_N, keys, rows, d,
+            &one, K, CUDA_R_32F, kvDim, 0, Q, CUDA_R_32F, hq * d, d,
+            &zero, e->scores, CUDA_R_32F, keys, strideS, g, ct, CUBLAS_GEMM_DEFAULT);
+        if (st != CUBLAS_STATUS_SUCCESS) return -(1000 + (int)st);
+        launch(attn_softmax_rows_kernel, dim3(rows, g), 256, 0, e->stream, e->scores, rows, keys, kStart, pos0,
+            scale, softcap, window);
+        // O[d x rows] = V . P.
+        st = cublasGemmStridedBatchedEx(e->blas, CUBLAS_OP_N, CUBLAS_OP_N, d, rows, keys,
+            &one, V, CUDA_R_32F, kvDim, 0, e->scores, CUDA_R_32F, keys, strideS,
+            &zero, O, CUDA_R_32F, hq * d, d, g, ct, CUBLAS_GEMM_DEFAULT);
+        if (st != CUBLAS_STATUS_SUCCESS) return -(1000 + (int)st);
+    }
+    if (gate)
+    {
+        long long count = (long long)rows * hq * d;
+        launch(attn_gate_kernel, (unsigned)((count + 255) / 256), 256, 0, e->stream, out, gate, count);
+    }
+    return ok(cudaGetLastError());
+}
+
 /// part: scratch of [8 × hq × nsplit × (d + 2)] floats for the decode split;
 /// nsplit = ceil(cache capacity / SPLIT_KEYS) — see amqe_attention_split_keys.
 AMQE_EXPORT int amqe_attention_split_keys(void) { return SPLIT_KEYS; }
@@ -1339,6 +1494,87 @@ __global__ void __launch_bounds__(FUSED ? 512 : 128) gdn_scan_kernel(const float
     for (int i = 0; i < KP; i++) st[(long long)(part * KP + i) * vd + col] = S[i];
 }
 
+// The recurrence over a prompt: the same arithmetic as gdn_scan_kernel, laid
+// out for latency. LANES = KD/16 lanes share a value column (16 key rows of
+// state each, so the dependent FMA chains are half as long), a block is 8
+// columns (so 4x the blocks reach the SMs), and the next row's q, k, v, decay
+// and β are loaded before this row's arithmetic, so the loads' latency hides
+// behind it instead of opening every step.
+template <int KD>
+__global__ void __launch_bounds__(8 * (KD / 16)) gdn_scan_rows_kernel(const float* __restrict__ qk,
+    const float* __restrict__ conv, const float* __restrict__ gb,
+    int rows, int keyDim, int convDim, int nk, int nv, int vd, float* __restrict__ state, float* __restrict__ out, int valueDim)
+{
+    pdl_enter();
+    constexpr int KP = 16, LANES = KD / KP;
+    int h = blockIdx.x;
+    int col = blockIdx.y * 8 + threadIdx.x / LANES;
+    int part = threadIdx.x % LANES;
+    int kh = h / (nv / nk);
+    float S[KP];
+    float* st = state + (long long)h * KD * vd;
+    #pragma unroll
+    for (int i = 0; i < KP; i++) S[i] = st[(long long)(part * KP + i) * vd + col];
+    const float qScale = rsqrtf((float)KD);
+    const long long qkStride = 2LL * keyDim;
+    const float* qBase = qk + kh * KD + part * KP;
+    const float* vBase = conv + 2 * keyDim + h * vd + col;
+
+    float kv[KP], qv[KP], v, decay, beta;
+    auto load = [&](int r, float* kd_, float* qd_, float& v_, float& dc_, float& bt_)
+    {
+        const float* qr = qBase + r * qkStride;
+        const float* kr = qr + keyDim;
+        #pragma unroll
+        for (int i = 0; i < KP; i += 4)
+        {
+            float4 a = __ldg(reinterpret_cast<const float4*>(kr + i));
+            float4 b = __ldg(reinterpret_cast<const float4*>(qr + i));
+            kd_[i] = a.x; kd_[i + 1] = a.y; kd_[i + 2] = a.z; kd_[i + 3] = a.w;
+            qd_[i] = b.x; qd_[i + 1] = b.y; qd_[i + 2] = b.z; qd_[i + 3] = b.w;
+        }
+        v_ = __ldg(vBase + (long long)r * convDim);
+        dc_ = __ldg(gb + (long long)r * 2 * nv + h);
+        bt_ = __ldg(gb + (long long)r * 2 * nv + nv + h);
+    };
+    load(0, kv, qv, v, decay, beta);
+    for (int r = 0; r < rows; r++)
+    {
+        float kn[KP], qn[KP], vn = 0.f, dn = 0.f, bn = 0.f;
+        if (r + 1 < rows) load(r + 1, kn, qn, vn, dn, bn);
+        float m0 = 0.f, m1 = 0.f;
+        #pragma unroll
+        for (int i = 0; i < KP; i += 2)
+        {
+            S[i] *= decay; S[i + 1] *= decay;
+            m0 = fmaf(S[i], kv[i], m0);
+            m1 = fmaf(S[i + 1], kv[i + 1], m1);
+        }
+        float kvMem = m0 + m1;
+        #pragma unroll
+        for (int o = 1; o < LANES; o <<= 1) kvMem += __shfl_xor_sync(0xffffffffu, kvMem, o);
+        float delta = (v - kvMem) * beta;
+        float o0 = 0.f, o1 = 0.f;
+        #pragma unroll
+        for (int i = 0; i < KP; i += 2)
+        {
+            S[i] = fmaf(kv[i], delta, S[i]);
+            S[i + 1] = fmaf(kv[i + 1], delta, S[i + 1]);
+            o0 = fmaf(S[i], qv[i], o0);
+            o1 = fmaf(S[i + 1], qv[i + 1], o1);
+        }
+        float o = o0 + o1;
+        #pragma unroll
+        for (int x = 1; x < LANES; x <<= 1) o += __shfl_xor_sync(0xffffffffu, o, x);
+        if (part == 0) out[(long long)r * valueDim + h * vd + col] = o * qScale;
+        #pragma unroll
+        for (int i = 0; i < KP; i++) { kv[i] = kn[i]; qv[i] = qn[i]; }
+        v = vn; decay = dn; beta = bn;
+    }
+    #pragma unroll
+    for (int i = 0; i < KP; i++) st[(long long)(part * KP + i) * vd + col] = S[i];
+}
+
 // z-gated RMSNorm over each value head, in place: y = ô · w · silu(z).
 __global__ void gdn_gate_norm_kernel(float* o, int valueDim, int vd, const float* proj, int ldp, int zOff,
     const float* normW, float eps)
@@ -1381,6 +1617,16 @@ AMQE_EXPORT int amqe_gdn(Engine* e, const float* proj, int ldp, int rows, int ke
         launch(gdn_prep_kernel, dim3(rows, nk), kd, 0, e->stream, conv, keyDim, convDim, kd, proj, ldp, bOff, aOff, nv, aLog, dtBias, qk, gb);
     }
     bool fused = few && vd * 4 <= 512;
+    static int rowsScan = -1;
+    if (rowsScan < 0) { const char* v = getenv("AMQE_GDN_ROWS_SCAN"); rowsScan = v ? atoi(v) : 1; }
+    if (!few && rowsScan && vd % 8 == 0)
+    {
+        dim3 g(nv, vd / 8);
+        if (kd == 128) launch(gdn_scan_rows_kernel<128>, g, 64, 0, e->stream, qk, conv, gb, rows, keyDim, convDim, nk, nv, vd, state, out, valueDim);
+        else launch(gdn_scan_rows_kernel<64>, g, 32, 0, e->stream, qk, conv, gb, rows, keyDim, convDim, nk, nv, vd, state, out, valueDim);
+        launch(gdn_gate_norm_kernel, dim3(rows, nv), vd < 64 ? 64 : (vd > 256 ? 256 : vd), 0, e->stream, out, valueDim, vd, proj, ldp, zOff, normW, normEps);
+        return ok(cudaGetLastError());
+    }
     dim3 grid(nv, fused ? 1 : vd / 32);
     int threads = fused ? vd * 4 : 128;
     if (kd == 128)
