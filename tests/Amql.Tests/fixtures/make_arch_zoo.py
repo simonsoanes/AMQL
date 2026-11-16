@@ -89,6 +89,12 @@ FAMILIES = {
     "olmoe": dict(num_experts=4, num_experts_per_tok=2, norm_topk_prob=False),
     "olmo3": dict(sliding_window=4,
                   layer_types=["sliding_attention", "sliding_attention", "sliding_attention", "full_attention"]),
+    # Hybrid: Gated DeltaNet linear attention (64-wide heads, as the device
+    # engine runs them) between gated full-attention layers.
+    "qwen3_5-gdn": dict(model_type="qwen3_5_text", linear_num_key_heads=2, linear_num_value_heads=4,
+                        linear_key_head_dim=64, linear_value_head_dim=64, linear_conv_kernel_dim=4,
+                        partial_rotary_factor=0.25, attn_output_gate=True,
+                        layer_types=["linear_attention", "full_attention", "linear_attention", "full_attention"]),
 }
 
 

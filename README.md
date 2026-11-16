@@ -146,7 +146,7 @@ With the CUDA backend built (`native/amql_cuda/build-cuda.cmd`) and a CUDA devic
 `DecodeSession` runs a whole sequence on the device engine. Weights are uploaded once as BF16,
 activations, the KV cache and the recurrent state stay on the GPU, and each decode step is one
 CUDA graph. On Qwen 3.5 0.8B (RTX 5090) it decodes at ~655 tok/s against llama.cpp's ~440–500
-on the same weights in F16, and prefills 512 tokens at ~55k tok/s against ~21k. Prompts round
+on the same weights in F16, and prefills 512 tokens at ~64k tok/s against ~21k. Prompts round
 their activations to BF16 for the tensor cores, so logits agree with the managed path to ~0.3%;
 `AMQL_GPU_PREFILL=f32` (or `DecodeSession.ExactGpuPrefill`) keeps them at f32, agreeing to
 rounding, at about half the prompt speed. Decode steps are f32 either way. Routed experts, short convs, traces and patches stay

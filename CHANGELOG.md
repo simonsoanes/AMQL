@@ -8,6 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- **perf:** the device engine runs a Gated DeltaNet over a prompt in its chunked (WY) form. On Qwen 3.5 0.8B (RTX 5090) prefill goes from ~58,000 to ~64,000 tok/s at 512 and 2,000 tokens (+11%), and from ~30,000 to ~31,500 with `AMQL_GPU_PREFILL=f32`.
+  - Chunks are 64 rows. One kernel builds every chunk's W, U, decayed keys and masked Q·Kᵀ at once, solving the chunk's triangular system in 16-row blocks.
+  - A second kernel carries the state from chunk to chunk: two small products per chunk instead of a step per row. The next chunk's operands load (`cp.async`) while the current one computes.
+  - A third kernel forms every chunk's outputs at once from its starting state.
+
+  Decays stay in log space, and everything is f32: with `AMQL_GPU_PREFILL=f32` logits agree with the managed path to ~2e-5 over 2,000 tokens. It runs for prompt chunks of 256 rows or more; shorter ones keep the row scan, which is faster there. `AMQE_GDN_CHUNK` sets that threshold (`0` turns the chunked form off). The arch zoo gains `qwen3_5-gdn`, a hybrid with 64-wide linear-attention heads, so `GpuEngineTests` covers the engine's Gated DeltaNet. It now also runs an 800-token prompt, which takes the chunked form in two calls.
 - **perf:** device-engine prompts are 2–4× faster than llama.cpp's CUDA backend. On Qwen 3.5 0.8B (RTX 5090) prefill goes from ~5,800 to ~7,500 tok/s at 32 tokens (llama.cpp: 1,930), from ~20,000 to ~55,000 at 512 (20,700) and from ~15,000 to ~54,000 at 2,000 (26,500).
   - Prompt projections run as BF16 tensor-core GEMMs on the weights as stored (`cublasGemmEx`, f32 accumulation), instead of widening the weights to f32 for SGEMM.
   - Prompt attention runs as strided-batched GEMMs per KV-head group (TF32) around a masked softmax kernel, instead of a scalar tiled kernel.

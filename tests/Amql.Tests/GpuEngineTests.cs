@@ -56,9 +56,11 @@ public class GpuEngineTests
         var (ids, _) = ArchZooTests.Golden(family);
         // Exact prompts agree with the managed path to f32 rounding; the
         // default rounds prompt activations to BF16 for the tensor cores (a
-        // 3-token prompt takes the GEMV path, f32 either way).
+        // 3-token prompt takes the GEMV path, f32 either way). 800 tokens run
+        // as 512 + 288 rows, so a Gated DeltaNet takes its chunked form in
+        // both, with a partial last chunk and the state carried between them.
         foreach (bool exact in new[] { true, false })
-        foreach (int length in new[] { 3, 21 })
+        foreach (int length in new[] { 3, 21, 800 })
         {
             var prompt = Enumerable.Range(0, length).Select(i => ids[i % ids.Length]).ToArray();
             using var gpu = new DecodeSession(plan, store) { ExactGpuPrefill = exact };

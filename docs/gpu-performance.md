@@ -27,8 +27,10 @@ What the engine does:
     rounded to BF16, the weights are used as stored, and products accumulate in f32.
   - Attention is two strided-batched GEMMs per KV-head group (S = Q·Kᵀ, O = P·V, in
     TF32) around a masked softmax kernel.
-  - The conv and q/k normalisation run in parallel over rows. Only the recurrence
-    runs position by position, one 64-thread block per (value head, 8 columns).
+  - The conv and q/k normalisation run in parallel over rows.
+  - From 256 rows the Gated DeltaNet recurrence runs in its chunked (WY) form, 64
+    rows at a time (below). Shorter prompts scan it position by position, one
+    64-thread block per (value head, 8 columns).
 
 The engine covers:
 
@@ -60,8 +62,10 @@ agree to rounding, not bit for bit.
 
 Prompts, by default, round their activations to BF16 for the projections and use
 TF32 for attention. On Qwen 3.5 0.8B this moves the largest logit by ~0.04, about
-0.3% of the largest logit. Greedy decoding still agrees token for token after
-prompts of 32, 512 and 2,000 tokens.
+0.3% of the largest logit. Greedy decoding still agrees token for token over 64
+steps after prompts of 32, 512 and 1,300 tokens. After the 2,000-token prompt it
+parts at step 5, where the managed path's top two logits are 0.0012 apart.
+The f32 mode agrees there.
 
 `AMQL_GPU_PREFILL=f32` (or `DecodeSession.ExactGpuPrefill = true`) keeps prompts at
 f32: FP32 SGEMM over widened weights and FP32 attention GEMMs. The largest logit
@@ -91,21 +95,27 @@ vocabulary, tied head). RTX 5090 (170 SMs, ~1.79 TB/s), Windows 11, driver 617, 
 | | prefill pp32 | prefill pp512 | prefill pp2000 | decode tg128 |
 |---|---|---|---|---|
 | AMQL before (per-operator CUDA path) | — | — | — | ~41 tok/s |
-| **AMQL device engine** (BF16 prompts, the default) | **7,472 tok/s** | **55,354 tok/s** | **53,755 tok/s** | **655 tok/s** |
-| AMQL device engine, `AMQL_GPU_PREFILL=f32` | 5,296 tok/s | 27,906 tok/s | 25,693 tok/s | 650 tok/s |
+| **AMQL device engine** (BF16 prompts, the default) | **7,956 tok/s** | **64,310 tok/s** | **63,354 tok/s** | **679 tok/s** |
+| AMQL device engine, `AMQL_GPU_PREFILL=f32` | 6,045 tok/s | 31,784 tok/s | 30,795 tok/s | 682 tok/s |
 | llama.cpp, CUDA, F16, flash attention | 1,930 tok/s | 20,728 tok/s | 26,491 tok/s | 438–497 tok/s |
 
 How to read this:
 
 - **Decode stays flat with context.** It is ~610 tok/s after a 512- or 2000-token
   prompt. llama.cpp drops to ~460 after 512.
-- **Exact prompts trade speed for f32.** At 2,000 tokens llama.cpp is ~3% ahead of
-  the f32 mode. The default is ~2× ahead of llama.cpp there.
+- **Exact prompts trade speed for f32.** The f32 mode runs at about half the
+  default's prompt speed. It is still ~15% ahead of llama.cpp at 2,000 tokens, and
+  the default ~2.4×.
+- **The two AMQL rows come from a later session than llama.cpp's.** In that
+  session the engine without the chunked recurrence ran at 8,205, 58,115 and 58,324
+  tok/s (pp32, pp512, pp2000) and decoded at ~672. That is ~5% above the earlier
+  session's 7,472, 55,354 and 53,755 tok/s and 655 tok/s on the same code, so
+  compare rows from different sessions with that margin in mind.
 - **Measured on an idle machine.** Best of three runs each. The engine's decode
   varies by about ±1% between runs and llama.cpp's by more (438 and 497 tok/s on
   two sessions).
-- **Long prompts slow prefill a little.** It is ~15,000 tok/s at 2,000 tokens,
-  because attention grows with the prompt.
+- **Long prompts hold their speed.** Prefill at 2,000 tokens is within ~2% of 512,
+  since attention is a small share of a prompt's time at these lengths.
 
 **Where a decode step goes:** about 1.45 ms on the GPU, plus ~70 µs for the graph
 launch, the logits copy and the argmax.
@@ -143,8 +153,25 @@ launch, the logits copy and the argmax.
   `cublasGemmEx`, with no widened f32 copy written and read back per chunk. Attention
   is two cuBLAS GEMMs per KV-head group rather than a scalar kernel, which took it
   from ~50 ms to a few ms of a 2,000-token prompt.
-- **A prompt scan built for latency.** The recurrence is sequential in position, so
-  each step's latency is what counts.
+- **The Gated DeltaNet recurrence in chunks.** Over 64 rows the delta rule unrolls
+  to a triangular system, (I + A)·Δ = β·V − β·e^G·K·S₀. Its W and U factors, the
+  decayed keys and the masked, decayed Q·Kᵀ depend only on the chunk's own rows.
+  - The first kernel builds them for every chunk at once. It solves the triangle in
+    16-row blocks, one column per thread.
+  - The second kernel carries the state between chunks: Δ = U − W·S, then
+    S ← e^(G_C)·S + K̃ᵀ·Δ. That is two small products per chunk instead of 64
+    dependent steps. The next chunk's W and keys load (`cp.async`) while the current
+    one computes.
+  - The third kernel forms every chunk's outputs at once from the chunk's starting
+    state and Δ.
+
+  Decays stay in log space, so no ratio of two underflowed products forms. All of
+  it is f32 on CUDA cores. At 512 rows the three kernels take ~90 µs per layer
+  against ~140 µs for the row scan, which makes 512-token prompts ~11% faster. Below
+  256 rows a single block's latency outweighs that, and the row scan is kept
+  (`AMQE_GDN_CHUNK` moves the threshold; `0` turns the chunked form off).
+- **A prompt scan built for latency.** Short prompts scan the recurrence position by
+  position, so each step's latency is what counts.
   - Eight lanes share a value column (16 key rows each), which halves the dependent
     FMA chains.
   - Eight columns per block puts four times the blocks on the SMs.
@@ -167,9 +194,12 @@ launch, the logits copy and the argmax.
   exactness.
 - **Device-side sampling.** It would skip the 1 MB logits copy per token. That would
   mean returning a token rather than logits from `Step`.
-- **Chunked Gated DeltaNet.** The prompt recurrence is still one position at a time
-  and is now the largest prompt cost at 512 tokens. The chunked (WY) form would turn
-  most of it into GEMMs.
+- **Tensor cores in the chunked recurrence.** Its products run as f32 on CUDA cores,
+  and each kernel has only one block per (head, chunk) or (head, column slice).
+  - The chunk products, Q·Kᵀ and K·Kᵀ, take ~90 µs per layer at 512 rows, about a
+    fifth of the prompt's time.
+  - In the default mode, TF32 `mma` tiles could cut most of that. The f32 mode would
+    keep the present kernels.
 - **Fused prompt attention.** The GEMM attention writes its scores to a scratch
   buffer, falling back to the tiled kernel past a 1 GiB budget. A tensor-core flash
   kernel would avoid both.
