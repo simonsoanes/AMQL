@@ -75,6 +75,8 @@ leading space: see [The start of the text](#the-start-of-the-text).
 
 Reserved words: `program const state scale let token means for in to if else end
 def call attend back by entail when not emit only forbid vote sum min floor`.
+`carry` starts a carry statement only when a name follows it, so a state may still be
+called `carry`.
 
 ## Expressions
 
@@ -313,6 +315,41 @@ Nine steps cover 512 tokens, with one head each. `json.entail.txt` does this for
 as depth, and for "the latest value written", such as what stands open at each depth. A
 marker that clears what came before makes the result start where a text starts.
 
+## Reading a text of any length: `carry`
+
+```
+carry DEST from SOURCE
+```
+`DEST` starts every token holding `SOURCE`'s final value after the previous token, and
+0 at the start of the text. Both are declared states, one element each; use `for` for
+arrays. `DEST` may still be added to like any state, so a register that is kept, or
+replaced, reads:
+
+```
+state best, last_best
+carry last_best from best
+entail best = last_best                                       # keep
+entail best = val - last_best when hit, val - last_best >= 1  # or raise
+```
+
+A program built this way is a fold: each token updates a fixed set of lanes from the
+ones before it, so it reads 64 bytes or 8 MB in the same memory.
+[`scan.entail.txt`](../scripts/entail/scan.entail.txt) answers a question asked at the
+start of a text from records anywhere in it, holding 2,640 bytes of state.
+
+A fixed-depth transformer cannot do this: a lane's value at one token would have to be
+read at the bottom of the next after it was written at the top. So `compile`, `graft`
+and `adapter --dense` refuse a carry, while `entail run`, the sparse adapter and
+`entail run --file`, which streams a text of any size, run one. In a model the same
+operation is a recurrent layer, such as the Gated DeltaNet layers that make up 18 of
+Qwen 3.5's 24: a decay of 1 keeps a value, and the delta rule replaces the value stored
+under a key.
+
+Ask the question before the text where you can. A fold that knows the question keeps one
+answer. Asked afterwards, it has to keep the answer to every question it might be asked:
+[`scan-index.entail.txt`](../scripts/entail/scan-index.entail.txt) keeps one register per
+key, and with open questions that becomes the whole text, which is what attention keeps.
+
 ## The start of the text
 
 A head can only look back as far as the text goes. Past the start it finds the first
@@ -335,7 +372,9 @@ amql-cli entail run program.entail.txt --expr " 12+34="
 Runs the meaning with no weights, one character per token, feeding each output back.
 `--tokenizer <dir>` splits the text as that model would, and `--cases <file>` answers
 each case, with `--report <json>` for the replies. This is the quick way to test a
-program before grafting it.
+program before grafting it. `--file <text>` streams a whole file through the program
+in fixed memory, the rows its heads look back over and nothing more, and reports the
+state it held: the way to run a `carry` program over megabytes.
 
 ```bash
 amql-cli entail adapter program.entail.txt --tokenizer <partner-dir> --out adapter

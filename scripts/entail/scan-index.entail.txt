@@ -1,0 +1,82 @@
+program scan_index
+# Records first, query last:   a7;k3;b9;k5; ... ?k=
+# The same answer, but the question arrives after the data, so a fold must keep
+# the best value under every key it might be asked about: an index with one
+# register per key. Still fixed memory here, because there are only 26 keys;
+# with open-ended questions it is the whole text, which is what attention keeps.
+
+state is_q, is_end, is_digit, val, is_key, key[26]
+token "?" means is_q = 1
+token "=" means is_end = 1
+token "0" means is_digit = 1, val = 0
+token "1" means is_digit = 1, val = 1
+token "2" means is_digit = 1, val = 2
+token "3" means is_digit = 1, val = 3
+token "4" means is_digit = 1, val = 4
+token "5" means is_digit = 1, val = 5
+token "6" means is_digit = 1, val = 6
+token "7" means is_digit = 1, val = 7
+token "8" means is_digit = 1, val = 8
+token "9" means is_digit = 1, val = 9
+token "a" means is_key = 1, key[0] = 1
+token "b" means is_key = 1, key[1] = 1
+token "c" means is_key = 1, key[2] = 1
+token "d" means is_key = 1, key[3] = 1
+token "e" means is_key = 1, key[4] = 1
+token "f" means is_key = 1, key[5] = 1
+token "g" means is_key = 1, key[6] = 1
+token "h" means is_key = 1, key[7] = 1
+token "i" means is_key = 1, key[8] = 1
+token "j" means is_key = 1, key[9] = 1
+token "k" means is_key = 1, key[10] = 1
+token "l" means is_key = 1, key[11] = 1
+token "m" means is_key = 1, key[12] = 1
+token "n" means is_key = 1, key[13] = 1
+token "o" means is_key = 1, key[14] = 1
+token "p" means is_key = 1, key[15] = 1
+token "q" means is_key = 1, key[16] = 1
+token "r" means is_key = 1, key[17] = 1
+token "s" means is_key = 1, key[18] = 1
+token "t" means is_key = 1, key[19] = 1
+token "u" means is_key = 1, key[20] = 1
+token "v" means is_key = 1, key[21] = 1
+token "w" means is_key = 1, key[22] = 1
+token "x" means is_key = 1, key[23] = 1
+token "y" means is_key = 1, key[24] = 1
+token "z" means is_key = 1, key[25] = 1
+
+state k_prev[26], q_prev
+carry q_prev from is_q
+for c in 0 to 25
+    carry k_prev[c] from key[c]
+end
+
+state best[26], last_best[26]
+for c in 0 to 25
+    carry last_best[c] from best[c]
+    entail best[c] = last_best[c]
+    entail best[c] = val - last_best[c] when k_prev[c], is_digit, val - last_best[c] >= 1
+end
+
+# "?k": the asked key, held until "=".
+state asked[26], last_asked[26]
+for c in 0 to 25
+    carry last_asked[c] from asked[c]
+    entail asked[c] = last_asked[c]
+    entail asked[c] when q_prev, key[c]
+end
+
+state pick[26]
+for c in 0 to 25
+    entail pick[c] = last_best[c] when last_asked[c]
+end
+let answer = (sum c in 0 to 25 : pick[c])
+
+# The answer: the best value, then the end.
+state o[10], e_prev
+carry e_prev from is_end
+for d in 0 to 9
+    entail o[d] when is_end, answer == d
+    emit "{d}" when o[d]
+end
+emit end when e_prev

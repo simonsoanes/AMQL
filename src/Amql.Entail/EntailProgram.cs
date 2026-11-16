@@ -126,6 +126,13 @@ public sealed class EntailProgram
     /// positive score wins, as a softmax's would. An optimised program has
     /// none: votes are what `emit` replaces.</summary>
     public Dictionary<string, Lin> Votes { get; } = new(StringComparer.Ordinal);
+
+    /// <summary>Recurrent registers: lane <c>To</c> starts each token holding
+    /// lane <c>From</c>'s final value after the previous token (0 at the start
+    /// of the text). A fixed-depth transformer cannot express this, so only
+    /// targets that run token by token accept it: the interpreter and the
+    /// sparse adapter. Memory stays one row of lanes however long the text.</summary>
+    public List<(int From, int To)> Carries { get; } = new();
     public int Layers { get; set; }
     public int MaxNeurons { get; set; }
     public int Statements { get; set; }
@@ -221,7 +228,7 @@ public static class EntailCompiler
         {
             Read(vote, -1);
         }
-        p.Layers = p.Ops.Max(o => o.Layer) + 1;
+        p.Layers = p.Ops.Count == 0 ? 0 : p.Ops.Max(o => o.Layer) + 1;
         p.MaxNeurons = neurons.Values.DefaultIfEmpty(0).Max();
     }
 
@@ -499,6 +506,16 @@ public static class EntailCompiler
                         Program.Masks.Add((s.Allow, s.Texts.Select(t => Literal(Name(t))).ToList(), lane));
                     }
                     break;
+                case CarryStmt s:
+                    {
+                        int to = LaneFor(s.Target), from = LaneFor(s.Source);
+                        if (Program.Carries.Any(c => c.To == to))
+                        {
+                            throw new EntailException(s.Line, $"'{Key(s.Target)}' is already carried");
+                        }
+                        Program.Carries.Add((from, to));
+                    }
+                    break;
                 case VoteStmt s:
                     {
                         var key = Literal(Name(s.Text));
@@ -656,6 +673,10 @@ public static class EntailInterpreter
     /// program does not know write nothing).</summary>
     public static double[][] Run(EntailProgram p, IReadOnlyList<string> tokens)
     {
+        if (p.Carries.Count > 0)
+        {
+            return RunRecurrent(p, tokens);
+        }
         var x = new double[tokens.Count][];
         for (int t = 0; t < tokens.Count; t++)
         {
@@ -720,6 +741,82 @@ public static class EntailInterpreter
             foreach (var (t, lane, v) in delta)
             {
                 x[t][lane] += v;
+            }
+        }
+        return x;
+    }
+
+    /// <summary>Token by token, for a program with carried lanes: each token
+    /// runs every layer before the next begins, since its carried lanes start
+    /// from the previous token's final values. A head reads a finished row,
+    /// which is what it would read in the layer-parallel order too: a state
+    /// is closed once read.</summary>
+    private static double[][] RunRecurrent(EntailProgram p, IReadOnlyList<string> tokens)
+    {
+        var x = new double[tokens.Count][];
+        var groups = p.Ops.GroupBy(o => 2 * o.Layer + (o is Neuron ? 1 : 0)).OrderBy(g => g.Key)
+            .Select(g => g.ToArray()).ToArray();
+        var delta = new List<(int Lane, double V)>();
+        for (int t = 0; t < tokens.Count; t++)
+        {
+            var row = x[t] = new double[p.Lanes.Count];
+            if (p.Tokens.TryGetValue(tokens[t], out var writes))
+            {
+                foreach (var (lane, value) in writes)
+                {
+                    row[lane] = value;
+                }
+            }
+            if (t > 0)
+            {
+                foreach (var (from, to) in p.Carries)
+                {
+                    row[to] += x[t - 1][from];
+                }
+            }
+            foreach (var group in groups)
+            {
+                delta.Clear();
+                foreach (var op in group)
+                {
+                    if (op is Neuron n)
+                    {
+                        double up = n.Up.Eval(row);
+                        double gate = n.Gate.Eval(row);
+                        if (up != 0 && gate > -40)
+                        {
+                            delta.Add((n.Dest, n.Coef * Silu(gate) * up));
+                        }
+                    }
+                    else if (op is Head h)
+                    {
+                        int offset = h.Offset;
+                        if (h.Pointer is { } pointer)
+                        {
+                            offset = -1;
+                            foreach (var (lane, o) in pointer)
+                            {
+                                if (row[lane] > 0.5)
+                                {
+                                    offset = o;
+                                }
+                            }
+                            if (offset < 0)
+                            {
+                                continue;
+                            }
+                        }
+                        var source = offset == 0 ? row : x[Math.Max(t - offset, 0)];
+                        foreach (var (dest, lin) in h.Copies)
+                        {
+                            delta.Add((dest, lin.Eval(source)));
+                        }
+                    }
+                }
+                foreach (var (lane, v) in delta)
+                {
+                    row[lane] += v;
+                }
             }
         }
         return x;

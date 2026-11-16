@@ -132,6 +132,7 @@ internal sealed record EntailStmt(RefExpr Target, Expr? Value, IReadOnlyList<Con
 internal sealed record EmitStmt(string? Text, RefExpr Lane, int Line) : Stmt(Line);
 internal sealed record MaskStmt(bool Allow, IReadOnlyList<string> Texts, RefExpr Lane, int Line) : Stmt(Line);
 internal sealed record VoteStmt(string Text, Expr Value, int Line) : Stmt(Line);
+internal sealed record CarryStmt(RefExpr Target, RefExpr Source, int Line) : Stmt(Line);
 
 /// <summary>Recursive-descent parser for the statement forms of Entail.</summary>
 internal sealed class EntailParser
@@ -447,6 +448,19 @@ internal sealed class EntailParser
             var lane = Reference();
             EndOfLine();
             return new MaskStmt(only, texts, lane, line);
+        }
+
+        // carry DEST from SOURCE: DEST starts each token at SOURCE's final
+        // value after the previous token. A state may itself be called carry,
+        // so this is a carry statement only when a name follows.
+        if (IsWord("carry") && _tokens[_at + 1].Kind == Tok.Id)
+        {
+            _at++;
+            var target = Reference();
+            ExpectWord("from");
+            var carried = Reference();
+            EndOfLine();
+            return new CarryStmt(target, carried, line);
         }
 
         if (AcceptWord("vote"))

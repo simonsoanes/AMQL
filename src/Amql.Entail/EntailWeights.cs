@@ -702,6 +702,7 @@ public static class EntailWeights
     public static EntailBuildReport WriteFresh(EntailProgram p, string outDir, int context = 8192)
     {
         RefuseVotes(p);
+        RefuseCarries(p);
         if (p.Masks.Count > 0)
         {
             throw new EntailException("`only` and `forbid` narrow a host's predictions: graft this program instead");
@@ -924,6 +925,16 @@ public static class EntailWeights
         return root.ToJsonString();
     }
 
+    private static void RefuseCarries(EntailProgram p)
+    {
+        if (p.Carries.Count > 0)
+        {
+            throw new EntailException(
+                "this program carries lanes from token to token (`carry`), which a fixed-depth transformer cannot do: " +
+                "run it with `entail run`, or beside a model as a sparse adapter (`entail adapter`, without --dense)");
+        }
+    }
+
     private static void RefuseVotes(EntailProgram p)
     {
         if (p.Votes.Count > 0)
@@ -977,6 +988,7 @@ public static class EntailWeights
         double hostOutputNorm = DefaultHostOutputNorm)
     {
         RefuseVotes(p);
+        RefuseCarries(p);
         var t = hostFacts.Target;
         if (p.Ops.OfType<Head>().GroupBy(h => h.Layer).Any(g => g.Count() > t.ProgramHeads))
         {

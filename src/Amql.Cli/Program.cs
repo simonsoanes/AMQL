@@ -101,6 +101,8 @@ internal static partial class Program
                 "prune" => Prune(args[1..]),
                 "fine-tune" => FineTune(args[1..]),
                 "bake-predicate" => BakePredicate(args[1..]),
+                "lora-train" => LoraTrain(args[1..]),
+                "tool-trace" => ToolTrace(args[1..]),
                 "entail" => EntailCommand(args[1..]),
                 "classify" => Classify(args[1..]),
                 "tool-eval" => ToolEval.Run(args[1..], OptionValue, HasOption),
@@ -2744,6 +2746,8 @@ internal static partial class Program
                               [--approach provenance|corpus|random|star-elastic] [--seed 42]
                               [--text <corpus.txt>] [--sample 8192] [--min-layers 1]
                               [--min-intermediate 1]
+              amql-cli lora-train <container-dir> --data <train.jsonl> --out <lora-dir> [--eval <jsonl>] [--anchors <jsonl>] [--layers 23] [--rank 8] [--alpha 16] [--lr 2e-3] [--steps 60] [--grad-checks 2]
+              amql-cli tool-trace <container-dir> --cases <jsonl> --out <report.json>
               amql-cli fine-tune <container-dir> --data <pairs.tsv>
                               --out <patch.safetensors>
                               [--tokenizer <checkpoint-dir>] [--component target]
@@ -2757,6 +2761,7 @@ internal static partial class Program
               amql-cli entail eval <container-dir> --cases <cases.jsonl> [--adapter <dir>[,<dir>]] [--batch N] [--text <file>] [--report <json>] [--weights f32|disk]
               amql-cli entail find <container-dir> --subject <file> --out <dir> [--top 64] [--verify]
               amql-cli entail extract <container-dir> --subject <file> --out <dir>
+              amql-cli entail from-lora <container-dir> --lora <dir> --cases <jsonl> --out <file.entail.txt> [--occlude 3]
               amql-cli entail decompile <container-dir> --corpus <dir> --out <dir> [--contrast <file>] [--extra <file>] [--cover] [--only-holdout] [--units 4000] [--vote lift|share|bayes] [--from <study.bin>] [--no-columns]
               amql-cli entail fidelity <program.entail.txt> --holdout <file> [--lines 40]
               amql-cli entail optimise <dir> [--confidence 0.5]

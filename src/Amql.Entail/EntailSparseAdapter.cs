@@ -96,6 +96,14 @@ public sealed class EntailSparseAdapter : IEntailAdapter
                 x[lane] = value;
             }
         }
+        if (_position > 0)
+        {
+            var previous = _ring[(_position - 1) % _ring.Length];
+            foreach (var (from, to) in _plan.Carries)
+            {
+                x[to] += previous[from];
+            }
+        }
 
         // Every op in a stage sees the state before the stage, as a layer does.
         foreach (var stage in _plan.Stages)
@@ -225,7 +233,15 @@ public sealed class EntailSparseAdapter : IEntailAdapter
             }
             Stages = stages.ToArray();
             Window = p.Ops.OfType<Head>().Select(h => Math.Max(h.Offset, h.Pointer?.Max(x => x.Offset) ?? 0)).DefaultIfEmpty(0).Max();
+            Carries = p.Carries.ToArray();
+            // A carry reads the previous row, so the ring keeps at least one.
+            if (Carries.Length > 0)
+            {
+                Window = Math.Max(Window, 1);
+            }
         }
+
+        public (int From, int To)[] Carries { get; }
 
         public EntailAdapterManifest Manifest { get; }
 
@@ -237,6 +253,6 @@ public sealed class EntailSparseAdapter : IEntailAdapter
 
         public Stage[] Stages { get; }
 
-        public int Window { get; }
+        public int Window { get; private set; }
     }
 }

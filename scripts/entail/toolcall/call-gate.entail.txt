@@ -1,0 +1,249 @@
+program call_gate
+# Says <tool_call> on the reply's first token when the request touches a concept an
+# offered tool covers. A fold over the prompt: memory is one row, whatever its length.
+
+state im_start, is_sys, is_user, is_asst, think_end, blank
+token "<|im_start|>" means im_start = 1
+token "system" means is_sys = 1
+token "user" means is_user = 1
+token "assistant" means is_asst = 1
+token "</think>" means think_end = 1
+token "\n\n" means blank = 1
+
+state cw[7]
+# weather
+token " Weather" means cw[0] = 1
+token " weather" means cw[0] = 1
+token "Weather" means cw[0] = 1
+token "weather" means cw[0] = 1
+token " Forecast" means cw[0] = 1
+token " forecast" means cw[0] = 1
+token "Forecast" means cw[0] = 1
+token "forecast" means cw[0] = 1
+token " Temperature" means cw[0] = 1
+token " temperature" means cw[0] = 1
+token "Temperature" means cw[0] = 1
+token "temperature" means cw[0] = 1
+token " Rain" means cw[0] = 1
+token " rain" means cw[0] = 1
+token "Rain" means cw[0] = 1
+token "rain" means cw[0] = 1
+token " raining" means cw[0] = 1
+token " Snow" means cw[0] = 1
+token " snow" means cw[0] = 1
+token "Snow" means cw[0] = 1
+token "snow" means cw[0] = 1
+token " Sunny" means cw[0] = 1
+token " sunny" means cw[0] = 1
+token " Cold" means cw[0] = 1
+token " cold" means cw[0] = 1
+token "Cold" means cw[0] = 1
+token "cold" means cw[0] = 1
+token " Hot" means cw[0] = 1
+token " hot" means cw[0] = 1
+token "Hot" means cw[0] = 1
+token "hot" means cw[0] = 1
+token " Warm" means cw[0] = 1
+token " warm" means cw[0] = 1
+token "Warm" means cw[0] = 1
+token "warm" means cw[0] = 1
+token " Coat" means cw[0] = 1
+token " coat" means cw[0] = 1
+token "coat" means cw[0] = 1
+token " umbrella" means cw[0] = 1
+token " Jacket" means cw[0] = 1
+token " jacket" means cw[0] = 1
+token " picnic" means cw[0] = 1
+# timer
+token " Timer" means cw[1] = 1
+token " timer" means cw[1] = 1
+token "Timer" means cw[1] = 1
+token "timer" means cw[1] = 1
+token " Countdown" means cw[1] = 1
+token " countdown" means cw[1] = 1
+token " remind" means cw[1] = 1
+token " Reminder" means cw[1] = 1
+token " reminder" means cw[1] = 1
+token "Reminder" means cw[1] = 1
+token "reminder" means cw[1] = 1
+token " Alarm" means cw[1] = 1
+token " alarm" means cw[1] = 1
+token "Alarm" means cw[1] = 1
+token "alarm" means cw[1] = 1
+token " Minutes" means cw[1] = 1
+token " minutes" means cw[1] = 1
+token "Minutes" means cw[1] = 1
+token "minutes" means cw[1] = 1
+token " Minute" means cw[1] = 1
+token " minute" means cw[1] = 1
+token "Minute" means cw[1] = 1
+token "minute" means cw[1] = 1
+token " Seconds" means cw[1] = 1
+token " seconds" means cw[1] = 1
+token "Seconds" means cw[1] = 1
+token "seconds" means cw[1] = 1
+# money
+token " Currency" means cw[2] = 1
+token " currency" means cw[2] = 1
+token "Currency" means cw[2] = 1
+token "currency" means cw[2] = 1
+token " Convert" means cw[2] = 1
+token " convert" means cw[2] = 1
+token "Convert" means cw[2] = 1
+token "convert" means cw[2] = 1
+token " Money" means cw[2] = 1
+token " money" means cw[2] = 1
+token "Money" means cw[2] = 1
+token "money" means cw[2] = 1
+token " Euros" means cw[2] = 1
+token " euros" means cw[2] = 1
+token "euros" means cw[2] = 1
+token " Euro" means cw[2] = 1
+token " euro" means cw[2] = 1
+token "Euro" means cw[2] = 1
+token "euro" means cw[2] = 1
+token " Dollars" means cw[2] = 1
+token " dollars" means cw[2] = 1
+token " Dollar" means cw[2] = 1
+token " dollar" means cw[2] = 1
+token "Dollar" means cw[2] = 1
+token " pounds" means cw[2] = 1
+token " Yen" means cw[2] = 1
+token " yen" means cw[2] = 1
+token "yen" means cw[2] = 1
+token " owe" means cw[2] = 1
+token "owe" means cw[2] = 1
+token " Exchange" means cw[2] = 1
+token " exchange" means cw[2] = 1
+token "Exchange" means cw[2] = 1
+token "exchange" means cw[2] = 1
+# email
+token " Email" means cw[3] = 1
+token " email" means cw[3] = 1
+token "Email" means cw[3] = 1
+token "email" means cw[3] = 1
+token " Mail" means cw[3] = 1
+token " mail" means cw[3] = 1
+token "Mail" means cw[3] = 1
+token "mail" means cw[3] = 1
+token " recipient" means cw[3] = 1
+token "Recipient" means cw[3] = 1
+token "recipient" means cw[3] = 1
+token " Send" means cw[3] = 1
+token " send" means cw[3] = 1
+token "Send" means cw[3] = 1
+token "send" means cw[3] = 1
+token " Message" means cw[3] = 1
+token " message" means cw[3] = 1
+token "Message" means cw[3] = 1
+token "message" means cw[3] = 1
+# travel
+token " flights" means cw[4] = 1
+token " Flight" means cw[4] = 1
+token " flight" means cw[4] = 1
+token "Flight" means cw[4] = 1
+token "flight" means cw[4] = 1
+token " Fly" means cw[4] = 1
+token " fly" means cw[4] = 1
+token "Fly" means cw[4] = 1
+token "fly" means cw[4] = 1
+token " Flying" means cw[4] = 1
+token " flying" means cw[4] = 1
+token "Flying" means cw[4] = 1
+token " Travel" means cw[4] = 1
+token " travel" means cw[4] = 1
+token "Travel" means cw[4] = 1
+token "travel" means cw[4] = 1
+token " Trip" means cw[4] = 1
+token " trip" means cw[4] = 1
+token "Trip" means cw[4] = 1
+token "trip" means cw[4] = 1
+token " Airport" means cw[4] = 1
+token " airport" means cw[4] = 1
+token "Airport" means cw[4] = 1
+token "airport" means cw[4] = 1
+# order
+token " Order" means cw[5] = 1
+token " order" means cw[5] = 1
+token "Order" means cw[5] = 1
+token "order" means cw[5] = 1
+token " Orders" means cw[5] = 1
+token " orders" means cw[5] = 1
+token "Orders" means cw[5] = 1
+token "orders" means cw[5] = 1
+token " Cancel" means cw[5] = 1
+token " cancel" means cw[5] = 1
+token "Cancel" means cw[5] = 1
+token "cancel" means cw[5] = 1
+token " cancelling" means cw[5] = 1
+token " Address" means cw[5] = 1
+token " address" means cw[5] = 1
+token "Address" means cw[5] = 1
+token "address" means cw[5] = 1
+token " Delivery" means cw[5] = 1
+token " delivery" means cw[5] = 1
+token "Delivery" means cw[5] = 1
+token "delivery" means cw[5] = 1
+token " Status" means cw[5] = 1
+token " status" means cw[5] = 1
+token "Status" means cw[5] = 1
+token "status" means cw[5] = 1
+token " refund" means cw[5] = 1
+token "refund" means cw[5] = 1
+# account
+token " Account" means cw[6] = 1
+token " account" means cw[6] = 1
+token "Account" means cw[6] = 1
+token "account" means cw[6] = 1
+token " Delete" means cw[6] = 1
+token " delete" means cw[6] = 1
+token "Delete" means cw[6] = 1
+token "delete" means cw[6] = 1
+token " Verification" means cw[6] = 1
+token " verification" means cw[6] = 1
+token "Verification" means cw[6] = 1
+token "verification" means cw[6] = 1
+token " Verify" means cw[6] = 1
+token " verify" means cw[6] = 1
+token "Verify" means cw[6] = 1
+token "verify" means cw[6] = 1
+token " Code" means cw[6] = 1
+token " code" means cw[6] = 1
+token "Code" means cw[6] = 1
+token "code" means cw[6] = 1
+
+# Which turn this token is in, held until the next <|im_start|>.
+state after_start, prev_think
+carry after_start from im_start
+carry prev_think from think_end
+state role_sys, last_sys, role_user, last_user, role_asst, last_asst
+carry last_sys from role_sys
+carry last_user from role_user
+carry last_asst from role_asst
+entail role_sys = last_sys when not im_start
+entail role_sys when after_start, is_sys
+entail role_user = last_user when not im_start
+entail role_user when after_start, is_user
+entail role_asst = last_asst when not im_start
+entail role_asst when after_start, is_asst
+
+# Concepts offered (system turn) and asked (the latest user turn).
+state user_begins
+entail user_begins when after_start, is_user
+state offered[7], last_offered[7], asked[7], last_asked[7]
+for c in 0 to 6
+    carry last_offered[c] from offered[c]
+    carry last_asked[c] from asked[c]
+    entail offered[c] = last_offered[c]
+    entail offered[c] when role_sys, cw[c], not last_offered[c]
+    entail asked[c] = last_asked[c] when not user_begins
+    entail asked[c] when role_user, cw[c], not last_asked[c]
+end
+
+# The reply's first token: "\n\n" after </think>, in the assistant's turn.
+state hit, call
+for c in 0 to 6
+    entail hit when offered[c], asked[c]
+end
+entail call when blank, prev_think, role_asst, hit >= 1
+emit "<tool_call>" when call

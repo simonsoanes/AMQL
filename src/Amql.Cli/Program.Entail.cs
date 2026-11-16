@@ -30,6 +30,7 @@ internal static partial class Program
             "eval" => EntailEval(rest),
             "find" => EntailFind(rest),
             "decompile" => EntailDecompile(rest),
+            "from-lora" => EntailFromLora(rest),
             "fidelity" => EntailFidelity(rest),
             "extract" => EntailExtract(rest),
             "background" => EntailBackground(rest),
@@ -82,7 +83,8 @@ internal static partial class Program
         if (OptionValue(args, "--tokenizer") is { } dir)
         {
             var tokenizer = Tokenizer(dir);
-            split = text => tokenizer.EncodeToIds(text).Select(id => tokenizer.DecodeText(new List<int> { id }));
+            // Special tokens are kept: a program may read the chat template's markers.
+            split = text => tokenizer.EncodeToIds(text).Select(id => tokenizer.DecodeText(new List<int> { id }, skipSpecialTokens: false));
         }
 
         int limit = IntOption(args, "--max-tokens", 32);
@@ -112,7 +114,21 @@ internal static partial class Program
             return 0;
         }
 
-        var expression = OptionValue(args, "--expr") ?? throw new CliException("entail run requires '--expr \"12+34=\"' or '--cases <cases.jsonl>'");
+        // --file streams a text of any length through the program in fixed
+        // memory: the rows its heads can see back, nothing else.
+        if (OptionValue(args, "--file") is { } textPath)
+        {
+            var stream = new EntailStream(p);
+            var watch = System.Diagnostics.Stopwatch.StartNew();
+            string text = File.ReadAllText(textPath);
+            string answer = stream.Answer(split(text), limit);
+            Console.WriteLine($"read:   {text.Length:N0} characters, {stream.Position:N0} tokens in {watch.Elapsed.TotalSeconds:F1}s");
+            Console.WriteLine($"state:  {stream.Window} row(s) kept back, {stream.StateBytes:N0} bytes, whatever the length");
+            Console.WriteLine($"answer: {answer}");
+            return 0;
+        }
+
+        var expression = OptionValue(args, "--expr") ?? throw new CliException("entail run requires '--expr \"12+34=\"', '--file <text>' or '--cases <cases.jsonl>'");
         Console.WriteLine(expression + EntailInterpreter.Answer(p, split(expression), limit));
         return 0;
     }

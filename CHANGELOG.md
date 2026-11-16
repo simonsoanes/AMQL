@@ -8,6 +8,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- **feat:** `lora-train`, LoRA training in AMQL without an autograd engine, on FFN down-projections. The backward pass through the output head and final norm is exact, so the last layer's gradient is exact; earlier layers follow the direct residual path. Every run checks its gradient against finite differences at the first step and logs the result (`train.log.jsonl`), and also caches the frozen prefix, guards against loss spikes, stops early and supports self-anchors: unlabelled prompts the base model answers itself, kept as targets. Writes an `amql-lora-v1` adapter and a patch.
+- **feat:** `entail from-lora` writes a LoRA as Entail: one state per rank component, with the token pairs it fires on, its column read through the final norm and head as votes, and, by occlusion, which parts of the prompt the decision depends on.
+- **feat:** `tool-trace` traces a model's own tool call: attention over each tool's name and description, the request and the format instructions at the call, tool and argument decisions, and request-to-description similarity by layer.
+- **feat(entail):** `carry DEST from SOURCE`, a lane that starts each token with another lane's value from the token before, so a program can fold over a text of any length. Runs in the interpreter, the sparse adapter and the new `entail run --file`, which streams a file in fixed memory; compiled weights refuse it. `scan.entail.txt` answers from anywhere in an 8 MB text with 2,640 bytes of state.
+- **docs:** [entail-strategies.md](docs/entail-strategies.md), the tool-calling and long-context experiment on Qwen 3.5 0.8B.
+
+### Fixed
+
+- **fix(entail):** `entail run --tokenizer` dropped special tokens such as `<|im_start|>` when splitting a text, so no program could read a chat template's markers. Adapters were not affected.
+
 - **perf:** the device engine runs a Gated DeltaNet over a prompt in its chunked (WY) form. On Qwen 3.5 0.8B (RTX 5090) prefill goes from ~58,000 to ~64,000 tok/s at 512 and 2,000 tokens (+11%), and from ~30,000 to ~31,500 with `AMQL_GPU_PREFILL=f32`.
   - Chunks are 64 rows. One kernel builds every chunk's W, U, decayed keys and masked Q·Kᵀ at once, solving the chunk's triangular system in 16-row blocks.
   - A second kernel carries the state from chunk to chunk: two small products per chunk instead of a step per row. The next chunk's operands load (`cp.async`) while the current one computes.
