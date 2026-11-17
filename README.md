@@ -11,7 +11,7 @@ container, then probe token relationships, trace causal pathways, edit weights, 
 LoRA adapters, merge models, prune layers, and export back to a standard checkpoint.
 Built in C# against .NET 11.0 with an optional CUDA backend and a WPF desktop GUI.
 
-Credit for the VIndex3 design: [Chris Hay](https://github.com/chrishay).
+Credit for the VIndex3 design: [Chris Hay](https://github.com/chrishayuk).
 
 ## What is this for?
 
