@@ -42,8 +42,50 @@ internal static partial class Program
         bool progress = Environment.GetEnvironmentVariable("AMQL_PROGRESS") is "1" or "true";
         bool verbose = false;
         var filtered = new List<string>();
-        foreach (var a in args)
+        double? maxRamGb = null;
+        bool? fp4Prefill = null;
+        double? gpuMemoryGb = null;
+        for (int i = 0; i < args.Length; i++)
         {
+            string a = args[i];
+            if (a == "--fp4-prefill")
+            {
+                string? value = i + 1 < args.Length ? args[i + 1].ToLowerInvariant() : null;
+                if (value is not ("on" or "off"))
+                {
+                    Console.Error.WriteLine("error: --fp4-prefill needs on or off");
+                    return ExitUsage;
+                }
+                fp4Prefill = value == "on";
+                i++;
+                continue;
+            }
+            if (a == "--gpu-format")
+            {
+                string? format = i + 1 < args.Length ? args[i + 1].ToLowerInvariant() : null;
+                if (format is not ("nvfp4" or "fp16"))
+                {
+                    Console.Error.WriteLine("error: --gpu-format needs nvfp4 or fp16");
+                    return ExitUsage;
+                }
+                ComputeBudget.GpuWeightFormat = format == "nvfp4" ? GpuWeightFormat.Nvfp4 : GpuWeightFormat.Fp16;
+                i++;
+                continue;
+            }
+            if (a is "--max-ram" or "--gpu-memory")
+            {
+                if (i + 1 >= args.Length ||
+                    !double.TryParse(args[i + 1], System.Globalization.NumberStyles.Float,
+                        System.Globalization.CultureInfo.InvariantCulture, out double gb) || gb < 0 ||
+                    (a == "--max-ram" && gb == 0))
+                {
+                    Console.Error.WriteLine($"error: {a} needs a size in GiB, e.g. {a} 10");
+                    return ExitUsage;
+                }
+                if (a == "--max-ram") maxRamGb = gb; else gpuMemoryGb = gb;
+                i++;
+                continue;
+            }
             if (a == "--cpu") { forceCpu = true; continue; }
             if (a == "--gpu") { forceGpu = true; continue; }
             if (a == "--progress") { progress = true; continue; }
@@ -66,6 +108,25 @@ internal static partial class Program
             MergeGpu.ForceEnable();
         }
         // When neither flag is given, CudaShim auto-detects (the default).
+
+        // --max-ram / --gpu-memory size the lean working set, and asking for a
+        // RAM ceiling selects it unless a weight mode was chosen explicitly.
+        if (maxRamGb is { } ram)
+        {
+            ComputeBudget.LeanRamBytes = (long)(ram * (1L << 30));
+            if (Environment.GetEnvironmentVariable("AMQL_WEIGHTS") is null)
+            {
+                Environment.SetEnvironmentVariable("AMQL_WEIGHTS", "lean");
+            }
+        }
+        if (gpuMemoryGb is { } vram)
+        {
+            ComputeBudget.GpuMemoryBytes = (long)(vram * (1L << 30));
+        }
+        if (fp4Prefill is { } prefillOnTensorCores)
+        {
+            CudaShim.SetFp4Prefill(prefillOnTensorCores);
+        }
 
         args = filtered.ToArray();
         CliProgress.Configure(args[0], progress, verbose);
@@ -98,6 +159,9 @@ internal static partial class Program
                 "layers" => Layers(args[1..]),
                 "import" => Import(args[1..]),
                 "moe-ify" => MoeIfy(args[1..]),
+                "moe-eval" => MoeEval(args[1..]),
+                "moe-router" => MoeRouterCmd(args[1..]),
+                "moe-merge" => MoeMerge(args[1..]),
                 "prune" => Prune(args[1..]),
                 "fine-tune" => FineTune(args[1..]),
                 "bake-predicate" => BakePredicate(args[1..]),
@@ -734,8 +798,9 @@ internal static partial class Program
             "mxfp4" => WeightWorkingSet.Mxfp4,
             "fp4" => WeightWorkingSet.Mxfp4,
             "disk" => WeightWorkingSet.Disk,
+            "lean" => WeightWorkingSet.Lean,
             "" or null => null, // use env var default
-            _ => throw new CliException($"unknown weight mode '{weightMode}' — use f32, bf16, mxfp4 or disk"),
+            _ => throw new CliException($"unknown weight mode '{weightMode}' — use f32, bf16, mxfp4, disk or lean"),
         };
 
         using var container = Vindex3Container.Open(containerDir);
@@ -772,6 +837,10 @@ internal static partial class Program
         else if (workingSetEffective == WeightWorkingSet.Disk)
         {
             Console.WriteLine("weights:   disk (f32 widened from the container on use, CPU)");
+        }
+        else if (workingSetEffective == WeightWorkingSet.Lean)
+        {
+            Console.WriteLine($"weights:   lean (stored bits, routed experts on demand; {LeanTargets()})");
         }
         else
         {
@@ -830,6 +899,10 @@ internal static partial class Program
         var (prefill, steps2) = InferenceRunner.Generate(
             container, component, tokens, steps, config, showTopK, logprobsTopK, patch, genOpts, stopTokens, maxContextLength);
 
+        if (workingSetEffective == WeightWorkingSet.Lean)
+        {
+            Console.WriteLine($"memory:    {ProcessMemoryLine()}");
+        }
         string prefillText = tokenizer is null ? string.Empty : tokenizer.Decode(prefill);
         string mode = sampling ? "sampled" : "greedy";
         Console.WriteLine($"prefill [{string.Join(",", prefill)}] → position {prefill.Length} during [{mode}]" +
@@ -1380,6 +1453,11 @@ internal static partial class Program
         if (quant == "mxfp4")
         {
             Console.WriteLine("the MXFP4 checkpoint is a terminal artifact — the encoder reads full-precision dtypes; the Mxfp4 codec is the reference for consumer runtimes");
+        }
+        else if (archParam == Qwen4NextLayout.Arch)
+        {
+            Console.WriteLine("the qwen4_exp checkpoint loads in qwen4_exp runtimes (transformers, vLLM, llama.cpp qwen4exp) and encodes back into a container:");
+            Console.WriteLine($"  amql-cli encode {outDir} --out <new-container>");
         }
         else
         {
@@ -2657,7 +2735,7 @@ internal static partial class Program
             then run and inspect inference against it
 
             USAGE:
-              amql-cli [--cpu | --gpu] [--progress] [--verbose] <command> [args]
+              amql-cli [--cpu | --gpu] [--max-ram GB] [--gpu-memory GB] [--gpu-format nvfp4|fp16] [--fp4-prefill on|off] [--progress] [--verbose] <command> [args]
               amql-cli --version | -V
 
             Commands:
@@ -2742,11 +2820,19 @@ internal static partial class Program
               amql-cli moe-ify <container-dir> --out <moe-dir> --text <corpus.txt>
                               [--experts 8] [--top-k 2] [--sample 4096] [--eval 1024]
                               [--policy softmax|renormalise]
-              amql-cli prune <container-dir> --out <pruned-dir> --target-bytes <size>
+              amql-cli moe-eval <container-dir> --data <eval.jsonl> [--experts name=<lora-dir>,…]
+                              [--mix base,experts,average,sum,oracle] [--router name=<router>,…]
+                              [--top-k 0,1,2] [--report <json>]
+              amql-cli moe-router <container-dir> --experts name=<lora-dir>,… --data <route.jsonl>
+                              --out <router.safetensors> [--method loss|label] [--hold token|prompt]
+                              [--init <router>] [--steps 30] [--lr 1e-2] [--log <jsonl>]
+              amql-cli moe-merge <container-dir> --experts name=<lora-dir>,… --router <router>
+                              --out <moe-dir> [--top-k 0]
+              amql-cli prune<container-dir> --out <pruned-dir> --target-bytes <size>
                               [--approach provenance|corpus|random|star-elastic] [--seed 42]
                               [--text <corpus.txt>] [--sample 8192] [--min-layers 1]
                               [--min-intermediate 1]
-              amql-cli lora-train <container-dir> --data <train.jsonl> --out <lora-dir> [--eval <jsonl>] [--anchors <jsonl>] [--layers 23] [--rank 8] [--alpha 16] [--lr 2e-3] [--steps 60] [--grad-checks 2]
+              amql-cli lora-train <container-dir> --data <train.jsonl> --out <lora-dir> [--eval <jsonl>] [--anchors <jsonl>] [--layers 23] [--rank 8] [--alpha 16] [--lr 2e-3] [--steps 60] [--grad-checks 2] [--no-decode] [--batch 0] [--keep-best]
               amql-cli tool-trace <container-dir> --cases <jsonl> --out <report.json>
               amql-cli fine-tune <container-dir> --data <pairs.tsv>
                               --out <patch.safetensors>
@@ -2955,6 +3041,34 @@ internal static partial class Program
             weights on the device).  AMQL_GPU=0 is equivalent to --cpu;
             AMQL_GPU=1 is the same auto-probe as the default.  --cpu and
             --gpu take priority over the env var.
+            --max-ram GB runs with the lean working set (--weights lean,
+            AMQL_WEIGHTS=lean) and keeps the process near GB of RAM
+            (AMQL_MAX_RAM_GB; 10 by default): weights stay as their
+            stored bits, the embedding is read a row at a time, routed
+            experts are read only when the router picks them, and dense
+            weights then the hottest experts are cached in what the
+            target leaves. A head too large to cache is used a block of
+            rows at a time. Logits are bit-identical to --weights f32 on
+            the CPU. --gpu-memory GB (AMQL_GPU_MEMORY_GB) caps how much
+            of the GPU the lean set fills with FP16 copies of the large
+            dense matrices; by default it takes the free memory less
+            1 GiB, and 0 keeps every weight on the host. With the GPU in
+            use, 2 GiB of the RAM target is set aside for the CUDA
+            runtime's own host memory.
+            Quantised checkpoints (NVIDIA ModelOpt NVFP4 / MXFP8 / FP8,
+            FP8 block scales, MXFP4) encode as stored, each weight with
+            its scale tensors, and run decoded through them; the lean set
+            holds them at their stored size. NVFP4 and MXFP8 weights go
+            to the GPU as stored (0.56 and 1.03 bytes an element), routed
+            experts included, which then share the device in least-recently-used
+            order. --gpu-format nvfp4 (AMQL_GPU_FORMAT) also quantises
+            other weights to NVFP4 on their way to the GPU (lossy);
+            the default, fp16, keeps them exact.
+            Prefill products with NVFP4 weights run on the FP4 tensor
+            cores, quantising the activations to NVFP4 as well (W4A4,
+            what NVFP4 checkpoints are trained for); decode keeps FP32
+            activations. --fp4-prefill off (AMQL_FP4_PREFILL=0) decodes
+            FP16 tiles of the weight against FP16 activations instead.
             --progress turns on the machine-readable protocol (also via
             AMQL_PROGRESS=1): one JSON object per line on stdout, prefixed
             '##amql-progress ' for phase/done/total/percent updates and

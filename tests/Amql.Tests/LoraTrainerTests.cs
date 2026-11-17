@@ -54,6 +54,24 @@ public class LoraTrainerTests
     }
 
     [Fact]
+    public void Minibatches_With_Keep_Best_Return_The_Best_Evaluated_Adapter()
+    {
+        using var dir = new TempDir();
+        using var container = Vindex3Container.Open(WriteContainer(dir));
+        var train = Enumerable.Range(0, 6).Select(i => new LoraExample($"t{i}", new[] { 1, 2, 3 + i % 3 }, new[] { 7, 9, 7 })).ToArray();
+        var eval = new[] { new LoraExample("e", new[] { 1, 2, 4 }, new[] { 9, 7, 9 }) };
+        var log = new List<JsonElement>();
+        var report = LoraTrainer.Train(container, "target", train, eval,
+            new LoraTrainOptions { Steps = 40, Rank = 4, LearningRate = 3e-2, GradChecks = 0, EvalEvery = 5, BatchSize = 2, KeepBest = true, Decode = false, TargetLoss = 0 },
+            entry => log.Add(JsonSerializer.SerializeToElement(entry)));
+        var evals = log.Where(e => e.GetProperty("kind").GetString() == "eval" && e.GetProperty("set").GetString() == "eval")
+            .Select(e => e.GetProperty("loss").GetDouble()).ToList();
+        Assert.Equal(9, evals.Count); // step 0, then every 5 steps
+        Assert.Equal(evals.Skip(1).Min(), report.EvalAfter.Average(c => c.Loss), 9);
+        Assert.Equal(40, log.Count(e => e.GetProperty("kind").GetString() == "step"));
+    }
+
+    [Fact]
     public void Training_Fits_One_Example()
     {
         var (report, _) = Train(new LoraTrainOptions { Steps = 200, Rank = 4, LearningRate = 1e-2, GradChecks = 0, EvalEvery = 50 });

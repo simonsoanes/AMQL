@@ -144,8 +144,8 @@ internal sealed class DraftContext : IDisposable
 
         var dense = new GenericRuntime(_densePlan, _store);
         var finalNorm = BitPattern.WidenToF32(
-            _store.Resolve(_densePlan.FinalNorm.Weight.ObjectId, _densePlan.FinalNorm.Weight.TensorName).Dtype,
-            _store.Resolve(_densePlan.FinalNorm.Weight.ObjectId, _densePlan.FinalNorm.Weight.TensorName).Payload);
+            _store.Resolve(_densePlan.RequireFinalNorm("MTP drafting").Weight.ObjectId, _densePlan.RequireFinalNorm("MTP drafting").Weight.TensorName).Dtype,
+            _store.Resolve(_densePlan.RequireFinalNorm("MTP drafting").Weight.ObjectId, _densePlan.RequireFinalNorm("MTP drafting").Weight.TensorName).Payload);
         var table = dense.Weights.Matrix(
             _densePlan.Embedding!.Table, _densePlan.Embedding.VocabSize, _densePlan.Embedding.HiddenSize);
 
@@ -156,8 +156,8 @@ internal sealed class DraftContext : IDisposable
             {
                 var n = (float[])h.Data.Clone();
                 var view = new Tensor2D(n, h.Rows, h.Cols);
-                Norms.ApplyInPlace(view, _densePlan.FinalNorm.Kind, _densePlan.FinalNorm.Eps,
-                    finalNorm, _densePlan.FinalNorm.WeightOffset);
+                Norms.ApplyInPlace(view, _densePlan.RequireFinalNorm("MTP drafting").Kind, _densePlan.RequireFinalNorm("MTP drafting").Eps,
+                    finalNorm, _densePlan.RequireFinalNorm("MTP drafting").WeightOffset);
                 Array.Copy(n, 0, _normed, t * hidden, hidden);
                 var embedRow = TensorOps.GatherRows(table, new[] { tokens[t + 1] });
                 Array.Copy(embedRow.Data, 0, _embeddings, t * hidden, hidden);
@@ -168,8 +168,8 @@ internal sealed class DraftContext : IDisposable
         // layer, rebound onto mtp.stack; the shared embedding/head remain.
         var trunkPlan = GenerateMtp.BuildTrunkPlan(_container, containerDir, _densePlan, trunk, hidden);
         _trunkPlan = trunkPlan;
-        _eps = _densePlan.FinalNorm.Eps;
-        _weightOffset = _densePlan.FinalNorm.WeightOffset;
+        _eps = _densePlan.RequireFinalNorm("MTP drafting").Eps;
+        _weightOffset = _densePlan.RequireFinalNorm("MTP drafting").WeightOffset;
         var preFc = _store.Resolve("mtp.stack", "pre_fc_norm_hidden.weight");
         _preFcNorm = BitPattern.WidenToF32(preFc.Dtype, preFc.Payload);
     }

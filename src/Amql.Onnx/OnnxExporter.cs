@@ -147,7 +147,7 @@ public static class OnnxExporter
                 x = Residual(x, f);
             }
         }
-        x = g.Norm(x, plan.FinalNorm);
+        x = g.Norm(x, plan.RequireFinalNorm("ONNX export"));
 
         // ── output ──────────────────────────────────────────────────────
         if (isClassifier)

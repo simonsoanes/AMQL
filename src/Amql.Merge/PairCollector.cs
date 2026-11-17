@@ -71,7 +71,7 @@ public static class PairCollector
         // materialised — a carried mtp.stack has no tensors to probe), else
         // the model's final norm (what generate-mtp would copy).
         float[] preFcWeight;
-        float[] finalNormWeight = Widen(store, plan.FinalNorm.Weight);
+        float[] finalNormWeight = Widen(store, plan.RequireFinalNorm("fine-tuning").Weight);
         using (var mtp = container.CreateOperandStore())
         {
             bool moduleMaterialised = container.Graph?.Objects
@@ -100,14 +100,14 @@ public static class PairCollector
             if (t < nFit)
             {
                 var n = (float[])h.Data.Clone();
-                Norms.ApplyInPlace(new Tensor2D(n, 1, hidden), plan.FinalNorm.Kind,
-                    plan.FinalNorm.Eps, finalNormWeight, plan.FinalNorm.WeightOffset);
+                Norms.ApplyInPlace(new Tensor2D(n, 1, hidden), plan.RequireFinalNorm("fine-tuning").Kind,
+                    plan.RequireFinalNorm("fine-tuning").Eps, finalNormWeight, plan.RequireFinalNorm("fine-tuning").WeightOffset);
                 var halfH = (float[])n.Clone();
-                Norms.ApplyInPlace(new Tensor2D(halfH, 1, hidden), plan.FinalNorm.Kind,
-                    plan.FinalNorm.Eps, preFcWeight, plan.FinalNorm.WeightOffset);
+                Norms.ApplyInPlace(new Tensor2D(halfH, 1, hidden), plan.RequireFinalNorm("fine-tuning").Kind,
+                    plan.RequireFinalNorm("fine-tuning").Eps, preFcWeight, plan.RequireFinalNorm("fine-tuning").WeightOffset);
                 var halfE = (float[])TensorOps.GatherRows(table, new[] { tokens[t + 1] }).Data.Clone();
-                Norms.ApplyInPlace(new Tensor2D(halfE, 1, hidden), plan.FinalNorm.Kind,
-                    plan.FinalNorm.Eps, preFcWeight, plan.FinalNorm.WeightOffset);
+                Norms.ApplyInPlace(new Tensor2D(halfE, 1, hidden), plan.RequireFinalNorm("fine-tuning").Kind,
+                    plan.RequireFinalNorm("fine-tuning").Eps, preFcWeight, plan.RequireFinalNorm("fine-tuning").WeightOffset);
                 sink.WriteInput(halfH, halfE);
             }
         }

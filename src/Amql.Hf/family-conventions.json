@@ -21,6 +21,8 @@
   "qwen3_5_moe": { "norm_weight_offset": 1 },
   "qwen3_5_moe_text": { "norm_weight_offset": 1 },
   "qwen3_next": { "norm_weight_offset": 1 },
+  "qwen4_exp": { "norm_weight_offset": 1 },
+  "qwen4_exp_text": { "norm_weight_offset": 1 },
   "cohere": { "rope_interleaved": true },
   "cohere2": { "rope_interleaved": true },
   "glm": { "rope_interleaved": true },

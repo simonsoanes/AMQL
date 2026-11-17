@@ -1,8 +1,110 @@
 # Exporting AMQL Containers to the Qwen3.8-Flash-Next Inference Format
 
-**Status:** Design proposal
+**Status:** Phase A implemented and corrected against the published qwen4_exp contract; qwen4_exp imports and runs on the managed path (2026-11-17, see §0)
 **Author:** AMQL / Ariadne
 **Date:** 2026-09-22
+
+## 0. Status update (2026-11-17): the confirmed qwen4_exp contract
+
+Qwen4-Max (blog, 2026-11) confirmed that the Qwen4 series is this architecture: GDN + Qwen Sparse
+Attention (3:1), **Gated Residual** (four residual branches with dynamic read/write gates) and an
+**N-gram Embedding** at the second layer. The open preview is Qwen3.8-Flash-Next (`qwen4_exp`).
+The smaller open Qwen4 models (e.g. a 27B) are announced as the "same lineage" but are not yet
+published, so whether a 27B is MoE or dense is **unconfirmed**.
+
+The contract is pinned to the merged transformers `models/qwen4_exp`, llama.cpp
+`conversion/qwen4exp.py` and the published Flash-Next `config.json` and safetensors index.
+`--arch qwen4-next` now writes an **exact** rewrite: the exported model computes the source
+function. These Phase-A placeholders were wrong and are fixed:
+
+| Was | Now |
+|---|---|
+| `attn_hc.*` / `mlp_hc.*` | `attn_hyper_connection.*` / `mlp_hyper_connection.*` (checkpoint names) |
+| layer and final norms written but ignored (qwen4_exp has none), so dropped | folded into `hc_norm` = 2·(offset + w) − 1, because the read gate is sigmoid(0) = ½ with zero mix projections |
+| no QSA indexer (attention construction fails) | zero `self_attn.indexer.*`; `indexer_budget` = 2048 × ratio ≥ context, so every token is selected |
+| `output_gate_type: sigmoid` | `silu` (Qwen3.5's GDN z-gate; Flash-Next itself ships sigmoid) |
+| dense source: `num_experts: 0` (fails validation) | MLP becomes routed expert 0 (fused `experts.gate_up_proj`/`down_proj`) under a zero router |
+| no `shared_expert_gate` | zero gate, plus a zero shared expert when the source has none |
+
+A source without a gated attention output, without QK norm, or with post or sandwich norms is
+refused by name. PLE stays off (`ple_layer_ids: []`). The identities were checked against the
+upstream code.
+
+### 0.1 Import and run (2026-11-17)
+
+AMQL now **imports and runs** qwen4_exp on the managed (CPU) path; the device engine refuses it by
+name. The pieces, each transcribed from transformers' `modeling_qwen4_exp.py`:
+
+| Piece | Container | Runtime |
+|---|---|---|
+| Gated Residual | `ExecutionSurface.HyperConnections` (streams, lowrank); per-layer `attn_/mlp_hyper_connection.*`; the final-norm object holds `hyper_connection_mixer.*` | the residual is `streams × hidden` wide from the embedding on; `ComponentOpPlan.FinalMixer` replaces `FinalNorm` (null) |
+| QSA | `ExecutionSurface.SparseAttention`; per-layer `self_attn.indexer.*` | the indexer's raw keys are cached per layer; each complete block is pooled, normalised and rotated once; a row with more complete blocks than `budget / ratio` attends to its top blocks plus the tail, otherwise to every key (the dense kernel, exactly) |
+| n-gram embedding (PLE) | `ExecutionSurface.NgramEmbedding` (layers, hash geometry, eos, shard count); the shards stay separate tensors | hashed ids (`NgramHashing`) pick rows that are read straight from whichever shard holds them (`OperandStore.ReadRowsWidened`); the token history and the dilated conv's history carry across steps |
+| GDN gate | `linear_attention.gate_activation` | `sigmoid` where `output_gate_type` says so (Flash-Next) |
+| packed experts | split per expert on import (`FusedTensor.LeadingShape`) | ordinary routed experts; export packs them back |
+
+Import refuses a checkpoint whose shard rows do not add up to the table the config's hash heads
+need, or whose saved hash buffers (`layer_multipliers`, `ngram_heads_vocab_sizes`,
+`ngram_heads_offsets`) are not the ones its config derives. QSA layers are accepted under all three
+spellings: `full_attention` (the checkpoint), `qwen_sparse_attention` (transformers 5.16) and
+`indexed_attention` (the first release).
+
+**Verified:** `fixtures/arch-zoo/qwen4_exp-tiny` was made by transformers 5.16.1's own qwen4_exp, with
+PLE on, a 4-token QSA budget over 20 tokens and Flash-Next's sigmoid gate. Prefilled or decoded
+token by token, AMQL matches its logits within 2e-3. Run densely, the fixture moves by 2.4, and
+without PLE by 3.3, so both are exercised. A Qwen3.5 model exported with `--arch qwen4-next`
+re-imports and matches the source's transformers logits. **Not yet tried:** the real Flash-Next
+checkpoint (≈360 GB). Decode is CPU-bound until the device engine learns the three operators.
+
+### 0.2 Running it in under 10 GB (2026-11-17)
+
+`--max-ram 10` (the lean working set) is how the real checkpoint is meant to run:
+
+```bash
+amql-cli --max-ram 10 generate <flash-next-container> --prompt "..." --steps 32
+```
+
+What it holds, from the published geometry (48 layers, hidden 2560, 512 experts with 10 routed
+and 1 shared):
+
+| Part | Size | Lean set |
+|---|---|---|
+| n-gram table | ~51B params | rows read per token, never held |
+| embedding | ~1.3 GB | rows read per token |
+| routed experts | ~121B params; 9.8 MB each in BF16, 2.8 MB as NVFP4 (gate + up + down, 640 wide on a 2560 hidden) | read when picked: ≤ 480 a token, ~4.7 GB in BF16 or ~1.3 GB as NVFP4; the most recently used are cached in what the dense weights leave |
+| dense weights (GDN, QSA, shared experts, routers, gated residual) | ~3B params: ~6 GB in BF16, ~3 GB as the NVFP4 checkpoint's MXFP8 | cached on the host, or the large ones on the GPU as FP16 |
+| head | ~1.3 GB | cached, on the GPU, or used a block of rows at a time |
+
+#### The NVFP4 checkpoint
+
+NVIDIA's [Qwen3.8-Flash-Next-NVFP4-QAD](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4-QAD)
+(130 GB, ModelOpt `MIXED_PRECISION`) mixes formats by role. Its config gives the real geometry:
+hidden 2560, 48 layers, 512 experts of width 640 (10 routed and 1 shared), 24 heads and 2 KV heads
+of 256, and a GDN with 16 K and 48 V heads of 128.
+
+| Tensors | Stored as | In AMQL |
+|---|---|---|
+| routed and shared experts | NVFP4: `weight` U8 [out, in/2], `weight_scale` E4M3 [out, in/16], `weight_scale_2` F32, `input_scale` F32 | FP4 [out, in] plus its scales; host 0.75 B/element, GPU 0.56 B/element as packs; `input_scale` is carried and unused, since activations stay full precision |
+| attention, GDN, indexer projections | MXFP8: `weight` E4M3, `weight_scale` U8 E8M0 [out, in/32] | held as stored on the host and on the GPU (1.03 B/element), decoded in registers |
+| n-gram table (128 shards) | E4M3, one BF16 `weight_scale` [1] shared by the shards | rows read and decoded per token |
+| MTP experts | E4M3 with `weight_scale_inv` BF16 per 128×128 block | decoded through the block grid |
+| embedding, head, routers, gated residual, norms | BF16 | as before |
+
+Prefill products with NVFP4 weights run on the FP4 tensor cores, with the activations quantised to
+NVFP4 on the device (W4A4, as the checkpoint was trained). The checkpoint's static `input_scale`
+is not used: each call takes its own absolute maximum. Decode keeps FP32 activations.
+`--fp4-prefill off` gives W4A16 prefill through FP16 tiles instead.
+
+A routed expert is 3 × 640 × 2560 elements: 2.8 MB on the GPU as NVFP4, against 9.8 MB in BF16.
+On a 32 GB card the dense weights (about 2.7B elements, 2.8 GB as stored MXFP8, plus the 1.3 GB
+head) leave roughly 24 GB, enough for about 8,500 of the 24,576 experts at a time. A decode step
+reads about 1.3 GB of experts, against 4.7 GB in BF16.
+
+With the default 10 GiB target the weight cache gets 7.5 GiB (5.5 GiB with the GPU in use, which
+sets 2 GiB aside for the CUDA runtime). Expert reads come from the container's memory map, so the
+OS page cache serves repeats without counting against the process. Decode speed is then set by
+how many picked experts miss the cache and by disk throughput.
+
 
 ## 1. Purpose
 
@@ -289,7 +391,7 @@ Flash-Next-tensor-name table — the inverse of `encode`'s source-binding rebuil
 | MoE shared expert | `model.layers.N.mlp.shared_expert.{gate,up,down}_proj.weight` (ckpt prefix confirmed as `mlp.shared_expert`) |
 | Final norm | `model.norm.weight` |
 | Output head (untied) | `lm_head.weight`; tied → skipped (reuses embed) |
-| **Per-layer HyperConnection modules (new)** | `model.layers.N.{attn_hc,mlp_hc}.{hc_norm.weight,input_mix_weight_down.weight,input_mix_weight_up.weight,block_inject_weight.weight}` |
+| **Per-layer HyperConnection modules (new)** | `model.layers.N.{attn_hyper_connection,mlp_hyper_connection}.{hc_norm.weight,input_mix_weight_down.weight,input_mix_weight_up.weight,block_inject_weight.weight}` |
 | **Final HyperConnection mixer (new)** | `model.hyper_connection_mixer.{hc_norm.weight,input_mix_weight_down.weight,input_mix_weight_up.weight}` |
 | **PLE / n-gram block (new)** | `model.layers.{L}.ple.*` — see §5.4 |
 | MTP drafter | `mtp.embed_tokens.weight`, `mtp.fc_embedding.weight`, `mtp.fc_hidden.weight`, `mtp.layers.{i}.*`, `mtp.hyper_connection_mixer.*` (+ shared `lm_head`) |

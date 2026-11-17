@@ -500,7 +500,9 @@ public static class GatedDeltaKernel
     /// width <c>headVDim</c> (positions × heads flattened):
     /// <c>x̂ × weight × silu(z)</c>. The weight applies directly — no
     /// 1+w offset — unlike the layer norms.</summary>
-    public static Tensor2D GatedRMSNorm(Tensor2D x, Tensor2D z, float[] weight, double eps)
+    /// <para>Qwen4 can gate with a sigmoid instead (<c>output_gate_type</c>):
+    /// <c>x̂ × weight × sigmoid(z)</c>.</para>
+    public static Tensor2D GatedRMSNorm(Tensor2D x, Tensor2D z, float[] weight, double eps, bool sigmoidGate = false)
     {
         int rows = x.Rows;
         int width = x.Cols;
@@ -517,7 +519,9 @@ public static class GatedDeltaKernel
             double inv = 1.0 / Math.Sqrt(sumSquares / width + eps);
             for (int i = 0; i < width; i++)
             {
-                output[r * width + i] = (float)(xData[r * width + i] * inv * weight[i] * Silu(zData[r * width + i]));
+                float zi = zData[r * width + i];
+                float gate = sigmoidGate ? 1f / (1f + MathF.Exp(-zi)) : Silu(zi);
+                output[r * width + i] = (float)(xData[r * width + i] * inv * weight[i] * gate);
             }
         }
         // Rows are independent; the pool only changes which thread runs each.

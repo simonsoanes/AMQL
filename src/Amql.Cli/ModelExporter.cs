@@ -71,8 +71,11 @@ public static class ModelExporter
         IReadOnlyList<string>? layerTypes = null;
         if (isQwen4Next)
         {
+            // The qwen4_exp config needs facts the payload rewrite settles
+            // (shared-expert width, architecture); it is built after the
+            // rewrite below, still before anything is written.
             layerTypes = Qwen4NextLayout.BuildLayerTypes(container);
-            configJson = Qwen4NextLayout.BuildConfigJson(container, quantizeMxfp4, layerTypes);
+            configJson = string.Empty;
         }
         else if (isModernBert)
         {
@@ -232,37 +235,25 @@ public static class ModelExporter
             }
         });
 
-        // ── Flash-Next placeholder tensors (HC, shared expert) ────────
-        // Emitted as zero-initialised so the checkpoint is structurally
-        // loadable.  HC streams are identity-initialised (mix averages
-        // streams, combine injects 1:1); the shared expert duplicates the
-        // first routed expert when one is present.
+        // ── qwen4_exp rewrite (Gated Residual, QSA indexer, MoE) ──────
+        // An exact rewrite: the exported model computes the source function.
         if (isQwen4Next)
         {
-            int placeholders = 0;
-            foreach (var (name, shape, dtype) in Qwen4NextLayout.PlaceholderTensors(container))
+            var stack = graph.Objects.FirstOrDefault(o => o.Component == primaryId && o.Kind == ObjectKind.DecoderStack);
+            if (stack is null || !objectPrefixes.TryGetValue(stack.Id, out var qwen4StackPrefix))
             {
-                if (names.ContainsKey(name))
-                {
-                    continue; // a real tensor already occupies this name
-                }
-                byte[] zeroBytes = Qwen4NextLayout.ZeroPayload(shape, dtype);
-                payloads.Add(new TensorPayload
-                {
-                    Name = name,
-                    Dtype = dtype,
-                    Shape = shape,
-                    Data = zeroBytes,
-                });
-                names[name] = "(placeholder)";
-                placeholders++;
+                throw new CliException("qwen4_exp export needs a materialised decoder stack");
             }
-            if (placeholders > 0)
+            var facts = Qwen4NextLayout.Rewrite(container, layerTypes!, qwen4StackPrefix, payloads, names, quantized > 0);
+            configJson = Qwen4NextLayout.BuildConfigJson(container, quantizeMxfp4, layerTypes!, facts);
+            notes.Add($"qwen4_exp: {facts.FoldedNorms} layer/final norms folded into Gated Residual hc_norm " +
+                      $"(2*gain - 1, read gate 1/2), {facts.Placeholders} zero tensors (mix/inject projections, " +
+                      "QSA indexers, routers and shared experts as needed) — exact: streams stay identical, " +
+                      "inject = 1, QSA budget covers the context so attention stays dense");
+            if (facts.DenseAsSingleExpert)
             {
-                notes.Add($"{placeholders} Flash-Next placeholder tensors emitted as zeros " +
-                          "(HyperConnection streams, shared expert) — " +
-                          "the checkpoint is structurally loadable; HC identity init means " +
-                          "the model passes the residual through unchanged");
+                notes.Add("qwen4_exp: the dense MLP is routed expert 0 under a zero router " +
+                          $"(softmax over one logit = 1), plus a zero shared expert of width {facts.SharedExpertWidth}");
             }
         }
 
@@ -587,6 +578,28 @@ public static class ModelExporter
     private static byte[] ExportTensor(string objectId, SegmentFile segment, SegmentTensor tensor, WeightPatch? patch)
     {
         var dtype = DtypeExtensions.FromLabel(tensor.Dtype);
+        if (dtype is Dtype.I64 or Dtype.I32 or Dtype.I16 or Dtype.U8 or Dtype.BOOL)
+        {
+            // Integer buffers (Qwen4's n-gram hash constants) are not weights:
+            // carried verbatim, and never patched.
+            if (patch is not null && patch.TryGet(objectId, tensor.Name, out _))
+            {
+                throw new CliException($"'{objectId}/{tensor.Name}' is an {tensor.Dtype} buffer — a weight patch cannot apply to it");
+            }
+            return segment.ReadBytes(tensor.Name);
+        }
+        if (dtype is Dtype.FP4 or Dtype.F8_E4M3 or Dtype.F8_E5M2 or Dtype.F8_E8M0)
+        {
+            // A quantised checkpoint's elements and scales go back as they
+            // came; re-quantising a patched weight would need its scales
+            // chosen again, which export does not do.
+            if (patch is not null && patch.TryGet(objectId, tensor.Name, out _))
+            {
+                throw new CliException(
+                    $"'{objectId}/{tensor.Name}' is stored {tensor.Dtype} with block scales — export does not re-quantise a patched weight");
+            }
+            return segment.ReadBytes(tensor.Name);
+        }
         return EncodeToDtype(dtype, WidenedValues(segment, objectId, tensor, patch));
     }
 
@@ -629,11 +642,16 @@ public static class ModelExporter
             return new TensorPayload { Name = name, Dtype = dtype, Shape = tensor.Shape, Chunks = chunks };
         }
 
+        // FP4 is two elements a byte, which safetensors can only call U8 at
+        // half the columns, as the quantised checkpoint did.
+        var (exportDtype, exportShape) = dtype == Dtype.FP4 && tensor.Shape.Length == 2
+            ? (Dtype.U8, new[] { tensor.Shape[0], tensor.Shape[1] / 2 })
+            : (dtype, tensor.Shape);
         return new TensorPayload
         {
             Name = name,
-            Dtype = dtype,
-            Shape = tensor.Shape,
+            Dtype = exportDtype,
+            Shape = exportShape,
             Data = ExportTensor(objectId, segment, tensor, patch),
         };
     }

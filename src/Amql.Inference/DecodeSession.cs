@@ -45,9 +45,9 @@ public sealed class DecodeSession : IDisposable
         {
             throw new InvalidOperationException("sessions can only share weights on the CPU");
         }
-        if (_runtime.Weights.WorkingSet is not (WeightWorkingSet.ResidentF32 or WeightWorkingSet.Disk))
+        if (_runtime.Weights.WorkingSet is not (WeightWorkingSet.ResidentF32 or WeightWorkingSet.Disk or WeightWorkingSet.Lean))
         {
-            throw new InvalidOperationException("sessions can only share resident f32 or disk weights");
+            throw new InvalidOperationException("sessions can only share resident f32, disk or lean weights");
         }
         if (LastLogits is null)
         {

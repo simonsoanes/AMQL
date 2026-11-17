@@ -86,7 +86,7 @@ public sealed class GpuEngine : IDisposable
             _hasEmbedScale = embedOp.Scale is not null;
             _embedScale = (float)(embedOp.Scale ?? 1.0);
             _head = Matrix(weights, plan.Output.Projection, plan.Output.VocabSize, plan.Output.HiddenSize);
-            (_finalNormW, _finalNormB, _finalNormOff, _finalNormEps, _finalNormKind) = Norm(weights, plan.FinalNorm);
+            (_finalNormW, _finalNormB, _finalNormOff, _finalNormEps, _finalNormKind) = Norm(weights, plan.RequireFinalNorm("the GPU engine"));
 
             _layers = new LayerDevice[plan.Layers.Count];
             int projWidth = _hidden, qWidth = 1, ctxWidth = 1, convWidth = 1, gdnWidth = 1, ffnWidth = 1, keyWidth = 1, vHeads = 1;
@@ -238,6 +238,21 @@ public sealed class GpuEngine : IDisposable
         if (plan.Diffusion is not null)
         {
             return "masked diffusion";
+        }
+        if (plan.FinalMixer is not null)
+        {
+            return "Qwen4 gated residual";
+        }
+        foreach (var layer in plan.Layers)
+        {
+            if (layer.Ngram is not null || layer.Attention?.Indexer is not null)
+            {
+                return "Qwen4 QSA / n-gram embedding";
+            }
+            if (layer.LinearAttention is { SigmoidGate: true })
+            {
+                return "sigmoid-gated linear attention";
+            }
         }
         if (plan.Embedding is not { } embed || plan.Output is null)
         {

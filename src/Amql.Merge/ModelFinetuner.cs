@@ -87,7 +87,7 @@ public static class ModelFinetuner
 
         // ── one runtime for the whole session (keeps weight cache warm) ─
         var rt = new GenericRuntime(plan, store, basePatch);
-        var finalNormW = store.ResolveWidened(plan.FinalNorm.Weight).Values;
+        var finalNormW = store.ResolveWidened(plan.RequireFinalNorm("fine-tuning").Weight).Values;
 
         for (int epoch = 0; epoch < epochs; epoch++)
         {
@@ -113,8 +113,8 @@ public static class ModelFinetuner
                     }
 
                     var hNorm = hidden.Clone();
-                    Norms.ApplyInPlace(hNorm, plan.FinalNorm.Kind, plan.FinalNorm.Eps,
-                        finalNormW, plan.FinalNorm.WeightOffset);
+                    Norms.ApplyInPlace(hNorm, plan.RequireFinalNorm("fine-tuning").Kind, plan.RequireFinalNorm("fine-tuning").Eps,
+                        finalNormW, plan.RequireFinalNorm("fine-tuning").WeightOffset);
 
                     var row = hNorm.Row(hNorm.Rows - 1);
                     int baseOffset = targetId * hiddenSize;

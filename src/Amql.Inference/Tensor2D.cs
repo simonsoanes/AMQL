@@ -9,6 +9,7 @@ public sealed class Tensor2D
 {
     private float[]? _data;
     private ushort[]? _bf16;
+    private ScaledMatrix? _scaled;
 
     /// <summary>The values as f32, row-major. A tensor built over BF16 bits
     /// (<see cref="FromBf16"/>) widens them here on first access — exact, BF16
@@ -16,6 +17,11 @@ public sealed class Tensor2D
     /// tensor: <see cref="Bf16Bits"/> turns null so the kernels read it too,
     /// and an in-place edit through it is seen by every later operation.</summary>
     public float[] Data => _data ?? Materialize();
+
+    /// <summary>For a weight that lives on the GPU only (the lean working
+    /// set): reads the host values again when a kernel needs them, which only
+    /// happens when the device GEMM is not used. Null for an ordinary tensor.</summary>
+    private Func<Tensor2D>? _reload;
 
     /// <summary>The BF16 bit patterns this tensor is held as, while
     /// <see cref="Data"/> has not been touched; null otherwise. The GEMV
@@ -25,13 +31,53 @@ public sealed class Tensor2D
     {
         get
         {
+            if (_reload is not null && _bf16 is null && _scaled is null && Volatile.Read(ref _data) is null)
+            {
+                Reload();
+            }
             var bits = _bf16;
             return Volatile.Read(ref _data) is null ? bits : null;
         }
     }
 
+    /// <summary>The low-precision elements and block scales this tensor is held
+    /// as (a quantised checkpoint's weight, kept at its stored size), while
+    /// <see cref="Data"/> has not been touched; null otherwise. Products with
+    /// it decode a row block at a time (<see cref="TensorOps.MatMulTransposedB"/>).</summary>
+    public ScaledMatrix? Scaled
+    {
+        get
+        {
+            if (_reload is not null && _bf16 is null && _scaled is null && Volatile.Read(ref _data) is null)
+            {
+                Reload();
+            }
+            return Volatile.Read(ref _data) is null ? _scaled : null;
+        }
+    }
+
     public int Rows { get; }
     public int Cols { get; }
+
+    /// <summary>When non-zero, this weight is on the GPU as NVFP4 packs
+    /// (elements, E4M3 block scales) with <see cref="DeviceNvfp4Global"/> as
+    /// its tensor scale, and products with it run on the device.</summary>
+    public IntPtr DeviceNvfp4 { get; set; }
+
+    /// <summary>The tensor scale that goes with <see cref="DeviceNvfp4"/>.</summary>
+    public float DeviceNvfp4Global { get; set; } = 1f;
+
+    /// <summary>When non-zero, this weight is on the GPU as MXFP8 (E4M3
+    /// elements, E8M0 block exponents), as the checkpoint stored it.</summary>
+    public IntPtr DeviceMxfp8 { get; set; }
+
+    /// <summary>Whether this weight lives on the GPU with no host copy kept
+    /// (the lean working set's device weights), or as packs only the device
+    /// multiplies (NVFP4, MXFP8): either way its products belong on the device.</summary>
+    public bool DeviceFirst => (_reload is not null && OnGpu) || DeviceNvfp4 != IntPtr.Zero || DeviceMxfp8 != IntPtr.Zero;
+
+    /// <summary>Whether a device copy of this weight exists, in any format.</summary>
+    public bool OnGpu => DeviceWeightF16 != IntPtr.Zero || DeviceNvfp4 != IntPtr.Zero || DeviceMxfp8 != IntPtr.Zero;
 
     /// <summary>When non-zero, a device-resident FP16 copy of this tensor
     /// (a weight the MXFP4 working set uploaded once) exists and
@@ -61,11 +107,97 @@ public sealed class Tensor2D
         Cols = cols;
     }
 
+    private Tensor2D(int rows, int cols, IntPtr device, Func<Tensor2D> reload)
+    {
+        Rows = rows;
+        Cols = cols;
+        DeviceWeightF16 = device;
+        _reload = reload;
+    }
+
+    private Tensor2D(ScaledMatrix scaled)
+    {
+        _scaled = scaled;
+        Rows = scaled.Rows;
+        Cols = scaled.Cols;
+    }
+
+    /// <summary>A tensor held as low-precision elements and block scales
+    /// (see <see cref="Scaled"/>).</summary>
+    public static Tensor2D FromScaled(ScaledMatrix scaled) => new(scaled);
+
+    /// <summary>A weight held on the GPU as NVFP4 packs only, read back from
+    /// <paramref name="reload"/> if a kernel needs it on the host.</summary>
+    public static Tensor2D OnDeviceNvfp4(int rows, int cols, IntPtr device, float global, Func<Tensor2D> reload) =>
+        new(rows, cols, IntPtr.Zero, reload) { DeviceNvfp4 = device, DeviceNvfp4Global = global };
+
+    /// <summary>A weight held on the GPU as MXFP8 only.</summary>
+    public static Tensor2D OnDeviceMxfp8(int rows, int cols, IntPtr device, Func<Tensor2D> reload) =>
+        new(rows, cols, IntPtr.Zero, reload) { DeviceMxfp8 = device };
+
+    /// <summary>Scaled tensors whose values had to be widened whole, because
+    /// something read <see cref="Data"/> rather than multiplying.</summary>
+    public static long ScaledWidenings => Interlocked.Read(ref _scaledWidenings);
+    private static long _scaledWidenings;
+
+    /// <summary>A weight held on the GPU only: <see cref="DeviceWeightF16"/> is
+    /// set and nothing is kept on the host. A kernel that needs the host values
+    /// after all (the device GEMM failed, or the product is too small for it)
+    /// gets them from <paramref name="reload"/>, once; <see cref="HostReloads"/>
+    /// counts how often that happens.</summary>
+    public static Tensor2D OnDevice(int rows, int cols, IntPtr device, Func<Tensor2D> reload) =>
+        new(rows, cols, device, reload);
+
+    /// <summary>Host copies <see cref="OnDevice"/> tensors have had to read back.</summary>
+    public static long HostReloads => Interlocked.Read(ref _hostReloads);
+    private static long _hostReloads;
+
+    private void Reload()
+    {
+        lock (_reload!)
+        {
+            if (_bf16 is not null || _data is not null || _scaled is not null)
+            {
+                return;
+            }
+            var host = _reload();
+            Interlocked.Increment(ref _hostReloads);
+            if (host.Bf16Bits is { } bits)
+            {
+                _bf16 = bits;
+            }
+            else if (host.Scaled is { } scaled)
+            {
+                _scaled = scaled;
+            }
+            else
+            {
+                Volatile.Write(ref _data, host.Data);
+            }
+        }
+    }
+
     /// <summary>A tensor held as BF16 bit patterns (see <see cref="Bf16Bits"/>).</summary>
     public static Tensor2D FromBf16(ushort[] bits, int rows, int cols) => new(bits, rows, cols);
 
     private float[] Materialize()
     {
+        if (_reload is not null && _bf16 is null && _scaled is null)
+        {
+            Reload();
+            if (_data is { } loaded)
+            {
+                return loaded;
+            }
+        }
+        if (_scaled is { } scaled)
+        {
+            var values = scaled.Dequant();
+            Interlocked.Increment(ref _scaledWidenings);
+            var won = Interlocked.CompareExchange(ref _data, values, null) ?? values;
+            _scaled = null;
+            return won;
+        }
         var bits = _bf16!;
         var widened = GC.AllocateUninitializedArray<float>(bits.Length);
         BitPattern.WidenInto(Dtype.BF16,
@@ -79,6 +211,11 @@ public sealed class Tensor2D
     /// widening the whole tensor (an embedding lookup over a BF16 table).</summary>
     public void CopyRowTo(int row, Span<float> target)
     {
+        if (Scaled is { } scaled)
+        {
+            scaled.DequantRow(row, target);
+            return;
+        }
         var bits = Bf16Bits;
         if (bits is null)
         {
@@ -100,9 +237,11 @@ public sealed class Tensor2D
 
     public Span<float> Row(int row) => Data.AsSpan(row * Cols, Cols);
 
-    public Tensor2D Clone() => Bf16Bits is { } bits
-        ? FromBf16((ushort[])bits.Clone(), Rows, Cols)
-        : new((float[])Data.Clone(), Rows, Cols);
+    public Tensor2D Clone() => Scaled is { } scaled
+        ? FromScaled(scaled) // immutable: shared
+        : Bf16Bits is { } bits
+            ? FromBf16((ushort[])bits.Clone(), Rows, Cols)
+            : new((float[])Data.Clone(), Rows, Cols);
 
     /// <summary>First row (used for single-row outputs like logits).</summary>
     public ReadOnlySpan<float> FirstRow() => Row(0);
@@ -129,7 +268,7 @@ public static class TensorOps
     /// <summary>The CUDA dispatch floor: below this many
     /// multiply-accumulates the GEMM stays on the managed path (launch
     /// and copy-back would dominate the work).</summary>
-    private const long CudaMinimumMacs = 8L << 20; // 8M MACs
+    internal const long CudaMinimumMacs = 8L << 20; // 8M MACs
 
     /// <summary>Activation rows per GEMM tile (see <see cref="MatMulTransposedBCpu"/>):
     /// one micro-kernel's height. Four rows of activation sit in L1 while a
@@ -252,10 +391,24 @@ public static class TensorOps
         // to amortise the launch, run it on the device. Any failure falls
         // through to the managed kernels below — the device is never a
         // correctness dependency.
+        if (w.DeviceNvfp4 != IntPtr.Zero &&
+            CudaShim.TryGemmNvfp4(x.Data, m, k, w.DeviceNvfp4, n, w.DeviceNvfp4Global, out var fp4Result))
+        {
+            return new Tensor2D(fp4Result!, m, n);
+        }
+        if (w.DeviceMxfp8 != IntPtr.Zero &&
+            CudaShim.TryGemmMxfp8(x.Data, m, k, w.DeviceMxfp8, n, out var fp8Result))
+        {
+            return new Tensor2D(fp8Result!, m, n);
+        }
         if (w.DeviceWeightF16 != IntPtr.Zero && macs >= CudaMinimumMacs &&
             CudaShim.TryGemmTransposedB(x.Data, m, k, w.DeviceWeightF16, n, out var gpuResult))
         {
             return new Tensor2D(gpuResult!, m, n);
+        }
+        if (w.Scaled is { } scaled)
+        {
+            return ScaledProduct(x, scaled);
         }
 
         return MatMulTransposedBCpu(x, new[] { w })[0];
@@ -272,13 +425,40 @@ public static class TensorOps
     /// </summary>
     public static Tensor2D[] MatMulTransposedBMany(Tensor2D x, params Tensor2D[] weights)
     {
+        // Weights that belong on the device (see Tensor2D.DeviceFirst) share
+        // one upload of x and one download of their products; any others (the
+        // linear attention's small a/b projections stay on the host) run here.
+        if (weights.Length > 1 && CudaShim.Enabled)
+        {
+            var onDevice = Enumerable.Range(0, weights.Length)
+                .Where(i => weights[i].DeviceFirst && weights[i].Cols == x.Cols).ToArray();
+            if (onDevice.Length > 1 &&
+                CudaShim.TryMulti(x.Data, x.Rows, x.Cols, onDevice.Select(i => weights[i]).ToArray(), out var shared))
+            {
+                var results = new Tensor2D[weights.Length];
+                for (int j = 0; j < onDevice.Length; j++)
+                {
+                    results[onDevice[j]] = shared![j];
+                }
+                var rest = Enumerable.Range(0, weights.Length).Where(i => results[i] is null).ToArray();
+                if (rest.Length > 0)
+                {
+                    var hostResults = MatMulTransposedBMany(x, rest.Select(i => weights[i]).ToArray());
+                    for (int j = 0; j < rest.Length; j++)
+                    {
+                        results[rest[j]] = hostResults[j];
+                    }
+                }
+                return results;
+            }
+        }
         foreach (var w in weights)
         {
             if (x.Cols != w.Cols)
             {
                 throw new ArgumentException($"shape mismatch: x {x.Rows}x{x.Cols}, weight {w.Rows}x{w.Cols} (weight rows are output)");
             }
-            if (w.DeviceWeightF16 != IntPtr.Zero)
+            if (w.OnGpu || w.Scaled is not null)
             {
                 var single = new Tensor2D[weights.Length];
                 for (int i = 0; i < weights.Length; i++)
@@ -289,6 +469,32 @@ public static class TensorOps
             }
         }
         return MatMulTransposedBCpu(x, weights);
+    }
+
+    [ThreadStatic] private static Dictionary<int, float[]>? _scaledScratch;
+
+    /// <summary>
+    /// x times a scaled weight's transpose: the weight is decoded into a
+    /// reusable f32 scratch matrix and multiplied by the ordinary kernel, so
+    /// the product is exactly the one with the weight widened up front, while
+    /// only the stored size stays held between products.
+    /// </summary>
+    private static Tensor2D ScaledProduct(Tensor2D x, ScaledMatrix w)
+    {
+        int length = checked(w.Rows * w.Cols);
+        var scratch = _scaledScratch ??= new Dictionary<int, float[]>();
+        if (!scratch.TryGetValue(length, out var values))
+        {
+            values = GC.AllocateUninitializedArray<float>(length);
+            // Keep the decoded buffers of the few shapes a model has, up to
+            // 256 MiB a thread; a larger one is used once and dropped.
+            if (scratch.Values.Sum(v => (long)v.Length) + length <= (64L << 20))
+            {
+                scratch[length] = values;
+            }
+        }
+        w.DequantRows(0, w.Rows, values);
+        return MatMulTransposedBCpu(x, new[] { new Tensor2D(values, w.Rows, w.Cols) })[0];
     }
 
     /// <summary>The managed GEMV/GEMM over one or more weights (see

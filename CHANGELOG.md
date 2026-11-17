@@ -18,9 +18,77 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **feat:** `entail eval --watch TOKEN` records a token's probability on the reply's first row (and the prior's, when one is measured), plus the five likeliest tokens there. `--prefix TEXT` forces the reply's opening, and `--logprobs` records each reply token's probability.
 - **feat:** `lora-train` can run with CUDA on. The LoRA is now its own f32 low-rank path beside the frozen down-projection (`GenericRuntime.FfnAdapter`), not a delta added into the weight. So the managed path's device GEMMs and f16 weight copies never go stale and never round the update away. A 4-step run on Qwen 3.5 0.8B gives the same losses on CPU and GPU (0.2362 → 0.0044), with gradient checks within 0.14%. It is not yet faster: attention, the Gated DeltaNet and the head backward stay on the CPU. The next step is the device engine exposing an FFN-input capture and an FFN add, the seam this change defines.
 - **feat:** `make_real_cases.py` (decision points from recorded multi-turn tool conversations), `make_need_cases.py` (a held-out omission set), `variants.py` (prompt variants), `score_real.py`, `watch_auc.py` and `draft_features.py`.
+- **docs:** [moe-bar.md](docs/moe-bar.md), BAR on Qwen 3.5 0.8B with four topic experts. Routing closes 89–97% of the gap between the base and per-topic oracle experts; weight averaging closes 58% and task arithmetic is worse than the base. The merged container matches the bench, and a new topic expert can be added by warm-starting the router.
+- **feat:** branch-adapt-route ([BAR](https://allenai.org/blog/bar)) over topic LoRAs (`BranchRoute.cs`). The experts are LoRAs, each trained on one topic, and the base FFN is kept as a frozen anchor expert beside them. A linear router per layer picks the mix. Three commands:
+  - `moe-eval` scores mixes per topic: the base, each expert alone, weight averaging, task arithmetic, an oracle and trained routers at chosen top-k values. Given no experts, it scores a container as it is.
+  - `moe-router` trains a router with everything else frozen. `--method loss` follows BAR and trains on the LM loss; `--method label` is a logistic regression on the topic labels. `--hold token` routes each row; `--hold prompt` holds the prompt's mean routing through the reply. `--init` warm-starts from an existing router, keeping rows by expert name and starting new experts at zero, which is BAR's add-a-topic upgrade.
+  - `moe-merge` writes anchor + experts + router as one routed container (`{model}-bar{n}x{k}`), with each expert's down-projection materialised as base + ΔW. Layers without a router keep their dense FFN. `BranchRouteTests` checks that the merged container matches the bench at top-k 0, 1 and 2, and checks the router gradient against finite differences.
+- **feat:** `lora-train --batch N` (minibatches, reshuffled each epoch), `--keep-best` (returns the adapter from the step with the lowest held-out loss) and `--no-decode` (loss-only evaluation).
+- **feat:** `scripts/moe/make_topic_sets.py` builds code, math, structured-output and chat sets with train, route and eval splits from the post-training data. `scripts/moe/run_bar.sh` runs the whole experiment.
+- **feat:** a legacy-layout MoE container can mix routed and dense layers: a layer with a dense `down_proj` and no router plans as dense.
+- **feat(gpu):** FFNs whose weights are on the GPU run there end to end (`amql_cuda_ffn`). Before, the managed path copied activations up and products down for every weight, and a routed expert paid that three times.
+  - **Routed layers:** in a routed layer, every expert held on the device joins one call per row chunk. The rows go up once. Each expert gathers its rows, multiplies gate and up, applies SiLU(gate)·up and multiplies down, all on the device, then adds its weighted rows into the sum, which comes down once. Experts not on the GPU run on the host as before, and their sum is added after. A dense or shared-expert FFN is the same call with one job.
+  - **Eviction:** experts fetched for the running layer are pinned against eviction until the next layer starts.
+  - **Small batches:** the in-register GEMV now takes up to 32 rows, 8 per pass, so the small batches an expert gets in prefill skip activation quantisation. Only larger batches go to the FP4 tensor cores.
+  - **Routing on the host:** the router's top-k is a linear selection, giving the same order as the stable sort it replaces. The per-slot output buffer is only made when some expert runs on the host.
+  - **Speed:** on a Flash-Next-sized layer (512 NVFP4 experts of 640 on a 2560 hidden, top-10, RTX 5090), the fused layer was 1.4–3.1 times faster than one product at a time across runs of 1 to 2048 rows. The measurements were noisy because a game was using the GPU at the time.
+  - **Shared-input projections:** products that share an input share its upload too (`amql_cuda_multi`). This covers attention's q/k/v and the linear attention's input projections, when their weights are held on the device (NVFP4, MXFP8 or lean device-only FP16). The input goes up once and every product comes down in one copy. Weights left on the host, such as the GDN's small `a`/`b` projections, run on the host beside them. `Shared_Input_Products_Share_One_Upload` checks a mixed NVFP4, MXFP8 and host set.
+  - **Off switch:** `AMQL_FUSED_FFN=0` turns both the fusion and the shared uploads off.
+  - **Tests:** `Fused_Ffn_Matches_The_Host_And_Moves_Activations_Once` checks routed and dense FFNs with NVFP4 gate/up and MXFP8 down, for decode, FP16-tile prefill and tensor-core prefill. Each runs in one call.
+- **feat(gpu):** prefill with NVFP4 weights runs on Blackwell's FP4 tensor cores.
+  - **How:** the activations are quantised to NVFP4 on the device, using ModelOpt's recipe with this call's absolute maximum and the hardware E2M1/E4M3 conversions. cuBLASLt then multiplies E2M1 by E2M1 with UE4M3 block scales (`CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3`) and FP32 accumulation. Both tensor scales fold into a device-side alpha, so nothing syncs. This is W4A4, the arithmetic NVFP4 checkpoints are trained for; decode and small batches (up to 32 rows) keep the FP32-activation GEMV.
+  - **Scale layout:** weight block scales now sit on the device in cuBLAS's tiled layout (128 rows × 4 blocks a tile) for both paths, adding up to 127 rows of padding a matrix.
+  - **Fallback:** a shape cuBLASLt declines falls back to the FP16 tiles, as does `--fp4-prefill off` (`AMQL_FP4_PREFILL=0`).
+  - **Speed:** device time per product on an RTX 5090 (`amql_cuda_nvfp4_bench`), FP16 tiles vs tensor cores:
+
+  | Matrix | 128 rows | 512 rows | 2048 rows |
+  |---|---|---|---|
+  | `q_proj` [12288 × 2560] | 0.20 → 0.04 ms | 0.35 → 0.05 ms | 0.84 → 0.16 ms (0.8 PFLOP/s) |
+  | `out_proj` [2560 × 6144] | 0.15 → 0.06 ms | 0.23 → 0.07 ms | 0.41 → 0.11 ms |
+  | expert gate [640 × 2560] | 0.10 → 0.07 ms | 0.12 → 0.06 ms | 0.13 → 0.07 ms |
+  | head-sized [248320 × 2560] | 4.4 → 0.37 ms | 8.8 → 0.65 ms | 27.6 → 2.5 ms (1.05 PFLOP/s) |
+
+  Small expert products gain least, because quantising the activations has a fixed cost of about 50 µs. End to end, the managed path's per-product copies of activations and outputs across PCIe still dominate. A 2048-row `q_proj` takes 10 ms with its copies against 0.16 ms on the device, so prefill will not see most of this until activations stay on the device.
+  - **Tests:** the products match a host W4A4 reference (the same activation quantisation, then the product) within 2e-3. `Prefill_Runs_On_The_Fp4_Tensor_Cores_At_Flash_Next_Shapes` checks the tensor cores are really used for experts. The lean GPU fixture run checks W4A16 against the golden; on that untrained tiny model, W4A4 moves the logits by about 1.1.
+- **feat(gpu):** MXFP8 weights (the NVFP4 Flash-Next checkpoint's attention, GDN and indexer projections) stay on the GPU as stored: E4M3 elements plus an E8M0 exponent per 32, 1.03 bytes an element against FP16's 2. A decode product is a warp-per-row GEMV that decodes with Blackwell's hardware E4M3 conversion (`cvt.rn.f16x2.e4m3x2`) and accumulates in FP32; a prefill product decodes exact FP16 tiles for cuBLAS. The NVFP4 kernels now use the hardware E2M1 conversion too: a table lookup indexed by the element serialised across the warp, and made the first MXFP8 GEMV 2.6 times slower than FP16. On an RTX 5090, single-row products (including the host round trip) take:
+
+  | Matrix | FP16 | MXFP8 | NVFP4 |
+  |---|---|---|---|
+  | `in_proj_qkv` [10240 × 2560] | 71 µs | 37 µs | 43 µs |
+  | `out_proj` [2560 × 6144] | 62 µs | 41 µs | 40 µs |
+  | `q_proj` [12288 × 2560] | 73 µs | 69 µs | 60 µs |
+
+  A 32-row prefill product is within about 25% of FP16 either way. `Mxfp8.Quantize` builds test weights. Device products match the host at Flash-Next's widths (2560, 6144) for 1 to 17 rows, and the GPU lean run of `qwen4_exp-nvfp4-tiny` puts its MXFP8 projections on the device and matches the golden logits.
+- **feat:** quantised checkpoints run as stored, and NVFP4 runs on the GPU at four bits. The target is the layout of NVIDIA's [Qwen3.8-Flash-Next-NVFP4-QAD](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4-QAD) (ModelOpt `MIXED_PRECISION`), whose weights come in several sizes:
+  - NVFP4 experts and shared experts: `U8 [out, in/2]`, an E4M3 `weight_scale` per 16 columns and an F32 `weight_scale_2`;
+  - MXFP8 attention, GDN and indexer projections: E4M3 with a U8 E8M0 `weight_scale` per 32 columns;
+  - an FP8 n-gram table whose shards share one BF16 scale;
+  - FP8 MTP experts with 128×128 `weight_scale_inv` blocks;
+  - BF16 for everything else.
+
+  Encode keeps each weight's bytes and scale tensors, recording NVFP4 weights as FP4 at their real shape. The operand store decodes any of these through its scales (`ScaledMatrix`), so every working set runs them. The lean set holds them at their stored size: NVFP4 at 0.75 bytes an element on the host, against 2 for BF16. NVFP4 weights go to the GPU as their packs (0.56 bytes an element). There, a decode product is a warp-per-row GEMV that decodes in registers and accumulates in FP32, and a prefill product decodes FP16 tiles for cuBLAS. Routed experts share the device budget in least-recently-used order, and dense weights may displace them. `--gpu-format nvfp4` also quantises BF16 or F32 weights to NVFP4 on their way to the GPU; it is lossy and off by default. Export writes quantised weights back as they came.
+
+  `fixtures/arch-zoo/qwen4_exp-nvfp4-tiny` (`make_qwen4_exp_nvfp4_tiny.py`) is the tiny Qwen4 quantised in that layout. Quantisation moves its logits by up to 2.05. AMQL matches transformers' logits for the dequantised model within 2e-3, and lean holds the experts as NVFP4 with logits bit-identical to the widened path. On the GPU (RTX 5090) the NVFP4 GEMV and GEMM match the host product, and experts rotating through a device budget too small to hold them all still match the golden logits. On `containers/moe/bar-moe` with `--max-ram 10 --gpu-format nvfp4`, the whole model sits on the GPU in 545 MiB. Decode goes from 18.7 to 38.5 tok/s and prefill from 67 to 148 tok/s, against FP16, where only the head fit on the device.
+- **feat:** the lean working set (`--weights lean`, or `--max-ram GB`, which selects it): runs a model holding close to the bare minimum, for checkpoints far larger than RAM such as Qwen3.8-Flash-Next.
+  - Weights stay as their stored bits (BF16 is never widened).
+  - The embedding is read a row at a time.
+  - A routed FFN reads only the experts its router picks. `FfnKernel.Routed` now routes every row first, then runs each picked expert once over the rows that chose it; every MoE model benefits.
+  - What is cached fits a RAM target (`AMQL_MAX_RAM_GB`, 10 GiB by default): dense weights first, then the most recently used experts.
+  - A head too large to cache is multiplied a block of rows at a time.
+  - Streamed experts' buffers are reused, and the heap is collected when it nears the target.
+  - With CUDA, the large dense matrices go to the GPU as FP16, up to `--gpu-memory GB` (by default the free memory less 1 GiB), and keep no host copy.
+
+  On the CPU, logits are bit-identical to `--weights f32` (`LeanWorkingSetTests`: Qwen4, Qwen3-MoE, OLMoE, Qwen3.5 GDN and Llama fixtures, with nothing, some or everything cached). On a 2.3 GB MoE container (24 layers, F32), `bench` peaks at 0.99 GiB private with `--max-ram 1` (3.4 tok/s decode) and 1.98 GiB with `--max-ram 2` (6.0 tok/s), against 2.5 GiB resident (22 tok/s). `bench` and `generate` report private memory, and `bench` also reports what the lean set cached and read.
+- **feat:** Qwen4 (transformers `qwen4_exp`, the Qwen3.8-Flash-Next layout) imports and runs on the managed path. It has three parts Qwen3.5 lacks:
+  - the Gated Residual: four residual streams with gated reads and writes in place of every norm, and a final mixer in place of the final norm;
+  - QSA: each softmax layer's indexer scores blocks of keys and keeps the best of them;
+  - the hashed n-gram embedding (PLE). Its ~51B-parameter table stays in its checkpoint shards and is read a row at a time (`OperandStore.ReadRowsWidened`), never loaded whole.
+
+  Packed experts (`mlp.experts.gate_up_proj`, `down_proj`) split into per-expert tensors on import and are packed back on export. Import checks the shard row counts, and the hash constants the checkpoint saves, against the config. `fixtures/arch-zoo/qwen4_exp-tiny` (from transformers' own `qwen4_exp`) is sized so QSA and the n-gram embedding each move its logits by over 2. It matches them within 2e-3, prefilled or decoded token by token. Not yet tried on the real 360 GB checkpoint. The device engine, GGUF and ONNX export refuse Qwen4 by name.
 
 ### Fixed
 
+- **fix:** `export --arch qwen4-next` wrote a layout no qwen4_exp runtime would load or compute correctly: the wrong tensor names, ignored norms, no QSA indexers, a SiLU/sigmoid mix-up and `num_experts: 0` for dense models. It is now an exact rewrite of a Qwen3.5-family model: norms folded into the gated residual, a dense MLP as one routed expert, and a QSA budget covering the context. The output encodes back and runs to the source model's logits.
 - **fix(gpu):** the device engine replayed a stale decode graph after a prefill grew the KV cache. A session that had decoded a short prompt, and was then reset and given a longer one (past 1,024, 2,048, … rows), failed its next step with CUDA status 700 or read freed memory. `GpuEngineTests.Engine_Recaptures_After_A_Prefill_Grows_The_Cache` covers it.
 - **fix(entail):** `entail run --tokenizer` dropped special tokens such as `<|im_start|>` when splitting a text, so no program could read a chat template's markers. Adapters were not affected.
 

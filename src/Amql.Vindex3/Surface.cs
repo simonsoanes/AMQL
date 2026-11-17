@@ -396,6 +396,101 @@ public sealed class OptionMarkerSurface
     public bool DigitSplit { get; init; }
 }
 
+// ── Qwen4 (qwen4_exp) operators ─────────────────────────────────────────────
+
+/// <summary>
+/// Gated Residual (hyper-connections, Qwen4): the residual stream is
+/// <see cref="Streams"/> parallel copies of the hidden state (width
+/// <c>Streams × hidden</c>). Each sub-block reads a gated mean of the streams
+/// and writes its output back into every stream with its own gate:
+/// <code>
+/// n      = grouped_rmsnorm(x)                       (per stream, 1+w)
+/// read   = mean_s( sigmoid(up(silu(down(n)/S))) ⊙ n )_s
+/// x'     = x + out ⊗ 2·sigmoid(inject(n)/S)
+/// </code>
+/// There are no layer norms: <c>hc_norm</c> is the only normalisation, and a
+/// final mixer (a read without the write) replaces the final norm. The
+/// per-layer tensors are <c>attn_hyper_connection.*</c> and
+/// <c>mlp_hyper_connection.*</c>; the final mixer is the final-norm object's
+/// <c>hc_norm.weight</c>, <c>input_mix_weight_down.weight</c> and
+/// <c>input_mix_weight_up.weight</c>.
+/// </summary>
+public sealed class HyperConnectionSurface
+{
+    public required int Streams { get; init; }
+    public required int Lowrank { get; init; }
+}
+
+/// <summary>
+/// QSA, Qwen's sparse attention: each softmax layer carries an indexer that
+/// picks which keys a query may attend to. Keys are pooled (mean) in blocks of
+/// <see cref="CompressRatio"/> consecutive visible tokens, normalised and
+/// rotated at the block's first position; a query scores every complete block
+/// by <c>Σ_heads relu(q_h·k_b) / sqrt(head_dim)</c> and keeps the top
+/// <c>Budget / CompressRatio</c> blocks plus the incomplete tail block. With
+/// no more complete blocks than that, every visible key is kept and the
+/// attention is exactly dense.
+/// <para>Tensors: <c>self_attn.indexer.index_qk_proj.weight</c>
+/// [(heads + kv_heads)·head_dim, hidden], <c>q_layernorm.weight</c> and
+/// <c>k_layernorm.weight</c> [head_dim] (1+w).</para>
+/// </summary>
+public sealed class SparseAttentionSurface
+{
+    public required int Heads { get; init; }
+    public required int KvHeads { get; init; }
+    public required int HeadDim { get; init; }
+
+    /// <summary>Tokens a query may select (<c>indexer_budget</c>).</summary>
+    public required int Budget { get; init; }
+
+    /// <summary>Tokens pooled into one key block (<c>indexer_compress_ratio</c>).</summary>
+    public required int CompressRatio { get; init; }
+
+    public int BlockTopK => Budget / CompressRatio;
+}
+
+/// <summary>
+/// Qwen4's per-layer n-gram embedding (PLE): hashed 2…N-gram ids look up a
+/// large table whose rows are projected into a value and one key per residual
+/// stream; the normalised streams gate the value, and a dilated depthwise conv
+/// adds local context. Applied before the layer's attention read on the
+/// (0-based) <see cref="Layers"/>.
+/// <para>The table is stored in <see cref="Shards"/> row-shards
+/// (<c>ple.ple_embedding.ngram_embedding.shard_i.weight</c>), concatenated in
+/// shard order along the rows. It is never materialised whole: a lookup reads
+/// the rows it needs from the shard that holds them.</para>
+/// </summary>
+public sealed class NgramEmbeddingSurface
+{
+    /// <summary>Decoder layers (0-based) that carry a PLE block.</summary>
+    public required IReadOnlyList<int> Layers { get; init; }
+
+    /// <summary>The largest n-gram (<c>ngram_size</c>); 2…N-grams are hashed.</summary>
+    public required int NgramSize { get; init; }
+
+    public required int HeadsPerNgram { get; init; }
+    public required long VocabSizeBase { get; init; }
+    public required int VocabSizeDivisor { get; init; }
+    public required long Seed { get; init; }
+
+    /// <summary>Width of one token's concatenated n-gram embedding.</summary>
+    public required int EmbedDim { get; init; }
+
+    public required int ConvKernel { get; init; }
+
+    /// <summary>The token that separates documents: an n-gram never reaches
+    /// back across it (and the history before the first token reads as it).</summary>
+    public required int EosTokenId { get; init; }
+
+    /// <summary>The unigram vocabulary the hash multipliers are bounded by.</summary>
+    public required int VocabSize { get; init; }
+
+    /// <summary>Row-shards the table is stored in; 1 is one unsharded tensor.</summary>
+    public required int Shards { get; init; }
+
+    public int NgramHeads => (NgramSize - 1) * HeadsPerNgram;
+}
+
 // ── The surface proper ─────────────────────────────────────────────────────
 
 /// <summary>
@@ -463,6 +558,19 @@ public sealed class ExecutionSurface
 
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public DiffusionSurface? Diffusion { get; init; }
+
+    /// <summary>Qwen4's Gated Residual: present means the residual stream is
+    /// several streams wide and the layers carry no norms of their own.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public HyperConnectionSurface? HyperConnections { get; init; }
+
+    /// <summary>QSA: every softmax layer selects its keys with an indexer.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public SparseAttentionSurface? SparseAttention { get; init; }
+
+    /// <summary>Qwen4's hashed n-gram embedding on selected layers.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public NgramEmbeddingSurface? NgramEmbedding { get; init; }
 
     /// <summary>Which stack tensor plays which role, judged on import (see
     /// <see cref="TensorRoles"/>). Absent on containers written before roles

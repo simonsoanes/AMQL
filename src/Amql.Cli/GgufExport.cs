@@ -109,7 +109,7 @@ public static class GgufExport
         writer.Kv(shape.NormKind == NormType.RmsNorm
                 ? $"{arch}.attention.layer_norm_rms_epsilon"
                 : $"{arch}.attention.layer_norm_epsilon",
-            GgufValue.Float32((float)plan.FinalNorm.Eps));
+            GgufValue.Float32((float)plan.RequireFinalNorm("GGUF export").Eps));
         writer.Kv($"{arch}.rope.freq_base", GgufValue.Float32((float)(ropeTheta.FirstOrDefault() is var t and > 0 ? t : 10_000.0)));
         writer.Kv($"{arch}.rope.dimension_count", GgufValue.Uint32((uint)first.HeadDim));
         writer.Kv($"{arch}.vocab_size", GgufValue.Uint32((uint)head.VocabSize));
@@ -168,8 +168,8 @@ public static class GgufExport
             Add(b + "ffn_up.weight", ffn?.Up);
             Add(b + "ffn_down.weight", ffn?.Down);
         }
-        Add("output_norm.weight", plan.FinalNorm.Weight);
-        Add("output_norm.bias", plan.FinalNorm.Bias);
+        Add("output_norm.weight", plan.RequireFinalNorm("GGUF export").Weight);
+        Add("output_norm.bias", plan.RequireFinalNorm("GGUF export").Bias);
         if (!plan.Output.ReusesEmbedding)
         {
             Add("output.weight", plan.Output.Projection);
@@ -255,8 +255,8 @@ public static class GgufExport
         }
         long context = surface.ContextLength ?? long.MaxValue;
         return new Shape(
-            NormKind: plan.FinalNorm.Kind,
-            NormOffset: plan.FinalNorm.WeightOffset,
+            NormKind: plan.RequireFinalNorm("GGUF export").Kind,
+            NormOffset: plan.RequireFinalNorm("GGUF export").WeightOffset,
             PreAttn: layers[0].PreAttentionNorm is not null,
             PreFfn: layers[0].PreFfnNorm is not null,
             PostAttn: layers[0].PostAttentionNorm is not null,
@@ -265,7 +265,7 @@ public static class GgufExport
             QkvBias: Any(l => l.Attention!.QBias is not null || l.Attention.KBias is not null || l.Attention.VBias is not null),
             OBias: Any(l => l.Attention!.OBias is not null),
             FfnBias: Any(l => l.Ffn?.Dense is { } d && (d.GateBias ?? d.UpBias ?? d.DownBias) is not null),
-            NormBias: plan.FinalNorm.Bias is not null || Any(l => l.PreAttentionNorm?.Bias is not null),
+            NormBias: plan.RequireFinalNorm("GGUF export").Bias is not null || Any(l => l.PreAttentionNorm?.Bias is not null),
             Gated: All(l => l.Ffn?.Dense?.Gate is not null),
             Activation: surface.Ffn!.Activation,
             Interleaved: attention.RopeInterleaved,

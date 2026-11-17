@@ -34,6 +34,19 @@ public sealed record LoraTrainOptions
     /// layer, at the first step. 0 turns them off.</summary>
     public int GradChecks { get; init; } = 2;
 
+    /// <summary>Examples per step, drawn without replacement and reshuffled each
+    /// epoch. 0 takes the whole set every step (the default, for tiny sets).</summary>
+    public int BatchSize { get; init; }
+
+    /// <summary>Return the adapter as it was at the evaluation with the lowest eval
+    /// loss, not as it ends: early stopping without having to guess the step.</summary>
+    public bool KeepBest { get; init; }
+
+    /// <summary>Greedy-decode each example at every evaluation, to check exact
+    /// reproduction. Off, evaluations report the loss alone, which is far cheaper
+    /// on long general-text completions where exactness is not the aim.</summary>
+    public bool Decode { get; init; } = true;
+
     public IReadOnlySet<int>? StopTokens { get; init; }
     public int ExtraDecodeTokens { get; init; } = 8;
 
@@ -130,7 +143,7 @@ public static class LoraTrainer
             throw new MergeException($"component '{componentId}' has no output head");
         if (output.LogitSoftcapping is not null)
             throw new MergeException("logit softcapping is not supported by the LoRA trainer's backward pass");
-        if (plan.FinalNorm.Kind != NormType.RmsNorm)
+        if (plan.RequireFinalNorm("LoRA training").Kind != NormType.RmsNorm)
             throw new MergeException("the LoRA trainer's backward pass needs an RMSNorm final norm");
 
         int n = plan.Layers.Count;
@@ -200,11 +213,36 @@ public static class LoraTrainer
             var evalCache = eval.Select(e => Prefix(rt, e, first)).ToList();
             log(new { kind = "prefix", layers = first, examples = train.Count + eval.Count, seconds = sw.Elapsed.TotalSeconds });
 
-            var trainBefore = Evaluate(session, train, trainCache, first, options);
+            int viewCount = options.BatchSize > 0 ? Math.Min(64, train.Count) : train.Count;
+            var trainBefore = Evaluate(session, train.Take(viewCount).ToList(), trainCache.Take(viewCount).ToList(), first, options);
             var evalBefore = Evaluate(session, eval, evalCache, first, options);
             LogEval(log, 0, "train", trainBefore);
             LogEval(log, 0, "eval", evalBefore);
 
+            // With minibatches the train set can be large; the train-side evaluation then
+            // reads its first 64 examples only.
+            var trainView = options.BatchSize > 0 ? train.Take(64).ToList() : train.ToList();
+            var trainViewCache = trainCache.Take(trainView.Count).ToList();
+            double bestEval = double.PositiveInfinity;
+            (int Step, List<(float[] A, float[] B)> Weights, List<LoraEvalCase> Train, List<LoraEvalCase> Eval)? best = null;
+            var order = Enumerable.Range(0, train.Count).ToArray();
+            int cursor = order.Length;
+            IEnumerable<int> NextBatch()
+            {
+                if (options.BatchSize <= 0 || options.BatchSize >= train.Count)
+                    return order.OrderBy(i => i).ToArray();
+                var batch = new int[options.BatchSize];
+                for (int b = 0; b < batch.Length; b++)
+                {
+                    if (cursor >= order.Length)
+                    {
+                        rng.Shuffle(order);
+                        cursor = 0;
+                    }
+                    batch[b] = order[cursor++];
+                }
+                return batch;
+            }
             var adamM = loras.Select(l => (A: new float[l.A.Length], B: new float[l.B.Length])).ToList();
             var adamV = loras.Select(l => (A: new float[l.A.Length], B: new float[l.B.Length])).ToList();
             double lr = options.LearningRate;
@@ -219,7 +257,7 @@ public static class LoraTrainer
                 double loss = 0;
                 double rowsTotal = 0;
                 var perExample = new List<double>();
-                for (int e = 0; e < train.Count; e++)
+                foreach (int e in NextBatch())
                 {
                     var (exLoss, rows) = LossAndGrad(rt, plan, train[e], trainCache[e], first, loras, grads, weights[e]);
                     loss += exLoss * weights[e];
@@ -236,7 +274,8 @@ public static class LoraTrainer
                     initialLoss = loss;
 
                 // A step that made things much worse is undone, and the rate halved.
-                if (!double.IsNaN(lastLoss) && loss > lastLoss * options.SpikeFactor && snapshot is not null)
+                // Minibatch losses vary batch to batch, so the spike guard is for full batches only.
+                if (options.BatchSize <= 0 && !double.IsNaN(lastLoss) && loss > lastLoss * options.SpikeFactor && snapshot is not null)
                 {
                     lr /= 2;
                     for (int i = 0; i < loras.Count; i++)
@@ -277,10 +316,15 @@ public static class LoraTrainer
                 bool evalNow = step % options.EvalEvery == 0 || step == options.Steps || loss < options.TargetLoss;
                 if (evalNow)
                 {
-                    trainAfter = Evaluate(session, train, trainCache, first, options);
+                    trainAfter = Evaluate(session, trainView, trainViewCache, first, options);
                     evalAfter = Evaluate(session, eval, evalCache, first, options);
                     LogEval(log, step, "train", trainAfter);
                     LogEval(log, step, "eval", evalAfter);
+                    if (options.KeepBest && evalAfter.Count > 0 && evalAfter.Average(c => c.Loss) < bestEval)
+                    {
+                        bestEval = evalAfter.Average(c => c.Loss);
+                        best = (step, loras.Select(l => (A: (float[])l.A.Clone(), B: (float[])l.B.Clone())).ToList(), trainAfter, evalAfter);
+                    }
                     if (loss < options.TargetLoss && trainAfter.All(c => c.Exact))
                     {
                         log(new { kind = "stop", step, reason = "target loss reached and every training example decodes exactly" });
@@ -289,6 +333,16 @@ public static class LoraTrainer
                 }
             }
             int stepsRun = Math.Min(step, options.Steps);
+            if (best is { } kept && kept.Step != stepsRun)
+            {
+                for (int i = 0; i < loras.Count; i++)
+                {
+                    Array.Copy(kept.Weights[i].A, loras[i].A, loras[i].A.Length);
+                    Array.Copy(kept.Weights[i].B, loras[i].B, loras[i].B.Length);
+                }
+                (trainAfter, evalAfter) = (kept.Train, kept.Eval);
+                log(new { kind = "best", step = kept.Step, evalLoss = bestEval, note = "the adapter is returned as it was at this step" });
+            }
             double finalLoss = trainAfter.Average(c => c.Loss);
             return new LoraTrainReport(loras, stepsRun, initialLoss, finalLoss, trainBefore, trainAfter, evalBefore, evalAfter, notes);
         }
@@ -312,7 +366,7 @@ public static class LoraTrainer
 
     /// <summary>The residual entering <paramref name="first"/> for every
     /// position of prompt + completion[..^1].</summary>
-    private static Tensor2D Prefix(GenericRuntime rt, LoraExample e, int first)
+    internal static Tensor2D Prefix(GenericRuntime rt, LoraExample e, int first)
     {
         var tokens = Tokens(e);
         rt.ResetKvCache();
@@ -324,13 +378,13 @@ public static class LoraTrainer
         return x;
     }
 
-    private static int[] Tokens(LoraExample e) => e.Prompt.Concat(e.Completion.Take(e.Completion.Length - 1)).ToArray();
+    internal static int[] Tokens(LoraExample e) => e.Prompt.Concat(e.Completion.Take(e.Completion.Length - 1)).ToArray();
 
-    private sealed record Upper(Tensor2D Final, Dictionary<int, Tensor2D> FfnInputs);
+    internal sealed record Upper(Tensor2D Final, Dictionary<int, Tensor2D> FfnInputs);
 
     /// <summary>Runs the layers from <paramref name="first"/> up and keeps, for
     /// the completion rows, the final residual and each LoRA layer's FFN input.</summary>
-    private static Upper RunUpper(GenericRuntime rt, LoraExample e, Tensor2D prefix, int first, ISet<int> capture)
+    internal static Upper RunUpper(GenericRuntime rt, LoraExample e, Tensor2D prefix, int first, ISet<int> capture)
     {
         int rowStart = e.Prompt.Length - 1, rows = e.Completion.Length;
         var inputs = new Dictionary<int, Tensor2D>();
@@ -362,7 +416,20 @@ public static class LoraTrainer
         int first, List<LoraLayer> loras, List<(float[] A, float[] B)>? grads, double weight = 1.0)
     {
         var upper = RunUpper(rt, e, prefix, first, loras.Select(l => l.Layer).ToHashSet());
-        var x = upper.Final; // pre-norm residual, rows × hidden
+        var (loss, dx) = HeadLossGrad(rt, plan, upper.Final, e.Completion, weight, grads is not null);
+        int rows = upper.Final.Rows, hidden = upper.Final.Cols;
+        if (dx is null)
+            return (loss, rows);
+        LoraGrads(rt, plan, upper, dx, rows, hidden, loras, grads!);
+        return (loss, rows);
+    }
+
+    /// <summary>Summed cross-entropy of <paramref name="targets"/> given the final
+    /// pre-norm residual rows, and (when <paramref name="wantGrad"/>) its gradient
+    /// on those rows, back through the head and the final RMSNorm exactly.</summary>
+    internal static (double Loss, float[]? Dx) HeadLossGrad(GenericRuntime rt, ComponentOpPlan plan, Tensor2D x,
+        int[] targets, double weight, bool wantGrad)
+    {
         int rows = x.Rows, hidden = x.Cols;
         var normed = x.Clone();
         var logits = rt.FinalNormAndHead(normed);
@@ -381,9 +448,9 @@ public static class LoraTrainer
             foreach (var v in row)
                 sum += Math.Exp(v - max);
             double logZ = max + Math.Log(sum);
-            int target = e.Completion[r];
+            int target = targets[r];
             loss += logZ - row[target];
-            if (grads is null)
+            if (!wantGrad)
                 continue;
             // dL/dlogit = p - onehot; probabilities below 1e-9 are dropped,
             // which keeps the head backward sparse at no measurable cost.
@@ -399,11 +466,11 @@ public static class LoraTrainer
                     d[h] += g * w[h];
             }
         }
-        if (grads is null)
-            return (loss, rows);
+        if (!wantGrad)
+            return (loss, null);
 
         // Back through the final RMSNorm: y = x·inv·w', inv = (mean x² + eps)^-½.
-        var norm = plan.FinalNorm;
+        var norm = plan.RequireFinalNorm("LoRA training");
         var nw = rt.Weights.Vector(norm.Weight, hidden);
         var dx = new float[rows * hidden];
         for (int r = 0; r < rows; r++)
@@ -423,6 +490,12 @@ public static class LoraTrainer
             }
         }
 
+        return (loss, dx);
+    }
+
+    private static void LoraGrads(GenericRuntime rt, ComponentOpPlan plan, Upper upper, float[] dx, int rows, int hidden,
+        List<LoraLayer> loras, List<(float[] A, float[] B)> grads)
+    {
         // Each LoRA layer reads the gradient on the residual it writes to: exact
         // for the last layer, the direct path for the rest.
         for (int i = 0; i < loras.Count; i++)
@@ -464,7 +537,6 @@ public static class LoraTrainer
                 }
             }
         }
-        return (loss, rows);
     }
 
     /// <summary>For each LoRA layer, compares the gradient's prediction along a
@@ -537,9 +609,11 @@ public static class LoraTrainer
         {
             var e = examples[i];
             var (loss, rows) = LossAndGrad(rt, rt.Plan, e, cache[i], first, new List<LoraLayer>(), null);
-            var output = Greedy(session, e.Prompt, e.Completion.Length + options.ExtraDecodeTokens, options.StopTokens);
-            int firstWrong = -1;
-            for (int t = 0; t < e.Completion.Length; t++)
+            var output = options.Decode
+                ? Greedy(session, e.Prompt, e.Completion.Length + options.ExtraDecodeTokens, options.StopTokens)
+                : Array.Empty<int>();
+            int firstWrong = options.Decode ? -1 : 0;
+            for (int t = 0; options.Decode && t < e.Completion.Length; t++)
             {
                 if (t >= output.Length || output[t] != e.Completion[t])
                 {
@@ -618,7 +692,7 @@ public static class LoraTrainer
         return up;
     }
 
-    private static void AdamStep(float[] p, float[] g, float[] m, float[] v, double lr, double clip,
+    internal static void AdamStep(float[] p, float[] g, float[] m, float[] v, double lr, double clip,
         double b1, double b2, double eps, double c1, double c2, double wd)
     {
         for (int i = 0; i < p.Length; i++)
@@ -631,7 +705,7 @@ public static class LoraTrainer
         }
     }
 
-    private static double SumSq(float[] a)
+    internal static double SumSq(float[] a)
     {
         double s = 0;
         foreach (var v in a)
@@ -645,7 +719,7 @@ public static class LoraTrainer
             a[i] = (float)(a[i] * s);
     }
 
-    private static Tensor2D Slice(Tensor2D source, int firstRow, int rows)
+    internal static Tensor2D Slice(Tensor2D source, int firstRow, int rows)
     {
         var data = new float[rows * source.Cols];
         Array.Copy(source.Data, firstRow * source.Cols, data, 0, data.Length);

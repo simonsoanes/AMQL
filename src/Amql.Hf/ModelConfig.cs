@@ -339,7 +339,11 @@ public static class ModelConfig
                 HeadDim: Int(text, "head_dim", required: false) != 0
                     ? Int(text, "head_dim", required: false)
                     : Int(text, "hidden_size") / Int(text, "num_attention_heads"),
-                IntermediateSize: Int(text, "intermediate_size"),
+                // Qwen4 (qwen4_exp) has no dense FFN and so no intermediate_size:
+                // every layer is routed, and the expert width stands in for it.
+                IntermediateSize: text.TryGetProperty("intermediate_size", out _) || !text.TryGetProperty("moe_intermediate_size", out _)
+                    ? Int(text, "intermediate_size")
+                    : Int(text, "moe_intermediate_size"),
                 HiddenAct: hiddenAct,
                 RmsNormEps: rmsNormEps,
                 VocabSize: Int(text, "vocab_size"),

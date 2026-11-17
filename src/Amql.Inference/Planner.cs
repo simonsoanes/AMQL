@@ -96,14 +96,31 @@ public static class Planner
         {
             layers.Add(BuildLayer(store, stack.Id, l, policies[l], surface, ffnSurface, normSurface, roles, component.HiddenSize));
         }
+        if (surface.NgramEmbedding is { } ngram && ngram.Layers.Any(l => l < 0 || l >= component.NumLayers))
+        {
+            throw new ContainerException($"component '{componentId}': the n-gram embedding names layers outside the stack");
+        }
+        if ((surface.SparseAttention is not null || surface.NgramEmbedding is not null) && surface.HyperConnections is null)
+        {
+            throw new UnsupportedOperatorException(
+                $"component '{componentId}': QSA and the n-gram embedding are judged only inside Qwen4's gated residual");
+        }
+
+        // Qwen4: the gated residual's final mixer stands where the final norm does.
+        HyperConnectionOp? finalMixer = surface.HyperConnections is { } hc
+            ? BindHyperConnection(store, finalNormObj.Id, string.Empty, hc, normSurface.FinalNorm, component.HiddenSize, inject: false, layer: -1)
+            : null;
 
         return new ComponentOpPlan
         {
             ComponentId = componentId,
             Embedding = BuildEmbedding(store, embedObj, surface, component.HiddenSize),
             Layers = layers,
-            FinalNorm = NormOp.From(Bound(store, finalNormObj.Id, "weight"), normSurface.FinalNorm, component.HiddenSize,
-                store.ContainsTensor(finalNormObj.Id, "bias") ? new OperandRef(finalNormObj.Id, "bias") : null),
+            FinalNorm = finalMixer is not null
+                ? null
+                : NormOp.From(Bound(store, finalNormObj.Id, "weight"), normSurface.FinalNorm, component.HiddenSize,
+                    store.ContainsTensor(finalNormObj.Id, "bias") ? new OperandRef(finalNormObj.Id, "bias") : null),
+            FinalMixer = finalMixer,
             Output = BuildOutput(store, embedObj, headObj, surface, component.HiddenSize),
             ResidualScale = surface.ResidualScale ?? 1.0,
             Diffusion = surface.Diffusion is { } diffusion
@@ -143,6 +160,12 @@ public static class Planner
         {
             throw new UnsupportedOperatorException(
                 $"layer {layer}: expert gate policy '{ffnSurface.GatePolicy.GetType().Name}' has no managed implementation");
+        }
+
+        if (surface.HyperConnections is { } hyper)
+        {
+            return BuildHyperLayer(store, stackId, layer, policy, surface, ffnSurface, normSurface, roles, hiddenSize, hyper,
+                softmax, linear, conv);
         }
 
         // ── norm sites, by role: which exist is the block's shape ─────────
@@ -256,6 +279,9 @@ public static class Planner
             QkNormWeightOffset = attnSurface.QkNormWeightOffset,
             ParameterFreeQkNorm = attnSurface.ParameterFreeQkNorm,
             ParameterFreeQkNormEps = normSurface.Pre.Eps,
+            Indexer = surface.SparseAttention is { } sparse
+                ? BindIndexer(store, stackId, layer, sparse, policy.Position, attnSurface, normSurface)
+                : null,
             QNorm = BindOptionalQkNorm(store, stackId, layer, roles, TensorRoles.QNorm, attnSurface, normSurface),
             KNorm = BindOptionalQkNorm(store, stackId, layer, roles, TensorRoles.KNorm, attnSurface, normSurface),
             QProj = Projection(TensorRoles.Q),
@@ -354,6 +380,13 @@ public static class Planner
             ConvKernel = ConvKernel,
             HiddenSize = hiddenSize,
             NormEps = normSurface.Pre.Eps,
+            SigmoidGate = (json.TryGetProperty("gate_activation", out var gateAct) ? gateAct.GetString() : null) switch
+            {
+                null or "silu" => false,
+                "sigmoid" => true,
+                var other => throw new UnsupportedOperatorException(
+                    $"layer {layer}: gated-norm activation '{other}' has no managed implementation"),
+            },
         };
 
         static int? Int(System.Text.Json.JsonElement json, string name) =>
@@ -479,9 +512,12 @@ public static class Planner
                 };
             }
         }
-        else if (ffnSurface.Moe is { } moe)
+        else if (ffnSurface.Moe is { } moe && (store.ContainsTensor(stackId, $"{layer}.mlp.router.weight") ||
+                                                !store.ContainsTensor(stackId, $"{layer}.mlp.down_proj.weight")))
         {
-            // Containers judged before expert roles existed name the AMQL layout.
+            // Containers judged before expert roles existed name the AMQL layout. A
+            // layer that kept its dense FFN and has no router (moe-merge routes only
+            // the layers its experts changed) falls through to the dense FFN below.
             Require(store, stackId, $"{layer}.mlp.router.weight", layer, "moe router");
             var routed = new RoutedFfnOp
             {
@@ -584,6 +620,205 @@ public static class Planner
             ReusesEmbedding = false,
             Multiplier = headSurface.OutputMultiplier,
             LogitSoftcapping = headSurface.FinalLogitSoftcapping,
+        };
+    }
+
+    // ── Qwen4: gated residual, QSA indexer, n-gram embedding ─────────────
+
+    /// <summary>A Qwen4 layer: no norm sites; a gated residual around the mixer
+    /// and around the FFN, and on the PLE layers the n-gram embedding.</summary>
+    private static LayerPlan BuildHyperLayer(
+        OperandStore store, string stackId, int layer, AttentionLayerPolicy policy, ExecutionSurface surface,
+        FfnSurface ffnSurface, NormSurface normSurface, LayerRoleMap roles, int hiddenSize, HyperConnectionSurface hyper,
+        bool softmax, bool linear, bool conv)
+    {
+        if (conv)
+        {
+            throw new UnsupportedOperatorException($"layer {layer}: a short-conv layer inside a gated residual has no managed implementation");
+        }
+        if (surface.ParallelResidual)
+        {
+            throw new ContainerException($"layer {layer}: a gated residual over a parallel block is not a judged shape");
+        }
+        foreach (var role in new[] { TensorRoles.AttnIn, TensorRoles.AttnOut, TensorRoles.FfnIn, TensorRoles.FfnOut })
+        {
+            if (RoleTensor(store, stackId, layer, roles, role) is { } stray)
+            {
+                throw new ContainerException($"layer {layer}: '{stray}' is a layer norm, but a gated-residual layer has none");
+            }
+        }
+        var ffn = BuildFfn(store, stackId, layer, ffnSurface, roles, hiddenSize)
+            ?? throw new ContainerException($"layer {layer}: a gated-residual layer implies an FFN, and the segment carries none");
+
+        NgramEmbeddingOp? ngram = null;
+        if (surface.NgramEmbedding is { } ng && ng.Layers.ToList().IndexOf(layer) is var pleIndex and >= 0)
+        {
+            ngram = BindNgram(store, stackId, layer, ng, pleIndex, hyper, normSurface.Pre, hiddenSize);
+        }
+
+        return new LayerPlan
+        {
+            Attention = softmax ? BuildSoftmaxAttention(store, stackId, layer, policy, surface, normSurface, roles) : null,
+            LinearAttention = linear ? BuildLinearAttention(store, stackId, layer, surface, normSurface, hiddenSize) : null,
+            Ffn = ffn,
+            MixerHyperConnection = BindHyperConnection(store, stackId, $"{layer}.attn_hyper_connection.", hyper, normSurface.Pre, hiddenSize,
+                inject: true, layer),
+            FfnHyperConnection = BindHyperConnection(store, stackId, $"{layer}.mlp_hyper_connection.", hyper, normSurface.Pre, hiddenSize,
+                inject: true, layer),
+            Ngram = ngram,
+        };
+    }
+
+    private static HyperConnectionOp BindHyperConnection(OperandStore store, string objectId, string prefix,
+        HyperConnectionSurface hyper, NormSpec spec, int hiddenSize, bool inject, int layer)
+    {
+        if (spec.Kind != NormType.RmsNorm)
+        {
+            throw new UnsupportedOperatorException($"layer {layer}: a gated residual over a {spec.Kind} has no managed implementation");
+        }
+        long width = (long)hyper.Streams * hiddenSize;
+        OperandRef Shaped(string stem, params long[] shape)
+        {
+            string name = prefix + stem;
+            Require(store, objectId, name, layer, "gated residual");
+            var actual = store.ShapeOf(objectId, name);
+            if (!actual.SequenceEqual(shape))
+            {
+                throw new ContainerException(
+                    $"operand closure: '{objectId}/{name}' has shape [{string.Join(", ", actual)}], the gated residual needs [{string.Join(", ", shape)}]");
+            }
+            return new OperandRef(objectId, name);
+        }
+        return new HyperConnectionOp
+        {
+            Norm = Shaped("hc_norm.weight", width),
+            Down = Shaped("input_mix_weight_down.weight", hyper.Lowrank, width),
+            Up = Shaped("input_mix_weight_up.weight", width, hyper.Lowrank),
+            Inject = inject ? Shaped("block_inject_weight.weight", hyper.Streams, width) : null,
+            Streams = hyper.Streams,
+            Lowrank = hyper.Lowrank,
+            HiddenSize = hiddenSize,
+            Eps = spec.Eps,
+            NormWeightOffset = spec.WeightOffset,
+        };
+    }
+
+    private static SparseIndexerOp BindIndexer(OperandStore store, string stackId, int layer, SparseAttentionSurface sparse,
+        PositionPolicy attentionPosition, AttentionSurface attnSurface, NormSurface normSurface)
+    {
+        string prefix = $"{layer}.self_attn.indexer.";
+        var qk = Shaped("index_qk_proj.weight", (long)(sparse.Heads + sparse.KvHeads) * sparse.HeadDim, -1);
+        var qNorm = Shaped("q_layernorm.weight", sparse.HeadDim);
+        var kNorm = Shaped("k_layernorm.weight", sparse.HeadDim);
+        if (sparse.KvHeads != 1)
+        {
+            throw new UnsupportedOperatorException($"layer {layer}: a QSA indexer with {sparse.KvHeads} key heads has no managed implementation");
+        }
+        if (sparse.CompressRatio <= 0 || sparse.Budget % sparse.CompressRatio != 0)
+        {
+            throw new ContainerException($"layer {layer}: QSA budget {sparse.Budget} is not a whole number of {sparse.CompressRatio}-token blocks");
+        }
+        // The indexer rotates the same leading dims, at the same frequencies,
+        // as the attention: the attention's rotary width over the indexer head.
+        PositionPolicy position = attentionPosition switch
+        {
+            PositionNone none => none,
+            PositionRope rope => new PositionPartialRope
+            {
+                Theta = rope.Theta, Scaling = rope.Scaling, Mrope = rope.Mrope,
+                RotaryFactor = (double)attnSurface.HeadDim / sparse.HeadDim,
+            },
+            PositionPartialRope partial => new PositionPartialRope
+            {
+                Theta = partial.Theta, Scaling = partial.Scaling, Mrope = partial.Mrope,
+                RotaryFactor = (double)partial.RotaryWidth(attnSurface.HeadDim) / sparse.HeadDim,
+            },
+            var other => throw new UnsupportedOperatorException(
+                $"layer {layer}: a QSA indexer under position policy '{other.GetType().Name}' has no managed implementation"),
+        };
+        if (position is PositionPartialRope p && (p.RotaryFactor > 1.0 || p.RotaryWidth(sparse.HeadDim) % 2 != 0))
+        {
+            throw new ContainerException($"layer {layer}: the attention's rotary width does not fit the QSA head of {sparse.HeadDim}");
+        }
+        return new SparseIndexerOp
+        {
+            QkProj = qk,
+            QNorm = qNorm,
+            KNorm = kNorm,
+            Heads = sparse.Heads,
+            HeadDim = sparse.HeadDim,
+            Budget = sparse.Budget,
+            CompressRatio = sparse.CompressRatio,
+            Eps = normSurface.Pre.Eps,
+            NormWeightOffset = attnSurface.QkNormWeightOffset,
+            Position = position,
+            RopeInterleaved = attnSurface.RopeInterleaved,
+        };
+
+        OperandRef Shaped(string stem, params long[] shape)
+        {
+            string name = prefix + stem;
+            Require(store, stackId, name, layer, "QSA indexer");
+            var actual = store.ShapeOf(stackId, name);
+            if (actual.Length != shape.Length || actual.Zip(shape).Any(d => d.Second >= 0 && d.First != d.Second))
+            {
+                throw new ContainerException(
+                    $"operand closure: '{stackId}/{name}' has shape [{string.Join(", ", actual)}], the QSA indexer needs [{string.Join(", ", shape)}]");
+            }
+            return new OperandRef(stackId, name);
+        }
+    }
+
+    private static NgramEmbeddingOp BindNgram(OperandStore store, string stackId, int layer, NgramEmbeddingSurface surface,
+        int pleIndex, HyperConnectionSurface hyper, NormSpec spec, int hiddenSize)
+    {
+        string prefix = $"{layer}.ple.";
+        foreach (var stem in new[] { "key_proj.weight", "value_proj.weight", "norm_key.weight", "norm_query.weight", "norm_conv.weight", "conv1d.weight" })
+        {
+            Require(store, stackId, prefix + stem, layer, "n-gram embedding");
+        }
+        if (surface.NgramHeads <= 0 || surface.EmbedDim % surface.NgramHeads != 0)
+        {
+            throw new ContainerException($"layer {layer}: the n-gram embedding width {surface.EmbedDim} does not split over {surface.NgramHeads} heads");
+        }
+        var shards = new List<OperandRef>(surface.Shards);
+        var starts = new List<long>(surface.Shards);
+        long rows = 0;
+        int rowWidth = surface.EmbedDim / surface.NgramHeads;
+        for (int i = 0; i < surface.Shards; i++)
+        {
+            string name = $"{prefix}ple_embedding.ngram_embedding.shard_{i}.weight";
+            Require(store, stackId, name, layer, $"n-gram table shard {i}");
+            var shape = store.ShapeOf(stackId, name);
+            if (shape.Length != 2 || shape[1] != rowWidth)
+            {
+                throw new ContainerException($"operand closure: '{name}' is not a [rows, {rowWidth}] slice of the n-gram table");
+            }
+            shards.Add(new OperandRef(stackId, name));
+            starts.Add(rows);
+            rows += shape[0];
+        }
+        long needed = NgramHashing.For(surface, pleIndex).PaddedRows;
+        if (rows != needed)
+        {
+            throw new ContainerException($"layer {layer}: the n-gram shards hold {rows} rows, the hash heads need {needed}");
+        }
+        return new NgramEmbeddingOp
+        {
+            Surface = surface,
+            PleIndex = pleIndex,
+            Shards = shards,
+            ShardStarts = starts,
+            KeyProj = new OperandRef(stackId, prefix + "key_proj.weight"),
+            ValueProj = new OperandRef(stackId, prefix + "value_proj.weight"),
+            NormKey = new OperandRef(stackId, prefix + "norm_key.weight"),
+            NormQuery = new OperandRef(stackId, prefix + "norm_query.weight"),
+            NormConv = new OperandRef(stackId, prefix + "norm_conv.weight"),
+            Conv = new OperandRef(stackId, prefix + "conv1d.weight"),
+            Streams = hyper.Streams,
+            HiddenSize = hiddenSize,
+            Eps = spec.Eps,
+            NormWeightOffset = spec.WeightOffset,
         };
     }
 

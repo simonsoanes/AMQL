@@ -53,6 +53,14 @@ public sealed class FusedTensor
 {
     public required string Name { get; init; }
     public required List<string> Parts { get; init; }
+
+    /// <summary>The fused tensor's leading dims when it is not simply the parts'
+    /// rows end to end: packed experts (<c>mlp.experts.gate_up_proj</c>,
+    /// [experts, 2·intermediate, hidden]) are the per-expert parts' bytes in
+    /// order, reshaped. The trailing dims are the parts' own. Null keeps the
+    /// plain row concatenation.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<long>? LeadingShape { get; init; }
 }
 
 /// <summary>
@@ -148,6 +156,25 @@ public static class TensorRoles
     /// map is the union over all layers: hybrid stacks carry softmax roles from
     /// their attention layers and nothing from their recurrent ones.
     /// </summary>
+    /// <summary>
+    /// The weight a quantisation companion belongs to, or null when the name
+    /// is not one: <c>x.weight_scale</c>, <c>x.weight_scale_2</c> and
+    /// <c>x.weight_scale_inv</c> (block and tensor scales) and
+    /// <c>x.input_scale</c> (ModelOpt's activation scale, unused when
+    /// activations stay in full precision) all belong to <c>x.weight</c>.
+    /// </summary>
+    public static string? QuantisationCompanionOf(string name)
+    {
+        foreach (var suffix in new[] { ".weight_scale", ".weight_scale_2", ".weight_scale_inv", ".input_scale" })
+        {
+            if (name.EndsWith(suffix, StringComparison.Ordinal))
+            {
+                return name[..^suffix.Length] + ".weight";
+            }
+        }
+        return null;
+    }
+
     public static LayerRoleMap Judge(IEnumerable<string> layerRelativeNames, List<FusedTensor>? fused = null)
     {
         var suffixes = new HashSet<string>(StringComparer.Ordinal);
@@ -159,6 +186,9 @@ public static class TensorRoles
                 suffixes.Add(name[(dot + 1)..]);
             }
         }
+        // A quantised checkpoint's scales ride with their weight (the operand
+        // store decodes the weight through them); they are not roles.
+        suffixes.RemoveWhere(s => QuantisationCompanionOf(s) is { } weight && suffixes.Contains(weight));
         bool Has(string stem) => suffixes.Contains(stem + ".weight");
 
         foreach (var interleaved in InterleavedFusions)

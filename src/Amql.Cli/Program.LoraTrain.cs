@@ -47,6 +47,9 @@ internal static partial class Program
             Seed = IntOption(args, "--seed", 1234),
             AnchorTokens = IntOption(args, "--anchor-tokens", 40),
             AnchorWeight = DoubleOption(args, "--anchor-weight", 1.0),
+            Decode = !HasOption(args, "--no-decode"),
+            BatchSize = IntOption(args, "--batch", 0),
+            KeepBest = HasOption(args, "--keep-best"),
             StopTokens = ResolveStopTokens(tokenizerDir, tokenizer),
         };
 

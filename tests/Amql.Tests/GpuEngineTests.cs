@@ -17,10 +17,12 @@ public class GpuEngineTests
     private static string Zoo => Path.Combine(AppContext.BaseDirectory, "fixtures", "arch-zoo");
 
     /// <summary>Families whose plans need an operator the engine leaves to the
-    /// managed path (routed experts, length-dependent rope).</summary>
+    /// managed path (routed experts, length-dependent rope, Qwen4's gated
+    /// residual, QSA and n-gram embedding).</summary>
     private static readonly HashSet<string> Refused = new(StringComparer.Ordinal)
     {
         "mixtral", "olmoe", "qwen2_moe", "qwen3_moe", "llama-dynamic", "phi3-longrope-long", "phi3-longrope-short",
+        "qwen4_exp-tiny", "qwen4_exp-nvfp4-tiny",
     };
 
     private static bool GpuAvailable()

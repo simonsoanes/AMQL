@@ -55,7 +55,11 @@ internal static class GenericExport
         }
         if (surface.Ffn is { } ffn)
         {
-            Set("intermediate_size", ffn.IntermediateSize);
+            // A routed-only family (Qwen4) has no dense width to state.
+            if (text.ContainsKey("intermediate_size") || ffn.Moe is null)
+            {
+                Set("intermediate_size", ffn.IntermediateSize);
+            }
             var expertKey = new[] { "num_experts", "num_local_experts", "n_routed_experts" }.FirstOrDefault(text.ContainsKey);
             if (ffn.Moe is { } standard && expertKey is not null)
             {
@@ -101,7 +105,11 @@ internal static class GenericExport
         // count changed, rather than ship a table for the wrong stack.
         if (text.ContainsKey("layer_types"))
         {
-            Set("layer_types", new JsonArray(policies.Select(p => (JsonNode?)LayerType(p)).ToArray()));
+            // The source's own spelling survives where it names the same
+            // operator (Qwen4 writes its QSA layers qwen_sparse_attention).
+            var sourceTypes = text["layer_types"] as JsonArray;
+            Set("layer_types", new JsonArray(policies.Select((p, i) => (JsonNode?)LayerType(p,
+                sourceTypes?.Count == policies.Count ? sourceTypes[i]?.GetValue<string>() : null)).ToArray()));
         }
         if (text.ContainsKey("no_rope_layers"))
         {
@@ -155,6 +163,14 @@ internal static class GenericExport
         return root.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
     }
 
+    private static string LayerType(AttentionLayerPolicy policy, string? sourceSpelling = null)
+    {
+        string type = LayerType(policy);
+        return type == "full_attention" && sourceSpelling is "qwen_sparse_attention" or "indexed_attention"
+            ? sourceSpelling
+            : type;
+    }
+
     private static string LayerType(AttentionLayerPolicy policy) => policy.Operator switch
     {
         LayerOperators.Softmax => policy.Span == AttentionSpan.Sliding ? "sliding_attention" : "full_attention",
@@ -200,6 +216,17 @@ internal static class GenericExport
                 }
                 var shape = (long[])parts[0]!.Shape.Clone();
                 shape[0] = parts.Sum(p => p!.Shape[0]);
+                if (fusion.LeadingShape is { } leading)
+                {
+                    // Packed experts: the same bytes, the checkpoint's own 3-D shape.
+                    var packed = leading.Concat(parts[0]!.Shape.Skip(1)).ToArray();
+                    if (packed.Aggregate(1L, (a, b) => a * b) != shape.Aggregate(1L, (a, b) => a * b))
+                    {
+                        throw new CliException(
+                            $"layer {layer}: '{fusion.Name}' packs to [{string.Join(", ", packed)}] but its parts hold [{string.Join(", ", shape)}]");
+                    }
+                    shape = packed;
+                }
                 var chunks = parts.SelectMany(p => p!.Chunks ?? new[] { p.Data }).ToList();
                 var fused = new TensorPayload
                 {

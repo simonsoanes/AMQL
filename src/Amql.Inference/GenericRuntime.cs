@@ -10,7 +10,7 @@ namespace Amql.Inference;
 /// final norm, output head. Position/span behaviour comes exclusively from
 /// the per-layer policy table; no architecture branch exists here.
 /// </summary>
-public sealed class GenericRuntime
+public sealed partial class GenericRuntime
 {
     private readonly ComponentOpPlan _plan;
     private readonly WeightLoader _weights;
@@ -53,8 +53,9 @@ public sealed class GenericRuntime
     {
         var embed = _plan.Embedding
             ?? throw new UnsupportedOperatorException("plan carries no embedding op");
-        var table = _weights.Matrix(embed.Table, embed.VocabSize, embed.HiddenSize);
-        var hidden = TensorOps.GatherRows(table, tokens);
+        // The lean working set reads each token's row instead of the table.
+        var hidden = _weights.GatherRows(embed.Table, embed.VocabSize, embed.HiddenSize, tokens)
+            ?? TensorOps.GatherRows(_weights.Matrix(embed.Table, embed.VocabSize, embed.HiddenSize), tokens);
         if (embed.Norm is { } norm)
         {
             var ones = new float[hidden.Cols];
@@ -71,7 +72,10 @@ public sealed class GenericRuntime
                 hidden.Data[i] = (float)(hidden.Data[i] * scale);
             }
         }
-        return hidden;
+        _passTokens = tokens.ToArray();
+        // Qwen4's gated residual carries every stream from the start: the
+        // embedding repeated once per stream.
+        return _plan.ResidualStreams > 1 ? RepeatStreams(hidden, _plan.ResidualStreams) : hidden;
     }
 
     // ── Layer loop ──────────────────────────────────────────────────────────
@@ -88,6 +92,10 @@ public sealed class GenericRuntime
     {
         var layerPlan = _plan.Layers[layer];
         int hidden = _plan.HiddenSize;
+        if (layerPlan.MixerHyperConnection is not null)
+        {
+            return RunHyperLayer(x, layer, layerPlan, queryPositions, kvPositions, appendKv, positionStreams);
+        }
 
         // Pre-attention norm (shared by both operator families).
         Tensor2D h = x;
@@ -99,26 +107,7 @@ public sealed class GenericRuntime
             Report(layer, "pre_attn_norm", preAttnNorm.Weight, h, t);
         }
 
-        // Token mixer dispatch.
-        Tensor2D mixerOut;
-        if (layerPlan.LinearAttention is { } linear)
-        {
-            long t = TraceStart;
-            mixerOut = RunLinearAttention(h, layer, linear);
-            Report(layer, "linear_attn", null, mixerOut, t);
-        }
-        else if (layerPlan.Conv is { } conv)
-        {
-            long t = TraceStart;
-            mixerOut = RunConv(h, layer, conv);
-            Report(layer, "conv", null, mixerOut, t);
-        }
-        else
-        {
-            long t = TraceStart;
-            mixerOut = RunSoftmaxAttention(h, layer, layerPlan, queryPositions, kvPositions, appendKv, positionStreams);
-            Report(layer, "softmax_attn", null, mixerOut, t);
-        }
+        Tensor2D mixerOut = RunMixer(h, layer, layerPlan, queryPositions, kvPositions, appendKv, positionStreams);
 
         // Post-mixer norm (four-norm / sandwich placement) applies to the
         // mixer output before the residual add, whichever operator ran.
@@ -149,32 +138,7 @@ public sealed class GenericRuntime
         // FFN.
         if (layerPlan.Ffn is { IsPresent: true } ffn)
         {
-            FfnInputCapture?.Invoke(layer, hf);
-            Tensor2D ffnOut;
-            long t = TraceStart;
-            if (ffn.Dense is { } dense)
-            {
-                var gate = dense.Gate is null
-                    ? null
-                    : _weights.Matrix(dense.Gate, dense.IntermediateSize, hidden);
-                var up = _weights.Matrix(dense.Up, dense.IntermediateSize, hidden);
-                var down = _weights.Matrix(dense.Down, hidden, dense.IntermediateSize);
-                ffnOut = FfnKernel.Dense(hf, gate, up, down, dense.Activation, dense.IsGated,
-                    OptionalVector(dense.GateBias, dense.IntermediateSize),
-                    OptionalVector(dense.UpBias, dense.IntermediateSize),
-                    OptionalVector(dense.DownBias, hidden));
-                Report(layer, "ffn_dense", dense.Down, ffnOut, t);
-            }
-            else
-            {
-                var routed = ffn.Routed!;
-                ffnOut = RunRoutedFfn(hf, layer, routed);
-                Report(layer, "ffn_routed", routed.Router, ffnOut, t);
-            }
-            if (FfnAdapter?.Invoke(layer, hf) is { } extra)
-            {
-                AddInPlace(ffnOut, extra);
-            }
+            Tensor2D ffnOut = RunFfn(hf, layer, ffn);
 
             if (layerPlan.PostFfnNorm is { } postFfnNorm)
             {
@@ -202,6 +166,67 @@ public sealed class GenericRuntime
         // an operation with a duration of its own.
         Report(layer, "residual_out", null, x, 0);
         return x;
+    }
+
+    /// <summary>The token mixer the layer carries: linear attention, a short
+    /// conv or softmax attention.</summary>
+    private Tensor2D RunMixer(Tensor2D h, int layer, LayerPlan layerPlan, int[] queryPositions, int[] kvPositions, bool appendKv,
+        int[][]? positionStreams)
+    {
+        Tensor2D mixerOut;
+        if (layerPlan.LinearAttention is { } linear)
+        {
+            long t = TraceStart;
+            mixerOut = RunLinearAttention(h, layer, linear);
+            Report(layer, "linear_attn", null, mixerOut, t);
+        }
+        else if (layerPlan.Conv is { } conv)
+        {
+            long t = TraceStart;
+            mixerOut = RunConv(h, layer, conv);
+            Report(layer, "conv", null, mixerOut, t);
+        }
+        else
+        {
+            long t = TraceStart;
+            mixerOut = RunSoftmaxAttention(h, layer, layerPlan, queryPositions, kvPositions, appendKv, positionStreams);
+            Report(layer, "softmax_attn", null, mixerOut, t);
+        }
+        return mixerOut;
+    }
+
+    /// <summary>The layer's FFN over its (normalised) input, with any adapter's
+    /// contribution added.</summary>
+    private Tensor2D RunFfn(Tensor2D hf, int layer, LayerFfn ffn)
+    {
+        int hidden = _plan.HiddenSize;
+        FfnInputCapture?.Invoke(layer, hf);
+        Tensor2D ffnOut;
+        long t = TraceStart;
+        if (ffn.Dense is { } dense)
+        {
+            var gate = dense.Gate is null
+                ? null
+                : _weights.Matrix(dense.Gate, dense.IntermediateSize, hidden);
+            var up = _weights.Matrix(dense.Up, dense.IntermediateSize, hidden);
+            var down = _weights.Matrix(dense.Down, hidden, dense.IntermediateSize);
+            ffnOut = FfnKernel.Dense(hf, gate, up, down, dense.Activation, dense.IsGated,
+                OptionalVector(dense.GateBias, dense.IntermediateSize),
+                OptionalVector(dense.UpBias, dense.IntermediateSize),
+                OptionalVector(dense.DownBias, hidden));
+            Report(layer, "ffn_dense", dense.Down, ffnOut, t);
+        }
+        else
+        {
+            var routed = ffn.Routed!;
+            ffnOut = RunRoutedFfn(hf, layer, routed);
+            Report(layer, "ffn_routed", routed.Router, ffnOut, t);
+        }
+        if (FfnAdapter?.Invoke(layer, hf) is { } extra)
+        {
+            AddInPlace(ffnOut, extra);
+        }
+        return ffnOut;
     }
 
     /// <summary>Applies a norm op in place: the normalisation, the learned
@@ -331,6 +356,15 @@ public sealed class GenericRuntime
             : null;
 
         Tensor2D output;
+        // QSA: the indexer picks each query's keys. Null means every row keeps
+        // every visible key (no more complete blocks than its budget), and the
+        // attention below is exactly the dense one.
+        if (attn.Indexer is { } indexer &&
+            SelectSparseKeys(h, layer, indexer, queryPositions, kvPositions, appendKv, kvSeq, positionStreams) is { } selection)
+        {
+            output = SparseAttention(q, kBuffer, kWidth, vBuffer, vWidth, attn, selection, queryPositions);
+            goto attentionDone;
+        }
         // GPU attention path — fused QK^T + causal softmax + PV on device.
         // Only for non-trivial prefills (≥ 8 query tokens) when the weights
         // are already on the device.  Single-token decode is too small for
@@ -574,6 +608,7 @@ public sealed class GenericRuntime
     {
         _linearStates.Clear();
         _convStates.Clear();
+        ResetQwen4State();
         SessionPosition = 0;
         if (_patches.Count > 0)
         {
@@ -696,7 +731,7 @@ public sealed class GenericRuntime
         var gated = GatedDeltaKernel.GatedRMSNorm(
             new Tensor2D(core.Data, rows, op.HeadVDim),
             new Tensor2D(z.Data, rows, op.HeadVDim),
-            normWeight, op.NormEps);
+            normWeight, op.NormEps, op.SigmoidGate);
         Report(layer, "linear_norm", op.NormWeight, gated, 0);
         var out2 = TensorOps.MatMulTransposedB(
             new Tensor2D(gated.Data, t, op.ValueDim),
@@ -754,25 +789,22 @@ public sealed class GenericRuntime
     {
         int hidden = routed.HiddenSize;
         var router = _weights.Matrix(routed.Router, routed.NumExperts, hidden);
+        _weights.BeginExpertLayer();
 
         // Gate/up/down are resolved through the operand store by explicit
-        // per-expert names — the prefix fields disambiguate spellings.
-        var gates = new Tensor2D[routed.NumExperts];
-        var ups = new Tensor2D[routed.NumExperts];
-        var downs = new Tensor2D[routed.NumExperts];
+        // per-expert names — the prefix fields disambiguate spellings — and
+        // only for the experts the router picks.
         string stackId = routed.Router.ObjectId;
-        for (int e = 0; e < routed.NumExperts; e++)
-        {
-            gates[e] = _weights.Matrix(new OperandRef(stackId, $"{routed.ExpertGatePrefix}{e}.{routed.ExpertGateStem}"), routed.ExpertIntermediateSize, hidden);
-            ups[e] = _weights.Matrix(new OperandRef(stackId, $"{routed.ExpertUpPrefix}{e}.{routed.ExpertUpStem}"), routed.ExpertIntermediateSize, hidden);
-            downs[e] = _weights.Matrix(new OperandRef(stackId, $"{routed.ExpertDownPrefix}{e}.{routed.ExpertDownStem}"), hidden, routed.ExpertIntermediateSize);
-        }
+        (Tensor2D, Tensor2D, Tensor2D) Expert(int e) => (
+            _weights.ExpertMatrix(new OperandRef(stackId, $"{routed.ExpertGatePrefix}{e}.{routed.ExpertGateStem}"), routed.ExpertIntermediateSize, hidden),
+            _weights.ExpertMatrix(new OperandRef(stackId, $"{routed.ExpertUpPrefix}{e}.{routed.ExpertUpStem}"), routed.ExpertIntermediateSize, hidden),
+            _weights.ExpertMatrix(new OperandRef(stackId, $"{routed.ExpertDownPrefix}{e}.{routed.ExpertDownStem}"), hidden, routed.ExpertIntermediateSize));
 
         // Only the last row's routing is reported, matching Report's convention
         // — it is the row that decides the next token, and capturing every
         // prefill row would dwarf the rest of the trace.
         int lastRow = h.Rows - 1;
-        var mixture = FfnKernel.Routed(h, router, gates, ups, downs,
+        var mixture = FfnKernel.Routed(h, router, routed.NumExperts, hidden, Expert,
             routed.TopK, routed.RoutingPolicy, routed.Activation,
             onExpertsRouted: ExpertRoutingTrace is null
                 ? null
@@ -782,7 +814,13 @@ public sealed class GenericRuntime
                     {
                         ExpertRoutingTrace(layer, selected);
                     }
-                });
+                },
+            release: w =>
+            {
+                _weights.Release(w.Gate);
+                _weights.Release(w.Up);
+                _weights.Release(w.Down);
+            });
         if (routed.SharedExpert is { } shared)
         {
             // Every token also passes through the shared expert, scaled by
@@ -1158,20 +1196,26 @@ public sealed class GenericRuntime
     /// head (a classifier's score linear) reads.</summary>
     public Tensor2D FinalNorm(Tensor2D hidden)
     {
-        ApplyNorm(hidden, _plan.FinalNorm, hidden.Cols);
+        if (_plan.FinalMixer is { } mixer)
+        {
+            // Qwen4: the streams are read into one hidden state, not normalised in place.
+            return HyperRead(hidden, mixer).Read;
+        }
+        ApplyNorm(hidden, _plan.FinalNorm!, hidden.Cols);
         return hidden;
     }
 
     public Tensor2D FinalNormAndHead(Tensor2D hidden)
     {
-        FinalNorm(hidden);
+        hidden = FinalNorm(hidden);
 
         if (_plan.Output is not { } output)
         {
             throw new UnsupportedOperatorException("plan carries no output head");
         }
-        var head = _weights.Matrix(output.Projection, output.VocabSize, output.HiddenSize);
-        var logits = TensorOps.MatMulTransposedB(hidden, head);
+        // A head the lean working set cannot hold is used a block of rows at a time.
+        var logits = _weights.StreamedProduct(hidden, output.Projection, output.VocabSize, output.HiddenSize)
+            ?? TensorOps.MatMulTransposedB(hidden, _weights.Matrix(output.Projection, output.VocabSize, output.HiddenSize));
         if (output.Multiplier is { } multiplier)
         {
             for (int i = 0; i < logits.Data.Length; i++)

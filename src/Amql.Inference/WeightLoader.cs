@@ -128,6 +128,10 @@ public sealed class WeightLoader
     /// is a defect, not a convenience.</summary>
     public Tensor2D Matrix(OperandRef operand, int rows, int cols)
     {
+        if (_workingSet == WeightWorkingSet.Lean)
+        {
+            return MatrixLean(operand, rows, cols, expert: false);
+        }
         if (_workingSet == WeightWorkingSet.Disk)
         {
             return MatrixDisk(operand, rows, cols);
@@ -142,7 +146,8 @@ public sealed class WeightLoader
 
         var shape = new[] { (long)rows, cols };
         Tensor2D matrix;
-        if (_workingSet != WeightWorkingSet.ResidentF32 && Compactable(operand, shape))
+        if (_workingSet != WeightWorkingSet.ResidentF32 && Compactable(operand, shape) &&
+            !_store.IsScaled(operand.ObjectId, operand.TensorName))
         {
             matrix = _workingSet == WeightWorkingSet.OnDemandBf16
                 ? MatrixOnDemandBf16(operand, rows, cols)
@@ -187,6 +192,15 @@ public sealed class WeightLoader
         LoadTrace?.Invoke(operand.ObjectId, operand.TensorName, shape, false);
         return matrix;
     }
+
+    /// <summary>A routed expert's matrix. The same as <see cref="Matrix"/>
+    /// except in the lean working set, where experts are cached apart from the
+    /// dense weights: least recently used first out, in whatever room the dense
+    /// weights leave.</summary>
+    public Tensor2D ExpertMatrix(OperandRef operand, int rows, int cols) =>
+        _workingSet == WeightWorkingSet.Lean
+            ? MatrixLean(operand, rows, cols, expert: true)
+            : Matrix(operand, rows, cols);
 
     /// <summary>On-demand path: the tensor's stored bytes stay resident
     /// (BF16: 2 B/element, halving the f32 working set; also serves F16, I8
@@ -315,7 +329,11 @@ public sealed class WeightLoader
     private void ReclaimStreamed(long bytes)
     {
         _streamedSinceCollect += bytes;
-        long threshold = Math.Clamp(DiskCacheBytes / 4, 256L << 20, 2L << 30);
+        long threshold = _workingSet == WeightWorkingSet.Lean
+            // The lean set has a RAM target to keep: collect well inside the
+            // share of it that is held back for things other than the cache.
+            ? Math.Clamp(ComputeBudget.LeanReserveBytes(ComputeBudget.LeanRamBytes) / 4, 64L << 20, 512L << 20)
+            : Math.Clamp(DiskCacheBytes / 4, 256L << 20, 2L << 30);
         if (_streamedSinceCollect >= threshold)
         {
             _streamedSinceCollect = 0;
@@ -400,6 +418,664 @@ public sealed class WeightLoader
         _lruOrder.AddLast(node);
     }
 
+    // ── Lean working set ────────────────────────────────────────────────────
+
+    private readonly LinkedList<(string ObjectId, string Tensor)> _expertOrder = new();
+    private readonly Dictionary<(string ObjectId, string Tensor), LinkedListNode<(string ObjectId, string Tensor)>> _expertNodes = new();
+    private long _leanDenseBytes;
+    private long _leanExpertBytes;
+    private long _leanDeviceBytes;
+    private long _leanBytesRead;
+    private long? _leanDeviceBudget;
+    private long? _resolvedDeviceBudget;
+
+    /// <summary>Host bytes the lean working set may spend on cached weights:
+    /// <see cref="ComputeBudget.LeanCacheBytes"/> at construction. Zero
+    /// streams every matrix.</summary>
+    public long LeanCacheBytes { get; set; } = ComputeBudget.LeanCacheBytes(CudaShim.Enabled);
+
+    /// <summary>Device bytes the lean working set may fill with FP16 copies of
+    /// dense matrices. Null (the default) means the device's free memory at
+    /// first use, less a 1 GiB margin; zero keeps every weight on the host.
+    /// Set it before the first matrix loads.</summary>
+    public long? LeanDeviceBytes
+    {
+        get => _leanDeviceBudget ?? ComputeBudget.GpuMemoryBytes;
+        set
+        {
+            _leanDeviceBudget = value;
+            _resolvedDeviceBudget = null;
+        }
+    }
+
+    private long DeviceBudget()
+    {
+        if (_resolvedDeviceBudget is { } known)
+        {
+            return known;
+        }
+        long budget = 0;
+        if (CudaShim.Enabled)
+        {
+            if (LeanDeviceBytes is { } set)
+            {
+                budget = set;
+            }
+            else if (CudaShim.TryMemoryInfo(out long free, out _))
+            {
+                // Leave room for the GEMMs' activations, cuBLAS workspace and
+                // anything else sharing the device.
+                budget = Math.Max(0, free - (1L << 30));
+            }
+        }
+        _resolvedDeviceBudget = budget;
+        return budget;
+    }
+
+    /// <summary>What the lean working set holds and has read, for reporting.</summary>
+    public LeanStats Lean
+    {
+        get
+        {
+            lock (_diskLock)
+            {
+                return new LeanStats(_leanDenseBytes, _leanExpertBytes, _expertNodes.Count,
+                    _leanDeviceBytes, DiskReads, _leanBytesRead, Tensor2D.HostReloads, LeanCacheBytes, DeviceBudget(),
+                    _deviceExpertNodes.Count, Tensor2D.ScaledWidenings);
+            }
+        }
+    }
+
+    /// <summary>
+    /// The lean working set's entry point. A matrix comes from the cache, or
+    /// is read from the container as its stored bits (a BF16 tensor is never
+    /// widened: the kernels widen in registers). A dense matrix big enough for
+    /// the device GEMM goes to the GPU while its budget has room, and then only
+    /// the device copy is kept. Otherwise a dense matrix is cached while the
+    /// host budget has room (displacing experts if it must: every pass needs
+    /// every dense weight, but only some experts) and an expert joins the
+    /// expert LRU. Whatever does not fit streams through and is read again
+    /// next time. Locked like the disk set, so sibling sessions can share it.
+    /// </summary>
+    private long _heapFloor;
+
+    // Streamed experts' BF16 buffers, recycled: a decode step streams every
+    // picked expert that is not cached, and as fresh large-object arrays they
+    // would be garbage the GC has to be made to collect, step after step.
+    private readonly HashSet<Tensor2D> _recyclable = new(ReferenceEqualityComparer.Instance);
+    private readonly Dictionary<(long Elements, bool Bf16), Stack<Array>> _pool = new();
+    private long _pooledBytes;
+
+    private T[]? Rent<T>(long elements)
+    {
+        bool bf16 = typeof(T) == typeof(ushort);
+        if (_pool.TryGetValue((elements, bf16), out var stack) && stack.TryPop(out var array))
+        {
+            _pooledBytes -= elements * (bf16 ? 2 : 4);
+            return (T[])array;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Hands back a matrix from <see cref="ExpertMatrix"/> once it has been
+    /// used. A streamed expert's buffer is then reused for the next one read;
+    /// a cached matrix, or one from another working set, is left alone. The
+    /// caller must not touch the matrix afterwards.
+    /// </summary>
+    public void Release(Tensor2D matrix)
+    {
+        if (_workingSet != WeightWorkingSet.Lean)
+        {
+            return;
+        }
+        lock (_diskLock)
+        {
+            if (!_recyclable.Remove(matrix) || matrix.Scaled is not null)
+            {
+                return; // a scaled matrix's arrays are its own
+            }
+            Array array = (Array?)matrix.Bf16Bits ?? matrix.Data;
+            bool bf16 = array is ushort[];
+            long bytes = array.LongLength * (bf16 ? 2 : 4);
+            // Room for a few layers' worth of experts, within the reserve.
+            long cap = ComputeBudget.LeanReserveBytes(ComputeBudget.LeanRamBytes) / 4;
+            if (_pooledBytes + bytes > cap)
+            {
+                return;
+            }
+            if (!_pool.TryGetValue((array.LongLength, bf16), out var stack))
+            {
+                _pool[(array.LongLength, bf16)] = stack = new Stack<Array>();
+            }
+            stack.Push(array);
+            _pooledBytes += bytes;
+        }
+    }
+
+    /// <summary>
+    /// Keeps the managed heap near the RAM target. Streamed matrices and the
+    /// activations made from them are garbage as soon as a layer has run, but
+    /// most are large-object allocations, which only a full collection frees,
+    /// and with RAM to spare the GC lets gigabytes of them build up first. So
+    /// once the heap passes the target less a margin, it is collected. If what
+    /// is live is itself over that line, the next collection waits until the
+    /// heap has grown another 256 MiB, rather than collecting on every load.
+    /// </summary>
+    private void KeepHeapNearTarget()
+    {
+        long ram = ComputeBudget.LeanRamBytes;
+        long line = Math.Max(_heapFloor, ram - Math.Min(512L << 20, ram / 8));
+        if (GC.GetTotalMemory(false) <= line)
+        {
+            return;
+        }
+        GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, blocking: true);
+        _streamedSinceCollect = 0;
+        _heapFloor = GC.GetTotalMemory(false) + (256L << 20);
+    }
+
+    private Tensor2D MatrixLean(OperandRef operand, int rows, int cols, bool expert)
+    {
+        var key = (operand.ObjectId, operand.TensorName);
+        lock (_diskLock)
+        {
+            KeepHeapNearTarget();
+            if (_matrices.TryGetValue(key, out var cached) ||
+                (_streamed.TryGetValue(key, out var weak) && weak.TryGetTarget(out cached)))
+            {
+                if (_expertNodes.TryGetValue(key, out var node))
+                {
+                    _expertOrder.Remove(node);
+                    _expertOrder.AddLast(node);
+                }
+                if (_deviceExpertNodes.TryGetValue(key, out var deviceNode))
+                {
+                    _deviceExpertOrder.Remove(deviceNode);
+                    _deviceExpertOrder.AddLast(deviceNode);
+                    _deviceExpertGeneration[key] = _expertGeneration;
+                }
+                LoadTrace?.Invoke(operand.ObjectId, operand.TensorName, new long[] { rows, cols }, true);
+                return cached!;
+            }
+
+            Tensor2D matrix;
+            if (TryLeanDevice(operand, rows, cols, expert, out var onDevice))
+            {
+                matrix = onDevice;
+                _matrices[key] = matrix;
+            }
+            else
+            {
+                matrix = LeanFromStore(operand, rows, cols, expert);
+                long bytes = HostBytes(matrix);
+                bool kept = expert ? CacheExpert(key, matrix, bytes) : CacheDense(key, matrix, bytes);
+                if (!kept && expert && matrix.Scaled is null)
+                {
+                    // Handed back through Release once its expert has run.
+                    _recyclable.Add(matrix);
+                }
+                else if (!kept)
+                {
+                    _streamed[key] = new WeakReference<Tensor2D>(matrix);
+                    ReclaimStreamed(bytes);
+                }
+            }
+            LoadTrace?.Invoke(operand.ObjectId, operand.TensorName, new long[] { rows, cols }, false);
+            return matrix;
+        }
+    }
+
+    /// <summary>A matrix as the container stores it: BF16 bits when the
+    /// tensor is BF16 and unpatched, otherwise widened to f32 with any patch
+    /// and added delta applied.</summary>
+    private Tensor2D LeanFromStore(OperandRef operand, int rows, int cols, bool recycled = false)
+    {
+        DiskReads++;
+        long count = (long)rows * cols;
+        if (!Patched(operand) && _store.ResolveScaled(operand) is { } scaled)
+        {
+            // A quantised checkpoint's weight: held at its stored size.
+            if (scaled.Rows != rows || scaled.Cols != cols)
+            {
+                throw new ContainerException(
+                    $"operand '{operand.ObjectId}/{operand.TensorName}' is [{scaled.Rows} x {scaled.Cols}] — expected [{rows} x {cols}]");
+            }
+            _leanBytesRead += scaled.Elements.LongLength;
+            return Tensor2D.FromScaled(scaled);
+        }
+        if (HoldAsBf16Always(operand))
+        {
+            var (shape, bits) = _store.ResolveBf16(operand.ObjectId, operand.TensorName,
+                recycled ? Rent<ushort>(count) : null);
+            if (shape.Length == 0 || ElementCount(shape) != (long)rows * cols)
+            {
+                throw new ContainerException(
+                    $"operand '{operand.ObjectId}/{operand.TensorName}' resolves to shape " +
+                    $"[{string.Join(",", shape)}] — expected [{rows} x {cols}]");
+            }
+            _leanBytesRead += bits.LongLength * 2;
+            return Tensor2D.FromBf16(bits, rows, cols);
+        }
+        var resolution = _store.ResolveWidened(operand.ObjectId, operand.TensorName,
+            recycled ? Rent<float>(count) : null);
+        if (resolution.Shape.Length == 0 || ElementCount(resolution.Shape) != (long)rows * cols)
+        {
+            throw new ContainerException(
+                $"operand '{operand.ObjectId}/{operand.TensorName}' resolves to shape " +
+                $"[{string.Join(",", resolution.Shape)}] — expected [{rows} x {cols}]");
+        }
+        ApplyPatch(operand, resolution.Values);
+        _leanBytesRead += resolution.Values.LongLength * 4;
+        return new Tensor2D(resolution.Values, rows, cols);
+    }
+
+    private bool Patched(OperandRef operand) =>
+        _added.ContainsKey((operand.ObjectId, operand.TensorName)) ||
+        (_patch is not null && _patch.TryGet(operand.ObjectId, operand.TensorName, out _));
+
+    /// <summary>Smallest matrix worth putting on the GPU as NVFP4: below it the
+    /// launch and the activation's round trip cost more than the host product.</summary>
+    public long LeanNvfp4MinimumElements { get; set; } = 1L << 18;
+
+    // Experts on the GPU, least recently used first: the device budget's
+    // share that dense weights leave, refilled as routing moves on.
+    private readonly LinkedList<(string ObjectId, string Tensor)> _deviceExpertOrder = new();
+    private readonly Dictionary<(string ObjectId, string Tensor), LinkedListNode<(string ObjectId, string Tensor)>> _deviceExpertNodes = new();
+    private long _leanDeviceExpertBytes;
+
+    /// <summary>
+    /// Puts a matrix on the GPU when the device budget has room, keeping no
+    /// host copy. A weight the checkpoint stores as NVFP4 goes as its packs
+    /// (0.5625 bytes an element), routed experts included, which then share
+    /// the device in least-recently-used order. With
+    /// <see cref="ComputeBudget.GpuWeightFormat"/> NVFP4, other weights are
+    /// quantised to NVFP4 on the way (lossy). Otherwise a dense matrix big
+    /// enough for the device GEMM goes as FP16, decoded exactly from what is
+    /// stored. Dense weights may displace experts, never the other way round.
+    /// </summary>
+    private bool TryLeanDevice(OperandRef operand, int rows, int cols, bool expert, out Tensor2D matrix)
+    {
+        matrix = null!;
+        if (!CudaShim.Enabled || DeviceBudget() <= 0)
+        {
+            return false;
+        }
+        long elements = (long)rows * cols;
+        var stored = _store.DtypeOf(operand.ObjectId, operand.TensorName);
+        bool patched = Patched(operand);
+        // A checkpoint's MXFP8 goes as stored (exact, 1.03 bytes an element);
+        // its NVFP4 too; anything else as NVFP4 only when asked for.
+        bool mxfp8 = stored == Dtype.F8_E4M3 && cols % Mxfp8.BlockElements == 0 &&
+                     elements >= LeanNvfp4MinimumElements && !patched;
+        bool nvfp4 = !mxfp8 && cols % Nvfp4.BlockElements == 0 && elements >= LeanNvfp4MinimumElements && !patched &&
+                     (stored == Dtype.FP4 || ComputeBudget.GpuWeightFormat == GpuWeightFormat.Nvfp4);
+        bool fp16 = !mxfp8 && !nvfp4 && !expert && elements >= TensorOps.CudaMinimumMacs;
+        if (!mxfp8 && !nvfp4 && !fp16)
+        {
+            return false;
+        }
+        long bytes = mxfp8 ? CudaShim.Mxfp8DeviceBytes(rows, cols)
+            : nvfp4 ? CudaShim.Nvfp4DeviceBytes(rows, cols)
+            : elements * 2;
+        if (!MakeDeviceRoom(bytes, expert))
+        {
+            return false;
+        }
+        var host = LeanFromStore(operand, rows, cols);
+        Func<Tensor2D> reload = () =>
+        {
+            lock (_diskLock)
+            {
+                return LeanFromStore(operand, rows, cols);
+            }
+        };
+        if (mxfp8)
+        {
+            if (host.Scaled is not { IsMxfp8: true } stored8)
+            {
+                return false; // FP8 with other scales (per tensor, 128x128 blocks): host
+            }
+            var device = CudaShim.UploadMxfp8(stored8);
+            if (device == IntPtr.Zero)
+            {
+                return false;
+            }
+            matrix = Tensor2D.OnDeviceMxfp8(rows, cols, device, reload);
+        }
+        else if (nvfp4)
+        {
+            var packs = host.Scaled is { IsNvfp4: true } exact
+                ? exact
+                : ComputeBudget.GpuWeightFormat == GpuWeightFormat.Nvfp4
+                    ? Nvfp4.Quantize(host.Scaled?.Dequant() ?? host.Data, rows, cols)
+                    : null;
+            var device = packs is null ? IntPtr.Zero : CudaShim.UploadNvfp4(packs);
+            if (device == IntPtr.Zero)
+            {
+                return false;
+            }
+            matrix = Tensor2D.OnDeviceNvfp4(rows, cols, device, packs!.Global, reload);
+        }
+        else
+        {
+            string deviceKey = PatchedDeviceKey(operand) ?? $"{operand.ObjectId}/{operand.TensorName}";
+            if (_added.ContainsKey((operand.ObjectId, operand.TensorName)))
+            {
+                deviceKey += $"#added{Version}";
+            }
+            var device = CudaShim.UploadRawF16(deviceKey,
+                host.Scaled is { } scaled ? BitPattern.F32ToFp16Bytes(scaled.Dequant()) : Fp16Of(host), rows, cols);
+            if (device == IntPtr.Zero)
+            {
+                return false;
+            }
+            matrix = Tensor2D.OnDevice(rows, cols, device, reload);
+        }
+        _leanDeviceBytes += bytes;
+        AnyDeviceWeight = true;
+        if (expert)
+        {
+            var key = (operand.ObjectId, operand.TensorName);
+            _deviceExpertNodes[key] = _deviceExpertOrder.AddLast(key);
+            _deviceExpertGeneration[key] = _expertGeneration;
+            _leanDeviceExpertBytes += bytes;
+        }
+        return true;
+    }
+
+    /// <summary>Frees device experts, oldest first, until <paramref name="bytes"/>
+    /// more fit the budget. An expert can only displace other experts.</summary>
+    /// <summary>Frees a matrix's NVFP4 or MXFP8 device copy, leaving anyone who
+    /// still holds the matrix to fall back to the host; the bytes it took.</summary>
+    private static long FreeScaledDevice(Tensor2D matrix)
+    {
+        if (matrix.DeviceNvfp4 is var fp4 && fp4 != IntPtr.Zero)
+        {
+            matrix.DeviceNvfp4 = IntPtr.Zero;
+            CudaShim.FreeNvfp4(fp4, matrix.Rows, matrix.Cols);
+            return CudaShim.Nvfp4DeviceBytes(matrix.Rows, matrix.Cols);
+        }
+        if (matrix.DeviceMxfp8 is var fp8 && fp8 != IntPtr.Zero)
+        {
+            matrix.DeviceMxfp8 = IntPtr.Zero;
+            CudaShim.FreeMxfp8(fp8, matrix.Rows, matrix.Cols);
+            return CudaShim.Mxfp8DeviceBytes(matrix.Rows, matrix.Cols);
+        }
+        return 0;
+    }
+
+    private bool MakeDeviceRoom(long bytes, bool expert)
+    {
+        long budget = DeviceBudget();
+        if (bytes > budget || (!expert && _leanDeviceBytes - _leanDeviceExpertBytes + bytes > budget))
+        {
+            return false;
+        }
+        // Experts fetched for the layer running now are waiting for its fused
+        // device call: they are skipped, never evicted from under it.
+        var candidate = _deviceExpertOrder.First;
+        while (_leanDeviceBytes + bytes > budget && candidate is not null)
+        {
+            var next = candidate.Next;
+            if (_deviceExpertGeneration.GetValueOrDefault(candidate.Value) != _expertGeneration)
+            {
+                EvictDeviceExpert(candidate.Value);
+            }
+            candidate = next;
+        }
+        return _leanDeviceBytes + bytes <= budget;
+    }
+
+    private long _expertGeneration;
+    private readonly Dictionary<(string ObjectId, string Tensor), long> _deviceExpertGeneration = new();
+
+    /// <summary>Starts a routed layer: device experts it fetches stay on the
+    /// device until the next layer starts, so its fused call can use them all.</summary>
+    public void BeginExpertLayer()
+    {
+        lock (_diskLock)
+        {
+            _expertGeneration++;
+        }
+    }
+
+    private void EvictDeviceExpert((string ObjectId, string Tensor) key)
+    {
+        _deviceExpertGeneration.Remove(key);
+        if (_deviceExpertNodes.Remove(key, out var node))
+        {
+            _deviceExpertOrder.Remove(node);
+        }
+        if (_matrices.Remove(key, out var evicted))
+        {
+            long bytes = FreeScaledDevice(evicted);
+            _leanDeviceBytes -= bytes;
+            _leanDeviceExpertBytes -= bytes;
+        }
+    }
+
+    /// <summary>FP16 bytes of a host matrix, converted a slice at a time so a
+    /// BF16 matrix is never widened whole on its way to the GPU.</summary>
+    private static byte[] Fp16Of(Tensor2D host)
+    {
+        const int Slice = 1 << 20;
+        long elements = (long)host.Rows * host.Cols;
+        var fp16 = GC.AllocateUninitializedArray<byte>(checked((int)(elements * 2)));
+        var bits = host.Bf16Bits;
+        var widened = bits is null ? null : new float[Math.Min(Slice, elements)];
+        for (long first = 0; first < elements; first += Slice)
+        {
+            int n = (int)Math.Min(Slice, elements - first);
+            ReadOnlySpan<float> values;
+            if (bits is not null)
+            {
+                BitPattern.WidenInto(Dtype.BF16,
+                    System.Runtime.InteropServices.MemoryMarshal.AsBytes(bits.AsSpan((int)first, n)), widened.AsSpan(0, n));
+                values = widened.AsSpan(0, n);
+            }
+            else
+            {
+                values = host.Data.AsSpan((int)first, n);
+            }
+            BitPattern.F32ToFp16Bytes(values).CopyTo(fp16.AsSpan((int)(first * 2), n * 2));
+        }
+        return fp16;
+    }
+
+    private static long HostBytes(Tensor2D matrix) =>
+        matrix.Scaled is { } scaled ? scaled.Bytes
+        : matrix.Bf16Bits is { } bits ? bits.LongLength * 2
+        : matrix.Data.LongLength * 4;
+
+    private bool CacheDense((string ObjectId, string Tensor) key, Tensor2D matrix, long bytes)
+    {
+        if (_leanDenseBytes + bytes > LeanCacheBytes)
+        {
+            return false;
+        }
+        while (_leanDenseBytes + _leanExpertBytes + bytes > LeanCacheBytes && _expertOrder.First is { } oldest)
+        {
+            EvictExpert(oldest.Value);
+        }
+        _matrices[key] = matrix;
+        _leanDenseBytes += bytes;
+        return true;
+    }
+
+    private bool CacheExpert((string ObjectId, string Tensor) key, Tensor2D matrix, long bytes)
+    {
+        if (_leanDenseBytes + bytes > LeanCacheBytes)
+        {
+            return false;
+        }
+        while (_leanDenseBytes + _leanExpertBytes + bytes > LeanCacheBytes && _expertOrder.First is { } oldest)
+        {
+            EvictExpert(oldest.Value);
+        }
+        _matrices[key] = matrix;
+        _leanExpertBytes += bytes;
+        _expertNodes[key] = _expertOrder.AddLast(key);
+        return true;
+    }
+
+    private void EvictExpert((string ObjectId, string Tensor) key)
+    {
+        if (_matrices.Remove(key, out var evicted))
+        {
+            _leanExpertBytes -= HostBytes(evicted);
+        }
+        if (_expertNodes.Remove(key, out var node))
+        {
+            _expertOrder.Remove(node);
+        }
+    }
+
+    /// <summary>f32 bytes of a matrix block <see cref="StreamedProduct"/> holds at once.</summary>
+    public long StreamBlockBytes { get; set; } = 64L << 20;
+
+    /// <summary>Products <see cref="StreamedProduct"/> has computed a block at a time.</summary>
+    public long BlockStreamedProducts { get; private set; }
+
+    /// <summary>
+    /// x times W-transposed for a matrix the lean working set cannot hold: the
+    /// matrix is read a block of rows at a time and each block's columns of the
+    /// product computed from it, so no more than a block is ever in memory.
+    /// Null when the matrix is held (cached or on the GPU), would be held if
+    /// loaded, is patched, or the working set is not lean: the caller then
+    /// multiplies by <see cref="Matrix"/>. Each output is the same dot over the
+    /// same values, so the product is the whole-matrix one.
+    /// </summary>
+    public Tensor2D? StreamedProduct(Tensor2D x, OperandRef operand, int rows, int cols)
+    {
+        if (_workingSet != WeightWorkingSet.Lean || x.Cols != cols ||
+            (_patch is not null && _patch.TryGet(operand.ObjectId, operand.TensorName, out _)) ||
+            _added.ContainsKey((operand.ObjectId, operand.TensorName)))
+        {
+            return null;
+        }
+        long blockRows = Math.Max(1, StreamBlockBytes / ((long)cols * 4));
+        lock (_diskLock)
+        {
+            var key = (operand.ObjectId, operand.TensorName);
+            long elements = (long)rows * cols;
+            long hostBytes = elements * (_store.DtypeOf(operand.ObjectId, operand.TensorName) == Dtype.BF16 ? 2 : 4);
+            bool held = _matrices.ContainsKey(key) ||
+                        (_streamed.TryGetValue(key, out var weak) && weak.TryGetTarget(out _));
+            bool wouldHold = _leanDenseBytes + hostBytes <= LeanCacheBytes ||
+                             (CudaShim.Enabled && elements >= TensorOps.CudaMinimumMacs &&
+                              _leanDeviceBytes + elements * 2 <= DeviceBudget());
+            if (held || wouldHold || rows <= blockRows)
+            {
+                return null;
+            }
+            DiskReads++;
+            BlockStreamedProducts++;
+            _leanBytesRead += hostBytes;
+            LoadTrace?.Invoke(operand.ObjectId, operand.TensorName, new long[] { rows, cols }, false);
+        }
+
+        // A BF16 matrix streams as its bits, which the kernel widens in
+        // registers: half the bytes read, and the same dots.
+        bool bf16 = _store.DtypeOf(operand.ObjectId, operand.TensorName) == Dtype.BF16;
+        var result = new float[(long)x.Rows * rows];
+        var bitsBlock = bf16 ? new ushort[blockRows * cols] : null;
+        var floatBlock = bf16 ? null : new float[blockRows * cols];
+        for (long first = 0; first < rows; first += blockRows)
+        {
+            int n = (int)Math.Min(blockRows, rows - first);
+            Tensor2D w;
+            lock (_diskLock)
+            {
+                if (bitsBlock is not null)
+                {
+                    var target = n == blockRows ? bitsBlock : new ushort[n * cols];
+                    _store.ReadRowRange(operand, first, n, target);
+                    w = Tensor2D.FromBf16(target, n, cols);
+                }
+                else
+                {
+                    var target = n == blockRows ? floatBlock! : new float[n * cols];
+                    _store.ReadRowRange(operand, first, n, target);
+                    w = new Tensor2D(target, n, cols);
+                }
+            }
+            var part = TensorOps.MatMulTransposedB(x, w);
+            for (int r = 0; r < x.Rows; r++)
+            {
+                part.Data.AsSpan(r * n, n).CopyTo(result.AsSpan((int)(r * (long)rows + first), n));
+            }
+        }
+        return new Tensor2D(result, x.Rows, rows);
+    }
+
+    /// <summary>
+    /// Gathers rows of an embedding table without holding the table: in the
+    /// lean working set each token's row is read straight from the container.
+    /// Null in the other working sets, when the table is patched (a row read
+    /// would miss the patch), or when the table is already held (it is also
+    /// the output head) — the caller then gathers from <see cref="Matrix"/>.
+    /// </summary>
+    public Tensor2D? GatherRows(OperandRef table, int vocab, int hidden, ReadOnlySpan<int> tokens)
+    {
+        if (_workingSet != WeightWorkingSet.Lean ||
+            (_patch is not null && _patch.TryGet(table.ObjectId, table.TensorName, out _)) ||
+            _added.ContainsKey((table.ObjectId, table.TensorName)))
+        {
+            return null;
+        }
+        lock (_diskLock)
+        {
+            // A table held on the host (also the output head) is gathered from;
+            // one held only on the GPU is not read back for a few rows.
+            if (_matrices.TryGetValue((table.ObjectId, table.TensorName), out var held) && !held.OnGpu)
+            {
+                return null;
+            }
+            var ids = new long[tokens.Length];
+            for (int i = 0; i < tokens.Length; i++)
+            {
+                if ((uint)tokens[i] >= (uint)vocab)
+                {
+                    throw new ArgumentOutOfRangeException(nameof(tokens), $"token {tokens[i]} is outside the {vocab}-row embedding");
+                }
+                ids[i] = tokens[i];
+            }
+            var values = new float[(long)tokens.Length * hidden];
+            _store.ReadRowsWidened(table, ids, values);
+            _leanBytesRead += (long)tokens.Length * hidden * 2;
+            LoadTrace?.Invoke(table.ObjectId, table.TensorName, new long[] { tokens.Length, hidden }, false);
+            return new Tensor2D(values, tokens.Length, hidden);
+        }
+    }
+
+    /// <summary>Like <see cref="HoldAsBf16"/>, but not switched off by
+    /// <c>AMQL_RESIDENT_BF16</c>: the lean set never widens what it need not.</summary>
+    private bool HoldAsBf16Always(OperandRef operand)
+    {
+        var key = (operand.ObjectId, operand.TensorName);
+        if (_added.ContainsKey(key) || (_patch is not null && _patch.TryGet(operand.ObjectId, operand.TensorName, out _)))
+        {
+            return false;
+        }
+        return _store.DtypeOf(operand.ObjectId, operand.TensorName) == Dtype.BF16;
+    }
+
+    /// <summary>Reads chosen rows of a table straight from storage, widened to
+    /// f32 — nothing cached, nothing charged to the working set. For tables too
+    /// large to load (Qwen4's n-gram embedding). A patch on the table refuses:
+    /// a row read would silently miss it.</summary>
+    public void ReadRows(OperandRef operand, ReadOnlySpan<long> rows, Span<float> target)
+    {
+        if ((_patch is not null && _patch.TryGet(operand.ObjectId, operand.TensorName, out _)) ||
+            _added.ContainsKey((operand.ObjectId, operand.TensorName)))
+        {
+            throw new UnsupportedOperatorException(
+                $"'{operand.ObjectId}/{operand.TensorName}' is read a row at a time, and a weight patch on it would be missed");
+        }
+        _store.ReadRowsWidened(operand, rows, target);
+    }
+
     /// <summary>Loads a 1-D weight (norm scales).</summary>
     public float[] Vector(OperandRef operand, int width)
     {
@@ -475,6 +1151,21 @@ public sealed class WeightLoader
                 // A device copy that no longer matches the host weight would
                 // silently compute with the old values; drop to managed GEMMs.
                 matrix.DeviceWeightF16 = IntPtr.Zero;
+            }
+        }
+        if (matrix.DeviceNvfp4 != IntPtr.Zero || matrix.DeviceMxfp8 != IntPtr.Zero)
+        {
+            // Four or eight bits cannot carry a small delta: the weight leaves
+            // the GPU and runs from its updated host values.
+            lock (_diskLock)
+            {
+                long bytes = FreeScaledDevice(matrix);
+                _leanDeviceBytes -= bytes;
+                if (_deviceExpertNodes.Remove(key, out var node))
+                {
+                    _deviceExpertOrder.Remove(node);
+                    _leanDeviceExpertBytes -= bytes;
+                }
             }
         }
     }
@@ -599,3 +1290,19 @@ public sealed class WeightLoader
             ? $"{bytes / (double)(1L << 30):0.0} GiB"
             : $"{bytes / (double)(1L << 20):0.0} MiB";
 }
+
+/// <summary>What a lean working set holds and has read.</summary>
+/// <param name="DenseBytes">Host bytes of dense weights cached.</param>
+/// <param name="ExpertBytes">Host bytes of routed experts cached.</param>
+/// <param name="ExpertsCached">Expert matrices cached.</param>
+/// <param name="DeviceBytes">FP16 bytes of dense weights on the GPU.</param>
+/// <param name="Reads">Matrices read from the container.</param>
+/// <param name="BytesRead">Bytes those reads (and embedding rows) produced.</param>
+/// <param name="HostReloads">GPU-held matrices whose host values had to be read back.</param>
+/// <param name="CacheBudget">The host cache budget.</param>
+/// <param name="DeviceBudget">The GPU budget.</param>
+/// <param name="DeviceExperts">Expert matrices on the GPU.</param>
+/// <param name="ScaledWidenings">Quantised matrices that had to be widened whole.</param>
+public sealed record LeanStats(long DenseBytes, long ExpertBytes, int ExpertsCached, long DeviceBytes,
+    long Reads, long BytesRead, long HostReloads, long CacheBudget, long DeviceBudget,
+    int DeviceExperts = 0, long ScaledWidenings = 0);

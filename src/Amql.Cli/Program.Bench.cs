@@ -37,8 +37,9 @@ internal static partial class Program
             "bf16" => WeightWorkingSet.OnDemandBf16,
             "mxfp4" or "fp4" => WeightWorkingSet.Mxfp4,
             "disk" => WeightWorkingSet.Disk,
+            "lean" => WeightWorkingSet.Lean,
             "" => null,
-            _ => throw new CliException($"unknown weight mode '{weightMode}' — use f32, bf16, mxfp4 or disk"),
+            _ => throw new CliException($"unknown weight mode '{weightMode}' — use f32, bf16, mxfp4, disk or lean"),
         };
 
         using var container = Vindex3Container.Open(containerDir);
@@ -86,6 +87,11 @@ internal static partial class Program
         }
         Console.WriteLine($"checksum:  {checksum:x16} (bit patterns of the prefill and final-step logits)");
         Console.WriteLine($"best:      pp{promptTokens} {prefillRates.Max():F1} tok/s   tg{steps} {decodeRates.Max():F1} tok/s");
+        if (session.Runtime.Weights.WorkingSet == WeightWorkingSet.Lean)
+        {
+            Console.WriteLine($"lean:      {LeanLine(session.Runtime.Weights.Lean)}");
+        }
+        Console.WriteLine($"memory:    {ProcessMemoryLine()}");
         return 0;
     }
 

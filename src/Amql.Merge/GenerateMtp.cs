@@ -79,7 +79,7 @@ public static class GenerateMtp
                 throw new MergeException(
                     "no full-attention layer to copy as the MTP trunk — the MTP trunk is always a softmax layer");
             }
-            if (plan.FinalNorm.Weight is not { } finalNormRef ||
+            if (plan.RequireFinalNorm("MTP generation").Weight is not { } finalNormRef ||
                 plan.Embedding is not { } embedPlan ||
                 plan.Output is null)
             {
@@ -322,7 +322,7 @@ public static class GenerateMtp
                 },
             },
             FinalNorm = NormOp.From(new OperandRef("mtp.stack", "norm.weight"),
-                NormSpecOf(densePlan.FinalNorm), hidden),
+                NormSpecOf(densePlan.RequireFinalNorm("MTP generation")), hidden),
             Output = densePlan.Output,
         };
     }

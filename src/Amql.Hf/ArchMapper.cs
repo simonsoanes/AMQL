@@ -60,6 +60,9 @@ public static partial class ArchMapper
             throw new ModelConfigException(e.Message, e);
         }
         bool parallel = TensorRoles.IsParallelBlock(roles);
+        // Qwen4: the gated residual, QSA and the n-gram embedding, judged
+        // against the bound tensors before anything leans on the norm roles.
+        Qwen4Facts? qwen4 = IsQwen4Exp(facts) ? JudgeQwen4(facts, inventory, prefix, stackTensors) : null;
         // Routed experts: the count and top-k come from the config, the
         // expert width from the expert tensors themselves.
         MoeFacts? moeFacts = facts.Moe;
@@ -120,6 +123,10 @@ public static partial class ArchMapper
                 Operator = layerType switch
                 {
                     "full_attention" or "sliding_attention" => LayerOperators.Softmax,
+                    // Qwen4's QSA layers: softmax attention whose keys an indexer selects.
+                    // (transformers spells them qwen_sparse_attention; its first
+                    // release, indexed_attention; the checkpoint, full_attention).
+                    "qwen_sparse_attention" or "indexed_attention" when qwen4 is not null => LayerOperators.Softmax,
                     "linear_attention" => LayerOperators.LinearAttention,
                     "conv" => LayerOperators.Conv,
                     var other => throw new ModelConfigException(
@@ -185,7 +192,7 @@ public static partial class ArchMapper
                 // LFM3 gates each head's output by sigmoid(gate_proj·x), one
                 // scalar per head — a different operator from Qwen3.5's
                 // elementwise gate folded into q_proj.
-                OutputGate = facts.AttentionOutputGate
+                OutputGate = facts.AttentionOutputGate || qwen4 is not null
                     ? JsonSerializer.SerializeToElement(new { attn_output_gate = true }, ViJson.Options)
                     : HasPerHeadGate(inventory)
                         ? JsonSerializer.SerializeToElement(new { per_head_gate = true }, ViJson.Options)
@@ -234,16 +241,31 @@ public static partial class ArchMapper
             // decoder adds (h' = h + branch*rm).
             ResidualScale = facts.ResidualMultiplier,
             LinearAttention = facts.LinearAttention is { } la
-                ? JsonSerializer.SerializeToElement(new
-                {
-                    key_heads = la.KeyHeads,
-                    key_head_dim = la.KeyHeadDim,
-                    value_heads = la.ValueHeads,
-                    value_head_dim = la.ValueHeadDim,
-                    conv_kernel = la.ConvKernelDim,
-                    state_dtype = "float32",
-                }, ViJson.Options)
+                ? qwen4 is null
+                    ? JsonSerializer.SerializeToElement(new
+                    {
+                        key_heads = la.KeyHeads,
+                        key_head_dim = la.KeyHeadDim,
+                        value_heads = la.ValueHeads,
+                        value_head_dim = la.ValueHeadDim,
+                        conv_kernel = la.ConvKernelDim,
+                        state_dtype = "float32",
+                    }, ViJson.Options)
+                    : JsonSerializer.SerializeToElement(new
+                    {
+                        key_heads = la.KeyHeads,
+                        key_head_dim = la.KeyHeadDim,
+                        value_heads = la.ValueHeads,
+                        value_head_dim = la.ValueHeadDim,
+                        conv_kernel = la.ConvKernelDim,
+                        state_dtype = "float32",
+                        // Qwen4's output_gate_type: the gated norm's activation on z.
+                        gate_activation = qwen4.LinearGateActivation,
+                    }, ViJson.Options)
                 : null,
+            HyperConnections = qwen4?.HyperConnections,
+            SparseAttention = qwen4?.SparseAttention,
+            NgramEmbedding = qwen4?.NgramEmbedding,
             Classifier = classification is { HasScoreTensor: true }
                 ? new ClassifierSurface
                 {
@@ -289,7 +311,8 @@ public static partial class ArchMapper
             // LFM2/LFM3 name the final norm "embedding_norm"; the binding has
             // to carry the real stem or export rebuilds a name nothing loads.
             TextObject("target.final_norm", ObjectKind.FinalNorm, prefix,
-                inventory.TryGet($"{prefix}.embedding_norm.weight", out _) ? "embedding_norm" : "norm", encoding),
+                qwen4 is not null ? "hyper_connection_mixer"
+                : inventory.TryGet($"{prefix}.embedding_norm.weight", out _) ? "embedding_norm" : "norm", encoding),
             new()
             {
                 Id = "target.output_head",
@@ -501,7 +524,7 @@ public static partial class ArchMapper
             Rep("target.embedding", encoding,
                 BindOne(inventory, prefix, "embed_tokens.weight")),
             Rep("target.decoder_stack", encoding, stackTensors),
-            Rep("target.final_norm", encoding, BindFinalNorm(inventory, prefix)),
+            Rep("target.final_norm", encoding, qwen4 is not null ? BindFinalMixer(inventory, prefix) : BindFinalNorm(inventory, prefix)),
         };
         if (untied)
         {
@@ -778,7 +801,7 @@ public static partial class ArchMapper
                 continue;
             }
             string relative = fullName[layersPrefix.Length..];
-            if (SplitFusion(inventory, fullName, relative, facts) is { } split)
+            if ((SplitPackedExperts(inventory, fullName, relative, facts) ?? SplitFusion(inventory, fullName, relative, facts)) is { } split)
             {
                 bound.AddRange(split.Parts);
                 fused.TryAdd(split.Fused.Name, split.Fused);
@@ -923,17 +946,41 @@ public static partial class ArchMapper
     private static NamedTensorData ToTensorData(HfInventory inventory, string fullName, string relative)
     {
         var info = inventory.Get(fullName);
+        var (dtype, shape) = PackedFp4(inventory, fullName, info) ?? (info.Dtype, info.Shape);
         // Read from the checkpoint's memory map only when the segment is
         // written, a chunk at a time: encoding a checkpoint never holds more
         // than one chunk of it, however large the model.
         return new NamedTensorData
         {
             Name = relative,
-            Dtype = info.Dtype,
-            Shape = info.Shape,
+            Dtype = dtype,
+            Shape = shape,
             Source = (offset, count) => inventory.ReadBytes(fullName, offset, count),
             SourceLength = info.DataLength,
         };
+    }
+
+    /// <summary>
+    /// A quantised checkpoint's FP4 weight, which safetensors can only call
+    /// <c>U8 [out, in/2]</c>: two E2M1 elements to a byte. It is recognised by
+    /// its block-scale companion, <c>{name}_scale</c>, whose columns tile the
+    /// unpacked row: E4M3 per 16 elements (NVFP4, as ModelOpt writes it) or
+    /// U8 E8M0 exponents per 32 (MXFP4). The bytes are kept; the container
+    /// records them as FP4 at their logical shape, so every shape check and
+    /// the operand store see the matrix the model multiplies by.
+    /// </summary>
+    internal static (Dtype Dtype, long[] Shape)? PackedFp4(HfInventory inventory, string fullName, TensorInfo info)
+    {
+        if (info.Dtype != Dtype.U8 || info.Shape.Length != 2 ||
+            !inventory.TryGet(fullName + "_scale", out var scale) || scale.Shape.Length != 2 ||
+            scale.Shape[0] != info.Shape[0])
+        {
+            return null;
+        }
+        long cols = info.Shape[1] * 2;
+        bool nvfp4 = scale.Dtype == Dtype.F8_E4M3 && scale.Shape[1] * 16 == cols;
+        bool mxfp4 = scale.Dtype is Dtype.U8 or Dtype.F8_E8M0 && scale.Shape[1] * 32 == cols;
+        return nvfp4 || mxfp4 ? (Dtype.FP4, new[] { info.Shape[0], cols }) : null;
     }
 
     private static RepresentationSpec Rep(string objectId, string encoding, List<NamedTensorData> tensors) => new()

@@ -96,7 +96,7 @@ internal static partial class Program
         int hidden = plan.HiddenSize, last = plan.Layers.Count - 1;
         var output = plan.Output ?? throw new CliException("the model has no output head");
         var head = rt.Weights.Matrix(output.Projection, output.VocabSize, output.HiddenSize);
-        var finalW = rt.Weights.Vector(plan.FinalNorm.Weight, hidden);
+        var finalW = rt.Weights.Vector(plan.RequireFinalNorm("entail-from-lora").Weight, hidden);
         string Tok(int id) => Show(tokenizer.DecodeText(new[] { id }));
 
         var cases = File.ReadAllLines(casesPath).Where(l => l.Trim().Length > 0)
@@ -177,7 +177,7 @@ internal static partial class Program
             {
                 var col = new float[hidden];
                 for (int h = 0; h < hidden; h++)
-                    col[h] = l.B[h * l.Rank + k] * (finalW[h] + plan.FinalNorm.WeightOffset);
+                    col[h] = l.B[h * l.Rank + k] * (finalW[h] + plan.RequireFinalNorm("entail-from-lora").WeightOffset);
                 var scores = new double[output.VocabSize];
                 for (int v = 0; v < scores.Length; v++)
                 {

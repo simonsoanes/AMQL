@@ -16,7 +16,10 @@
 
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
+#include <cublasLt.h>
 #include <cusolverDn.h>
+#include <cuda_fp8.h>
+#include <cuda_fp4.h>
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
@@ -1518,5 +1521,1164 @@ AMQL_EXPORT int amql_cuda_cholesky_solve_f64(
 
     cudaFree(dA); cudaFree(dB); cudaFree((void*)dWorkspace);
     cudaFree(dInfo);
+    return 0;
+}
+// ── NVFP4 weights resident as packs ───────────────────────────────────────
+//
+// A weight stored as NVFP4 (FP4 E2M1 elements two to a byte, low nibble
+// first; one E4M3 scale per 16 elements of a row; an F32 tensor scale) stays
+// on the device in that form: the packed elements, then (256-byte aligned)
+// the block scales in cuBLASLt's tiled layout, so the tensor cores can read
+// them as they are. 0.5625 bytes an element (plus tile padding) against
+// FP16's 2. Products never widen the whole matrix:
+//   - up to 32 activation rows (decode, and the small batches a routed
+//     expert gets), 8 per pass, a warp per output row decodes its
+//     packs in registers and accumulates in FP32 against FP32 activations;
+//   - more rows (prefill), the activations are quantised to NVFP4 on the
+//     device and the FP4 tensor cores multiply (cuBLASLt, block-scaled
+//     E2M1 x E2M1, FP32 accumulate): W4A4, the arithmetic NVFP4 checkpoints
+//     are trained for. Where cuBLASLt declines a shape, or with
+//     AMQL_FP4_PREFILL=0, a tile of the weight is decoded to FP16 (exact)
+//     for an FP16 cuBLAS GEMM instead.
+//
+// Scale tiles (cuBLAS "1D Block Scaling Factors Layout"): 128 rows x 4
+// blocks of 16 elements per 512-byte tile, tiles row-major, rows padded to
+// 128 and blocks to 4 with zero scales.
+
+static void* gNvfp4Tile = nullptr;
+static size_t gNvfp4TileBytes = 0;
+
+static size_t nvfp4_scale_offset(int rows, int cols)
+{
+    size_t packed = (size_t)rows * (size_t)cols / 2;
+    return (packed + 255) & ~(size_t)255;
+}
+
+__host__ __device__ __forceinline__ int fp4_scale_tiles_inner(int cols)
+{
+    return (cols / 16 + 3) / 4;
+}
+
+__host__ __device__ __forceinline__ size_t fp4_scale_bytes(int rows, int cols)
+{
+    return (size_t)((rows + 127) / 128) * 128 * (size_t)fp4_scale_tiles_inner(cols) * 4;
+}
+
+// Offset of the scale of (row, 16-element block) in the tiled layout.
+__host__ __device__ __forceinline__ size_t fp4_scale_index(int row, int block, int tilesInner)
+{
+    return ((size_t)(row / 128) * tilesInner + block / 4) * 512
+         + (size_t)(row % 32) * 16 + (size_t)((row % 128) / 32) * 4 + (size_t)(block % 4);
+}
+
+__device__ __forceinline__ float e4m3_decoded(unsigned char b)
+{
+    int exponent = (b >> 3) & 0x0F;
+    int mantissa = b & 0x07;
+    float v;
+    if (exponent == 0)
+    {
+        v = ldexpf((float)mantissa, -9);              // subnormal: m/8 x 2^-6
+    }
+    else if (exponent == 15 && mantissa == 7)
+    {
+        v = 0.f;                                      // NaN: pinned to 0
+    }
+    else
+    {
+        v = ldexpf(1.f + (float)mantissa * 0.125f, exponent - 7);
+    }
+    return (b & 0x80) ? -v : v;
+}
+
+// Hardware conversions (sm_89+ for E4M3, Blackwell for E2M1): two elements
+// to an FP16 pair per instruction, the low byte or nibble first. A lookup
+// table indexed by the element would serialise across the warp.
+__device__ __forceinline__ float2 e4m3x2_decoded(unsigned short pair)
+{
+    __half2_raw raw = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)pair, __NV_E4M3);
+    return __half22float2(*reinterpret_cast<__half2*>(&raw));
+}
+
+__device__ __forceinline__ float2 e2m1x2_decoded(unsigned char pair)
+{
+    __half2_raw raw = __nv_cvt_fp4x2_to_halfraw2((__nv_fp4x2_storage_t)pair, __NV_E2M1);
+    return __half22float2(*reinterpret_cast<__half2*>(&raw));
+}
+
+__global__ void tile_fp4_scales(const unsigned char* __restrict__ linear, unsigned char* __restrict__ tiled,
+    int rows, int cols)
+{
+    long index = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    int blocks = cols / 16;
+    if (index >= (long)rows * blocks)
+    {
+        return;
+    }
+    int row = (int)(index / blocks);
+    int block = (int)(index % blocks);
+    tiled[fp4_scale_index(row, block, fp4_scale_tiles_inner(cols))] = linear[index];
+}
+
+template <int M>
+__global__ void nvfp4_gemv(
+    const unsigned char* __restrict__ packed, const unsigned char* __restrict__ scales,
+    const float* __restrict__ a, float* __restrict__ c, int n, int k, float global)
+{
+    int row = (int)((blockIdx.x * (long)blockDim.x + threadIdx.x) >> 5);
+    int lane = threadIdx.x & 31;
+    if (row >= n)
+    {
+        return;
+    }
+    int blocks = k / 16;
+    int tilesInner = fp4_scale_tiles_inner(k);
+    const unsigned char* rowPack = packed + (size_t)row * (k / 2);
+    float acc[M];
+#pragma unroll
+    for (int i = 0; i < M; i++)
+    {
+        acc[i] = 0.f;
+    }
+    for (int b = lane; b < blocks; b += 32)
+    {
+        float scale = e4m3_decoded(scales[fp4_scale_index(row, b, tilesInner)]);
+        uint2 bytes = *reinterpret_cast<const uint2*>(rowPack + (size_t)b * 8);
+        float w[16];
+#pragma unroll
+        for (int j = 0; j < 16; j += 2)
+        {
+            unsigned int word = (j >> 3) == 0 ? bytes.x : bytes.y;
+            float2 pair = e2m1x2_decoded((unsigned char)((word >> (((j >> 1) & 3) * 8)) & 0xFF));
+            w[j] = pair.x * scale;
+            w[j + 1] = pair.y * scale;
+        }
+#pragma unroll
+        for (int i = 0; i < M; i++)
+        {
+            const float4* x = reinterpret_cast<const float4*>(a + (size_t)i * k + (size_t)b * 16);
+            float4 x0 = x[0], x1 = x[1], x2 = x[2], x3 = x[3];
+            acc[i] += w[0] * x0.x + w[1] * x0.y + w[2] * x0.z + w[3] * x0.w
+                    + w[4] * x1.x + w[5] * x1.y + w[6] * x1.z + w[7] * x1.w
+                    + w[8] * x2.x + w[9] * x2.y + w[10] * x2.z + w[11] * x2.w
+                    + w[12] * x3.x + w[13] * x3.y + w[14] * x3.z + w[15] * x3.w;
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < M; i++)
+    {
+        float v = acc[i];
+        for (int offset = 16; offset > 0; offset >>= 1)
+        {
+            v += __shfl_down_sync(0xffffffff, v, offset);
+        }
+        if (lane == 0)
+        {
+            c[(size_t)i * n + row] = v * global;
+        }
+    }
+}
+
+static const int kGemvRows = 32;
+// Up to kGemvRows activation rows through the in-register GEMV, 8 at a time
+// (each group re-reads the weight, from L2 after the first): for the small
+// batches a routed expert gets, cheaper than quantising for the tensor cores.
+static void nvfp4_gemv_rows(const unsigned char* packed, const unsigned char* scales, float global, const float* aDev, float* cDev, int m, int n, int k, cudaStream_t stream)
+{
+    const int threads = 256;
+    int blocks = (int)(((long)n * 32 + threads - 1) / threads);
+    for (int done = 0; done < m; done += 8)
+    {
+        const float* a = aDev + (size_t)done * k;
+        float* c = cDev + (size_t)done * n;
+        switch (std::min(8, m - done))
+        {
+            case 1: nvfp4_gemv<1><<<blocks, threads, 0, stream>>>(packed, scales, a, c, n, k, global); break;
+            case 2: nvfp4_gemv<2><<<blocks, threads, 0, stream>>>(packed, scales, a, c, n, k, global); break;
+            case 3: nvfp4_gemv<3><<<blocks, threads, 0, stream>>>(packed, scales, a, c, n, k, global); break;
+            case 4: nvfp4_gemv<4><<<blocks, threads, 0, stream>>>(packed, scales, a, c, n, k, global); break;
+            case 5: nvfp4_gemv<5><<<blocks, threads, 0, stream>>>(packed, scales, a, c, n, k, global); break;
+            case 6: nvfp4_gemv<6><<<blocks, threads, 0, stream>>>(packed, scales, a, c, n, k, global); break;
+            case 7: nvfp4_gemv<7><<<blocks, threads, 0, stream>>>(packed, scales, a, c, n, k, global); break;
+            default: nvfp4_gemv<8><<<blocks, threads, 0, stream>>>(packed, scales, a, c, n, k, global); break;
+        }
+    }
+}
+
+__global__ void dequant_nvfp4_to_f16(
+    const unsigned char* __restrict__ packed, const unsigned char* __restrict__ scales,
+    __half* __restrict__ out, int firstRow, int rows, int k)
+{
+    long index = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= (long)rows * k)
+    {
+        return;
+    }
+    int row = firstRow + (int)(index / k);
+    int col = (int)(index % k);
+    unsigned char byte = packed[(size_t)row * (k / 2) + col / 2];
+    float2 pair = e2m1x2_decoded(byte);
+    float scale = e4m3_decoded(scales[fp4_scale_index(row, col / 16, fp4_scale_tiles_inner(k))]);
+    out[index] = __float2half_rn(((col & 1) ? pair.y : pair.x) * scale);
+}
+
+// ── Activations to NVFP4 (the prefill's B operand) ───────────────────────
+
+__global__ void abs_max(const float* __restrict__ x, long count, unsigned int* __restrict__ result)
+{
+    float local = 0.f;
+    for (long i = (long)blockIdx.x * blockDim.x + threadIdx.x; i < count; i += (long)gridDim.x * blockDim.x)
+    {
+        local = fmaxf(local, fabsf(x[i]));
+    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+    {
+        local = fmaxf(local, __shfl_down_sync(0xffffffff, local, offset));
+    }
+    if ((threadIdx.x & 31) == 0)
+    {
+        atomicMax(result, __float_as_uint(local));    // non-negative floats order as their bits
+    }
+}
+
+// One thread per 16-element block of an activation row: ModelOpt's NVFP4
+// recipe with the tensor scale from this call's absolute maximum. Thread 0
+// also writes alpha = (weight tensor scale) x (activation tensor scale).
+__global__ void quantise_nvfp4_rows(
+    const float* __restrict__ x, int m, int k, const unsigned int* __restrict__ amaxBits,
+    unsigned char* __restrict__ packed, unsigned char* __restrict__ scales, float weightGlobal,
+    float* __restrict__ alphaBeta)
+{
+    long index = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    int blocks = k / 16;
+    float amax = __uint_as_float(*amaxBits);
+    float global = amax > 0.f ? amax / (6.f * 448.f) : 1.f;
+    if (index == 0)
+    {
+        alphaBeta[0] = weightGlobal * global;
+        alphaBeta[1] = 0.f;
+    }
+    if (index >= (long)m * blocks)
+    {
+        return;
+    }
+    int row = (int)(index / blocks);
+    int block = (int)(index % blocks);
+    const float* src = x + (size_t)row * k + (size_t)block * 16;
+    float v[16];
+    float peak = 0.f;
+#pragma unroll
+    for (int i = 0; i < 16; i++)
+    {
+        v[i] = src[i];
+        peak = fmaxf(peak, fabsf(v[i]));
+    }
+    __nv_fp8_storage_t code = __nv_cvt_float_to_fp8(peak / 6.f / global, __NV_SATFINITE, __NV_E4M3);
+    float step = e4m3_decoded((unsigned char)code) * global;
+    float inv = step > 0.f ? 1.f / step : 0.f;
+    unsigned char* out = packed + (size_t)row * (k / 2) + (size_t)block * 8;
+#pragma unroll
+    for (int i = 0; i < 16; i += 2)
+    {
+        out[i / 2] = (unsigned char)__nv_cvt_float2_to_fp4x2(make_float2(v[i] * inv, v[i + 1] * inv),
+            __NV_E2M1, cudaRoundNearest);
+    }
+    scales[fp4_scale_index(row, block, fp4_scale_tiles_inner(k))] = (unsigned char)code;
+}
+
+// ── cuBLASLt plans, one per (m, n, k) ─────────────────────────────────────
+
+#include <map>
+#include <tuple>
+
+struct Fp4Plan
+{
+    cublasLtMatmulDesc_t desc = nullptr;
+    cublasLtMatrixLayout_t a = nullptr, b = nullptr, d = nullptr;
+    cublasLtMatmulAlgo_t algo{};
+    bool ok = false;
+};
+
+static cublasLtHandle_t gLt = nullptr;
+static std::map<std::tuple<int, int, int>, Fp4Plan> gFp4Plans;
+static void* gLtWorkspace = nullptr;
+static const size_t kLtWorkspaceBytes = 32u << 20;
+static void* gActPacked = nullptr;   static size_t gActPackedBytes = 0;
+static void* gActScales = nullptr;   static size_t gActScalesBytes = 0;
+static void* gAmax = nullptr;        // unsigned int, then float alpha, beta
+
+static int gFp4PrefillState = -1;
+
+static bool fp4_prefill_enabled()
+{
+    if (gFp4PrefillState < 0)
+    {
+        const char* env = getenv("AMQL_FP4_PREFILL");
+        gFp4PrefillState = (env != nullptr && (env[0] == '0' || env[0] == 'f' || env[0] == 'o')) ? 0 : 1;
+    }
+    return gFp4PrefillState == 1;
+}
+
+/// Turns the FP4 tensor-core prefill on (1) or off (0, FP16 tiles instead).
+AMQL_EXPORT void amql_cuda_set_fp4_prefill(int enabled)
+{
+    gFp4PrefillState = enabled != 0 ? 1 : 0;
+}
+
+// D[n,m] (column-major, = C[m,n] row-major) = W[n,k] x X[m,k]^T: the weight
+// is A (k x n column-major, transposed), the activations B (k x m, as is).
+static Fp4Plan* fp4_plan(int m, int n, int k, void* aScales, void* bScales)
+{
+    auto key = std::make_tuple(m, n, k);
+    auto found = gFp4Plans.find(key);
+    if (found != gFp4Plans.end())
+    {
+        return found->second.ok ? &found->second : nullptr;
+    }
+    Fp4Plan& plan = gFp4Plans[key];
+    if (gLt == nullptr && cublasLtCreate(&gLt) != CUBLAS_STATUS_SUCCESS)
+    {
+        return nullptr;
+    }
+    cublasOperation_t transA = CUBLAS_OP_T, transB = CUBLAS_OP_N;
+    cublasLtMatmulMatrixScale_t mode = CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
+    cublasLtPointerMode_t pointerMode = CUBLASLT_POINTER_MODE_DEVICE;
+    if (cublasLtMatmulDescCreate(&plan.desc, CUBLAS_COMPUTE_32F, CUDA_R_32F) != CUBLAS_STATUS_SUCCESS ||
+        cublasLtMatmulDescSetAttribute(plan.desc, CUBLASLT_MATMUL_DESC_TRANSA, &transA, sizeof(transA)) != CUBLAS_STATUS_SUCCESS ||
+        cublasLtMatmulDescSetAttribute(plan.desc, CUBLASLT_MATMUL_DESC_TRANSB, &transB, sizeof(transB)) != CUBLAS_STATUS_SUCCESS ||
+        cublasLtMatmulDescSetAttribute(plan.desc, CUBLASLT_MATMUL_DESC_A_SCALE_MODE, &mode, sizeof(mode)) != CUBLAS_STATUS_SUCCESS ||
+        cublasLtMatmulDescSetAttribute(plan.desc, CUBLASLT_MATMUL_DESC_B_SCALE_MODE, &mode, sizeof(mode)) != CUBLAS_STATUS_SUCCESS ||
+        cublasLtMatmulDescSetAttribute(plan.desc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &aScales, sizeof(aScales)) != CUBLAS_STATUS_SUCCESS ||
+        cublasLtMatmulDescSetAttribute(plan.desc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &bScales, sizeof(bScales)) != CUBLAS_STATUS_SUCCESS ||
+        cublasLtMatmulDescSetAttribute(plan.desc, CUBLASLT_MATMUL_DESC_POINTER_MODE, &pointerMode, sizeof(pointerMode)) != CUBLAS_STATUS_SUCCESS ||
+        cublasLtMatrixLayoutCreate(&plan.a, CUDA_R_4F_E2M1, k, n, k) != CUBLAS_STATUS_SUCCESS ||
+        cublasLtMatrixLayoutCreate(&plan.b, CUDA_R_4F_E2M1, k, m, k) != CUBLAS_STATUS_SUCCESS ||
+        cublasLtMatrixLayoutCreate(&plan.d, CUDA_R_32F, n, m, n) != CUBLAS_STATUS_SUCCESS)
+    {
+        return nullptr;
+    }
+    cublasLtMatmulPreference_t preference = nullptr;
+    size_t workspace = kLtWorkspaceBytes;
+    cublasLtMatmulHeuristicResult_t result{};
+    int found_count = 0;
+    if (cublasLtMatmulPreferenceCreate(&preference) == CUBLAS_STATUS_SUCCESS &&
+        cublasLtMatmulPreferenceSetAttribute(preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace, sizeof(workspace)) == CUBLAS_STATUS_SUCCESS &&
+        cublasLtMatmulAlgoGetHeuristic(gLt, plan.desc, plan.a, plan.b, plan.d, plan.d, preference, 1, &result, &found_count) == CUBLAS_STATUS_SUCCESS &&
+        found_count > 0)
+    {
+        plan.algo = result.algo;
+        plan.ok = true;
+    }
+    if (preference != nullptr)
+    {
+        cublasLtMatmulPreferenceDestroy(preference);
+    }
+    return plan.ok ? &plan : nullptr;
+}
+
+// The tensor-core prefill: quantise, multiply. Returns 0, or nonzero to
+// fall back (nothing has been written to C that matters).
+static int nvfp4_tensor_core_gemm(const unsigned char* packed, const unsigned char* scales,
+    const float* aDev, float* cDev, int m, int k, int n, float global, cudaStream_t stream)
+{
+    if (!fp4_prefill_enabled())
+    {
+        return -1;
+    }
+    size_t actPacked = (size_t)m * k / 2;
+    size_t actScales = fp4_scale_bytes(m, k);
+    if (scratch_reserve(&gActPacked, &gActPackedBytes, actPacked) != 0 ||
+        scratch_reserve(&gActScales, &gActScalesBytes, actScales) != 0 ||
+        (gAmax == nullptr && cudaMalloc(&gAmax, 16) != cudaSuccess) ||
+        (gLtWorkspace == nullptr && cudaMalloc(&gLtWorkspace, kLtWorkspaceBytes) != cudaSuccess))
+    {
+        return -2;
+    }
+    // Scale pointers are plan attributes; the scratch only moves when it
+    // grows, so a plan is rebuilt for a new activation scale buffer.
+    Fp4Plan* plan = fp4_plan(m, n, k, (void*)scales, gActScales);
+    if (plan == nullptr)
+    {
+        return -3;
+    }
+    void* aScalesAttr = (void*)scales;
+    void* bScalesAttr = gActScales;
+    cublasLtMatmulDescSetAttribute(plan->desc, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &aScalesAttr, sizeof(aScalesAttr));
+    cublasLtMatmulDescSetAttribute(plan->desc, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &bScalesAttr, sizeof(bScalesAttr));
+
+    unsigned int* amax = (unsigned int*)gAmax;
+    float* alphaBeta = (float*)((unsigned char*)gAmax + 8);
+    long count = (long)m * k;
+    if (cudaMemsetAsync(amax, 0, 4, stream) != cudaSuccess ||
+        cudaMemsetAsync(gActScales, 0, actScales, stream) != cudaSuccess)
+    {
+        return -4;
+    }
+    abs_max<<<(int)std::min<long>(1024, (count + 255) / 256), 256, 0, stream>>>(aDev, count, amax);
+    long blocks = (long)m * (k / 16);
+    quantise_nvfp4_rows<<<(int)((blocks + 255) / 256), 256, 0, stream>>>(
+        aDev, m, k, amax, (unsigned char*)gActPacked, (unsigned char*)gActScales, global, alphaBeta);
+    if (cudaGetLastError() != cudaSuccess)
+    {
+        return -5;
+    }
+    cublasStatus_t status = cublasLtMatmul(gLt, plan->desc,
+        alphaBeta, packed, plan->a, gActPacked, plan->b,
+        alphaBeta + 1, cDev, plan->d, cDev, plan->d,
+        &plan->algo, gLtWorkspace, kLtWorkspaceBytes, stream);
+    return status == CUBLAS_STATUS_SUCCESS ? 0 : -6;
+}
+
+AMQL_EXPORT int amql_cuda_nvfp4_upload(
+    const unsigned char* packed, const unsigned char* scales, int rows, int cols, void** out)
+{
+    *out = nullptr;
+    if (ctx_ensure() != 0)
+    {
+        return -1;
+    }
+    if (rows <= 0 || cols <= 0 || cols % 16 != 0)
+    {
+        return -2;
+    }
+    size_t offset = nvfp4_scale_offset(rows, cols);
+    size_t linearScales = (size_t)rows * (cols / 16);
+    size_t tiledScales = fp4_scale_bytes(rows, cols);
+    void* dev = nullptr;
+    if (cudaMalloc(&dev, offset + tiledScales) != cudaSuccess)
+    {
+        return -3;
+    }
+    // The linear scales pass through the A staging scratch on their way to
+    // their tiles.
+    if (scratch_reserve(&gCtx.scratchA, &gCtx.scratchABytes, linearScales) != 0 ||
+        cudaMemcpy(dev, packed, (size_t)rows * cols / 2, cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(gCtx.scratchA, scales, linearScales, cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemset((unsigned char*)dev + offset, 0, tiledScales) != cudaSuccess)
+    {
+        cudaFree(dev);
+        return -4;
+    }
+    tile_fp4_scales<<<(int)((linearScales + 255) / 256), 256>>>(
+        (const unsigned char*)gCtx.scratchA, (unsigned char*)dev + offset, rows, cols);
+    if (cudaDeviceSynchronize() != cudaSuccess)
+    {
+        cudaFree(dev);
+        return -5;
+    }
+    *out = dev;
+    return 0;
+}
+
+/// Device bytes an NVFP4 upload of a [rows, cols] weight takes.
+AMQL_EXPORT long long amql_cuda_nvfp4_bytes(int rows, int cols)
+{
+    return (long long)(nvfp4_scale_offset(rows, cols) + fp4_scale_bytes(rows, cols));
+}
+
+AMQL_EXPORT int amql_cuda_nvfp4_gemm(
+    const float* a,        // [m,k] row-major host
+    const void* w,         // NVFP4 upload of an [n,k] weight
+    float* c,              // [m,n] row-major host out
+    int m, int k, int n, float global)
+{
+    if (ctx_ensure() != 0)
+    {
+        return -1;
+    }
+    if (m <= 0 || k <= 0 || n <= 0)
+    {
+        return 0;
+    }
+    if (k % 16 != 0)
+    {
+        return -2;
+    }
+    cudaStream_t stream = gCtx.stream;
+    const unsigned char* packed = (const unsigned char*)w;
+    const unsigned char* scales = packed + nvfp4_scale_offset(n, k);
+
+    if (scratch_reserve(&gCtx.scratchA, &gCtx.scratchABytes, (size_t)m * k * 4) != 0 ||
+        scratch_reserve(&gCtx.scratchC, &gCtx.scratchCBytes, (size_t)m * n * 4) != 0)
+    {
+        return -3;
+    }
+    if (cudaMemcpyAsync(gCtx.scratchA, a, (size_t)m * k * 4, cudaMemcpyHostToDevice, stream) != cudaSuccess)
+    {
+        return -4;
+    }
+    float* cDev = (float*)gCtx.scratchC;
+    const float* aDev = (const float*)gCtx.scratchA;
+
+    if (m <= kGemvRows)
+    {
+        nvfp4_gemv_rows(packed, scales, global, aDev, cDev, m, n, k, stream);
+        if (cudaGetLastError() != cudaSuccess)
+        {
+            return -5;
+        }
+    }
+    else if (nvfp4_tensor_core_gemm(packed, scales, aDev, cDev, m, k, n, global, stream) != 0)
+    {
+        cudaGetLastError(); // clear anything the declined path left
+        if (scratch_reserve(&gCtx.scratchAF16, &gCtx.scratchAF16Bytes, (size_t)m * k * 2) != 0)
+        {
+            return -6;
+        }
+        long actCount = (long)m * k;
+        cast_f32_to_f16<<<(int)((actCount + 255) / 256), 256, 0, stream>>>(
+            aDev, (__half*)gCtx.scratchAF16, actCount);
+        // Decode the weight a tile of rows at a time (at most 64 MiB of FP16).
+        int tileRows = (int)std::max<long>(1, std::min<long>(n, (32L << 20) / k));
+        if (scratch_reserve(&gNvfp4Tile, &gNvfp4TileBytes, (size_t)tileRows * k * 2) != 0)
+        {
+            return -7;
+        }
+        float beta = 0.f;
+        for (int first = 0; first < n; first += tileRows)
+        {
+            int rows = std::min(tileRows, n - first);
+            long count = (long)rows * k;
+            dequant_nvfp4_to_f16<<<(int)((count + 255) / 256), 256, 0, stream>>>(
+                packed, scales, (__half*)gNvfp4Tile, first, rows, k);
+            if (cudaGetLastError() != cudaSuccess)
+            {
+                return -8;
+            }
+            // D[n,m] column-major (= C[m,n] row-major); this tile is rows
+            // [first, first + rows) of D, so it starts at cDev + first, ldc n.
+            if (cublasGemmEx(gCtx.cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                    rows, m, k,
+                    &global,
+                    gNvfp4Tile, CUDA_R_16F, k,
+                    gCtx.scratchAF16, CUDA_R_16F, k,
+                    &beta,
+                    cDev + first, CUDA_R_32F, n,
+                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
+            {
+                return -9;
+            }
+        }
+    }
+    if (cudaMemcpyAsync(c, cDev, (size_t)m * n * 4, cudaMemcpyDeviceToHost, stream) != cudaSuccess)
+    {
+        return -10;
+    }
+    return cudaStreamSynchronize(stream) == cudaSuccess ? 0 : -11;
+}
+
+/// Whether NVFP4 products of this shape run on the tensor cores: 1 yes, 0 FP16 tiles.
+AMQL_EXPORT int amql_cuda_nvfp4_tensor_cores(int m, int n, int k)
+{
+    auto found = gFp4Plans.find(std::make_tuple(m, n, k));
+    return fp4_prefill_enabled() && found != gFp4Plans.end() && found->second.ok ? 1 : 0;
+}
+
+// ── MXFP8 weights resident as stored ──────────────────────────────────────
+//
+// A weight stored as MXFP8 (E4M3 elements, one E8M0 power-of-two scale per
+// 32 elements of a row) stays on the device in that form: 1.03 bytes an
+// element against FP16's 2. One allocation, the elements then (256-byte
+// aligned) the scale exponents. As for NVFP4:
+//   - up to 32 activation rows (8 per pass), a warp per output row decodes its elements in
+//     registers (the hardware E4M3 conversion) and accumulates in FP32;
+//   - more rows, a tile is decoded to FP16 for cuBLAS. E4M3 times a power of
+//     two is exact in FP16 while the product stays inside FP16's range,
+//     which a trained weight's does.
+
+static size_t mxfp8_scale_offset(int rows, int cols)
+{
+    size_t elements = (size_t)rows * (size_t)cols;
+    return (elements + 255) & ~(size_t)255;
+}
+
+template <int M>
+__global__ void mxfp8_gemv(
+    const unsigned char* __restrict__ elements, const unsigned char* __restrict__ scales,
+    const float* __restrict__ a, float* __restrict__ c, int n, int k)
+{
+    int row = (int)((blockIdx.x * (long)blockDim.x + threadIdx.x) >> 5);
+    int lane = threadIdx.x & 31;
+    if (row >= n)
+    {
+        return;
+    }
+    // Lanes take 16-element halves of the 32-element blocks, so a warp reads
+    // 512 contiguous bytes of the row at a time.
+    int halves = k / 16;
+    const unsigned char* rowElements = elements + (size_t)row * k;
+    const unsigned char* rowScale = scales + (size_t)row * (k / 32);
+    float acc[M];
+#pragma unroll
+    for (int i = 0; i < M; i++)
+    {
+        acc[i] = 0.f;
+    }
+    for (int h = lane; h < halves; h += 32)
+    {
+        float scale = e8m0_decoded(rowScale[h >> 1]);
+        uint4 bytes = *reinterpret_cast<const uint4*>(rowElements + (size_t)h * 16);
+        unsigned int words[4] = {bytes.x, bytes.y, bytes.z, bytes.w};
+        float w[16];
+#pragma unroll
+        for (int j = 0; j < 16; j += 2)
+        {
+            float2 pair = e4m3x2_decoded((unsigned short)((words[j >> 2] >> ((j & 2) * 8)) & 0xFFFF));
+            w[j] = pair.x * scale;
+            w[j + 1] = pair.y * scale;
+        }
+#pragma unroll
+        for (int i = 0; i < M; i++)
+        {
+            const float4* x = reinterpret_cast<const float4*>(a + (size_t)i * k + (size_t)h * 16);
+            float4 x0 = x[0], x1 = x[1], x2 = x[2], x3 = x[3];
+            acc[i] += w[0] * x0.x + w[1] * x0.y + w[2] * x0.z + w[3] * x0.w
+                    + w[4] * x1.x + w[5] * x1.y + w[6] * x1.z + w[7] * x1.w
+                    + w[8] * x2.x + w[9] * x2.y + w[10] * x2.z + w[11] * x2.w
+                    + w[12] * x3.x + w[13] * x3.y + w[14] * x3.z + w[15] * x3.w;
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < M; i++)
+    {
+        float v = acc[i];
+        for (int offset = 16; offset > 0; offset >>= 1)
+        {
+            v += __shfl_down_sync(0xffffffff, v, offset);
+        }
+        if (lane == 0)
+        {
+            c[(size_t)i * n + row] = v;
+        }
+    }
+}
+
+// Up to kGemvRows activation rows through the in-register GEMV, 8 at a time
+// (each group re-reads the weight, from L2 after the first): for the small
+// batches a routed expert gets, cheaper than quantising for the tensor cores.
+static void mxfp8_gemv_rows(const unsigned char* elements, const unsigned char* scales, const float* aDev, float* cDev, int m, int n, int k, cudaStream_t stream)
+{
+    const int threads = 256;
+    int blocks = (int)(((long)n * 32 + threads - 1) / threads);
+    for (int done = 0; done < m; done += 8)
+    {
+        const float* a = aDev + (size_t)done * k;
+        float* c = cDev + (size_t)done * n;
+        switch (std::min(8, m - done))
+        {
+            case 1: mxfp8_gemv<1><<<blocks, threads, 0, stream>>>(elements, scales, a, c, n, k); break;
+            case 2: mxfp8_gemv<2><<<blocks, threads, 0, stream>>>(elements, scales, a, c, n, k); break;
+            case 3: mxfp8_gemv<3><<<blocks, threads, 0, stream>>>(elements, scales, a, c, n, k); break;
+            case 4: mxfp8_gemv<4><<<blocks, threads, 0, stream>>>(elements, scales, a, c, n, k); break;
+            case 5: mxfp8_gemv<5><<<blocks, threads, 0, stream>>>(elements, scales, a, c, n, k); break;
+            case 6: mxfp8_gemv<6><<<blocks, threads, 0, stream>>>(elements, scales, a, c, n, k); break;
+            case 7: mxfp8_gemv<7><<<blocks, threads, 0, stream>>>(elements, scales, a, c, n, k); break;
+            default: mxfp8_gemv<8><<<blocks, threads, 0, stream>>>(elements, scales, a, c, n, k); break;
+        }
+    }
+}
+
+__global__ void dequant_mxfp8_to_f16(
+    const unsigned char* __restrict__ elements, const unsigned char* __restrict__ scales,
+    __half* __restrict__ out, int rows, int k)
+{
+    long index = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= (long)rows * k)
+    {
+        return;
+    }
+    long row = index / k;
+    int col = (int)(index % k);
+    float scale = e8m0_decoded(scales[row * (k / 32) + col / 32]);
+    out[index] = __float2half_rn(e4m3x2_decoded(elements[index]).x * scale);
+}
+
+AMQL_EXPORT int amql_cuda_mxfp8_upload(
+    const unsigned char* elements, const unsigned char* scales, int rows, int cols, void** out)
+{
+    *out = nullptr;
+    if (ctx_ensure() != 0)
+    {
+        return -1;
+    }
+    if (rows <= 0 || cols <= 0 || cols % 32 != 0)
+    {
+        return -2;
+    }
+    size_t offset = mxfp8_scale_offset(rows, cols);
+    size_t scaleBytes = (size_t)rows * (cols / 32);
+    void* dev = nullptr;
+    if (cudaMalloc(&dev, offset + scaleBytes) != cudaSuccess)
+    {
+        return -3;
+    }
+    if (cudaMemcpy(dev, elements, (size_t)rows * cols, cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy((unsigned char*)dev + offset, scales, scaleBytes, cudaMemcpyHostToDevice) != cudaSuccess)
+    {
+        cudaFree(dev);
+        return -4;
+    }
+    *out = dev;
+    return 0;
+}
+
+AMQL_EXPORT int amql_cuda_mxfp8_gemm(
+    const float* a,        // [m,k] row-major host
+    const void* w,         // MXFP8 upload of an [n,k] weight
+    float* c,              // [m,n] row-major host out
+    int m, int k, int n)
+{
+    if (ctx_ensure() != 0)
+    {
+        return -1;
+    }
+    if (m <= 0 || k <= 0 || n <= 0)
+    {
+        return 0;
+    }
+    if (k % 32 != 0)
+    {
+        return -2;
+    }
+    cudaStream_t stream = gCtx.stream;
+    const unsigned char* elements = (const unsigned char*)w;
+    const unsigned char* scales = elements + mxfp8_scale_offset(n, k);
+
+    if (scratch_reserve(&gCtx.scratchA, &gCtx.scratchABytes, (size_t)m * k * 4) != 0 ||
+        scratch_reserve(&gCtx.scratchC, &gCtx.scratchCBytes, (size_t)m * n * 4) != 0)
+    {
+        return -3;
+    }
+    if (cudaMemcpyAsync(gCtx.scratchA, a, (size_t)m * k * 4, cudaMemcpyHostToDevice, stream) != cudaSuccess)
+    {
+        return -4;
+    }
+    float* cDev = (float*)gCtx.scratchC;
+    const float* aDev = (const float*)gCtx.scratchA;
+
+    if (m <= kGemvRows)
+    {
+        mxfp8_gemv_rows(elements, scales, aDev, cDev, m, n, k, stream);
+        if (cudaGetLastError() != cudaSuccess)
+        {
+            return -5;
+        }
+    }
+    else
+    {
+        if (scratch_reserve(&gCtx.scratchAF16, &gCtx.scratchAF16Bytes, (size_t)m * k * 2) != 0)
+        {
+            return -6;
+        }
+        long actCount = (long)m * k;
+        cast_f32_to_f16<<<(int)((actCount + 255) / 256), 256, 0, stream>>>(
+            (const float*)gCtx.scratchA, (__half*)gCtx.scratchAF16, actCount);
+        int tileRows = (int)std::max<long>(1, std::min<long>(n, (32L << 20) / k));
+        if (scratch_reserve(&gNvfp4Tile, &gNvfp4TileBytes, (size_t)tileRows * k * 2) != 0)
+        {
+            return -7;
+        }
+        float alpha = 1.f, beta = 0.f;
+        for (int first = 0; first < n; first += tileRows)
+        {
+            int rows = std::min(tileRows, n - first);
+            long count = (long)rows * k;
+            dequant_mxfp8_to_f16<<<(int)((count + 255) / 256), 256, 0, stream>>>(
+                elements + (size_t)first * k, scales + (size_t)first * (k / 32),
+                (__half*)gNvfp4Tile, rows, k);
+            if (cudaGetLastError() != cudaSuccess)
+            {
+                return -8;
+            }
+            if (cublasGemmEx(gCtx.cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                    rows, m, k,
+                    &alpha,
+                    gNvfp4Tile, CUDA_R_16F, k,
+                    gCtx.scratchAF16, CUDA_R_16F, k,
+                    &beta,
+                    cDev + first, CUDA_R_32F, n,
+                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
+            {
+                return -9;
+            }
+        }
+    }
+    if (cudaMemcpyAsync(c, cDev, (size_t)m * n * 4, cudaMemcpyDeviceToHost, stream) != cudaSuccess)
+    {
+        return -10;
+    }
+    return cudaStreamSynchronize(stream) == cudaSuccess ? 0 : -11;
+}
+
+// ── Device-resident FFN: activations stay on the GPU between products ─────
+//
+// The managed path multiplies one weight at a time, copying the activations
+// up and the product down each time; for a routed MoE layer in prefill that
+// is most of the time spent (each picked expert re-uploads its rows and
+// downloads both of its intermediates). amql_cuda_ffn runs a whole gated
+// FFN, or every device-resident expert of a routed layer, as one call:
+// the activations go up once, each job gathers its rows, multiplies gate
+// and up, applies SiLU(gate) * up, multiplies down and adds its weighted
+// rows into the output on the device, and the output comes down once.
+//
+// Weight formats per product: 1 NVFP4 upload, 2 MXFP8 upload, 3 FP16.
+
+static void* gFfnX = nullptr;     static size_t gFfnXBytes = 0;
+static void* gFfnRows = nullptr;  static size_t gFfnRowsBytes = 0;
+static void* gFfnG = nullptr;     static size_t gFfnGBytes = 0;
+static void* gFfnU = nullptr;     static size_t gFfnUBytes = 0;
+static void* gFfnY = nullptr;     static size_t gFfnYBytes = 0;
+static void* gFfnOut = nullptr;   static size_t gFfnOutBytes = 0;
+static void* gFfnIdx = nullptr;   static size_t gFfnIdxBytes = 0;
+static void* gFfnW = nullptr;     static size_t gFfnWBytes = 0;
+
+__global__ void gather_rows(const float* __restrict__ x, const int* __restrict__ rows, int count, int k,
+    float* __restrict__ out)
+{
+    long index = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= (long)count * k)
+    {
+        return;
+    }
+    int r = (int)(index / k);
+    out[index] = x[(size_t)rows[r] * k + index % k];
+}
+
+__global__ void silu_times(float* __restrict__ gate, const float* __restrict__ up, long count)
+{
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count)
+    {
+        float g = gate[i];
+        gate[i] = g / (1.f + expf(-g)) * up[i];
+    }
+}
+
+__global__ void scatter_add_rows(const float* __restrict__ y, const int* __restrict__ rows,
+    const float* __restrict__ weights, int count, int width, float* __restrict__ out)
+{
+    long index = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= (long)count * width)
+    {
+        return;
+    }
+    int r = (int)(index / width);
+    out[(size_t)rows[r] * width + index % width] += weights[r] * y[index];
+}
+
+// One product C[m,n] = A[m,k] W[n,k]^T with A and C on the device.
+static int device_product(int format, const void* w, float global,
+    const float* aDev, float* cDev, int m, int k, int n, cudaStream_t stream)
+{
+    if (format == 1)
+    {
+        const unsigned char* packed = (const unsigned char*)w;
+        const unsigned char* scales = packed + nvfp4_scale_offset(n, k);
+        if (k % 16 != 0)
+        {
+            return -1;
+        }
+        if (m <= kGemvRows)
+        {
+            nvfp4_gemv_rows(packed, scales, global, aDev, cDev, m, n, k, stream);
+            return cudaGetLastError() == cudaSuccess ? 0 : -2;
+        }
+        if (nvfp4_tensor_core_gemm(packed, scales, aDev, cDev, m, k, n, global, stream) == 0)
+        {
+            return 0;
+        }
+        cudaGetLastError();
+    }
+    else if (format == 2)
+    {
+        if (k % 32 != 0)
+        {
+            return -1;
+        }
+        const unsigned char* elements = (const unsigned char*)w;
+        const unsigned char* scales = elements + mxfp8_scale_offset(n, k);
+        if (m <= kGemvRows)
+        {
+            mxfp8_gemv_rows(elements, scales, aDev, cDev, m, n, k, stream);
+            return cudaGetLastError() == cudaSuccess ? 0 : -2;
+        }
+    }
+    else if (format != 3)
+    {
+        return -3;
+    }
+
+    // FP16 activations against FP16 weight tiles (decoded for formats 1 and
+    // 2, resident for 3), FP32 accumulate.
+    if (scratch_reserve(&gCtx.scratchAF16, &gCtx.scratchAF16Bytes, (size_t)m * k * 2) != 0)
+    {
+        return -4;
+    }
+    long actCount = (long)m * k;
+    cast_f32_to_f16<<<(int)((actCount + 255) / 256), 256, 0, stream>>>(aDev, (__half*)gCtx.scratchAF16, actCount);
+    float beta = 0.f;
+    if (format == 3)
+    {
+        return cublasGemmEx(gCtx.cublas, CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, &global,
+            w, CUDA_R_16F, k, gCtx.scratchAF16, CUDA_R_16F, k, &beta,
+            cDev, CUDA_R_32F, n, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS ? 0 : -5;
+    }
+    int tileRows = (int)std::max<long>(1, std::min<long>(n, (32L << 20) / k));
+    if (scratch_reserve(&gNvfp4Tile, &gNvfp4TileBytes, (size_t)tileRows * k * 2) != 0)
+    {
+        return -6;
+    }
+    for (int first = 0; first < n; first += tileRows)
+    {
+        int rows = std::min(tileRows, n - first);
+        long count = (long)rows * k;
+        if (format == 1)
+        {
+            const unsigned char* packed = (const unsigned char*)w;
+            dequant_nvfp4_to_f16<<<(int)((count + 255) / 256), 256, 0, stream>>>(
+                packed, packed + nvfp4_scale_offset(n, k), (__half*)gNvfp4Tile, first, rows, k);
+        }
+        else
+        {
+            const unsigned char* elements = (const unsigned char*)w;
+            dequant_mxfp8_to_f16<<<(int)((count + 255) / 256), 256, 0, stream>>>(
+                elements + (size_t)first * k, elements + mxfp8_scale_offset(n, k) + (size_t)first * (k / 32),
+                (__half*)gNvfp4Tile, rows, k);
+        }
+        if (cudaGetLastError() != cudaSuccess ||
+            cublasGemmEx(gCtx.cublas, CUBLAS_OP_T, CUBLAS_OP_N, rows, m, k, &global,
+                gNvfp4Tile, CUDA_R_16F, k, gCtx.scratchAF16, CUDA_R_16F, k, &beta,
+                cDev + first, CUDA_R_32F, n, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
+        {
+            return -7;
+        }
+    }
+    return 0;
+}
+
+/// Runs gated SiLU FFN jobs over rows of x, all on the device, and writes
+/// the weighted sum of their outputs to out ([m, width], overwritten).
+/// Job j covers rows[rowStart[j] .. rowStart[j + 1]) with rowWeights, and
+/// has inter[j] hidden units; its gate, up and down weights are
+/// weights[3j .. 3j + 2] with formats[...] and globals[...].
+AMQL_EXPORT int amql_cuda_ffn(
+    const float* x, int m, int k, int width,
+    int jobs, const int* rowStart, const int* rows, const float* rowWeights,
+    const int* inter, const void* const* weights, const int* formats, const float* globals,
+    float* out)
+{
+    if (ctx_ensure() != 0)
+    {
+        return -1;
+    }
+    if (m <= 0 || jobs <= 0)
+    {
+        return -2;
+    }
+    cudaStream_t stream = gCtx.stream;
+    int totalRows = rowStart[jobs];
+    int maxRows = 0, maxInter = 0;
+    for (int j = 0; j < jobs; j++)
+    {
+        maxRows = std::max(maxRows, rowStart[j + 1] - rowStart[j]);
+        maxInter = std::max(maxInter, inter[j]);
+    }
+    if (scratch_reserve(&gFfnX, &gFfnXBytes, (size_t)m * k * 4) != 0 ||
+        scratch_reserve(&gFfnRows, &gFfnRowsBytes, (size_t)maxRows * k * 4) != 0 ||
+        scratch_reserve(&gFfnG, &gFfnGBytes, (size_t)maxRows * maxInter * 4) != 0 ||
+        scratch_reserve(&gFfnU, &gFfnUBytes, (size_t)maxRows * maxInter * 4) != 0 ||
+        scratch_reserve(&gFfnY, &gFfnYBytes, (size_t)maxRows * width * 4) != 0 ||
+        scratch_reserve(&gFfnOut, &gFfnOutBytes, (size_t)m * width * 4) != 0 ||
+        scratch_reserve(&gFfnIdx, &gFfnIdxBytes, (size_t)std::max(1, totalRows) * 4) != 0 ||
+        scratch_reserve(&gFfnW, &gFfnWBytes, (size_t)std::max(1, totalRows) * 4) != 0)
+    {
+        return -3;
+    }
+    if (cudaMemcpyAsync(gFfnX, x, (size_t)m * k * 4, cudaMemcpyHostToDevice, stream) != cudaSuccess ||
+        cudaMemcpyAsync(gFfnIdx, rows, (size_t)totalRows * 4, cudaMemcpyHostToDevice, stream) != cudaSuccess ||
+        cudaMemcpyAsync(gFfnW, rowWeights, (size_t)totalRows * 4, cudaMemcpyHostToDevice, stream) != cudaSuccess ||
+        cudaMemsetAsync(gFfnOut, 0, (size_t)m * width * 4, stream) != cudaSuccess)
+    {
+        return -4;
+    }
+    const int* idx = (const int*)gFfnIdx;
+    const float* wts = (const float*)gFfnW;
+    for (int j = 0; j < jobs; j++)
+    {
+        int first = rowStart[j];
+        int count = rowStart[j + 1] - first;
+        if (count == 0)
+        {
+            continue;
+        }
+        int hiddenUnits = inter[j];
+        long gathered = (long)count * k;
+        gather_rows<<<(int)((gathered + 255) / 256), 256, 0, stream>>>(
+            (const float*)gFfnX, idx + first, count, k, (float*)gFfnRows);
+        int code;
+        if ((code = device_product(formats[3 * j], weights[3 * j], globals[3 * j],
+                 (const float*)gFfnRows, (float*)gFfnG, count, k, hiddenUnits, stream)) != 0 ||
+            (code = device_product(formats[3 * j + 1], weights[3 * j + 1], globals[3 * j + 1],
+                 (const float*)gFfnRows, (float*)gFfnU, count, k, hiddenUnits, stream)) != 0)
+        {
+            return -100 + code;
+        }
+        long hiddenCount = (long)count * hiddenUnits;
+        silu_times<<<(int)((hiddenCount + 255) / 256), 256, 0, stream>>>(
+            (float*)gFfnG, (const float*)gFfnU, hiddenCount);
+        if ((code = device_product(formats[3 * j + 2], weights[3 * j + 2], globals[3 * j + 2],
+                 (const float*)gFfnG, (float*)gFfnY, count, hiddenUnits, width, stream)) != 0)
+        {
+            return -200 + code;
+        }
+        long outCount = (long)count * width;
+        scatter_add_rows<<<(int)((outCount + 255) / 256), 256, 0, stream>>>(
+            (const float*)gFfnY, idx + first, wts + first, count, width, (float*)gFfnOut);
+        if (cudaGetLastError() != cudaSuccess)
+        {
+            return -5;
+        }
+    }
+    if (cudaMemcpyAsync(out, gFfnOut, (size_t)m * width * 4, cudaMemcpyDeviceToHost, stream) != cudaSuccess)
+    {
+        return -6;
+    }
+    return cudaStreamSynchronize(stream) == cudaSuccess ? 0 : -7;
+}
+
+/// Several products sharing one input, C_i[m, n_i] = A[m, k] W_i[n_i, k]^T:
+/// attention's q/k/v, the linear attention's input projections. A goes up
+/// once and every product comes down in one copy, into out as C_0 then C_1
+/// and so on, each row-major.
+static void* gMultiOut = nullptr; static size_t gMultiOutBytes = 0;
+
+AMQL_EXPORT int amql_cuda_multi(
+    const float* a, int m, int k, int count,
+    const void* const* weights, const int* formats, const float* globals, const int* ns,
+    float* out)
+{
+    if (ctx_ensure() != 0)
+    {
+        return -1;
+    }
+    if (m <= 0 || count <= 0)
+    {
+        return -2;
+    }
+    cudaStream_t stream = gCtx.stream;
+    size_t total = 0;
+    for (int i = 0; i < count; i++)
+    {
+        total += (size_t)m * ns[i];
+    }
+    if (scratch_reserve(&gFfnX, &gFfnXBytes, (size_t)m * k * 4) != 0 ||
+        scratch_reserve(&gMultiOut, &gMultiOutBytes, total * 4) != 0)
+    {
+        return -3;
+    }
+    if (cudaMemcpyAsync(gFfnX, a, (size_t)m * k * 4, cudaMemcpyHostToDevice, stream) != cudaSuccess)
+    {
+        return -4;
+    }
+    size_t offset = 0;
+    for (int i = 0; i < count; i++)
+    {
+        int code = device_product(formats[i], weights[i], globals[i],
+            (const float*)gFfnX, (float*)gMultiOut + offset, m, k, ns[i], stream);
+        if (code != 0)
+        {
+            return -100 + code;
+        }
+        offset += (size_t)m * ns[i];
+    }
+    if (cudaMemcpyAsync(out, gMultiOut, total * 4, cudaMemcpyDeviceToHost, stream) != cudaSuccess)
+    {
+        return -5;
+    }
+    return cudaStreamSynchronize(stream) == cudaSuccess ? 0 : -6;
+}
+
+// ── Device-only timing of the NVFP4 prefill paths (benchmarks) ────────────
+
+__global__ void fill_pattern(float* x, long count)
+{
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count)
+    {
+        unsigned int h = (unsigned int)i * 2654435761u;
+        x[i] = ((float)(h >> 8) / 16777216.f) * 2.f - 1.f;
+    }
+}
+
+/// Times one NVFP4 product of m rows against an uploaded [n,k] weight with
+/// the activations already on the device: tensor cores (W4A4, including the
+/// activation quantisation) and FP16 tiles (including the tile decode).
+/// Milliseconds per product into msCores / msTiles; -1 where a path is unavailable.
+AMQL_EXPORT int amql_cuda_nvfp4_bench(const void* w, int m, int k, int n, float global, int reps,
+    float* msCores, float* msTiles)
+{
+    *msCores = *msTiles = -1.f;
+    if (ctx_ensure() != 0)
+    {
+        return -1;
+    }
+    cudaStream_t stream = gCtx.stream;
+    const unsigned char* packed = (const unsigned char*)w;
+    const unsigned char* scales = packed + nvfp4_scale_offset(n, k);
+    float *a = nullptr, *c = nullptr;
+    if (cudaMalloc(&a, (size_t)m * k * 4) != cudaSuccess || cudaMalloc(&c, (size_t)m * n * 4) != cudaSuccess)
+    {
+        return -2;
+    }
+    long count = (long)m * k;
+    fill_pattern<<<(int)((count + 255) / 256), 256, 0, stream>>>(a, count);
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    if (nvfp4_tensor_core_gemm(packed, scales, a, c, m, k, n, global, stream) == 0)
+    {
+        cudaEventRecord(start, stream);
+        for (int r = 0; r < reps; r++)
+        {
+            nvfp4_tensor_core_gemm(packed, scales, a, c, m, k, n, global, stream);
+        }
+        cudaEventRecord(stop, stream);
+        cudaEventSynchronize(stop);
+        cudaEventElapsedTime(msCores, start, stop);
+        *msCores /= reps;
+    }
+    cudaGetLastError();
+    // FP16 tiles: cast the activations, decode tiles, GEMM (as the fallback does).
+    if (scratch_reserve(&gCtx.scratchAF16, &gCtx.scratchAF16Bytes, (size_t)m * k * 2) == 0)
+    {
+        int tileRows = (int)std::max<long>(1, std::min<long>(n, (32L << 20) / k));
+        if (scratch_reserve(&gNvfp4Tile, &gNvfp4TileBytes, (size_t)tileRows * k * 2) == 0)
+        {
+            float beta = 0.f;
+            cudaEventRecord(start, stream);
+            for (int r = 0; r < reps; r++)
+            {
+                cast_f32_to_f16<<<(int)((count + 255) / 256), 256, 0, stream>>>(a, (__half*)gCtx.scratchAF16, count);
+                for (int first = 0; first < n; first += tileRows)
+                {
+                    int rows = std::min(tileRows, n - first);
+                    long tile = (long)rows * k;
+                    dequant_nvfp4_to_f16<<<(int)((tile + 255) / 256), 256, 0, stream>>>(
+                        packed, scales, (__half*)gNvfp4Tile, first, rows, k);
+                    cublasGemmEx(gCtx.cublas, CUBLAS_OP_T, CUBLAS_OP_N, rows, m, k, &global,
+                        gNvfp4Tile, CUDA_R_16F, k, gCtx.scratchAF16, CUDA_R_16F, k, &beta,
+                        c + first, CUDA_R_32F, n, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+                }
+            }
+            cudaEventRecord(stop, stream);
+            cudaEventSynchronize(stop);
+            cudaEventElapsedTime(msTiles, start, stop);
+            *msTiles /= reps;
+        }
+    }
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    cudaFree(a);
+    cudaFree(c);
     return 0;
 }

@@ -482,9 +482,9 @@ public static class MoeIfy
 
     // ── tensor slicing ─────────────────────────────────────────────────────
 
-    private sealed record ResolvedTable(Dtype Dtype, byte[] Payload);
+    internal sealed record ResolvedTable(Dtype Dtype, byte[] Payload);
 
-    private static ResolvedTable Resolve(OperandStore store, string stackId, string tensorName)
+    internal static ResolvedTable Resolve(OperandStore store, string stackId, string tensorName)
     {
         var resolution = store.Resolve(stackId, tensorName);
         return new ResolvedTable(resolution.Dtype, resolution.Payload);
@@ -546,7 +546,7 @@ public static class MoeIfy
         return router;
     }
 
-    private static byte[] ToF32Bytes(float[] values)
+    internal static byte[] ToF32Bytes(float[] values)
     {
         var bytes = new byte[values.Length * 4];
         Buffer.BlockCopy(values, 0, bytes, 0, bytes.Length);
@@ -555,7 +555,7 @@ public static class MoeIfy
 
     // ── container writing ──────────────────────────────────────────────────
 
-    private static void CopySegment(
+    internal static void CopySegment(
         Vindex3Container source,
         string outDir,
         string objectId,
@@ -573,7 +573,7 @@ public static class MoeIfy
         segments[entry.Segment[..^4]] = 1;
     }
 
-    private static void CopyTokenizer(Vindex3Container source, string outDir)
+    internal static void CopyTokenizer(Vindex3Container source, string outDir)
     {
         var tokenizer = Path.Combine(source.Root, "tokenizer.json");
         if (File.Exists(tokenizer))
@@ -583,7 +583,7 @@ public static class MoeIfy
         HfAncillaryFiles.CopyInto(source.Root, outDir);
     }
 
-    private static void WriteGraph(
+    internal static void WriteGraph(
         string outDir,
         SystemGraph graph,
         Component component,
@@ -629,7 +629,7 @@ public static class MoeIfy
             }, ViJson.Options));
     }
 
-    private static void WriteIndex(
+    internal static void WriteIndex(
         string outDir,
         Vindex3Container source,
         Component component,

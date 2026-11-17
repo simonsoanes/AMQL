@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using Amql.Safetensors;
 
 namespace Amql.Inference;
 
@@ -307,6 +308,349 @@ public static class CudaShim
         return amql_cuda_host_to_device_f32(dst, src, checked((nuint)bytes));
     }
 
+    // ── NVFP4 weights ──────────────────────────────────────────────────────
+
+    [DllImport("amql_cuda")]
+    private static extern int amql_cuda_nvfp4_upload(byte[] packed, byte[] scales, int rows, int cols, out IntPtr device);
+
+    [DllImport("amql_cuda")]
+    private static extern int amql_cuda_nvfp4_gemm(float[] a, IntPtr w, float[] c, int m, int k, int n, float global);
+
+    /// <summary>Device bytes held by NVFP4 and MXFP8 uploads.</summary>
+    public static long Nvfp4Bytes => Interlocked.Read(ref _nvfp4Bytes);
+    private static long _nvfp4Bytes;
+
+    /// <summary>The device bytes an NVFP4 upload of a [rows, cols] weight takes.</summary>
+    public static long Nvfp4DeviceBytes(int rows, int cols) =>
+        (((long)rows * cols / 2 + 255) & ~255L) +
+        // Block scales in the tensor cores' tiles: rows padded to 128, blocks to 4.
+        (long)((rows + 127) / 128) * 128 * ((cols / Nvfp4.BlockElements + 3) / 4) * 4;
+
+    [DllImport("amql_cuda")]
+    private static extern int amql_cuda_nvfp4_tensor_cores(int m, int n, int k);
+
+    [DllImport("amql_cuda")]
+    private static extern void amql_cuda_set_fp4_prefill(int enabled);
+
+    /// <summary>
+    /// Whether NVFP4 products of more than 8 rows (prefill) run on the FP4
+    /// tensor cores, which quantise the activations to NVFP4 too (W4A4, what
+    /// NVFP4 checkpoints are trained for), or decode FP16 tiles of the weight
+    /// against FP16 activations (W4A16, slower, closer to the dequantised
+    /// model). On by default; <c>AMQL_FP4_PREFILL=0</c> or
+    /// <c>--fp4-prefill off</c> turns it off.
+    /// </summary>
+    public static void SetFp4Prefill(bool enabled)
+    {
+        if (!Enabled)
+        {
+            return;
+        }
+        try
+        {
+            amql_cuda_set_fp4_prefill(enabled ? 1 : 0);
+        }
+        catch (EntryPointNotFoundException)
+        {
+        }
+    }
+
+    /// <summary>Whether NVFP4 products of this shape ran on the FP4 tensor cores
+    /// (W4A4 through cuBLASLt) rather than decoded FP16 tiles.</summary>
+    public static bool Nvfp4UsedTensorCores(int m, int n, int k)
+    {
+        try
+        {
+            return Enabled && amql_cuda_nvfp4_tensor_cores(m, n, k) == 1;
+        }
+        catch (EntryPointNotFoundException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Puts an NVFP4 weight on the device as its packs and block scales, the
+    /// tensor scale staying with the caller. Zero when there is no device or
+    /// the allocation fails; a failed allocation (the device is full) does not
+    /// turn the GPU off, the weight simply stays on the host.
+    /// </summary>
+    public static IntPtr UploadNvfp4(ScaledMatrix weight)
+    {
+        if (!Enabled || _deviceFailed || !weight.IsNvfp4)
+        {
+            return IntPtr.Zero;
+        }
+        try
+        {
+            if (amql_cuda_nvfp4_upload(weight.Elements, weight.Nvfp4ScaleBytes(), weight.Rows, weight.Cols, out var device) != 0)
+            {
+                return IntPtr.Zero;
+            }
+            Interlocked.Add(ref _nvfp4Bytes, Nvfp4DeviceBytes(weight.Rows, weight.Cols));
+            return device;
+        }
+        catch (Exception ex) when (ex is EntryPointNotFoundException or DllNotFoundException)
+        {
+            return IntPtr.Zero; // a native library from before NVFP4
+        }
+    }
+
+    [DllImport("amql_cuda")]
+    private static extern int amql_cuda_mxfp8_upload(byte[] elements, byte[] scales, int rows, int cols, out IntPtr device);
+
+    [DllImport("amql_cuda")]
+    private static extern int amql_cuda_mxfp8_gemm(float[] a, IntPtr w, float[] c, int m, int k, int n);
+
+    /// <summary>The device bytes an MXFP8 upload of a [rows, cols] weight takes.</summary>
+    public static long Mxfp8DeviceBytes(int rows, int cols) =>
+        (((long)rows * cols + 255) & ~255L) + (long)rows * (cols / Mxfp8.BlockElements);
+
+    /// <summary>
+    /// Puts an MXFP8 weight on the device as stored: its E4M3 elements and E8M0
+    /// exponents. Zero when there is no device or the allocation fails (the
+    /// weight then stays on the host; the GPU stays on).
+    /// </summary>
+    public static IntPtr UploadMxfp8(ScaledMatrix weight)
+    {
+        if (!Enabled || _deviceFailed || !weight.IsMxfp8)
+        {
+            return IntPtr.Zero;
+        }
+        try
+        {
+            if (amql_cuda_mxfp8_upload(weight.Elements, weight.Mxfp8ScaleBytes(), weight.Rows, weight.Cols, out var device) != 0)
+            {
+                return IntPtr.Zero;
+            }
+            Interlocked.Add(ref _nvfp4Bytes, Mxfp8DeviceBytes(weight.Rows, weight.Cols));
+            return device;
+        }
+        catch (Exception ex) when (ex is EntryPointNotFoundException or DllNotFoundException)
+        {
+            return IntPtr.Zero;
+        }
+    }
+
+    /// <summary>Frees an <see cref="UploadMxfp8"/> weight of the given shape.</summary>
+    public static void FreeMxfp8(IntPtr device, int rows, int cols)
+    {
+        if (device == IntPtr.Zero || !Enabled)
+        {
+            return;
+        }
+        amql_cuda_free(device);
+        Interlocked.Add(ref _nvfp4Bytes, -Mxfp8DeviceBytes(rows, cols));
+    }
+
+    /// <summary>C[m,n] = A[m,k]·W[n,k]ᵀ for an MXFP8 device weight; false on any failure.</summary>
+    public static bool TryGemmMxfp8(float[] a, int m, int k, IntPtr w, int n, out float[]? result)
+    {
+        result = null;
+        if (!Enabled || _deviceFailed || w == IntPtr.Zero)
+        {
+            return false;
+        }
+        var c = new float[m * n];
+        int code = amql_cuda_mxfp8_gemm(a, w, c, m, k, n);
+        LastNativeError = code;
+        if (code != 0)
+        {
+            return false;
+        }
+        result = c;
+        return true;
+    }
+
+    [DllImport("amql_cuda")]
+    private static extern int amql_cuda_ffn(float[] x, int m, int k, int width,
+        int jobs, int[] rowStart, int[] rows, float[] rowWeights,
+        int[] inter, IntPtr[] weights, int[] formats, float[] globals, float[] output);
+
+    /// <summary>One gated SiLU FFN over chosen rows: <c>rows[i]</c> contributes
+    /// <c>weights[i]</c> times its output to the sum.</summary>
+    public sealed record FfnJob(int[] Rows, float[] Weights, Tensor2D Gate, Tensor2D Up, Tensor2D Down);
+
+    /// <summary>Calls made through <see cref="TryFfn"/>, and the jobs they ran.</summary>
+    public static long FfnCalls => Interlocked.Read(ref _ffnCalls);
+    public static long FfnJobs => Interlocked.Read(ref _ffnJobs);
+    private static long _ffnCalls, _ffnJobs;
+
+    private static (IntPtr Weight, int Format, float Global) DeviceForm(Tensor2D w) =>
+        w.DeviceNvfp4 != IntPtr.Zero ? (w.DeviceNvfp4, 1, w.DeviceNvfp4Global)
+        : w.DeviceMxfp8 != IntPtr.Zero ? (w.DeviceMxfp8, 2, 1f)
+        : w.DeviceWeightF16 != IntPtr.Zero ? (w.DeviceWeightF16, 3, 1f)
+        : (IntPtr.Zero, 0, 0f);
+
+    /// <summary>Whether gate, up and down are all on the device, so the FFN
+    /// can run there without its activations leaving it.</summary>
+    public static bool CanFuse(Tensor2D gate, Tensor2D up, Tensor2D down) =>
+        FuseFfn && gate.OnGpu && up.OnGpu && down.OnGpu && gate.Rows == up.Rows && down.Cols == gate.Rows &&
+        gate.Cols == up.Cols;
+
+    /// <summary>Whether FFNs whose weights are all on the device run as one
+    /// fused call, and products sharing an input share its upload (the
+    /// default), or each product runs on its own; <c>AMQL_FUSED_FFN=0</c>
+    /// turns both off.</summary>
+    public static bool FuseFfn { get; set; } =
+        Environment.GetEnvironmentVariable("AMQL_FUSED_FFN")?.Trim() is not ("0" or "false" or "off");
+
+    /// <summary>
+    /// Runs FFN jobs over rows of <paramref name="x"/> ([m, k]) on the device:
+    /// x goes up once, each job gathers its rows, multiplies gate and up, takes
+    /// SiLU(gate) times up, multiplies down and adds its weighted rows into the
+    /// sum, which comes down once ([m, width]). False on any failure (the
+    /// caller then runs the products one at a time).
+    /// </summary>
+    public static bool TryFfn(float[] x, int m, int k, int width, IReadOnlyList<FfnJob> jobs, out float[]? sum)
+    {
+        sum = null;
+        if (!Enabled || _deviceFailed || jobs.Count == 0)
+        {
+            return false;
+        }
+        var rowStart = new int[jobs.Count + 1];
+        for (int j = 0; j < jobs.Count; j++)
+        {
+            rowStart[j + 1] = rowStart[j] + jobs[j].Rows.Length;
+        }
+        var rows = new int[rowStart[^1]];
+        var rowWeights = new float[rowStart[^1]];
+        var inter = new int[jobs.Count];
+        var weights = new IntPtr[jobs.Count * 3];
+        var formats = new int[jobs.Count * 3];
+        var globals = new float[jobs.Count * 3];
+        for (int j = 0; j < jobs.Count; j++)
+        {
+            var job = jobs[j];
+            job.Rows.CopyTo(rows, rowStart[j]);
+            job.Weights.CopyTo(rowWeights, rowStart[j]);
+            inter[j] = job.Gate.Rows;
+            int i = 0;
+            foreach (var w in new[] { job.Gate, job.Up, job.Down })
+            {
+                var (pointer, format, global) = DeviceForm(w);
+                if (pointer == IntPtr.Zero)
+                {
+                    return false; // evicted since it was fetched
+                }
+                (weights[3 * j + i], formats[3 * j + i], globals[3 * j + i]) = (pointer, format, global);
+                i++;
+            }
+        }
+        var output = new float[(long)m * width];
+        try
+        {
+            int code = amql_cuda_ffn(x, m, k, width, jobs.Count, rowStart, rows, rowWeights, inter, weights, formats, globals, output);
+            LastNativeError = code;
+            if (code != 0)
+            {
+                return false;
+            }
+        }
+        catch (EntryPointNotFoundException)
+        {
+            return false;
+        }
+        Interlocked.Increment(ref _ffnCalls);
+        Interlocked.Add(ref _ffnJobs, jobs.Count);
+        sum = output;
+        return true;
+    }
+
+    [DllImport("amql_cuda")]
+    private static extern int amql_cuda_multi(float[] a, int m, int k, int count,
+        IntPtr[] weights, int[] formats, float[] globals, int[] ns, float[] output);
+
+    /// <summary>Calls made through <see cref="TryMulti"/>.</summary>
+    public static long MultiCalls => Interlocked.Read(ref _multiCalls);
+    private static long _multiCalls;
+
+    /// <summary>
+    /// Products of one input with several device weights (attention's q/k/v,
+    /// the linear attention's input projections): the input goes up once and
+    /// every product comes down in one copy. False on any failure, or if a
+    /// weight has no device copy, and the caller multiplies them one at a time.
+    /// </summary>
+    public static bool TryMulti(float[] a, int m, int k, IReadOnlyList<Tensor2D> weights, out Tensor2D[]? products)
+    {
+        products = null;
+        if (!Enabled || _deviceFailed || !FuseFfn)
+        {
+            return false;
+        }
+        var pointers = new IntPtr[weights.Count];
+        var formats = new int[weights.Count];
+        var globals = new float[weights.Count];
+        var ns = new int[weights.Count];
+        long total = 0;
+        for (int i = 0; i < weights.Count; i++)
+        {
+            (pointers[i], formats[i], globals[i]) = DeviceForm(weights[i]);
+            if (pointers[i] == IntPtr.Zero)
+            {
+                return false;
+            }
+            ns[i] = weights[i].Rows;
+            total += (long)m * ns[i];
+        }
+        var output = new float[total];
+        try
+        {
+            int code = amql_cuda_multi(a, m, k, weights.Count, pointers, formats, globals, ns, output);
+            LastNativeError = code;
+            if (code != 0)
+            {
+                return false;
+            }
+        }
+        catch (EntryPointNotFoundException)
+        {
+            return false;
+        }
+        products = new Tensor2D[weights.Count];
+        long offset = 0;
+        for (int i = 0; i < weights.Count; i++)
+        {
+            int length = m * ns[i];
+            products[i] = new Tensor2D(output.AsSpan((int)offset, length).ToArray(), m, ns[i]);
+            offset += length;
+        }
+        Interlocked.Increment(ref _multiCalls);
+        return true;
+    }
+
+    /// <summary>Frees an <see cref="UploadNvfp4"/> weight of the given shape.</summary>
+    public static void FreeNvfp4(IntPtr device, int rows, int cols)
+    {
+        if (device == IntPtr.Zero || !Enabled)
+        {
+            return;
+        }
+        amql_cuda_free(device);
+        Interlocked.Add(ref _nvfp4Bytes, -Nvfp4DeviceBytes(rows, cols));
+    }
+
+    /// <summary>C[m,n] = A[m,k]·W[n,k]ᵀ × <paramref name="global"/> for an NVFP4
+    /// device weight. False (the caller falls back to the host) on any failure.</summary>
+    public static bool TryGemmNvfp4(float[] a, int m, int k, IntPtr w, int n, float global, out float[]? result)
+    {
+        result = null;
+        if (!Enabled || _deviceFailed || w == IntPtr.Zero)
+        {
+            return false;
+        }
+        var c = new float[m * n];
+        int code = amql_cuda_nvfp4_gemm(a, w, c, m, k, n, global);
+        LastNativeError = code;
+        if (code != 0)
+        {
+            return false;
+        }
+        result = c;
+        return true;
+    }
+
     /// <summary>Calls the transposed-B GEMM (C[m,n] = A[m,k]·W[n,k]ᵀ with
     /// A host f32, W device FP16) and copies the result back. Returns true
     /// when the kernel ran; false leaves <paramref name="result"/> set to
@@ -518,6 +862,34 @@ public static class CudaShim
 
     [DllImport("amql_cuda")]
     private static extern int amql_cuda_unified_memory();
+
+    [DllImport("amql_cuda")]
+    private static extern int amqe_mem_info(out nuint freeBytes, out nuint totalBytes);
+
+    /// <summary>The device's free and total memory, or false when there is no
+    /// device (or the native library predates the query).</summary>
+    public static bool TryMemoryInfo(out long freeBytes, out long totalBytes)
+    {
+        freeBytes = totalBytes = 0;
+        if (!Enabled)
+        {
+            return false;
+        }
+        try
+        {
+            if (amqe_mem_info(out var free, out var total) != 0)
+            {
+                return false;
+            }
+            freeBytes = (long)free;
+            totalBytes = (long)total;
+            return true;
+        }
+        catch (Exception ex) when (ex is EntryPointNotFoundException or DllNotFoundException)
+        {
+            return false;
+        }
+    }
 
     [DllImport("amql_cuda")]
     private static extern int amql_cuda_malloc(out IntPtr ptr, nuint bytes);
