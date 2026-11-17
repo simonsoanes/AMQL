@@ -72,11 +72,26 @@ public sealed class SideBySideSession
     private readonly Stopwatch _partnerClock = new();
     private readonly Stopwatch _adapterClock = new();
 
+    private double[]? _prior;
+    private bool _fresh = true;
+
     public SideBySideSession(DecodeSession partner, IReadOnlyList<IEntailAdapter> adapters)
     {
         _partner = partner;
         _adapters = adapters;
     }
+
+    /// <summary>
+    /// Turns a prompt into its blank: the same conversation with the latest message's
+    /// content replaced (see <see cref="ChatPrior"/>), or null when it has none.
+    /// Set it when an adapter weighs a token against the partner's prior: a fresh prefill
+    /// then runs the blank first, and its next-token distribution is that prior.
+    /// </summary>
+    public Func<int[], int[]?>? PriorPrompt { get; set; }
+
+    /// <summary>The partner's next-token distribution for the blank of the last prompt, if
+    /// one was measured.</summary>
+    public IReadOnlyList<double>? Prior => _prior;
 
     /// <summary>The partner's logits for the next token, unchanged.</summary>
     public Tensor2D Logits { get; private set; } = null!;
@@ -89,7 +104,8 @@ public sealed class SideBySideSession
 
     /// <summary>A session sharing these weights, for another thread. Run this
     /// one first: see <see cref="DecodeSession.Sibling"/>.</summary>
-    public SideBySideSession Sibling() => new(_partner.Sibling(), _adapters.Select(a => a.Sibling()).ToList());
+    public SideBySideSession Sibling() =>
+        new(_partner.Sibling(), _adapters.Select(a => a.Sibling()).ToList()) { PriorPrompt = PriorPrompt };
 
     public void Reset()
     {
@@ -99,11 +115,20 @@ public sealed class SideBySideSession
             adapter.Reset();
         }
         Verdict = EntailVerdict.Silence;
+        _prior = null;
+        _fresh = true;
     }
 
     public void Prefill(int[] tokens)
     {
         _partnerClock.Start();
+        if (_fresh && PriorPrompt is not null && _adapters.Any(a => a.Manifest.NeedsPrior)
+            && PriorPrompt(tokens) is { } blank)
+        {
+            _prior = Softmax(_partner.Prefill(blank).Row(0));
+            _partner.Reset();
+        }
+        _fresh = false;
         Logits = _partner.Prefill(tokens);
         _partnerClock.Stop();
         _adapterClock.Start();
@@ -122,5 +147,25 @@ public sealed class SideBySideSession
     }
 
     /// <summary>Chooses the next token greedily, and says who decided it.</summary>
-    public (int Token, EntailTokenSource Source) Choose() => Verdict.Choose(Logits.Row(0));
+    public (int Token, EntailTokenSource Source) Choose() => Verdict.Choose(Logits.Row(0), _prior);
+
+    private static double[] Softmax(ReadOnlySpan<float> logits)
+    {
+        float max = float.NegativeInfinity;
+        foreach (float v in logits)
+        {
+            max = Math.Max(max, v);
+        }
+        var p = new double[logits.Length];
+        double sum = 0;
+        for (int i = 0; i < logits.Length; i++)
+        {
+            sum += p[i] = Math.Exp(logits[i] - max);
+        }
+        for (int i = 0; i < p.Length; i++)
+        {
+            p[i] /= sum;
+        }
+        return p;
+    }
 }

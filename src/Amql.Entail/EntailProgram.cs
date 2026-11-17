@@ -122,6 +122,14 @@ public sealed class EntailProgram
     /// (<c>only</c>), or these (<c>forbid</c>). They need a host, whose
     /// predictions they narrow.</summary>
     public List<(bool Allow, IReadOnlyList<string> Texts, int Lane)> Masks { get; } = new();
+
+    /// <summary>Tokens a lane prefers: when it is set, the host says the token if its own
+    /// model gives it at least <c>Threshold</c> (or, with <c>TimesPrior</c>, that many times
+    /// what it gives the token with the latest message blanked), and otherwise chooses as it
+    /// would. The program decides where a decision is; the host's model supplies the evidence.</summary>
+    /// <remarks>A strict one (<c>decide</c>) also rules the token out below the threshold,
+    /// so the decision is the threshold's both ways.</remarks>
+    public List<(string Text, double Threshold, bool TimesPrior, bool Strict, int Lane)> Prefers { get; } = new();
     /// <summary>Soft output: token text → what adds to its score. The highest
     /// positive score wins, as a softmax's would. An optimised program has
     /// none: votes are what `emit` replaces.</summary>
@@ -504,6 +512,20 @@ public static class EntailCompiler
                         int lane = LaneFor(s.Lane);
                         Program.Lanes[lane].Emits = true;
                         Program.Masks.Add((s.Allow, s.Texts.Select(t => Literal(Name(t))).ToList(), lane));
+                    }
+                    break;
+                case PreferStmt s:
+                    {
+                        int lane = LaneFor(s.Lane);
+                        double threshold = Eval(s.Threshold).Const;
+                        if (s.TimesPrior ? threshold <= 0 : threshold is <= 0 or > 1)
+                        {
+                            throw new EntailException(s.Line, s.TimesPrior
+                                ? "prefer ... times prior takes a factor above 0"
+                                : "prefer takes a probability above 0 and at most 1");
+                        }
+                        Program.Lanes[lane].Emits = true;
+                        Program.Prefers.Add((Literal(Name(s.Text)), threshold, s.TimesPrior, s.Strict, lane));
                     }
                     break;
                 case CarryStmt s:

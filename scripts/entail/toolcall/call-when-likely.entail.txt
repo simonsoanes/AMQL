@@ -1,0 +1,46 @@
+program call_when_likely
+# The call decision, made by the model's own evidence at a threshold the program sets.
+#
+# A 0.8B model knows when a request needs a tool: on the reply's first token the request
+# raises its probability of <tool_call> well above what the same conversation gives it
+# with the latest message blanked. But that probability is still usually below prose's,
+# so the model talks first, and often talks itself out of the call.
+#
+# This program is a fold over the prompt (carry, so any length) that knows only the
+# template's structure: which turn each token is in, whether the system turn offered
+# tools (the template's format line holds the <tool_call> token), and where the reply
+# begins. There it decides: <tool_call> if the host's model gives it at least twice its
+# prior, and never <tool_call> otherwise. The host measures the prior by running the
+# prompt once more with the latest message replaced by "N/A" (ChatPrior). There are no
+# word lists. The model supplies the evidence; the program supplies the strategy.
+
+state im_start, is_sys, is_asst, think_end, blank, call_token
+token "<|im_start|>" means im_start = 1
+token "system" means is_sys = 1
+token "assistant" means is_asst = 1
+token "</think>" means think_end = 1
+token "\n\n" means blank = 1
+token "<tool_call>" means call_token = 1
+
+# Which turn this token is in, held until the next <|im_start|>.
+state after_start, prev_think
+carry after_start from im_start
+carry prev_think from think_end
+state role_sys, last_sys, role_asst, last_asst
+carry last_sys from role_sys
+carry last_asst from role_asst
+entail role_sys = last_sys when not im_start
+entail role_sys when after_start, is_sys
+entail role_asst = last_asst when not im_start
+entail role_asst when after_start, is_asst
+
+# Tools are on offer once the system turn has shown the call format.
+state offered, last_offered
+carry last_offered from offered
+entail offered = last_offered
+entail offered when role_sys, call_token, not last_offered
+
+# The reply's first token: "\n\n" after </think>, in an assistant turn.
+state reply_start
+entail reply_start when blank, prev_think, role_asst, offered
+decide "<tool_call>" at 2 times prior when reply_start

@@ -283,7 +283,10 @@ internal static partial class Program
         using var store = container.CreateOperandStore();
         var plan = Planner.Plan(container, OptionValue(args, "--component") ?? "target", store);
         var adapters = OpenAdapters(args, tokenizerDir);
-        var side = new SideBySideSession(new DecodeSession(plan, store, null, EntailWorkingSet(args, container)), adapters);
+        var side = new SideBySideSession(new DecodeSession(plan, store, null, EntailWorkingSet(args, container)), adapters)
+        {
+            PriorPrompt = ChatPriorFor(tokenizer),
+        };
 
         side.Prefill(tokenizer.EncodeToIds(EntailPrompt(prompt, template, args.Contains("--chat"), args.Contains("--think"))).ToArray());
         var spans = new List<(EntailTokenSource Source, List<int> Tokens)>();
@@ -339,6 +342,57 @@ internal static partial class Program
     /// <c>--text &lt;file&gt;</c> it also measures next-token loss, so a model
     /// and its graft can be compared on ordinary prose.
     /// </summary>
+    /// <summary>The blank of a ChatML prompt, for an adapter that weighs a token against the
+    /// partner's prior; null for a tokenizer without ChatML's turn markers.</summary>
+    private static Func<int[], int[]?>? ChatPriorFor(HfTokenizer tokenizer) =>
+        tokenizer.AddedTokenId("<|im_start|>") is { } start && tokenizer.AddedTokenId("<|im_end|>") is { } end
+            ? ChatPrior.ForChatMl(t => tokenizer.EncodeToIds(t), ids => tokenizer.DecodeText(ids, skipSpecialTokens: false), start, end)
+            : null;
+
+    /// <summary>The k most probable tokens of a row, as [text, probability] pairs.</summary>
+    private static JsonArray TopTokens(ReadOnlySpan<float> logits, int k, HfTokenizer tokenizer)
+    {
+        var best = new List<int>();
+        for (int i = 0; i < logits.Length; i++)
+        {
+            int at = best.Count;
+            while (at > 0 && logits[i] > logits[best[at - 1]])
+            {
+                at--;
+            }
+            if (at < k)
+            {
+                best.Insert(at, i);
+                if (best.Count > k)
+                {
+                    best.RemoveAt(k);
+                }
+            }
+        }
+        var top = new JsonArray();
+        foreach (int id in best)
+        {
+            top.Add(new JsonArray(tokenizer.DecodeText(new List<int> { id }, skipSpecialTokens: false), Math.Round(Softmax(logits, id), 5)));
+        }
+        return top;
+    }
+
+    /// <summary>The softmax probability of one entry of a row of logits.</summary>
+    private static double Softmax(ReadOnlySpan<float> logits, int index)
+    {
+        float max = float.NegativeInfinity;
+        foreach (float v in logits)
+        {
+            max = Math.Max(max, v);
+        }
+        double sum = 0;
+        foreach (float v in logits)
+        {
+            sum += Math.Exp(v - max);
+        }
+        return Math.Exp(logits[index] - max) / sum;
+    }
+
     private static int EntailEval(string[] args)
     {
         var containerDir = Arg(args, 0) ?? throw new CliException("entail eval requires a container directory");
@@ -353,7 +407,10 @@ internal static partial class Program
         using var store = container.CreateOperandStore();
         var plan = Planner.Plan(container, OptionValue(args, "--component") ?? "target", store);
         var adapters = OpenAdapters(args, tokenizerDir);
-        var session = new SideBySideSession(new DecodeSession(plan, store, null, EntailWorkingSet(args, container)), adapters);
+        var session = new SideBySideSession(new DecodeSession(plan, store, null, EntailWorkingSet(args, container)), adapters)
+        {
+            PriorPrompt = ChatPriorFor(tokenizer),
+        };
 
         static int ArgMax(ReadOnlySpan<float> row)
         {
@@ -379,17 +436,45 @@ internal static partial class Program
             var clock = Stopwatch.StartNew();
             var chosen = cases.Take(limit).ToList();
 
-            (string Text, int Said, int Steered) Answer(SideBySideSession on, JsonObject c)
+            // --watch TOKEN: the probability the partner gives TOKEN on the reply's first
+            // row, before any adapter acts, so a decision can be read as a score.
+            int? watched = null;
+            if (OptionValue(args, "--watch") is { } watchText)
+            {
+                var ids = tokenizer.EncodeToIds(watchText);
+                watched = ids.Count == 1 ? ids[0] : throw new CliException($"--watch '{watchText}' is {ids.Count} tokens, not one");
+            }
+
+            string? defaultPrefix = OptionValue(args, "--prefix")?.Replace("\\n", "\n");
+            bool logprobs = args.Contains("--logprobs");
+
+            (string Text, int Said, int Steered, double? Watch, double? PriorWatch, JsonArray? Top, JsonObject? Probs) Answer(SideBySideSession on, JsonObject c)
             {
                 string rendered = EntailPrompt(c["prompt"]!.GetValue<string>(), template,
                     c["chat"]?.GetValue<bool>() ?? false, c["think"]?.GetValue<bool>() ?? false);
                 on.Reset();
+                // A prefix (--prefix, or the case's "prefix") is the reply's forced opening: it is
+                // prefilled with the prompt and is the start of the reply that is scored.
+                string prefix = c["prefix"]?.GetValue<string>() ?? defaultPrefix ?? string.Empty;
+                var forced = prefix.Length > 0 ? tokenizer.EncodeToIds(prefix).ToArray() : Array.Empty<int>();
                 on.Prefill(tokenizer.EncodeToIds(rendered).ToArray());
-                var reply = new List<int>();
+                double? watch = watched is { } w ? Softmax(on.Logits.Row(0), w) : null;
+                double? priorWatch = watched is { } pw0 && on.Prior is { } prior ? prior[pw0] : null;
+                JsonArray? top = watched is null ? null : TopTokens(on.Logits.Row(0), 5, tokenizer);
+                foreach (int f in forced)
+                {
+                    on.Step(f);
+                }
+                var reply = new List<int>(forced);
+                var probs = new JsonArray();
                 int said = 0, steered = 0;
                 for (int i = 0; i < (c["max_tokens"]?.GetValue<int>() ?? maxTokens); i++)
                 {
                     var (next, source) = on.Choose();
+                    if (logprobs)
+                    {
+                        probs.Add(Math.Round(Softmax(on.Logits.Row(0), next), 5));
+                    }
                     if (stop.Contains(next))
                     {
                         break;
@@ -399,12 +484,14 @@ internal static partial class Program
                     reply.Add(next);
                     on.Step(next);
                 }
-                return (tokenizer.DecodeText(reply), said, steered);
+                var tokens = logprobs ? new JsonArray(reply.Skip(forced.Length)
+                    .Select(t => (JsonNode)tokenizer.DecodeText(new List<int> { t }, skipSpecialTokens: false)).ToArray()) : null;
+                return (tokenizer.DecodeText(reply), said, steered, watch, priorWatch, top, tokens is null ? null : new JsonObject { ["tokens"] = tokens, ["p"] = probs });
             }
 
             // Cases are independent, so each thread takes the next one on its own session.
             // The first runs alone, because it is what loads the weights the others share.
-            var replies = new (string Text, int Said, int Steered)[chosen.Count];
+            var replies = new (string Text, int Said, int Steered, double? Watch, double? PriorWatch, JsonArray? Top, JsonObject? Probs)[chosen.Count];
             int batch = Math.Clamp(IntOption(args, "--batch", 1), 1, Math.Max(chosen.Count, 1));
             if (batch > 1)
             {
@@ -446,6 +533,19 @@ internal static partial class Program
                     ["category"] = category, ["prompt"] = prompt, ["answer"] = answer,
                     ["reply"] = text, ["pass"] = pass,
                 };
+                if (replies[i].Watch is { } pw)
+                {
+                    detail["watch"] = pw;
+                    detail["first_top"] = replies[i].Top;
+                    if (replies[i].PriorWatch is { } prw)
+                    {
+                        detail["prior_watch"] = prw;
+                    }
+                }
+                if (replies[i].Probs is { } pr)
+                {
+                    detail["logprobs"] = pr;
+                }
                 if (adapters.Count > 0)
                 {
                     detail["said"] = replies[i].Said;

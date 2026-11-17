@@ -21,7 +21,9 @@ decisions. Everything below was run on Qwen 3.5 0.8B on the CPU, in float32.
 | What does one training example teach? | A bias, not a rule. The LoRA learned to suppress the openers "To" and "I" on the reply's first token whatever the request, so the model then calls a tool for everything. |
 | Is the tool the one nearest the request's intent? | Yes, but in layers 7 to 15, not in the embedding: there the request is nearest the chosen tool's description in 9 or 10 cases of 10, against 6 of 10 for static embeddings. Middle layers attend to that description, a layer-19 head copies its name, and argument values are copied from the request. |
 | Can a program read an unbounded context? | Yes, as a fold. With the new `carry` statement, an Entail program read 2 MB and 8 MB texts in 2,640 bytes of state and found the one record that decided the answer. |
-| A generic fix? | Split the work: the model supplies meaning (which tool is near, where a value lies), and a program supplies the strategy (when to call, what takes precedence, what to carry). A first call gate, 88 neurons beside the unchanged model, makes calls open at once, but its hand-written lexicon costs as much as it gains on these cases. |
+| A generic fix? | Split the work: the model supplies meaning (which tool is near, where a value lies), and a program supplies the strategy (when to call, what takes precedence, what to carry). A first call gate with a hand-written lexicon cost as much as it gained. |
+| A generic fix for missed calls? | Yes. The model's first-token probability of `<tool_call>` already says when a call is due. It is only below prose's. A 10-neuron program, `decide "<tool_call>" at 2 times prior`, calls when the latest message at least doubles that probability over the same conversation with the message blanked. With two template lines removed, the clean set goes from 23 to 36 calls of 36 with no new false call. On 120 real policy conversations, calls rise from 64 to 94 and right tools from 46 to 70. No word lists are involved. |
+| What fails next? | Choosing the tool: a tool listed late loses to one listed early. Restating the tools near the reply fixes that, but it blurs the call decision. |
 
 ## What was built
 
@@ -32,7 +34,10 @@ decisions. Everything below was run on Qwen 3.5 0.8B on the CPU, in float32.
 | Tool tracer | `amql-cli tool-trace` | For the model's own reply, traces the call, tool and argument decisions: attention over the prompt's parts, and request-to-tool similarity. |
 | Recurrent registers | `carry DEST from SOURCE` | A lane that starts each token holding another lane's value from the token before. A fold over the text. |
 | Streaming | `entail run --file` | Runs a program over a file of any size in fixed memory. |
-| Cases | `scripts/entail/toolcall/` | The synthetic cases, anchors, scorer, trace summary and the call gate's generator. |
+| Host-weighed outputs | `prefer`, `decide` | Say a token when the host's own model gives it enough probability, absolutely or relative to its prior for the same conversation with the latest message blanked. |
+| The call program | `call-when-likely.entail.txt` | The tool-call decision as a 10-neuron fold plus one `decide`. |
+| Decision probes | `entail eval --watch --prefix --logprobs` | First-token probabilities, forced openings and per-token probabilities. |
+| Cases | `scripts/entail/toolcall/` | The synthetic and real cases, anchors, scorers, prompt variants, trace summary and the call programs. |
 
 ### Training without autograd
 
@@ -63,6 +68,15 @@ Other features of the trainer:
   training. Its own replies become extra targets, so the adapter learns the new behaviour
   without forgetting the old. They need no human labels.
 - **Log.** `train.log.jsonl` has one line per step, check, anchor and evaluation.
+- **On the GPU.** The LoRA runs as its own f32 path beside the frozen down-projection
+  (`GenericRuntime.FfnAdapter`) and is never added into the weight. So with CUDA on (no
+  `--cpu`), the managed path's GEMMs run on the device, and their f16 weight copies stay
+  valid. A 4-step run gives the same losses on both devices (0.2362, 0.1369, 0.0263, 0.0044),
+  with gradient checks within 0.14% on the GPU and 0.06% on the CPU. It is no faster yet: the
+  prefix takes 55 s and a step 1 s either way, because attention, the Gated DeltaNet and the
+  head backward still run on the CPU. Making it faster needs the device engine to take the
+  same seam: hand out the FFN input at the LoRA layers and add the LoRA's output, keeping
+  the final residual for the backward pass.
 
 ```bash
 amql-cli --cpu lora-train <container> --tokenizer <dir> --data train.jsonl --eval eval.jsonl \
@@ -345,6 +359,154 @@ On these cases the gate does not win overall, and the reasons are instructive:
   The multi-turn conversations in the post-training set, with long policies, are where to
   measure that.
 
+## Calling on the model's own evidence
+
+The word-list gate showed where to act, the reply's first token, but not how to decide
+there without a hand-written lexicon. This section finds a decision rule that needs no
+words at all, and measures it on real conversations as well as on synthetic ones.
+
+### Three sets
+
+| Set | Cases | What it measures |
+|---|---|---|
+| Original | the 26 cases above | the need, policy and selection sets |
+| Clean | 36 need a tool, 24 don't | the omission alone. One user turn, the same 8 tools in every case. The requests imply a tool without naming it ("give me a shout in 7 minutes", "is that true about NVDA?"). There are 12 decoys from a tool's domain that need none ("What does CC mean in an email?"). It was written before any strategy was run on it. |
+| Real | 120 call turns, 60 text turns | one decision point from each of 180 recorded multi-turn conversations in `tool_calling.jsonl` (customer service with long policies), up to 6,000 tokens. The label is what the recording's much larger model did: called a tool, or wrote to the user. |
+
+The real set's text labels are a larger model's judgement, often "ask the customer for
+their email first", so a call there is not always wrong. Its call turns are the measure
+that matters, and they reproduce the complaint. The base model opens a call in 36 of 120,
+calls at all within 96 tokens in only 64, and names the recorded tool in 46. The typical
+miss is "I understand you're concerned about… I can help you with that", and then nothing.
+
+`make_need_cases.py` and `make_real_cases.py` write these sets, and `score_real.py` scores
+them. `entail eval` gained `--watch TOKEN`, which records the probability of a token on
+the reply's first row and the five most likely tokens there. It also gained `--prefix TEXT`,
+which forces the reply's opening, and `--logprobs`.
+
+### The model knows; it is miscalibrated
+
+On the clean set, the probability the model gives `<tool_call>` on the first token
+separates the requests that need a tool from those that don't almost perfectly (AUC 0.98).
+In 36 of 36 need cases it is above 0.013. In 23 of 24 no-tool cases it is below 0.017. The
+exception is "What is 17 times 23?", which wants a calculator. Yet the model only says
+`<tool_call>` when it is the most likely token, which happened in 18 of 36. So the
+evidence is there and the threshold is wrong: a 1-in-20 chance of a call is a strong
+signal, and the model acts only on better than even.
+
+Two instruments that ask the model more directly do no better on the real set. A hidden
+question, "should your next reply be a call to one of the functions? Yes or No", scores AUC
+0.64. Forcing a draft call and reading its confidence scores AUC 0.68, as does checking that
+its argument values come from the context.
+
+### Calibrating per conversation
+
+On real conversations the raw first-token probability is much weaker (AUC 0.66), because
+each has its own system prompt and policy, and so its own baseline inclination to call. The
+fix is contextual calibration (Zhao et al., 2021), done per prompt. Run the same
+conversation again with the latest message's content replaced by "N/A", and compare:
+
+| Score | Clean AUC | Real AUC |
+|---|---|---|
+| p(`<tool_call>`) | 0.98 | 0.69 |
+| p(`<tool_call>`) / p(`<tool_call>` with the latest message blanked) | 0.98 | **0.78** |
+
+The ratio asks how much the latest message itself moved the model towards a call. That
+question transfers from clean prompts to long policy conversations, which the raw
+probability does not. A ratio of 2 works on both sets. Raw-threshold rules
+(`call if p ≥ 0.03`) do just as well on the clean set but make 30 false calls of 60 on the
+real one.
+
+### The program
+
+[`call-when-likely.entail.txt`](../scripts/entail/toolcall/call-when-likely.entail.txt)
+is the whole strategy. It is a fold over the prompt that knows only the template's
+structure: turn markers, whether the system turn showed the call format (the `<tool_call>`
+token), and where the reply begins. At that point it applies one rule:
+
+```
+decide "<tool_call>" at 2 times prior when reply_start
+```
+
+`decide` is new in Entail (see [entail-language.md](entail-language.md#output)). The host
+says `<tool_call>` when its own model gives it at least twice its prior, and rules it out
+otherwise. The host measures the prior with one more prefill of the blanked prompt. The
+program has 10 neurons and no word lists. The model supplies the evidence and the program
+supplies the threshold and where to apply it.
+
+```bash
+amql-cli entail adapter scripts/entail/toolcall/call-when-likely.entail.txt --tokenizer <dir> --out adapters/call
+```
+
+```bash
+amql-cli entail eval <container> --tokenizer <dir> --cases cases.jsonl --adapter adapters/call --watch "<tool_call>"
+```
+
+### The template
+
+[`qwen3.5-calls.jinja`](../scripts/entail/toolcall/qwen3.5-calls.jinja) is Qwen 3.5's own
+template with two lines of its `<IMPORTANT>` block removed:
+
+- "You may provide optional reasoning for your function call in natural language BEFORE
+  the function call", which invites talking first.
+- "If there is no function call available, answer the question like normal…", which the
+  occlusion study found suppresses calling by a factor of four.
+
+Restating the tools near the reply was also tried: their names, their names and
+descriptions, with or without an instruction, and before the reply or before the latest
+turn. Each raises calling everywhere and blurs the decision (AUC 0.95 to 0.97 on the clean
+set). That trades against the program, so the shipped template does not do it.
+
+### Results
+
+Every reply has 96 tokens. "Calls" counts a call anywhere in the reply, "tool" a call to
+the expected tool, and "quiet" a no-tool case left without a call.
+
+| Set | Template | Program | Opens a call | Calls | Right tool | Quiet |
+|---|---|---|---|---|---|---|
+| Clean, 36 + 24 | stock | none | 18 | 23 | 21 | 23 |
+| | stock | `decide` | 34 | 34 | 24 | 23 |
+| | edited | none | 28 | 31 | 26 | 23 |
+| | edited | `decide` | **36** | **36** | 27 | **23** |
+| Real, 120 + 60 | stock | none | 36 | 64 | 46 | 51 |
+| | stock | `decide` | 77 | 89 | 67 | 48 |
+| | edited | none | 47 | 75 | 56 | 48 |
+| | edited | `decide` | **83** | **94** | **70** | 47 |
+| Original need, 7 + 3 | stock | none | 8 | 9 | 9 | (counted with the rest) |
+| | stock | `decide` | **10** | **10** | **10** | |
+
+On the real conversations, the program and the template together turn 64 calls into 94
+and 46 right tools into 70, for 4 more calls among the 60 turns the larger model answered
+in words. With the stock template the program alone gets most of that: 89 calls and 67
+right tools. The selection and policy sets of the original 26 are unchanged, except that
+policy replies now open with their call (7 of 7, from 5), still to the tool nearest the
+request.
+
+The two examples:
+
+| Request | Before | After |
+|---|---|---|
+| "I'm flying to Oslo tomorrow. Do I need to pack a warm coat?" | "To determine if you need a warm coat, I would need to know the current weather conditions in Oslo. I can check…" | `get_weather(city=Oslo, unit=celsius)` |
+| "Let sarah@example.com know the meeting has moved to 3pm." | "I cannot send an email to sarah@example.com. I can, however, help you with other tasks…" | `send_email(to=sarah@example.com, subject=Meeting Moved to 3pm, …)` |
+| "Is wool or down warmer for a winter coat?" (the decoy the word-list gate called on) | "For a winter coat, **wool** is generally warmer…" | unchanged |
+
+On the original 5-tool prompts the program alone fixes both. On the clean set's 8 tools,
+Oslo's ratio with the stock template is only 1.3. The edited template raises it to 3.0, and
+the call follows.
+
+### What it exposes: selection
+
+With every needed call now made, the next failure is the choice of tool. On the clean set,
+9 of the 36 calls name the wrong one. In 8 of them a tool listed early takes a request meant
+for one listed late: `create_event`, `get_stock_price` and `send_sms` are last in the list,
+and their requests go to `set_timer`, `get_weather` and `send_email`. Restating every tool
+with its description just before the reply fixes it, with the right tool in 35 of 36 in
+either list order. But that is the reminder that blurs the call decision. So decision and
+selection want different contexts: decide on the plain prompt, then write the call with the
+tools restated. That is a host strategy with two prefills, not yet built. On the real
+conversations the restated list does not help selection (67 right tools against 70), so it
+is not a general fix either.
+
 ## Reading a context of any length
 
 ### Why a model's context is limited, and a program's need not be
@@ -428,12 +590,14 @@ each a different kind of operation:
 
 | Step | What the 0.8B model does | Kind of operation | As a program |
 |---|---|---|---|
-| 1. Call or talk | a weak prior on the first token, set by the template | a threshold on relevance | a fold that marks offered and asked concepts, and `emit "<tool_call>"` (the call gate) |
+| 1. Call or talk | the right evidence on the first token, but below prose's | a threshold on relevance | a fold that finds the reply's start, and `decide "<tool_call>" at 2 times prior`: no lexicon needed |
 | 2. Which tool | nearest description to the request, layers 7 to 15 | nearest neighbour in meaning | a score per offered tool from shared concepts; the highest wins |
 | 3. Policy before match | a second, weaker vote at the same position | precedence | a rule that fires first: a precondition not yet met forces its own tool |
 | 4. Which arguments | copy the span of the request the parameter names, layer 15 | pointer copy | `attend back by` a pointer to the span start, or the model itself |
 
 Steps 1 and 3 are where a small model is weakest, and they are the easiest to state exactly.
+Step 1 turned out to need no concepts at all, only a threshold on the model's own evidence,
+measured against that conversation's prior.
 Step 2 needs a notion of meaning, which is what a model is for, and step 4 is something the
 model already does almost perfectly. So the division of labour that follows is:
 
@@ -444,7 +608,7 @@ model already does almost perfectly. So the division of labour that follows is:
 
 Two things stand between that and a generic solution:
 
-1. **A derived lexicon.** The gate's concept words were written by hand. The trace gives a
+1. **A derived lexicon, for steps 2 and 3.** The first gate's concept words were written by hand. The trace gives a
    way to derive them: the request-to-description similarity at layer 15 picks the right tool
    in 10 of 10 cases, so concept membership can be read off the model's own layer-15
    representations, as `probe_words.py` did for Python from replies. Entail token facts are
@@ -487,8 +651,13 @@ comparable with each other and not with the 72-token table above.
 
 ## Limits
 
-- Every figure here is from a handful of synthetic, single-turn cases, on one model. They
-  show mechanisms, not rates. The attention figures are from the 6 softmax layers only.
+- Most figures here are from a handful of synthetic, single-turn cases, on one model. They
+  show mechanisms, not rates. The attention figures are from the 6 softmax layers only. The
+  call decision is also measured on 180 real decision points. Those are labelled by a larger
+  model's choices, so the text turns are a judgement, not ground truth.
+- The calibrated decision costs a second prefill of the prompt, with the latest message
+  blanked. It is measured for ChatML templates, at the first token of a fresh prefill only,
+  and the factor of 2 was chosen on the clean set and checked on the other two.
 - The trainer handles LoRA on dense FFN down-projections. Gradients are exact for the last
   layer and follow the direct residual path below it. The monitoring measures that
   approximation rather than correcting it.
@@ -497,8 +666,8 @@ comparable with each other and not with the 72-token table above.
   forward passes per removed segment.
 - `carry` runs in the interpreter, the stream runner and the sparse adapter, not in compiled
   weights.
-- The call gate's lexicon is hand-written, and it has been run on the cases it was evaluated
-  on. A fresh case set is needed before quoting its figures.
+- The word-list call gate's lexicon is hand-written, and it was only run on the cases it was
+  evaluated on. `decide` replaces it.
 
 ## Reproducing
 
@@ -535,6 +704,36 @@ python scripts/entail/make_scan.py scan
 ```bash
 amql-cli entail run scripts/entail/scan.entail.txt --file scan/first-2mb.txt
 ```
+
+The call decision:
+
+```bash
+python scripts/entail/toolcall/make_need_cases.py <tokenizer-dir> need/cases.jsonl
+```
+
+```bash
+python scripts/entail/toolcall/make_real_cases.py <tokenizer-dir> tool_calling.jsonl real/cases.jsonl
+```
+
+```bash
+python scripts/entail/toolcall/variants.py need/cases.jsonl need/v base noimp
+```
+
+```bash
+amql-cli entail adapter scripts/entail/toolcall/call-when-likely.entail.txt --tokenizer <dir> --out adapters/call
+```
+
+```bash
+amql-cli entail eval <container> --tokenizer <dir> --cases need/v/noimp.jsonl --adapter adapters/call \
+    --watch "<tool_call>" --report need/noimp-call.json
+```
+
+```bash
+python scripts/entail/toolcall/score_real.py need/cases.jsonl call=need/noimp-call.json
+```
+
+`variants.py noimp` renders the same prompts as `qwen3.5-calls.jinja`. `watch_auc.py`
+gives the threshold table for a report run with `--watch`.
 
 `data/eval-all.jsonl` is the three held-out sets with prefixed ids (`n:`, `p:`, `w:`), and
 `lora-cases.jsonl` and `trace-cases.jsonl` are subsets of it. `compare_eval.py` scores

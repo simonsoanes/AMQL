@@ -383,7 +383,12 @@ public sealed class GpuEngine : IDisposable
         {
             throw new ArgumentException("prefill requires at least one token", nameof(tokens));
         }
-        EnsureKv(_position + tokens.Length);
+        // Growing moves the KV buffers, and the captured decode graph holds their old
+        // addresses: replaying it after a long prefill read freed memory (status -700).
+        if (EnsureKv(_position + tokens.Length))
+        {
+            _graphReady = false;
+        }
         var ids = tokens.ToArray();
         for (int start = 0; start < ids.Length; start += ChunkRows)
         {

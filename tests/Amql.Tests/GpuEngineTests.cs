@@ -125,6 +125,46 @@ public class GpuEngineTests
         AssertClose(a, b, "after growing the cache");
     }
 
+    /// <summary>A short request captures the decode graph; the next, after a reset, is
+    /// long enough that its prefill grows the cache. The graph must be captured again,
+    /// or its first step reads the freed buffers (CUDA status 700).</summary>
+    [Fact]
+    public void Engine_Recaptures_After_A_Prefill_Grows_The_Cache()
+    {
+        if (!GpuAvailable())
+        {
+            return;
+        }
+        using var dir = new TempDir();
+        string containerDir = Path.Combine(dir.Path, "c");
+        ModelToContainer.Encode(Path.Combine(Zoo, "qwen3"), containerDir, "qwen3",
+            new ArchMapper.EncodeOptions { IncludeVision = false, IncludeMtp = false });
+        using var container = Vindex3Container.Open(containerDir);
+        using var store = container.CreateOperandStore();
+        var plan = Planner.Plan(container, "target", store);
+        var (ids, _) = ArchZooTests.Golden("qwen3");
+
+        using var gpu = new DecodeSession(plan, store) { ExactGpuPrefill = true };
+        var a = gpu.Prefill(ids.Take(5).ToArray()).FirstRow().ToArray();
+        for (int step = 0; step < 3; step++)
+        {
+            a = gpu.Step(Sampler.ArgMax(a)).FirstRow().ToArray();
+        }
+        gpu.Reset();
+        var prompt = Enumerable.Range(0, 1500).Select(i => ids[i % ids.Length]).ToArray();
+        a = gpu.Prefill(prompt).FirstRow().ToArray();
+
+        using var cpu = new DecodeSession(plan, store) { AllowGpuEngine = false };
+        var b = cpu.Prefill(prompt).FirstRow().ToArray();
+        for (int step = 0; step < 3; step++)
+        {
+            int next = Sampler.ArgMax(b);
+            a = gpu.Step(next).FirstRow().ToArray();
+            b = cpu.Step(next).FirstRow().ToArray();
+        }
+        AssertClose(a, b, "after a prefill grew the cache");
+    }
+
     private static void AssertClose(float[] actual, float[] expected, string where, double tolerance = 1e-3)
     {
         Assert.Equal(expected.Length, actual.Length);

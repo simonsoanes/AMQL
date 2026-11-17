@@ -2758,7 +2758,7 @@ internal static partial class Program
               amql-cli entail adapter <program.entail.txt> --tokenizer <partner-dir> --out <dir> [--dense]
               amql-cli entail side <container-dir> --adapter <dir>[,<dir>] --prompt <text> [--chat] [--think] [--max-tokens N] [--weights f32|disk]
               amql-cli entail run <program> --expr <text>|--cases <cases.jsonl> [--tokenizer <dir>] [--report <json>]
-              amql-cli entail eval <container-dir> --cases <cases.jsonl> [--adapter <dir>[,<dir>]] [--batch N] [--text <file>] [--report <json>] [--weights f32|disk]
+              amql-cli entail eval <container-dir> --cases <cases.jsonl> [--adapter <dir>[,<dir>]] [--batch N] [--watch TOKEN] [--prefix TEXT] [--logprobs] [--text <file>] [--report <json>] [--weights f32|disk]
               amql-cli entail find <container-dir> --subject <file> --out <dir> [--top 64] [--verify]
               amql-cli entail extract <container-dir> --subject <file> --out <dir>
               amql-cli entail from-lora <container-dir> --lora <dir> --cases <jsonl> --out <file.entail.txt> [--occlude 3]

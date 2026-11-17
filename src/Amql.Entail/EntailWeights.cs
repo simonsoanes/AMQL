@@ -108,7 +108,7 @@ public static class EntailWeights
         }
 
         int end = 2 * p.Layers + 1;
-        foreach (int lane in p.Emits.Select(e => e.Lane).Concat(p.Masks.Select(m => m.Lane)))
+        foreach (int lane in p.Emits.Select(e => e.Lane).Concat(p.Masks.Select(m => m.Lane)).Concat(p.Prefers.Select(f => f.Lane)))
         {
             lastRead[lane] = keepEmitsLive ? int.MaxValue : end;
             if (keepEmitsLive)
@@ -703,6 +703,7 @@ public static class EntailWeights
     {
         RefuseVotes(p);
         RefuseCarries(p);
+        RefusePrefers(p);
         if (p.Masks.Count > 0)
         {
             throw new EntailException("`only` and `forbid` narrow a host's predictions: graft this program instead");
@@ -780,6 +781,14 @@ public static class EntailWeights
         {
             Add(allow ? EntailOutputKind.Only : EntailOutputKind.Forbid, lane,
                 texts.Where(ids.ContainsKey).Select(t => ids[t]).Distinct().ToArray());
+        }
+        foreach (var (text, threshold, timesPrior, strict, lane) in p.Prefers)
+        {
+            if (ids.TryGetValue(text, out int id))
+            {
+                outputs.Add((entries.Count, lane));
+                entries.Add(new EntailAdapterOutput(entries.Count, EntailOutputKind.Prefer, new[] { id }, threshold, timesPrior, strict));
+            }
         }
 
         var manifest = new EntailAdapterManifest(p.Name,
@@ -935,6 +944,16 @@ public static class EntailWeights
         }
     }
 
+    /// <summary>A prefer weighs the host's own probability, which only a sampler beside
+    /// the host can read: it runs as an adapter, not in weights.</summary>
+    private static void RefusePrefers(EntailProgram p)
+    {
+        if (p.Prefers.Count > 0)
+        {
+            throw new EntailException("`prefer` and `decide` weigh the host's own probability: run this program as an adapter (`entail adapter`)");
+        }
+    }
+
     private static void RefuseVotes(EntailProgram p)
     {
         if (p.Votes.Count > 0)
@@ -989,6 +1008,7 @@ public static class EntailWeights
     {
         RefuseVotes(p);
         RefuseCarries(p);
+        RefusePrefers(p);
         var t = hostFacts.Target;
         if (p.Ops.OfType<Head>().GroupBy(h => h.Layer).Any(g => g.Count() > t.ProgramHeads))
         {
@@ -1560,7 +1580,7 @@ public static class EntailWeights
         var ids = new Dictionary<string, int>(StringComparer.Ordinal);
         var missing = new List<string>();
         foreach (var token in p.Tokens.Keys.Concat(p.Emits.Where(e => e.Text is not null).Select(e => e.Text!))
-            .Concat(p.Masks.SelectMany(m => m.Texts)).Distinct())
+            .Concat(p.Masks.SelectMany(m => m.Texts)).Concat(p.Prefers.Select(f => f.Text)).Distinct())
         {
             var bytes = Encoding.UTF8.GetBytes(token);
             var spellings = new List<string>

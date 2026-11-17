@@ -76,7 +76,8 @@ leading space: see [The start of the text](#the-start-of-the-text).
 Reserved words: `program const state scale let token means for in to if else end
 def call attend back by entail when not emit only forbid vote sum min floor`.
 `carry` starts a carry statement only when a name follows it, so a state may still be
-called `carry`.
+called `carry`. Likewise `prefer` and `decide` start an output only when a quoted token
+follows them.
 
 ## Expressions
 
@@ -248,6 +249,31 @@ With the lane set, `only` lowers every token in the vocabulary but those listed,
 `forbid` lowers those listed. A list may break after any comma. `compile` refuses a mask,
 which has no predictions to narrow, and `entail run` ignores one, so test a mask in a
 graft. See `json.entail.txt`, which uses them to keep a text valid while it is written.
+
+```
+prefer "TEXT" at P when LANE
+prefer "TEXT" at K times prior when LANE
+decide "TEXT" at K times prior when LANE
+```
+A decision taken on the host's own evidence. The program says where the decision is
+and how much evidence it needs. The host's model says how likely TEXT is. With the lane
+set, `prefer` says TEXT if the host gives it a probability of at least `P`, and otherwise
+leaves the choice to the host. `decide` does the same, and below the threshold it also
+rules TEXT out, so the threshold settles the decision both ways.
+
+`times prior` makes the threshold relative. The prior is the probability the host gives
+TEXT at the same place in the same conversation with the latest message's content
+replaced by "N/A". So `at 2 times prior` reads "if the latest message at least doubles
+the model's inclination to say TEXT". The host measures the prior with one more prefill
+of the blanked prompt, for ChatML templates (`ChatPrior` in `Amql.Inference`). It does
+this only when an adapter asks for it. Without a prior, a relative `prefer` is silent.
+
+Both forms need a host's probabilities, so both run only as adapters. `compile` and
+`graft` refuse them, and `entail run` ignores them. A state may still be called
+`prefer` or `decide`: the statement needs a quoted token after the word.
+[`call-when-likely.entail.txt`](../scripts/entail/toolcall/call-when-likely.entail.txt)
+uses `decide` for the tool-call decision. See
+[entail-strategies.md](entail-strategies.md#calling-on-the-models-own-evidence).
 
 ```
 vote "TEXT" by EXPRESSION

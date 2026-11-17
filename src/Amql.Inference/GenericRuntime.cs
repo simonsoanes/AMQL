@@ -171,6 +171,10 @@ public sealed class GenericRuntime
                 ffnOut = RunRoutedFfn(hf, layer, routed);
                 Report(layer, "ffn_routed", routed.Router, ffnOut, t);
             }
+            if (FfnAdapter?.Invoke(layer, hf) is { } extra)
+            {
+                AddInPlace(ffnOut, extra);
+            }
 
             if (layerPlan.PostFfnNorm is { } postFfnNorm)
             {
@@ -986,6 +990,12 @@ public sealed class GenericRuntime
     /// seam (see <c>amql-cli moe-ify</c>).</summary>
     public Action<int, Tensor2D>? FfnInputCapture { get; set; }
 
+    /// <summary>When set, called with each layer's FFN input (normed, rows × hidden); a
+    /// result is added to that layer's FFN output before any post-FFN norm. A LoRA trained
+    /// here runs through it as its own low-rank path in f32, so the base weights, and any
+    /// device copies of them, never change.</summary>
+    public Func<int, Tensor2D, Tensor2D?>? FfnAdapter { get; set; }
+
     /// <summary>When set, each softmax-attention layer's per-head context
     /// output (rows × QDim, contiguous per-head <c>HeadDim</c> blocks, before
     /// the output gate and <c>o_proj</c>) is handed out as the layer runs —
@@ -1095,7 +1105,7 @@ public sealed class GenericRuntime
     /// the GPU and has none of these seams, so a session with any of them runs
     /// here instead.</summary>
     internal bool HasObservers =>
-        OpTrace is not null || AttentionTrace is not null || FfnInputCapture is not null ||
+        OpTrace is not null || AttentionTrace is not null || FfnInputCapture is not null || FfnAdapter is not null ||
         AttentionContextCapture is not null || LayerNormTrace is not null || LogitLensTrace is not null ||
         ExpertRoutingTrace is not null || _patches.Count > 0;
 

@@ -132,6 +132,7 @@ internal sealed record EntailStmt(RefExpr Target, Expr? Value, IReadOnlyList<Con
 internal sealed record EmitStmt(string? Text, RefExpr Lane, int Line) : Stmt(Line);
 internal sealed record MaskStmt(bool Allow, IReadOnlyList<string> Texts, RefExpr Lane, int Line) : Stmt(Line);
 internal sealed record VoteStmt(string Text, Expr Value, int Line) : Stmt(Line);
+internal sealed record PreferStmt(string Text, Expr Threshold, bool TimesPrior, bool Strict, RefExpr Lane, int Line) : Stmt(Line);
 internal sealed record CarryStmt(RefExpr Target, RefExpr Source, int Line) : Stmt(Line);
 
 /// <summary>Recursive-descent parser for the statement forms of Entail.</summary>
@@ -461,6 +462,28 @@ internal sealed class EntailParser
             var carried = Reference();
             EndOfLine();
             return new CarryStmt(target, carried, line);
+        }
+
+        // prefer "TEXT" at P [times prior] when LANE: say TEXT if the host gives it at
+        // least P, or at least P times what it gives TEXT with the latest message blanked.
+        // decide is the same, and below the threshold it also rules TEXT out.
+        // A state may be called either, so this is one only when a quoted token follows.
+        if ((IsWord("prefer") || IsWord("decide")) && _tokens[_at + 1].Kind == Tok.Str)
+        {
+            bool strict = IsWord("decide");
+            _at++;
+            var text = Next().Text;
+            ExpectWord("at");
+            var threshold = Expression();
+            bool timesPrior = AcceptWord("times");
+            if (timesPrior)
+            {
+                ExpectWord("prior");
+            }
+            ExpectWord("when");
+            var lane = Reference();
+            EndOfLine();
+            return new PreferStmt(text, threshold, timesPrior, strict, lane, line);
         }
 
         if (AcceptWord("vote"))

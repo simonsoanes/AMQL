@@ -160,23 +160,24 @@ public static class LoraTrainer
             };
         }).ToList();
 
+        // The device engine has no seams to add a LoRA through, so the session runs the
+        // managed path. That path's GEMMs go to the GPU whenever CUDA is on (no --cpu):
+        // the base weights stay frozen and the LoRA runs beside them as its own f32
+        // low-rank path, so their device copies, f16 or not, never go stale.
         var session = new DecodeSession(plan, store, workingSet: WeightWorkingSet.ResidentF32) { AllowGpuEngine = false };
         var rt = session.Runtime;
-        var applied = loras.Select(l => new float[l.Hidden * l.Inter]).ToList();
         var notes = new List<string>();
         int first = layerIds[0];
+        var byLayer = loras.ToDictionary(l => l.Layer);
+        rt.FfnAdapter = (layer, hf) =>
+            byLayer.TryGetValue(layer, out var l) ? LoraPath(rt, plan.Layers[layer].Ffn!.Dense!, l, hf) : null;
+        log(new { kind = "device", gpu = CudaShim.Enabled, note = CudaShim.Enabled
+            ? "managed path, GEMMs on the GPU; the LoRA path in f32"
+            : "managed path on the CPU" });
 
-        void Apply()
+        // The LoRA path reads A and B as they are, so there is nothing to apply.
+        static void Apply()
         {
-            for (int i = 0; i < loras.Count; i++)
-            {
-                var want = loras[i].Delta();
-                var step = new float[want.Length];
-                for (int j = 0; j < want.Length; j++)
-                    step[j] = want[j] - applied[i][j];
-                rt.Weights.AddDelta(loras[i].Down, loras[i].Hidden, loras[i].Inter, step);
-                applied[i] = want;
-            }
         }
 
         try
@@ -269,7 +270,7 @@ public static class LoraTrainer
                 log(new
                 {
                     kind = "step", step, loss, lr, gradNorm, clipped = clip < 1,
-                    deltaNorm = loras.Select((l, i) => Math.Sqrt(SumSq(applied[i]))).ToArray(),
+                    deltaNorm = loras.Select(l => Math.Sqrt(SumSq(l.Delta()))).ToArray(),
                     perExample, seconds,
                 });
 
@@ -293,13 +294,7 @@ public static class LoraTrainer
         }
         finally
         {
-            // Undo the in-memory deltas: device copies and caches are keyed by
-            // tensor name, so a later runtime must not inherit them.
-            for (int i = 0; i < loras.Count; i++)
-            {
-                var neg = applied[i].Select(v => -v).ToArray();
-                rt.Weights.AddDelta(loras[i].Down, loras[i].Hidden, loras[i].Inter, neg);
-            }
+            rt.FfnAdapter = null;
             session.Dispose();
         }
     }
@@ -576,6 +571,40 @@ public static class LoraTrainer
     }
 
     // ── small helpers ───────────────────────────────────────────────────
+
+    /// <summary>A LoRA's own contribution to its layer's FFN output: scale · B · (A · act),
+    /// with act the down-projection's input, rows × hidden.</summary>
+    private static Tensor2D? LoraPath(GenericRuntime rt, DenseFfnOp dense, LoraLayer l, Tensor2D hf)
+    {
+        // B starts at zero, and then the path adds nothing.
+        if (Array.TrueForAll(l.B, b => b == 0f))
+            return null;
+        int rows = hf.Rows, rank = l.Rank, inter = l.Inter, hidden = l.Hidden;
+        var act = Intermediate(rt, dense, hf, hidden);
+        var u = new double[rank];
+        var output = new float[rows * hidden];
+        for (int r = 0; r < rows; r++)
+        {
+            var a = act.Row(r);
+            for (int k = 0; k < rank; k++)
+            {
+                var ak = l.A.AsSpan(k * inter, inter);
+                double s = 0;
+                for (int j = 0; j < inter; j++)
+                    s += ak[j] * a[j];
+                u[k] = s * l.Scale;
+            }
+            var o = output.AsSpan(r * hidden, hidden);
+            for (int h = 0; h < hidden; h++)
+            {
+                double s = 0;
+                for (int k = 0; k < rank; k++)
+                    s += l.B[h * rank + k] * u[k];
+                o[h] = (float)s;
+            }
+        }
+        return new Tensor2D(output, rows, hidden);
+    }
 
     public static Tensor2D Intermediate(GenericRuntime rt, DenseFfnOp dense, Tensor2D h, int hidden)
     {
