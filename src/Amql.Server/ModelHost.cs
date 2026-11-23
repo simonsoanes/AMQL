@@ -301,7 +301,11 @@ public static class StopTokens
 
 /// <summary>Defaults one model applies to requests that leave them out
 /// (null: the server's default).</summary>
-public sealed record ModelDefaults(bool? Think = null, int? MaxTokens = null, float? Temperature = null, float? TopP = null, int? TopK = null);
+public sealed record ModelDefaults(bool? Think = null, int? MaxTokens = null, float? Temperature = null, float? TopP = null, int? TopK = null)
+{
+    /// <summary>The n-gram packs this model blends by default (names of loaded packs).</summary>
+    public IReadOnlyList<string>? NGramPacks { get; init; }
+}
 
 public sealed record GenerationParams(
     int MaxTokens,
@@ -329,6 +333,9 @@ public sealed record GenerationParams(
 
     /// <summary>The user's latest message and the tool results since, for the mentioned-parameter rule.</summary>
     public string? Recent { get; init; }
+
+    /// <summary>N-gram packs blended into the logits outside thinking (null: none).</summary>
+    public Amql.Inference.NGram.NGramPrior? NGram { get; init; }
 }
 
 public sealed record GenerationResult(string Text, string FinishReason, int PromptTokens, int CompletionTokens)
@@ -390,6 +397,24 @@ public sealed class TextGenerator : IDisposable
 
     /// <summary>A token's own text, for structured output to check; empty for a special token
     /// (it would vanish from the decoded reply, so it is never allowed there) or a padding row.</summary>
+    /// <summary>A token's text, from the cache <see cref="TokenText"/> fills when it is there.</summary>
+    internal string TokenPiece(int id)
+    {
+        var texts = _tokenTexts;
+        if (texts is not null && (uint)id < (uint)texts.Length)
+        {
+            return TokenText(id, texts.Length);
+        }
+        try
+        {
+            return Tokenizer.IsSpecial(id) ? "" : Tokenizer.DecodeText(new[] { id });
+        }
+        catch (TokenizerException)
+        {
+            return "";
+        }
+    }
+
     internal string TokenText(int id, int vocab)
     {
         var texts = _tokenTexts;
@@ -587,6 +612,8 @@ internal sealed class GenerationRun
     private int _loopFrom;   // the loop guard looks only at tokens from here on
     private float[]? _masked;
     private LogitsRow _logits = null!;
+    private float[]? _blended;      // this step's logits with the n-gram packs blended in
+    private bool _blendedNow;
     private EntailVerdict _verdict = EntailVerdict.Silence;
     private IReadOnlyList<double>? _prior;
 
@@ -656,6 +683,15 @@ internal sealed class GenerationRun
         {
             return Finish("length");
         }
+        _blendedNow = false;
+        if (_p.NGram is { } prior && _forced.Count == 0 && (!_p.Thinking || _thinkClosed) &&
+            (prior.Scope == "all" || _call is not null || Amql.Inference.NGram.NGramPrior.InFencedCode(_stableText)))
+        {
+            var raw = _logits();
+            _blended ??= new float[raw.Length];
+            _blendedNow = prior.Apply(raw, Context(prior), _blended);
+        }
+
         int token;
         if (_forced.Count > 0)
         {
@@ -672,7 +708,7 @@ internal sealed class GenerationRun
         else if (_verdict.Silent)
         {
             LogprobsResult? lp;
-            (token, lp) = Sampler.SampleWithLogprobs(_logits(), _config, _rng, _logprobsTopK);
+            (token, lp) = Sampler.SampleWithLogprobs(Row(), _config, _rng, _logprobsTopK);
             if (lp is not null)
             {
                 _logprobs!.Add(lp);
@@ -681,8 +717,8 @@ internal sealed class GenerationRun
         else
         {
             // An adapter rules on this token; logprobs still describe the model's own distribution.
-            (token, _) = _verdict.Choose(_logits(), _prior, r => Sampler.Sample(r, _config, _rng));
-            if (_logprobs is not null && Sampler.SampleWithLogprobs(_logits(), _config, new Random(0), _logprobsTopK).Logprobs is { } lp)
+            (token, _) = _verdict.Choose(Row(), _prior, r => Sampler.Sample(r, _config, _rng));
+            if (_logprobs is not null && Sampler.SampleWithLogprobs(Row(), _config, new Random(0), _logprobsTopK).Logprobs is { } lp)
             {
                 _logprobs.Add(lp);
             }
@@ -814,7 +850,7 @@ internal sealed class GenerationRun
     /// </summary>
     private int Constrained(ITokenConstraint grammar)
     {
-        var row = _logits();
+        var row = Row();
         int n = row.Length;
         _masked ??= new float[n];
         Array.Fill(_masked, float.NegativeInfinity);
@@ -884,7 +920,7 @@ internal sealed class GenerationRun
                 string rest = t.TrimStart(' ', '\n', '\r', '\t');
                 return rest.Length == 0 || path.StartsWith(rest, StringComparison.Ordinal) || rest.StartsWith(path, StringComparison.Ordinal);
             }
-            var row = _logits();
+            var row = Row();
             float max = float.NegativeInfinity;
             foreach (float v in row)
             {
@@ -906,6 +942,28 @@ internal sealed class GenerationRun
             }
         }
         return null;
+    }
+
+    /// <summary>The logits this step chooses from: the model's, or with the packs blended in.</summary>
+    private ReadOnlySpan<float> Row() => _blendedNow ? _blended : _logits();
+
+    private readonly List<int> _context = new();
+
+    /// <summary>The last tokens of prompt and reply together, as the n-gram packs read them.</summary>
+    private IReadOnlyList<int> Context(Amql.Inference.NGram.NGramPrior prior)
+    {
+        int need = prior.Packs.Max(p => p.Order) - 1;
+        _context.Clear();
+        int fromPrompt = Math.Max(0, need - _generated.Count);
+        for (int i = Math.Max(0, Prompt.Length - fromPrompt); i < Prompt.Length; i++)
+        {
+            _context.Add(Prompt[i]);
+        }
+        for (int i = Math.Max(0, _generated.Count - need); i < _generated.Count; i++)
+        {
+            _context.Add(_generated[i]);
+        }
+        return _context;
     }
 
     /// <summary>The reply's thinking so far (all of it, when the prompt opened a think block).</summary>

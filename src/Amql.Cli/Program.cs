@@ -168,6 +168,7 @@ internal static partial class Program
                 "lora-train" => LoraTrain(args[1..]),
                 "tool-trace" => ToolTrace(args[1..]),
                 "entail" => EntailCommand(args[1..]),
+                "ngram" => NGramCommand(args[1..]),
                 "classify" => Classify(args[1..]),
                 "tool-eval" => ToolEval.Run(args[1..], OptionValue, HasOption),
                 "decide" or "decisions" => Decide(args[1..]),

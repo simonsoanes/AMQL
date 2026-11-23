@@ -32,7 +32,15 @@ public sealed class ApiException : Exception
 /// <param name="Think">Think before answering when a request does not say.</param>
 /// <param name="Temperature">Sampling defaults for requests that leave them out.</param>
 public sealed record ServerSettings(string? ApiKey = null, int DefaultMaxTokens = 1024, bool Think = false,
-    float? Temperature = null, float? TopP = null, int? TopK = null);
+    float? Temperature = null, float? TopP = null, int? TopK = null)
+{
+    /// <summary>N-gram packs by name (<c>--ngram-pack</c>), for requests and models to choose from.</summary>
+    public IReadOnlyDictionary<string, Amql.Inference.NGram.NGramPack> NGramPacks { get; init; } =
+        new Dictionary<string, Amql.Inference.NGram.NGramPack>();
+
+    /// <summary>How a chosen pack is blended (λ and its gates), unless a request says otherwise.</summary>
+    public Amql.Inference.NGram.NGramPrior NGramDefaults { get; init; } = new(Array.Empty<Amql.Inference.NGram.NGramPack>());
+}
 
 /// <summary>Responses kept for <c>previous_response_id</c>: each response's
 /// conversation (its instructions excluded), the newest few hundred, in memory.</summary>
@@ -265,6 +273,7 @@ public static class ServerApp
 
     // AMQL_SERVER_DUMP=<dir>: every request body is written there, to replay a client's request exactly.
     private static readonly string? DumpDir = Environment.GetEnvironmentVariable("AMQL_SERVER_DUMP");
+    private static int _dumped;
 
     private static async Task<JsonDocument> ReadBody(HttpContext ctx)
     {
@@ -273,7 +282,9 @@ public static class ServerApp
             using var copy = new MemoryStream();
             await ctx.Request.Body.CopyToAsync(copy, ctx.RequestAborted);
             Directory.CreateDirectory(DumpDir);
-            string file = Path.Combine(DumpDir, $"{DateTime.Now:HHmmss-fff}-{ctx.Request.Path.Value?.Trim('/').Replace('/', '-')}.json");
+            // A sequence number too: requests arriving in the same millisecond must not share a file.
+            string file = Path.Combine(DumpDir,
+                $"{DateTime.Now:HHmmss-fff}-{Interlocked.Increment(ref _dumped):D5}-{ctx.Request.Path.Value?.Trim('/').Replace('/', '-')}.json");
             await File.WriteAllBytesAsync(file, copy.ToArray());
             Log($"{ctx.Request.Method} {ctx.Request.Path}: request saved to {file}");
             copy.Position = 0;
@@ -1259,8 +1270,58 @@ public static class ServerApp
         var p = Sampling(body, maxTokens, settings, model.Defaults) with
         {
             Forced = forced, Thinking = thinking, Json = format?.Schema, Tools = tools, Recent = recent,
+            NGram = Packs(body, model, settings, recent),
         };
         return new ChatTurn(prompt, p, tools, parallel);
+    }
+
+    /// <summary>
+    /// The n-gram packs a request is blended with: the request's <c>ngram_packs</c> (names, or
+    /// <c>[]</c> for none) when it gives them; else the model's own (<c>--config</c>); else every
+    /// loaded pack one of whose keywords the current task mentions. <c>ngram_lambda</c> overrides λ.
+    /// </summary>
+    private static Amql.Inference.NGram.NGramPrior? Packs(JsonElement body, ModelHost model, ServerSettings settings, string recent)
+    {
+        if (settings.NGramPacks.Count == 0)
+        {
+            return null;
+        }
+        List<Amql.Inference.NGram.NGramPack> chosen;
+        if (body.TryGetProperty("ngram_packs", out var named) && named.ValueKind == JsonValueKind.Array)
+        {
+            chosen = named.EnumerateArray().Select(n => n.GetString() is { } id && settings.NGramPacks.TryGetValue(id, out var pack)
+                ? pack
+                : throw new ApiException(400, $"no n-gram pack named '{n}' is loaded ({string.Join(", ", settings.NGramPacks.Keys)})", param: "ngram_packs")).ToList();
+        }
+        else if (model.Defaults.NGramPacks is { } own)
+        {
+            chosen = own.Where(settings.NGramPacks.ContainsKey).Select(id => settings.NGramPacks[id]).ToList();
+        }
+        else
+        {
+            chosen = settings.NGramPacks.Values.Where(p => p.Keywords.Any(k => recent.Contains(k, StringComparison.OrdinalIgnoreCase))).ToList();
+        }
+        if (chosen.Count == 0)
+        {
+            return null;
+        }
+        var d = settings.NGramDefaults;
+        double lambda = body.TryGetProperty("ngram_lambda", out var l) && l.ValueKind == JsonValueKind.Number ? l.GetDouble() : d.Lambda;
+        // ngram_scope: "code" (the default: fenced code and tool-call values), "members" (member
+        // names within code), or "all".
+        string scope = body.TryGetProperty("ngram_scope", out var sc) && sc.GetString() is { } given ? given : d.Scope;
+        if (scope is not ("code" or "members" or "all"))
+        {
+            throw new ApiException(400, $"'ngram_scope' is code, members or all, not '{scope}'", param: "ngram_scope");
+        }
+        bool members = scope == "members" || d.MembersOnly is not null;
+        var generator = model.Generator!;
+        return new Amql.Inference.NGram.NGramPrior(chosen)
+        {
+            Lambda = lambda, HalfCount = d.HalfCount, MinContext = d.MinContext, ModelConfident = d.ModelConfident, PackConfident = d.PackConfident,
+            MembersOnly = members ? generator.TokenPiece : null,
+            Scope = scope == "all" ? "all" : "code",
+        };
     }
 
     private static string? ToolName(JsonElement tool) =>

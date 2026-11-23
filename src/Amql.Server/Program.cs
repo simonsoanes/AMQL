@@ -15,6 +15,9 @@ int? maxTokens = null;
 bool warm = true, think = false;
 float? temperature = null, topP = null;
 int? topK = null;
+var ngramPacks = new Dictionary<string, Amql.Inference.NGram.NGramPack>();
+var ngram = new Amql.Inference.NGram.NGramPrior(Array.Empty<Amql.Inference.NGram.NGramPack>());
+double Num(string s) => double.Parse(s, CultureInfo.InvariantCulture);
 for (int i = 0; i < args.Length; i++)
 {
     string Next() => i + 1 < args.Length ? args[++i] : throw new ArgumentException($"{args[i]} needs a value");
@@ -48,6 +51,17 @@ for (int i = 0; i < args.Length; i++)
         case "--no-loop-guard": TextGenerator.LoopGuardEnabled = false; break;
         case "--free-tool-calls": TextGenerator.ToolGrammarEnabled = false; break;
         case "--no-mention-rule": TextGenerator.MentionRuleEnabled = false; break;
+        case "--ngram-pack":
+        {
+            var pack = Amql.Inference.NGram.NGramPack.Load(Next());
+            ngramPacks[pack.Name] = pack;
+            break;
+        }
+        case "--ngram-lambda": ngram = new(ngram.Packs) { Lambda = Num(Next()), HalfCount = ngram.HalfCount, MinContext = ngram.MinContext, ModelConfident = ngram.ModelConfident, PackConfident = ngram.PackConfident }; break;
+        case "--ngram-min-context": ngram = new(ngram.Packs) { Lambda = ngram.Lambda, HalfCount = ngram.HalfCount, MinContext = int.Parse(Next()), ModelConfident = ngram.ModelConfident, PackConfident = ngram.PackConfident }; break;
+        case "--ngram-model-confident": ngram = new(ngram.Packs) { Lambda = ngram.Lambda, HalfCount = ngram.HalfCount, MinContext = ngram.MinContext, ModelConfident = Num(Next()), PackConfident = ngram.PackConfident }; break;
+        case "--ngram-members-only": ngram = new(ngram.Packs) { Lambda = ngram.Lambda, HalfCount = ngram.HalfCount, MinContext = ngram.MinContext, ModelConfident = ngram.ModelConfident, PackConfident = ngram.PackConfident, MembersOnly = _ => "" }; break;
+        case "--ngram-pack-confident": ngram = new(ngram.Packs) { Lambda = ngram.Lambda, HalfCount = ngram.HalfCount, MinContext = ngram.MinContext, ModelConfident = ngram.ModelConfident, PackConfident = Num(Next()) }; break;
         case "--batch-bf16":
             // Batches of 4 or more run their projections on tensor cores (activations
             // rounded to BF16), as prompts already do: ~1.6x the throughput, but a reply
@@ -95,6 +109,11 @@ for (int i = 0; i < args.Length; i++)
                                 declared tool and its parameters, gives the required ones, and typed values parse)
                   --no-mention-rule  do not open an optional parameter the reply's thinking or the newest
                                 user/tool message names (by default it is opened when the model gives it any chance)
+                  --ngram-pack FILE  load an n-gram pack (amql-cli ngram build); a request names packs with
+                                "ngram_packs", a model with "ngram_packs" in --config, else a pack is chosen when
+                                one of its keywords is in the current task
+                  --ngram-lambda, --ngram-min-context, --ngram-model-confident, --ngram-pack-confident
+                                how a chosen pack is blended (a request may set "ngram_lambda")
                   --no-loop-guard  let a reply repeat itself to its token limit (by default a reply whose
                                 own tail repeats a stretch 4+ times, 192+ tokens, is stopped, or its thinking closed)
                   --batch-bf16  batches of 4+ on tensor cores, activations rounded to BF16: ~1.6x the
@@ -180,7 +199,16 @@ if (adapterSpecs.FirstOrDefault(a => a.Id is not null && containers.All(c => c.I
     Console.Error.WriteLine($"--adapter names the model '{unknown}', which is not loaded");
     return 2;
 }
-var app = ServerApp.Build(models, new ServerSettings(apiKey, maxTokens ?? (think ? 4096 : 1024), think, temperature, topP, topK));
+foreach (var pack in ngramPacks.Values)
+{
+    Console.WriteLine($"ngram:     pack {pack.Name}, order {pack.Order}, {pack.ContextCount:N0} contexts from {pack.CorpusTokens:N0} tokens; " +
+                      $"chosen for {(pack.Keywords.Count > 0 ? string.Join(", ", pack.Keywords) : "requests that name it")}");
+}
+var app = ServerApp.Build(models, new ServerSettings(apiKey, maxTokens ?? (think ? 4096 : 1024), think, temperature, topP, topK)
+{
+    NGramPacks = ngramPacks,
+    NGramDefaults = ngram,
+});
 app.Urls.Add(urls);
 Console.WriteLine($"listening on {urls}{(apiKey is null ? " (no API key — requests are not authenticated)" : "")}");
 await app.RunAsync();

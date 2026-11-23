@@ -19,7 +19,7 @@ public static class ServerConfig
         {
             throw new InvalidDataException($"{file} needs a \"models\" array");
         }
-        var known = new HashSet<string> { "id", "path", "adapters", "think", "max_tokens", "temperature", "top_p", "top_k" };
+        var known = new HashSet<string> { "id", "path", "adapters", "think", "max_tokens", "temperature", "top_p", "top_k", "ngram_packs" };
         var list = new List<ConfiguredModel>();
         int i = 0;
         foreach (var m in models.EnumerateArray())
@@ -39,7 +39,13 @@ public static class ServerConfig
             float? Float(string name) => m.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number ? v.GetSingle() : null;
             int? Int(string name) => m.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number ? v.GetInt32() : null;
             bool? think = m.TryGetProperty("think", out var tv) && tv.ValueKind is JsonValueKind.True or JsonValueKind.False ? tv.GetBoolean() : null;
-            list.Add(new ConfiguredModel(id, path, adapters, new ModelDefaults(think, Int("max_tokens"), Float("temperature"), Float("top_p"), Int("top_k"))));
+            var packs = m.TryGetProperty("ngram_packs", out var np) && np.ValueKind == JsonValueKind.Array
+                ? np.EnumerateArray().Select(x => x.GetString()!).ToList()
+                : null;
+            list.Add(new ConfiguredModel(id, path, adapters, new ModelDefaults(think, Int("max_tokens"), Float("temperature"), Float("top_p"), Int("top_k"))
+            {
+                NGramPacks = packs,
+            }));
         }
         return list;
     }
