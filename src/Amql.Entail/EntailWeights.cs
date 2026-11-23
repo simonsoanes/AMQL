@@ -791,6 +791,12 @@ public static class EntailWeights
             }
         }
 
+        foreach (var (span, lane) in p.RepeatBans)
+        {
+            outputs.Add((entries.Count, lane));
+            entries.Add(new EntailAdapterOutput(entries.Count, EntailOutputKind.ForbidRepeat, Array.Empty<int>(), Span: span));
+        }
+
         var manifest = new EntailAdapterManifest(p.Name,
             EntailAdapterManifest.TokenizerHash(partnerTokenizerDir), rows, entries);
         return new EntailAdapterBinding(manifest, inputs, outputs, missing);
@@ -799,6 +805,7 @@ public static class EntailWeights
     private static EntailBuildReport WriteBlank(EntailProgram p, string outDir, int context, IReadOnlyList<string> vocab,
         IReadOnlyList<(int Row, string Text)> inputs, IReadOnlyList<(int Row, int Lane, float Weight)> outputs, List<string> missing)
     {
+        RefuseCarries(p);
         Directory.CreateDirectory(outDir);
         int hidden = WidthFor(Allocate(p, firstDim: 0, keepEmitsLive: true).Used);
         var (ballastDims, shift) = BallastShape(hidden);
@@ -941,6 +948,12 @@ public static class EntailWeights
             throw new EntailException(
                 "this program carries lanes from token to token (`carry`), which a fixed-depth transformer cannot do: " +
                 "run it with `entail run`, or beside a model as a sparse adapter (`entail adapter`, without --dense)");
+        }
+        if (p.Repeats.Count > 0 || p.RepeatBans.Count > 0)
+        {
+            throw new EntailException(
+                "this program matches the text against all of itself (`repeat`), which compiled heads, each reading a " +
+                "fixed or pointed offset, cannot do: run it with `entail run`, or as a sparse adapter (`entail adapter`, without --dense)");
         }
     }
 

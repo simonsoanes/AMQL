@@ -141,6 +141,24 @@ public sealed class EntailProgram
     /// targets that run token by token accept it: the interpreter and the
     /// sparse adapter. Memory stays one row of lanes however long the text.</summary>
     public List<(int From, int To)> Carries { get; } = new();
+
+    /// <summary>Repeat detectors: lane <c>Lane</c> is 1 at a token when the <c>Span</c>
+    /// tokens ending there were seen, in order, at least <c>Times</c> times earlier in the
+    /// text (<see cref="EntailRepeat"/>).
+    /// Like a carry, this needs the text token by token, so only the interpreter, the stream
+    /// runner and the sparse adapter accept it.</summary>
+    public List<(int Lane, int Span, int Times)> Repeats { get; } = new();
+
+    /// <summary>Dynamic masks: with <c>Lane</c> set, the token that followed the latest
+    /// earlier run of the last <c>Span</c> tokens may not come next. Adapter only.</summary>
+    public List<(int Span, int Lane)> RepeatBans { get; } = new();
+
+    /// <summary>Every run length the program's repeats and repeat bans read.</summary>
+    public IEnumerable<int> RepeatSpans => Repeats.Select(r => r.Span).Concat(RepeatBans.Select(b => b.Span));
+
+    /// <summary>The program must read its text token by token: it carries lanes or
+    /// detects repeats.</summary>
+    public bool Recurrent => Carries.Count > 0 || Repeats.Count > 0;
     public int Layers { get; set; }
     public int MaxNeurons { get; set; }
     public int Statements { get; set; }
@@ -538,6 +556,20 @@ public static class EntailCompiler
                         Program.Carries.Add((from, to));
                     }
                     break;
+                case RepeatStmt s:
+                    {
+                        int lane = LaneFor(s.Target);
+                        int times = s.Times is null ? 1 : Span(s.Times, s.Line);
+                        Program.Repeats.Add((lane, Span(s.Span, s.Line), times));
+                    }
+                    break;
+                case RepeatBanStmt s:
+                    {
+                        int lane = LaneFor(s.Lane);
+                        Program.Lanes[lane].Emits = true;
+                        Program.RepeatBans.Add((Span(s.Span, s.Line), lane));
+                    }
+                    break;
                 case VoteStmt s:
                     {
                         var key = Literal(Name(s.Text));
@@ -547,6 +579,14 @@ public static class EntailCompiler
                     }
                     break;
             }
+        }
+
+        private int Span(Expr span, int line)
+        {
+            double v = Eval(span).Const;
+            return v >= 1 && v <= 4096 && v == Math.Floor(v)
+                ? (int)v
+                : throw new EntailException(line, "a repeat's run length must be a whole number from 1 to 4096");
         }
 
         private static string Literal(string text) => text.Replace(EntailLexer.Brace, '{');
@@ -695,7 +735,7 @@ public static class EntailInterpreter
     /// program does not know write nothing).</summary>
     public static double[][] Run(EntailProgram p, IReadOnlyList<string> tokens)
     {
-        if (p.Carries.Count > 0)
+        if (p.Recurrent)
         {
             return RunRecurrent(p, tokens);
         }
@@ -779,6 +819,8 @@ public static class EntailInterpreter
         var groups = p.Ops.GroupBy(o => 2 * o.Layer + (o is Neuron ? 1 : 0)).OrderBy(g => g.Key)
             .Select(g => g.ToArray()).ToArray();
         var delta = new List<(int Lane, double V)>();
+        var repeat = new EntailRepeat(p.Repeats.Select(r => r.Span));
+        var ids = new Dictionary<string, int>(StringComparer.Ordinal);
         for (int t = 0; t < tokens.Count; t++)
         {
             var row = x[t] = new double[p.Lanes.Count];
@@ -794,6 +836,14 @@ public static class EntailInterpreter
                 foreach (var (from, to) in p.Carries)
                 {
                     row[to] += x[t - 1][from];
+                }
+            }
+            if (repeat.Any)
+            {
+                repeat.Push(ids.TryGetValue(tokens[t], out int id) ? id : ids[tokens[t]] = ids.Count);
+                foreach (var (lane, span, times) in p.Repeats)
+                {
+                    row[lane] = repeat.Seen(span, times) ? 1 : 0;
                 }
             }
             foreach (var group in groups)

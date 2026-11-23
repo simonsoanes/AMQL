@@ -376,6 +376,30 @@ answer. Asked afterwards, it has to keep the answer to every question it might b
 [`scan-index.entail.txt`](../scripts/entail/scan-index.entail.txt) keeps one register per
 key, and with open questions that becomes the whole text, which is what attention keeps.
 
+## Matching the text against itself: `repeat`
+
+```
+repeat DEST over N [times K]
+forbid repeat N when LANE
+```
+`repeat` sets `DEST` to 1 at a token when the `N` tokens ending there have already been
+written, in the same order, at least `K` times (1 by default) earlier in the text, and to 0
+otherwise. `forbid repeat` is a mask: with `LANE` set, the token that followed the latest
+earlier run of the last `N` tokens may not come next, so a text that has begun to copy
+itself cannot go on copying. `N` and `K` are whole numbers from 1 to 4096.
+
+This is what an induction head computes, a match of the recent tokens against all those
+before them. It is how a program notices that a model is going round in circles, which no
+fixed-offset head can see. `K` separates the two kinds of repetition: quoting the question,
+or restating a line once, is seen once or twice, while a loop comes round again and again.
+[`stop-circling.entail.txt`](../scripts/entail/reasoning/stop-circling.entail.txt) closes a
+reasoning block when the last 16 tokens have been written three times before; see
+[entail-reasoning.md](entail-reasoning.md).
+
+Like `carry`, it reads the text token by token, so `entail run`, `entail run --file` and
+the sparse adapter run it, and `compile`, `graft` and `adapter --dense` refuse it. Its memory
+is not fixed: it keeps one id and one table entry per token for each run length named.
+
 ## The start of the text
 
 A head can only look back as far as the text goes. Past the start it finds the first

@@ -1,0 +1,51 @@
+program stop_circling
+# When reasoning starts going round in circles, stop at the end of the line and answer.
+#
+# A 0.8B reasoning model usually has the answer long before it stops: on generated problems
+# it first writes the right number after a median of about 260 tokens, then doubts it until
+# it repeats itself word for word (a median of about 950). It almost never gives </think>
+# any probability on its own, so there is no readiness to weigh: in 74 of 80 replies
+# p(</think>) never reached 1%. But repetition is evidence. A run of text written for the
+# fourth time means the reasoning has stopped producing anything new, and what it produced
+# before is the best it has.
+#
+# So this program watches the reasoning match itself (`repeat`, what an induction head
+# does). Once the last 16 tokens have been written three times before, or after BUDGET
+# tokens of reasoning as a backstop, it closes the block at the next line break, so the
+# model starts its answer on a fresh line instead of carrying a sentence of reasoning over.
+# The run length and count were chosen on the baseline's own replies: there they fire after
+# the right number was written in 60 of the 61 replies that wrote it.
+#
+# Nothing here knows about the problem or its words: only the block's markers, line
+# breaks, a count, and the text's match against itself.
+
+const SPAN = 16
+const SEEN = 3
+const BUDGET = 1536
+
+state open_think, close_think, newline
+token "<think>" means open_think = 1
+token "</think>" means close_think = 1
+token "\n", "\n\n", "\n\n\n", " \n", " \n\n", "\r\n" means newline = 1
+
+state thinking, last_thinking
+carry last_thinking from thinking
+entail thinking = last_thinking when not close_think
+entail thinking when open_think, not last_thinking
+
+# Tokens of reasoning so far.
+state count, last_count
+carry last_count from count
+entail count = last_count + 1 when thinking
+
+# Circling or out of budget, held until the block closes.
+state again, done, last_done
+repeat again over SPAN times SEEN
+carry last_done from done
+entail done = last_done when thinking
+entail done when again, thinking, not last_done
+entail done when count >= BUDGET, thinking, not last_done, not again
+
+state close
+entail close when done, newline
+emit "</think>" when close

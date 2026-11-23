@@ -38,10 +38,12 @@ public sealed class EntailSparseAdapter : IEntailAdapter
     private readonly float[] _outputs;
     private readonly List<(int Lane, double Value)> _delta = new();
     private int _position;
+    private readonly EntailRepeat _repeat;
 
     private EntailSparseAdapter(Compiled plan)
     {
         _plan = plan;
+        _repeat = new EntailRepeat(plan.RepeatSpans);
         _ring = new double[plan.Window + 1][];
         for (int i = 0; i < _ring.Length; i++)
         {
@@ -73,7 +75,11 @@ public sealed class EntailSparseAdapter : IEntailAdapter
 
     public IEntailAdapter Sibling() => new EntailSparseAdapter(_plan);
 
-    public void Reset() => _position = 0;
+    public void Reset()
+    {
+        _position = 0;
+        _repeat.Reset();
+    }
 
     public EntailVerdict Prefill(int[] partnerTokens)
     {
@@ -102,6 +108,14 @@ public sealed class EntailSparseAdapter : IEntailAdapter
             foreach (var (from, to) in _plan.Carries)
             {
                 x[to] += previous[from];
+            }
+        }
+        if (_repeat.Any)
+        {
+            _repeat.Push(partnerToken);
+            foreach (var (lane, span, times) in _plan.Repeats)
+            {
+                x[lane] = _repeat.Seen(span, times) ? 1 : 0;
             }
         }
 
@@ -139,7 +153,17 @@ public sealed class EntailSparseAdapter : IEntailAdapter
         {
             _outputs[i] = (float)x[_plan.Outputs[i]];
         }
-        return EntailVerdict.Read(_plan.Manifest, _outputs);
+        var verdict = EntailVerdict.Read(_plan.Manifest, _outputs);
+        // A repeat ban names no token of its own: it rules out whatever continued the
+        // earlier run, which only the text so far can say.
+        foreach (var o in _plan.Manifest.Outputs)
+        {
+            if (o.Kind == EntailOutputKind.ForbidRepeat && _outputs[o.Row] > 0.5f && _repeat.Continuation(o.Span) is { } next)
+            {
+                verdict = verdict.Banning(next);
+            }
+        }
+        return verdict;
     }
 
     private void Read(CompiledHead head, double[] x)
@@ -234,6 +258,8 @@ public sealed class EntailSparseAdapter : IEntailAdapter
             Stages = stages.ToArray();
             Window = p.Ops.OfType<Head>().Select(h => Math.Max(h.Offset, h.Pointer?.Max(x => x.Offset) ?? 0)).DefaultIfEmpty(0).Max();
             Carries = p.Carries.ToArray();
+            Repeats = p.Repeats.ToArray();
+            RepeatSpans = p.RepeatSpans.Distinct().ToArray();
             // A carry reads the previous row, so the ring keeps at least one.
             if (Carries.Length > 0)
             {
@@ -242,6 +268,10 @@ public sealed class EntailSparseAdapter : IEntailAdapter
         }
 
         public (int From, int To)[] Carries { get; }
+
+        public (int Lane, int Span, int Times)[] Repeats { get; }
+
+        public int[] RepeatSpans { get; }
 
         public EntailAdapterManifest Manifest { get; }
 

@@ -1,0 +1,29 @@
+program unloop
+# Do not copy a run of your own reasoning a third time.
+#
+# Greedy decoding of a 0.8B reasoning model ends in a loop more often than in an answer:
+# a doubt ("Wait, is it possible the user meant ...?") leads back to a check it has already
+# made, which leads back to the same doubt, word for word. Once a run of text has come
+# round twice, the model's own next-token prediction is a copy of what followed it before,
+# and the copy is self-reinforcing.
+#
+# This program matches the recent tokens against everything before them (`repeat`, what an
+# induction head does), and when the last 12 tokens have already been written twice, it rules
+# out the token that continued them last time. The model then takes its next-best token and
+# the text leaves the loop. A first or second occurrence is never touched, so quoting the
+# question, or restating a line once, is free. It acts only while thinking, and knows nothing
+# about the problem.
+
+state open_think, close_think
+token "<think>" means open_think = 1
+token "</think>" means close_think = 1
+
+state thinking, last_thinking
+carry last_thinking from thinking
+entail thinking = last_thinking when not close_think
+entail thinking when open_think, not last_thinking
+
+state again, looping
+repeat again over 12 times 2
+entail looping when again, thinking
+forbid repeat 12 when looping

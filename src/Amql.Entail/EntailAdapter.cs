@@ -18,11 +18,14 @@ public enum EntailOutputKind
     /// <summary>This token comes next if the partner gives it at least the output's threshold,
     /// or, when the output is relative, that many times the partner's prior for it.</summary>
     Prefer,
+    /// <summary>The token that continued the latest earlier run of the last <c>Span</c>
+    /// tokens may not come next. The adapter computes which token that is.</summary>
+    ForbidRepeat,
 }
 
 /// <summary>One output row of an adapter, in the partner's token ids.</summary>
 public sealed record EntailAdapterOutput(int Row, EntailOutputKind Kind, IReadOnlyList<int> Tokens,
-    double Threshold = 0, bool TimesPrior = false, bool Strict = false);
+    double Threshold = 0, bool TimesPrior = false, bool Strict = false, int Span = 0);
 
 /// <summary>
 /// Joins an adapter to its partner: which of the partner's tokens the program
@@ -83,6 +86,10 @@ public sealed record EntailAdapterManifest(string Program, string Tokenizer,
                     output["strict"] = true;
                 }
             }
+            if (o.Kind == EntailOutputKind.ForbidRepeat)
+            {
+                output["span"] = o.Span;
+            }
             outputs.Add(output);
         }
         var root = new JsonObject
@@ -111,7 +118,8 @@ public sealed record EntailAdapterManifest(string Program, string Tokenizer,
             o["tokens"]!.AsArray().Select(t => t!.GetValue<int>()).ToArray(),
             o["threshold"]?.GetValue<double>() ?? 0,
             o["times_prior"]?.GetValue<bool>() ?? false,
-            o["strict"]?.GetValue<bool>() ?? false)).ToList();
+            o["strict"]?.GetValue<bool>() ?? false,
+            o["span"]?.GetValue<int>() ?? 0)).ToList();
         return new EntailAdapterManifest(root["program"]!.GetValue<string>(), root["tokenizer"]!.GetValue<string>(), rows, outputs);
     }
 }
@@ -185,6 +193,9 @@ public sealed class EntailVerdict
                 case EntailOutputKind.Only:
                     verdict.Allow(output.Tokens);
                     break;
+                case EntailOutputKind.ForbidRepeat:
+                    // Read by the adapter, which knows the text (see Banning).
+                    break;
                 case EntailOutputKind.Prefer:
                     verdict._prefers.Add((output.Tokens[0], output.Threshold, output.TimesPrior, output.Strict));
                     break;
@@ -225,7 +236,16 @@ public sealed class EntailVerdict
     /// <summary>Chooses greedily from the partner's logits. <paramref name="prior"/> is the
     /// partner's next-token distribution with the latest message blanked, for a prefer that
     /// is relative to it; without one, such a prefer stays silent.</summary>
-    public (int Token, EntailTokenSource Source) Choose(ReadOnlySpan<float> logits, IReadOnlyList<double>? prior = null)
+    public (int Token, EntailTokenSource Source) Choose(ReadOnlySpan<float> logits, IReadOnlyList<double>? prior = null) =>
+        Choose(logits, prior, null);
+
+    /// <summary>
+    /// Chooses from the partner's logits. A said or preferred token comes first, as in greedy
+    /// choice; otherwise <paramref name="sample"/>, when given, draws from the logits with every
+    /// token the rules leave out set to negative infinity, and greedy choice is the fallback.
+    /// </summary>
+    public (int Token, EntailTokenSource Source) Choose(ReadOnlySpan<float> logits, IReadOnlyList<double>? prior,
+        Func<float[], int>? sample)
     {
         if (Say is { } say)
         {
@@ -280,9 +300,37 @@ public sealed class EntailVerdict
         if (held < 0)
         {
             Conflict = true;
-            return (free, EntailTokenSource.Partner);
+            return (sample?.Invoke(logits.ToArray()) ?? free, EntailTokenSource.Partner);
         }
-        return (held, held == free ? EntailTokenSource.Partner : EntailTokenSource.Narrowed);
+        if (sample is null)
+        {
+            return (held, held == free ? EntailTokenSource.Partner : EntailTokenSource.Narrowed);
+        }
+        var masked = logits.ToArray();
+        bool narrowed = false;
+        if (Allowed is not null || Banned.Count > 0 || below is not null)
+        {
+            for (int i = 0; i < masked.Length; i++)
+            {
+                if (!Permits(i) || below?.Contains(i) == true)
+                {
+                    masked[i] = float.NegativeInfinity;
+                    narrowed = true;
+                }
+            }
+        }
+        return (sample(masked), narrowed ? EntailTokenSource.Narrowed : EntailTokenSource.Partner);
+    }
+
+    /// <summary>This verdict with one more token ruled out.</summary>
+    public EntailVerdict Banning(int token)
+    {
+        var v = new EntailVerdict
+        {
+            Say = Say, Allowed = Allowed, Banned = Banned.Append(token).ToHashSet(), Conflict = Conflict,
+        };
+        v._prefers.AddRange(_prefers);
+        return v;
     }
 
     public bool Permits(int token) => (Allowed is null || Allowed.Contains(token)) && !Banned.Contains(token);

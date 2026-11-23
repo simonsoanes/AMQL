@@ -17,10 +17,13 @@ public sealed class EntailStream
     private readonly List<(int Lane, double V)> _delta = new();
     private readonly double[] _first;
     private long _position;
+    private readonly EntailRepeat _repeat;
+    private readonly Dictionary<string, int> _ids = new(StringComparer.Ordinal);
 
     public EntailStream(EntailProgram p)
     {
         _p = p;
+        _repeat = new EntailRepeat(p.Repeats.Select(r => r.Span));
         _groups = p.Ops.GroupBy(o => 2 * o.Layer + (o is Neuron ? 1 : 0)).OrderBy(g => g.Key)
             .Select(g => g.ToArray()).ToArray();
         Window = p.Ops.OfType<Head>().Select(h => Math.Max(h.Offset, h.Pointer?.Max(x => x.Offset) ?? 0))
@@ -57,6 +60,14 @@ public sealed class EntailStream
             var previous = _ring[(_position - 1) % _ring.Length];
             foreach (var (from, to) in _p.Carries)
                 row[to] += previous[from];
+        }
+        if (_repeat.Any)
+        {
+            if (!_ids.TryGetValue(token, out int id))
+                _ids[token] = id = _ids.Count;
+            _repeat.Push(id);
+            foreach (var (lane, span, times) in _p.Repeats)
+                row[lane] = _repeat.Seen(span, times) ? 1 : 0;
         }
         foreach (var group in _groups)
         {

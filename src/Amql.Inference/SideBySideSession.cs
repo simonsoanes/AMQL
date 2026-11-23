@@ -149,6 +149,11 @@ public sealed class SideBySideSession
     /// <summary>Chooses the next token greedily, and says who decided it.</summary>
     public (int Token, EntailTokenSource Source) Choose() => Verdict.Choose(Logits.Row(0), _prior);
 
+    /// <summary>Draws the next token with <paramref name="config"/>, from what the adapters
+    /// permit; a token they say or prefer comes first, as in <see cref="Choose()"/>.</summary>
+    public (int Token, EntailTokenSource Source) Sample(SamplingConfig config, Random rng) =>
+        Verdict.Choose(Logits.Row(0), _prior, row => Sampler.Sample(row, config, rng));
+
     private static double[] Softmax(ReadOnlySpan<float> logits)
     {
         float max = float.NegativeInfinity;

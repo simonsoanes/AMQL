@@ -757,9 +757,18 @@ internal static partial class Program
         else
         {
             tokens = ParseIntList(OptionValue(args, "--tokens"), fallback: new[] { 0 });
+            // Raw ids need no tokenizer, but one given says which ids end the text.
+            if (OptionValue(args, "--tokenizer") is not null)
+            {
+                tokenizerSource = ResolveTokenizerDir(containerDir, args);
+                tokenizer = Tokenizer(tokenizerSource);
+            }
         }
 
-        int steps = IntOption(args, "--steps", 8);
+        // Without --steps, generate runs until the model says an end token (or the context
+        // is full), which needs a tokenizer to know the end tokens. Raw --tokens with no
+        // tokenizer have no end tokens to stop on, so they keep a short default of 8.
+        int steps = IntOption(args, "--steps", tokenizerSource is null ? 8 : -1);
 
         int? maxContextLength = null;
         IReadOnlySet<int>? stopTokens = null;
@@ -2764,7 +2773,7 @@ internal static partial class Program
                               [--patch <patch.safetensors>]
               amql-cli generate <container-dir>
                               --prompt "text" --tokenizer <checkpoint-dir>
-                              [--steps N|-1] [--temperature 0] [--top-k 0] [--top-p 0]
+                              [--steps N|-1 (default: until an end token)] [--temperature 0] [--top-k 0] [--top-p 0]
                               [--seed 42] [--logits K] [--logprobs [K]] [--uncertainty] [--component target]
                               [--patch <patch.safetensors>]
                               [--trace] [--trace-tensors] [--weights f32|bf16|mxfp4|disk]
@@ -2845,6 +2854,7 @@ internal static partial class Program
               amql-cli entail side <container-dir> --adapter <dir>[,<dir>] --prompt <text> [--chat] [--think] [--max-tokens N] [--weights f32|disk]
               amql-cli entail run <program> --expr <text>|--cases <cases.jsonl> [--tokenizer <dir>] [--report <json>]
               amql-cli entail eval <container-dir> --cases <cases.jsonl> [--adapter <dir>[,<dir>]] [--batch N] [--watch TOKEN] [--prefix TEXT] [--logprobs] [--text <file>] [--report <json>] [--weights f32|disk]
+              amql-cli entail bench <container-dir> [--suite reasoning --per 10 --seed 7 --families a,b | --cases <jsonl>] [--no-think] [--max-tokens 2048] [--temperature 0 --top-p 0 --top-k 0 --sample-seed 1] [--watch TOKEN] [--score answer|tools] [--simulate N] [--adapter <dir>[,<dir>]] [--report <json>] [--compare <json>] [--write-cases <jsonl>]
               amql-cli entail find <container-dir> --subject <file> --out <dir> [--top 64] [--verify]
               amql-cli entail extract <container-dir> --subject <file> --out <dir>
               amql-cli entail from-lora <container-dir> --lora <dir> --cases <jsonl> --out <file.entail.txt> [--occlude 3]

@@ -17,7 +17,7 @@ internal static partial class Program
     private static int EntailCommand(string[] args)
     {
         string verb = Arg(args, 0) ?? throw new CliException(
-            "entail requires a verb: check | run | compile | graft | adapter | side | eval | find | extract | optimise | review | accept");
+            "entail requires a verb: check | run | compile | graft | adapter | side | eval | bench | find | extract | optimise | review | accept");
         var rest = args[1..];
         return verb switch
         {
@@ -28,6 +28,7 @@ internal static partial class Program
             "adapter" => EntailAdapter(rest),
             "side" => EntailSide(rest),
             "eval" => EntailEval(rest),
+            "bench" => EntailBench(rest),
             "find" => EntailFind(rest),
             "decompile" => EntailDecompile(rest),
             "from-lora" => EntailFromLora(rest),
@@ -68,8 +69,10 @@ internal static partial class Program
     {
         var p = LoadEntail(args);
         PrintEntail(p);
-        Console.WriteLine($"attention:  every head beats every other token by at least " +
-                          $"{EntailWeights.AttentionGap(p, IntOption(args, "--context", 8192)):F1} logits");
+        Console.WriteLine(p.Ops.OfType<Head>().Any()
+            ? $"attention:  every head beats every other token by at least " +
+              $"{EntailWeights.AttentionGap(p, IntOption(args, "--context", 8192)):F1} logits"
+            : "attention:  no heads");
         return 0;
     }
 

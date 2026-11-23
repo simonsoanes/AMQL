@@ -37,7 +37,7 @@ is a separate challenge, but AMQL lets you apply them once they exist.
 # Create a tiny demo model, encode it, and generate a few tokens
 amql-cli synth-model demo-model
 amql-cli encode demo-model --out demo-container
-amql-cli generate demo-container --prompt "The capital of France is" --tokenizer demo-model
+amql-cli generate demo-container --prompt "The capital of France is" --tokenizer demo-model --steps 8
 
 # Probe a token relationship
 amql-cli route demo-container France Paris --tokenizer demo-model --top 5
@@ -78,7 +78,7 @@ AMQL/
 ```
 amql-cli encode <model-dir> --out <container-dir>
 amql-cli verify <container-dir>
-amql-cli generate <container> --prompt "text" --tokenizer <dir> [--steps N] [--patch <file>]
+amql-cli generate <container> --prompt "text" --tokenizer <dir> [--steps N (default: until an end token)] [--patch <file>]
                      [--trace] [--trace-tensors] [--weights f32|bf16|mxfp4]
 amql-cli route <container> <A> <B> --tokenizer <dir> [--top N] [--patch <file>]
 amql-cli path <container> <A> <B> [--topk N] [--max-nodes N]

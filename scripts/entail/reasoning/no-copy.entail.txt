@@ -1,0 +1,32 @@
+program no_copy
+# Outside reasoning, do not write the same run of text a fourth time.
+#
+# A 0.8B model writing a long file degenerates the way its reasoning does: it defines the
+# same helper again and again, or grows a name word by word ("PushIfNotEmptyAndPopAndCheck
+# AndCheckAndCheck"), until the budget runs out with the file's tool call still open, so
+# the file is never written. In an agent loop the same copy shows up as a call repeated
+# word for word after it has failed ("dotnet /b diskviewer", a dozen times).
+#
+# When the last 16 tokens have already been written three times, this program rules out
+# the token that continued them last time, so the text has to take another way: the next
+# function, the end of the file, or a different command. A run seen once or twice, such as
+# a repeated `elif` line or a quoted error, is untouched. It leaves reasoning to
+# stop-circling.entail.txt, where breaking a loop alone only makes the model paraphrase
+# its doubts until the budget is gone.
+
+const SPAN = 16
+const SEEN = 3
+
+state open_think, close_think
+token "<think>" means open_think = 1
+token "</think>" means close_think = 1
+
+state thinking, last_thinking
+carry last_thinking from thinking
+entail thinking = last_thinking when not close_think
+entail thinking when open_think, not last_thinking
+
+state again, copying
+repeat again over SPAN times SEEN
+entail copying when again, not thinking
+forbid repeat SPAN when copying

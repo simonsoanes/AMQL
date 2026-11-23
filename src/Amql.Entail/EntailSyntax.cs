@@ -134,6 +134,8 @@ internal sealed record MaskStmt(bool Allow, IReadOnlyList<string> Texts, RefExpr
 internal sealed record VoteStmt(string Text, Expr Value, int Line) : Stmt(Line);
 internal sealed record PreferStmt(string Text, Expr Threshold, bool TimesPrior, bool Strict, RefExpr Lane, int Line) : Stmt(Line);
 internal sealed record CarryStmt(RefExpr Target, RefExpr Source, int Line) : Stmt(Line);
+internal sealed record RepeatStmt(RefExpr Target, Expr Span, Expr? Times, int Line) : Stmt(Line);
+internal sealed record RepeatBanStmt(Expr Span, RefExpr Lane, int Line) : Stmt(Line);
 
 /// <summary>Recursive-descent parser for the statement forms of Entail.</summary>
 internal sealed class EntailParser
@@ -431,6 +433,18 @@ internal sealed class EntailParser
             return new EmitStmt(text, lane, line);
         }
 
+        // forbid repeat N when LANE: rules out the token that followed the latest earlier
+        // run of the last N tokens, so a text that has begun to copy itself cannot go on.
+        if (IsWord("forbid") && _tokens[_at + 1].Kind == Tok.Id && _tokens[_at + 1].Text == "repeat")
+        {
+            _at += 2;
+            var span = Expression();
+            ExpectWord("when");
+            var lane = Reference();
+            EndOfLine();
+            return new RepeatBanStmt(span, lane, line);
+        }
+
         bool only = AcceptWord("only");
         if (only || AcceptWord("forbid"))
         {
@@ -462,6 +476,20 @@ internal sealed class EntailParser
             var carried = Reference();
             EndOfLine();
             return new CarryStmt(target, carried, line);
+        }
+
+        // repeat DEST over N [times K]: DEST is 1 at a token when the N tokens ending there
+        // were seen, in that order, at least K times (1 by default) earlier in the text.
+        // A state may be called repeat, so this is one only when a name follows.
+        if (IsWord("repeat") && _tokens[_at + 1].Kind == Tok.Id)
+        {
+            _at++;
+            var target = Reference();
+            ExpectWord("over");
+            var span = Expression();
+            var times = AcceptWord("times") ? Expression() : null;
+            EndOfLine();
+            return new RepeatStmt(target, span, times, line);
         }
 
         // prefer "TEXT" at P [times prior] when LANE: say TEXT if the host gives it at

@@ -256,11 +256,21 @@ public static class Sampler
         // Top-k filter.
         if (config.TopK > 0 && config.TopK < n)
         {
-            var topkOrder = Enumerable.Range(0, n)
-                .OrderByDescending(i => probs[i])
-                .Take(config.TopK)
-                .ToArray();
-            float cutoff = probs[topkOrder[^1]];
+            // The k-th largest probability, from a min-heap of k: one pass over the
+            // vocabulary instead of sorting it. Ties at the cutoff are all kept, as before.
+            var heap = new PriorityQueue<float, float>(config.TopK + 1);
+            for (int i = 0; i < n; i++)
+            {
+                if (heap.Count < config.TopK)
+                {
+                    heap.Enqueue(probs[i], probs[i]);
+                }
+                else if (probs[i] > heap.Peek())
+                {
+                    heap.EnqueueDequeue(probs[i], probs[i]);
+                }
+            }
+            float cutoff = heap.Peek();
             for (int i = 0; i < n; i++)
             {
                 if (probs[i] < cutoff)
@@ -273,9 +283,11 @@ public static class Sampler
         // Top-p filter (cumulative, descending).
         if (config.TopP is > 0f and < 1f)
         {
-            sortedIndices = Enumerable.Range(0, n)
-                .OrderByDescending(i => probs[i])
-                .ToArray();
+            // Only non-zero entries can be kept, so only they are sorted: after a top-k
+            // filter that is k entries rather than the whole vocabulary. Zeros follow, in
+            // index order, as a stable sort would leave them.
+            var nonZero = Enumerable.Range(0, n).Where(i => probs[i] > 0f).OrderByDescending(i => probs[i]);
+            sortedIndices = nonZero.Concat(Enumerable.Range(0, n).Where(i => probs[i] <= 0f)).ToArray();
             float cumulative = 0f;
             var keep = new HashSet<int>();
             foreach (var i in sortedIndices)

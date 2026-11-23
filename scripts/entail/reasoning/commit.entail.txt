@@ -1,0 +1,25 @@
+program commit_when_ready
+# Stop thinking once the model itself is ready to.
+#
+# A 0.8B model that reasons often reaches the answer and then keeps going: it re-checks
+# what it has checked, wonders whether the question meant something else, and either runs
+# out of budget or falls into a loop. All the while it gives </think> a real probability
+# at the end of each step, but never the most likely one, because "Wait" or "Let me
+# double-check" always edges it out. The evidence that it is done is there; its threshold
+# for acting on it is wrong, as with the tool-call decision.
+#
+# This program is a fold that knows only whether the text is inside a reasoning block, and
+# there it applies one rule: close the block whenever the host's own model gives </think>
+# at least P. It has no word lists and knows nothing about the problem.
+
+state open_think, close_think
+token "<think>" means open_think = 1
+token "</think>" means close_think = 1
+
+# Inside <think> ... </think>, held across tokens.
+state thinking, last_thinking
+carry last_thinking from thinking
+entail thinking = last_thinking when not close_think
+entail thinking when open_think, not last_thinking
+
+prefer "</think>" at 0.1 when thinking
