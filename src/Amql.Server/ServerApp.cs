@@ -91,6 +91,20 @@ public static class ServerApp
         builder.Logging.SetMinimumLevel(LogLevel.Warning);
         var app = builder.Build();
 
+        // One line per request, whatever its path: a client calling the wrong URL shows up here.
+        app.Use(async (ctx, next) =>
+        {
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+            try
+            {
+                await next(ctx);
+            }
+            finally
+            {
+                Log($"{ctx.Connection.RemoteIpAddress} {ctx.Request.Method} {ctx.Request.Path}{ctx.Request.QueryString} -> {ctx.Response.StatusCode} ({clock.ElapsedMilliseconds} ms)");
+            }
+        });
+
         app.Use(async (ctx, next) =>
         {
             try
@@ -109,11 +123,19 @@ public static class ServerApp
             }
             catch (ApiException e) when (!ctx.Response.HasStarted)
             {
+                Log($"{ctx.Request.Method} {ctx.Request.Path} -> {e.Status} {e.Code ?? e.Type}: {e.Message}");
                 await WriteError(ctx, e);
             }
             catch (JsonException e) when (!ctx.Response.HasStarted)
             {
+                Log($"{ctx.Request.Method} {ctx.Request.Path} -> 400 invalid JSON: {e.Message}");
                 await WriteError(ctx, new ApiException(400, $"the request body is not valid JSON: {e.Message}"));
+            }
+            catch (Exception e) when (e is not OperationCanceledException && !ctx.Response.HasStarted)
+            {
+                // A failure of the server's own: logged whole, and reported to the client in the API's shape.
+                Log($"{ctx.Request.Method} {ctx.Request.Path} -> 500{Environment.NewLine}{e}");
+                await WriteError(ctx, new ApiException(500, e.Message, "server_error"));
             }
         });
 
@@ -238,8 +260,31 @@ public static class ServerApp
         throw new ApiException(404, $"The model '{name}' does not exist", code: "model_not_found", param: "model");
     }
 
+    /// <summary>A line on the server's error stream, timestamped.</summary>
+    private static void Log(string line) => Console.Error.WriteLine($"{DateTime.Now:HH:mm:ss.fff} {line}");
+
+    // AMQL_SERVER_DUMP=<dir>: every request body is written there, to replay a client's request exactly.
+    private static readonly string? DumpDir = Environment.GetEnvironmentVariable("AMQL_SERVER_DUMP");
+
     private static async Task<JsonDocument> ReadBody(HttpContext ctx)
     {
+        if (DumpDir is not null)
+        {
+            using var copy = new MemoryStream();
+            await ctx.Request.Body.CopyToAsync(copy, ctx.RequestAborted);
+            Directory.CreateDirectory(DumpDir);
+            string file = Path.Combine(DumpDir, $"{DateTime.Now:HHmmss-fff}-{ctx.Request.Path.Value?.Trim('/').Replace('/', '-')}.json");
+            await File.WriteAllBytesAsync(file, copy.ToArray());
+            Log($"{ctx.Request.Method} {ctx.Request.Path}: request saved to {file}");
+            copy.Position = 0;
+            var dumped = await JsonDocument.ParseAsync(copy, cancellationToken: ctx.RequestAborted);
+            if (dumped.RootElement.ValueKind != JsonValueKind.Object)
+            {
+                dumped.Dispose();
+                throw new ApiException(400, "the request body must be a JSON object");
+            }
+            return dumped;
+        }
         var doc = await JsonDocument.ParseAsync(ctx.Request.Body, cancellationToken: ctx.RequestAborted);
         if (doc.RootElement.ValueKind != JsonValueKind.Object)
         {
@@ -471,11 +516,7 @@ public static class ServerApp
         {
             throw new ApiException(400, "only n=1 is supported", param: "n");
         }
-        if (body.TryGetProperty("response_format", out var rf) && rf.ValueKind == JsonValueKind.Object &&
-            rf.TryGetProperty("type", out var rft) && rft.GetString() != "text")
-        {
-            throw new ApiException(400, "structured output (response_format) is not supported", param: "response_format");
-        }
+        var format = OutputFormat(body.TryGetProperty("response_format", out var rf) ? rf : default, chat: true);
         if (!body.TryGetProperty("messages", out var msgs) || msgs.ValueKind != JsonValueKind.Array || msgs.GetArrayLength() == 0)
         {
             throw new ApiException(400, "'messages' must be a non-empty array", param: "messages");
@@ -501,7 +542,7 @@ public static class ServerApp
         }
 
         var tools = ChatTools(body, model);
-        var turn = Turn(model, body, settings, messages, tools, maxTokens, ChatEffort(body));
+        var turn = Turn(model, body, settings, messages, tools, maxTokens, ChatEffort(body), format);
 
         string id = "chatcmpl-" + Guid.NewGuid().ToString("N");
         long created = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
@@ -656,11 +697,8 @@ public static class ServerApp
         var body = doc.RootElement;
         var model = Route(models, body, Capability.Chat);
         RefuseUnsupported(body, "conversation", "prompt");
-        if (body.TryGetProperty("text", out var textOpt) && textOpt.ValueKind == JsonValueKind.Object &&
-            textOpt.TryGetProperty("format", out var fmt) && fmt.TryGetProperty("type", out var ft) && ft.GetString() != "text")
-        {
-            throw new ApiException(400, "structured output (text.format) is not supported", param: "text.format");
-        }
+        var format = OutputFormat(body.TryGetProperty("text", out var textOpt) && textOpt.ValueKind == JsonValueKind.Object &&
+            textOpt.TryGetProperty("format", out var fmt) ? fmt : default, chat: false);
 
         // An earlier response's conversation continues, without its instructions.
         var messages = new List<ChatMessage>();
@@ -690,7 +728,7 @@ public static class ServerApp
         var tools = ResponseTools(body);
         string? effort = body.TryGetProperty("reasoning", out var reasoningOpt) && reasoningOpt.ValueKind == JsonValueKind.Object
             && reasoningOpt.TryGetProperty("effort", out var eff) && eff.ValueKind == JsonValueKind.String ? eff.GetString() : null;
-        var turn = Turn(model, body, settings, conversation, tools, maxTokens, effort);
+        var turn = Turn(model, body, settings, conversation, tools, maxTokens, effort, format);
         bool keep = !(body.TryGetProperty("store", out var st) && st.ValueKind == JsonValueKind.False);
 
         string id = "resp_" + Guid.NewGuid().ToString("N");
@@ -1075,8 +1113,56 @@ public static class ServerApp
     /// (<c>none</c>/<c>minimal</c> turn it off), then the server's default;
     /// tools unless <c>tool_choice</c> is <c>none</c>, with <c>required</c> or a
     /// named function enforced by writing the start of the call for the model.</summary>
+    /// <summary>Structured output asked for: the schema to hold the reply to, and the instruction
+    /// that tells the model about it.</summary>
+    private sealed record JsonFormat(JsonSchemaNode Schema, string Instruction);
+
+    /// <summary>
+    /// A request's output format: chat's <c>response_format</c>
+    /// (<c>{"type":"json_schema","json_schema":{name, schema}}</c>) or the Responses API's
+    /// <c>text.format</c> (<c>{"type":"json_schema", name, schema}</c>), either also
+    /// <c>{"type":"json_object"}</c>; null for plain text.
+    /// </summary>
+    private static JsonFormat? OutputFormat(JsonElement format, bool chat)
+    {
+        string param = chat ? "response_format" : "text.format";
+        if (format.ValueKind != JsonValueKind.Object)
+        {
+            return null;
+        }
+        string type = format.TryGetProperty("type", out var t) && t.ValueKind == JsonValueKind.String ? t.GetString()! : "text";
+        switch (type)
+        {
+            case "text":
+                return null;
+            case "json_object":
+                return new JsonFormat(JsonSchemaNode.AnyObject(), "Respond with a single JSON object and nothing else.");
+            case "json_schema":
+            {
+                var holder = chat && format.TryGetProperty("json_schema", out var js) ? js : format;
+                if (!holder.TryGetProperty("schema", out var schema) || schema.ValueKind is not (JsonValueKind.Object or JsonValueKind.True))
+                {
+                    throw new ApiException(400, $"'{param}' needs a JSON schema", param: param);
+                }
+                try
+                {
+                    var node = JsonSchemaNode.Compile(schema);
+                    string name = holder.TryGetProperty("name", out var nm) && nm.ValueKind == JsonValueKind.String ? $" ({nm.GetString()})" : "";
+                    return new JsonFormat(node,
+                        $"Respond with a single JSON value{name} that follows this JSON Schema, and nothing else:\n{JsonSerializer.Serialize(schema)}");
+                }
+                catch (ArgumentException e)
+                {
+                    throw new ApiException(400, $"'{param}': {e.Message}", param: param);
+                }
+            }
+            default:
+                throw new ApiException(400, $"unknown '{param}' type '{type}' (text, json_object, json_schema)", param: param);
+        }
+    }
+
     private static ChatTurn Turn(ModelHost model, JsonElement body, ServerSettings settings, List<ChatMessage> messages,
-        List<JsonElement>? tools, int maxTokens, string? effort)
+        List<JsonElement>? tools, int maxTokens, string? effort, JsonFormat? format = null)
     {
         var generator = model.Generator!;
         bool thinking = Think(model, settings);
@@ -1129,6 +1215,18 @@ public static class ServerApp
         }
         bool parallel = !(body.TryGetProperty("parallel_tool_calls", out var pc) && pc.ValueKind == JsonValueKind.False);
 
+        // Structured output: the reply is the JSON value, so no thinking block, no calls, and
+        // the schema in the system turn, where a small model can see what it is asked to write.
+        if (format is not null)
+        {
+            thinking = false;
+            tools = null;
+            forced = null;
+            messages = messages.Count > 0 && messages[0].Role == "system"
+                ? messages.Skip(1).Prepend(messages[0] with { Content = messages[0].Content.TrimEnd() + "\n\n" + format.Instruction }).ToList()
+                : messages.Prepend(new ChatMessage("system", format.Instruction)).ToList();
+        }
+
         int[] prompt;
         try
         {
@@ -1138,7 +1236,7 @@ public static class ServerApp
         {
             throw new ApiException(400, e.Message, param: "messages");
         }
-        var p = Sampling(body, maxTokens, settings, model.Defaults) with { Forced = forced, Thinking = thinking };
+        var p = Sampling(body, maxTokens, settings, model.Defaults) with { Forced = forced, Thinking = thinking, Json = format?.Schema };
         return new ChatTurn(prompt, p, tools, parallel);
     }
 
@@ -1235,6 +1333,7 @@ public static class ServerApp
         catch (Exception e) when (e is not OperationCanceledException)
         {
             // The status line is already sent; report the failure in-band.
+            Log($"{ctx.Request.Method} {ctx.Request.Path} -> failed while streaming{Environment.NewLine}{e}");
             var error = new JsonObject { ["error"] = new JsonObject { ["message"] = e.Message, ["type"] = "server_error" } };
             await ctx.Response.WriteAsync($"data: {error.ToJsonString(Json)}\n\n");
         }

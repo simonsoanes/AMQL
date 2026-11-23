@@ -31,7 +31,7 @@ is refused at startup:
 ```jsonc
 {
   "models": [
-    { "id": "qwen-think", "path": "qwen3.5-0.8b", "adapters": ["adapters/stop-circling", "adapters/no-copy"],
+    { "id": "qwen-think", "path": "qwen3.5-0.8b", "adapters": ["adapters/stop-circling"],
       "think": true, "temperature": 0 },
     { "id": "qwen", "path": "qwen3.5-0.8b", "think": false, "max_tokens": 1024 }
   ]
@@ -154,8 +154,29 @@ tools, calls and tool results), plain ChatML and Llama 3 — and tokenised witho
   `sequence_number`. Nothing is sent before it is certain: text that could begin `</think>` or `<tool_call>`
   waits for the next token.
 - **Refused** (400, OpenAI error shape), rather than silently ignored: legacy `functions`, `n > 1`, audio, image
-  or other non-text content parts, structured output (`response_format` / `text.format` other than text), tool
-  types other than functions, and the Responses API's `conversation`.
+  or other non-text content parts, tool types other than functions, and the Responses API's `conversation`.
+
+### Structured output
+
+`response_format` (chat: `{"type":"json_schema","json_schema":{"name","schema","strict"}}` or
+`{"type":"json_object"}`) and `text.format` (Responses: `{"type":"json_schema","name","schema","strict"}` or
+`{"type":"json_object"}`) hold the reply to JSON by constrained decoding: at every token only those that keep the
+reply a value the schema allows can be drawn (the request's own temperature, top-p and top-k over just those),
+and the reply can end only where the value is complete. So the reply always parses and follows the schema,
+whatever the model would have written; a token limit can still cut a long one short (`length` / `incomplete`).
+
+- **The schema subset enforced:** `type` and type lists (`["string","null"]`), `properties` in their declared order
+  (an optional one may be left out, a required one may not), `required`, no undeclared properties, `items`,
+  `enum`, `const`, `maxLength`, `anyOf`/`oneOf` (merged), and `$ref` into the schema's own `$defs`/`definitions`.
+  Other keywords (`pattern`, `minimum`, `minItems` …) are not enforced; a remote `$ref` is a 400. `json_object`
+  takes any object.
+- **Bounded:** whitespace between tokens is limited (24 characters in a row) and a string without `maxLength` to
+  8,000 characters, so a reply cannot spin forever on either.
+- **The model is told:** the schema is appended to the system message ("Respond with a single JSON value … that
+  follows this JSON Schema"), so a small model knows what it is writing; the constraint only decides what it may
+  write. A structured reply has no thinking block and no tool calls.
+- **Cost:** the 256 likeliest tokens are checked against the grammar each step, the whole vocabulary only when
+  none fits; works in batches too. Hydra's 7,000-token transcript assessment comes back in 0.8 s.
 
 ### Tools (function calling)
 
@@ -187,11 +208,15 @@ client sent them, or the Responses API's flat `{"type":"function", name, descrip
 bare list goes to every chat model). Each rules on the next token as the reply is generated — the model's
 weights are never changed — so a program such as `stop-circling` (close the thinking block once the model
 repeats itself, see [entail-reasoning.md](entail-reasoning.md)) works through the API as it does in
-`amql-cli entail bench`. While an adapter is speaking, `logprobs` still describe the model's own distribution.
+`amql-cli entail bench`. While an adapter is speaking, `logprobs` still describe the model's own distribution. Not every program suits an agent: `no-copy`, which rules out the
+token that would continue a run already written three times, broke Hydra's tool calls. The working directory
+`D:\Temp\ModelTest` appeared three times in the conversation, so it ruled out `Test` and the model listed
+`D:\Temp\Model`; replayed without it, the same request gives the right path. Serve agents with `stop-circling`
+alone, which acts only inside the thinking block.
 
 ```bash
 dotnet bin/Release/amql-server.dll --model qwen=<qwen3.5-0.8b container> --think \
-    --adapter qwen=<adapters>/stop-circling,<adapters>/no-copy
+    --adapter qwen=<adapters>/stop-circling
 ```
 
 ## Verification
@@ -212,6 +237,11 @@ dotnet bin/Release/amql-server.dll --model qwen=<qwen3.5-0.8b container> --think
   `apply_chat_template` with Qwen3.5's template (6 conversations, from `fixtures/make_tool_chat_golden.py`);
 - a reply splits into reasoning, content and typed calls, and fed one character at a time gives the same result
   without ever sending part of a marker; a cut-off call is content; without tools a `<tool_call>` is text;
+- structured output (`JsonConstraintTests`, `ServerToolTests`): Hydra's assessment schema accepted however a reply
+  is split and refused for a skipped required property, an early close, an undeclared property, a value outside
+  an enum, a wrong type, a bad escape, text after the value or a code fence; numbers end only when whole; a random
+  model's replies, sampled at temperature 1 with thinking asked for, parse and follow the schema on chat and
+  Responses, on the managed path and the GPU engine;
 - batching: 14 concurrent requests per model (more than a batch, greedy and sampled, thinking on and off,
   with and without an Entail adapter) equal the same requests one at a time, on the managed path and on the GPU
   engine (`fixtures/qwen-lm-engine`, a tiny Qwen3.5 the engine runs); a client that goes away leaves the batch

@@ -320,6 +320,9 @@ public sealed record GenerationParams(
 
     /// <summary>The prompt ended inside an open think block.</summary>
     public bool Thinking { get; init; }
+
+    /// <summary>Structured output: the reply must be a JSON value this schema allows.</summary>
+    public JsonSchemaNode? Json { get; init; }
 }
 
 public sealed record GenerationResult(string Text, string FinishReason, int PromptTokens, int CompletionTokens)
@@ -366,6 +369,37 @@ public sealed class TextGenerator : IDisposable
     public int ContextLength { get; }
     internal int? ThinkClose { get; }
     internal IReadOnlySet<int> StopTokenIds => _stopTokens;
+
+    private string?[]? _tokenTexts;
+
+    /// <summary>A token's own text, for structured output to check; empty for a special token
+    /// (it would vanish from the decoded reply, so it is never allowed there) or a padding row.</summary>
+    internal string TokenText(int id, int vocab)
+    {
+        var texts = _tokenTexts;
+        if (texts is null || texts.Length < vocab)
+        {
+            texts = _tokenTexts = new string?[vocab];
+        }
+        if ((uint)id >= (uint)texts.Length)
+        {
+            return "";
+        }
+        if (texts[id] is { } known)
+        {
+            return known;
+        }
+        string text;
+        try
+        {
+            text = Tokenizer.IsSpecial(id) ? "" : Tokenizer.DecodeText(new[] { id });
+        }
+        catch (TokenizerException)
+        {
+            text = "";   // a padding row of the head, no token at all
+        }
+        return texts[id] = text;
+    }
 
     /// <summary>The adapters running beside the model.</summary>
     public IReadOnlyList<IEntailAdapter> Adapters { get; }
@@ -491,6 +525,8 @@ internal sealed class GenerationRun
     private readonly List<LogprobsResult>? _logprobs;
     private bool _forcePending;
     private string _emitted = string.Empty;
+    private readonly JsonConstraint? _json;
+    private float[]? _masked;
     private LogitsRow _logits = null!;
     private EntailVerdict _verdict = EntailVerdict.Silence;
     private IReadOnlyList<double>? _prior;
@@ -522,6 +558,7 @@ internal sealed class GenerationRun
         _rng = new Random(p.Seed);
         _logprobs = logprobsTopK is > 0 ? new List<LogprobsResult>() : null;
         _holdBack = p.Stop.Count == 0 ? 0 : p.Stop.Max(s => s.Length) - 1;
+        _json = p.Json is null ? null : new JsonConstraint(p.Json);
         // Forced text goes in after the thinking block, or at once without one.
         _forcePending = p.Forced is not null;
         if (_forcePending && !p.Thinking)
@@ -561,6 +598,10 @@ internal sealed class GenerationRun
         {
             token = _forced.Dequeue();
         }
+        else if (_json is not null)
+        {
+            token = ChooseJson();
+        }
         else if (_verdict.Silent)
         {
             LogprobsResult? lp;
@@ -583,6 +624,7 @@ internal sealed class GenerationRun
         {
             return Finish("stop");
         }
+        _json?.Advance(_g.TokenText(token, _logits().Length));
         _generated.Add(token);
         if (_forcePending && _p.Thinking && token == _g.ThinkClose)
         {
@@ -629,6 +671,69 @@ internal sealed class GenerationRun
             _stableTokens = _generated.Count;
         }
         return text;
+    }
+
+    /// <summary>
+    /// The next token of a structured reply: the request's own sampling over just
+    /// the tokens that keep the reply valid JSON for its schema. The 256 likeliest
+    /// tokens are checked first, the whole vocabulary only when none of them fits;
+    /// a stop token is valid once the value is complete.
+    /// </summary>
+    private int ChooseJson()
+    {
+        var row = _logits();
+        int n = row.Length;
+        _masked ??= new float[n];
+        Array.Fill(_masked, float.NegativeInfinity);
+        bool Valid(int id) => _g.StopTokenIds.Contains(id) ? _json!.CanEnd : _g.TokenText(id, n) is { Length: > 0 } t && _json!.Accepts(t);
+
+        bool any = false;
+        foreach (int id in TopIndices(row, 256))
+        {
+            if (Valid(id))
+            {
+                _masked[id] = row[id];
+                any = true;
+            }
+        }
+        if (!any)
+        {
+            for (int id = 0; id < n; id++)
+            {
+                if (!float.IsNegativeInfinity(row[id]) && Valid(id))
+                {
+                    _masked[id] = row[id];
+                    any = true;
+                }
+            }
+        }
+        if (!any)
+        {
+            throw new InvalidOperationException("no token continues the JSON");
+        }
+        return Sampler.Sample(_masked, _config, _rng);
+    }
+
+    private static int[] TopIndices(ReadOnlySpan<float> row, int k)
+    {
+        var heap = new PriorityQueue<int, float>(k + 1);
+        for (int i = 0; i < row.Length; i++)
+        {
+            if (heap.Count < k)
+            {
+                heap.Enqueue(i, row[i]);
+            }
+            else if (row[i] > row[heap.Peek()])
+            {
+                heap.EnqueueDequeue(i, row[i]);
+            }
+        }
+        var top = new int[heap.Count];
+        for (int i = top.Length - 1; i >= 0; i--)
+        {
+            top[i] = heap.Dequeue();
+        }
+        return top;
     }
 
     /// <summary>Ends the reply now, for a failure in the model under it.</summary>

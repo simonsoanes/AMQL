@@ -454,4 +454,69 @@ public sealed class ServerToolTests : IClassFixture<ServerToolTests.ToolHost>
             Assert.Equal(20, body["usage"]!["completion_tokens"]!.GetValue<int>());
         }
     }
+
+    // ── structured output ───────────────────────────────────────────────
+
+    private const string Verdict = """{"type":"object","properties":{"ok":{"type":"boolean"},"mode":{"type":"string","enum":["fast","exact"]},"note":{"type":["string","null"],"maxLength":40}},"required":["ok","mode","note"],"additionalProperties":false}""";
+
+    private static void AssertVerdict(string text)
+    {
+        using var doc = JsonDocument.Parse(text);   // a random model's reply, still valid JSON
+        var o = doc.RootElement;
+        Assert.Equal(new[] { "ok", "mode", "note" }, o.EnumerateObject().Select(p => p.Name));
+        Assert.Contains(o.GetProperty("ok").ValueKind, new[] { JsonValueKind.True, JsonValueKind.False });
+        Assert.Contains(o.GetProperty("mode").GetString(), new[] { "fast", "exact" });
+        Assert.Contains(o.GetProperty("note").ValueKind, new[] { JsonValueKind.String, JsonValueKind.Null });
+    }
+
+    [Theory]
+    [InlineData("lm")]
+    [InlineData("lm-engine")]
+    public async Task Structured_Output_Holds_Even_A_Random_Model_To_The_Schema(string model)
+    {
+        for (int seed = 0; seed < 4; seed++)
+        {
+            var (status, chat) = await Post("/v1/chat/completions", $$$"""
+                {"model":"{{{model}}}","max_tokens":300,"temperature":1,"seed":{{{seed}}},"chat_template_kwargs":{"enable_thinking":true},
+                 "response_format":{"type":"json_schema","json_schema":{"name":"verdict","schema":{{{Verdict}}},"strict":true}},
+                 "messages":[{"role":"user","content":"judge this"}]}
+                """);
+            Assert.True(status == HttpStatusCode.OK, chat.ToJsonString());
+            Assert.Equal("stop", chat["choices"]![0]!["finish_reason"]!.GetValue<string>());
+            Assert.Null(chat["choices"]![0]!["message"]!["reasoning_content"]);   // no thinking block in a structured reply
+            AssertVerdict(chat["choices"]![0]!["message"]!["content"]!.GetValue<string>());
+        }
+
+        var (s2, resp) = await Post("/v1/responses", $$$"""
+            {"model":"{{{model}}}","max_output_tokens":300,"temperature":1,"seed":9,"input":"judge this",
+             "text":{"format":{"type":"json_schema","name":"verdict","schema":{{{Verdict}}},"strict":true} } }
+            """);
+        Assert.True(s2 == HttpStatusCode.OK, resp.ToJsonString());
+        Assert.Equal("completed", resp["status"]!.GetValue<string>());
+        AssertVerdict(resp["output"]!.AsArray().Single(o => o!["type"]!.GetValue<string>() == "message")!["content"]![0]!["text"]!.GetValue<string>());
+
+        var (s3, obj) = await Post("/v1/chat/completions", $$$"""
+            {"model":"{{{model}}}","max_tokens":200,"temperature":0,"response_format":{"type":"json_object"},"messages":[{"role":"user","content":"x"}]}
+            """);
+        Assert.True(s3 == HttpStatusCode.OK, obj.ToJsonString());
+        string text = obj["choices"]![0]!["message"]!["content"]!.GetValue<string>();
+        if (obj["choices"]![0]!["finish_reason"]!.GetValue<string>() == "stop")
+        {
+            Assert.Equal(JsonValueKind.Object, JsonDocument.Parse(text).RootElement.ValueKind);
+        }
+        else
+        {
+            Assert.StartsWith("{", text.TrimStart());   // a free object may run to the token limit
+        }
+    }
+
+    [Fact]
+    public async Task A_Bad_Schema_Is_Refused()
+    {
+        var (status, body) = await Post("/v1/chat/completions", """
+            {"model":"lm","response_format":{"type":"json_schema","json_schema":{"name":"x","schema":{"$ref":"https://elsewhere/s.json"}}},"messages":[{"role":"user","content":"x"}]}
+            """);
+        Assert.Equal(HttpStatusCode.BadRequest, status);
+        Assert.Contains("$ref", body["error"]!["message"]!.GetValue<string>());
+    }
 }

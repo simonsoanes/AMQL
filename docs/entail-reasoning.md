@@ -195,7 +195,12 @@ failure that does reproduce is **a file that is never written**: in 6 or 7 of 20
 degenerates into a copy loop (the same helper defined again and again, or a name grown word
 by word) and the budget runs out with the call still open. `no-copy.entail.txt` rules out the
 continuation of a 16-token run written three times, outside reasoning. That rescued 2 of
-those files and changed nothing else. Placeholders (`TODO`, `...`, `your code here`, stand-in
+those files and changed nothing else on these cases, but in real agent use it does harm: a
+conversation repeats its paths and commands, and copying them is correct. Served to Hydra, it
+truncated the working directory `D:\Temp\ModelTest` (written three times already) to
+`D:\Temp\Model` and split `dotnet` into `dot net`; the same request replayed without it gives
+the right path. It needs to tell a loop of the reply's own text from a copy of the conversation
+before it can serve an agent; until then, serve `stop-circling` alone. Placeholders (`TODO`, `...`, `your code here`, stand-in
 values such as `C:\Users\YourName`) appear in at most 3 of 20 replies, so on these tasks
 "lazy" code is mostly code that loops or calls APIs that don't exist, not code left blank.
 
