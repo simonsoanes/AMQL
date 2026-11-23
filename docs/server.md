@@ -179,8 +179,35 @@ call at 0.999, so the call failed the same way every time. So where a call can o
 parameter not given yet that the current task names, as a whole word, in the user's latest message, a tool
 result since, or the reply's own thinking, is opened next, provided the model gives the way there at least
 1e-4 of its probability. Its value is still the model's, under the grammar. In the agent session it took
-`create_file … overwrite: true` from failing five times in a row to succeeding first time. `--no-mention-rule`
+`create_file … overwrite: true` from failing five times in a row to succeeding first time. A tool result counts
+only where it tells the call what to pass ("Pass overwrite: true", "set 'force' to true"): results name many
+fields (`"handle": "bg-95c9"`) and warn about some ("'handle' means poll or stop"), and those are not hints.
+`--no-mention-rule` turns it off.
+
+**Announced calls.** A reply with tools on offer that ends, outside thinking and outside a code block, on a colon
+after saying it is about to act ("Now let me build it:", "I'll run the tests:") has promised a call; ending the
+turn there leaves the harness nothing to run, and a small model then claims the build succeeded. So there the
+call opens, when the model gives the way to `<tool_call>` at least 1e-4 of its probability. A colon after
+anything else ("Here's what was done:") introduces what follows, so the reply may not end on it but no call is
+forced: forcing one there sent the agent round again, re-running a program it had just run. `--no-announce-rule`
 turns it off.
+
+**Copied line decoration.** A harness may show a file with each line marked (`L42:a3f9c1│code`); a small model that
+reads a file and writes it back copies the marks with the code, and every line fails to build (Hydra's agent did
+exactly this, then copied the copy). So the server learns the decoration from the request's own tool results (a
+line start up to a separator, with a varying number or hash, on 80%+ of a result's lines; no harness is named
+in the code) and, in a call's string value where 80%+ of the lines carry it, removes it, along with the result's
+header lines copied above it. The shorter forms the model also writes (`L42:code`, the hash dropped) and a copy
+of a copy (marked twice) are removed too. Values that merely contain a mark or two are left alone. The log says
+when it acts.
+
+**Repeated calls.** At temperature 0 a small model copies its own previous call from the conversation: it ran the
+program, got the output, and ran it again, and again. A call (tool and arguments, key order ignored) that has
+already been made at least twice, with the same result the last two times (numbers and hashes such as build ids
+and durations ignored), is not made a third time: the reply is generated again from what it said before the
+call, with calls closed (the call's markup cannot be written as text either), after a lead-in that says why ("That
+run_terminal call has already returned the same result twice, so instead of running it again, here is what it
+showed:"). The agent then reports the output. `--allow-repeated-calls` turns it off.
 
 ### Continuing a reply
 
@@ -198,9 +225,13 @@ open call is only sent once the call closes. The server watches each reply's own
 there (`length` / `incomplete`; an open call comes back as text and is never run), and thinking is closed
 instead so the answer can follow. Only the reply is read, never the prompt, so copying a path or command from
 the conversation is never taken for a loop (what broke `no-copy`); lines that vary, even by one token, are not a
-loop either. The log says when it acts. Hydra's request that looped on one `this.Controls.Add(...)` line for
-32,000 tokens now ends after 424, in 4.7 s. `--no-loop-guard` turns it off; structured output is exempt (its
-grammar bounds it).
+loop either. A counting loop is the exception: lines that differ only in a number or a hash (the model writing
+`L2196:c74105│ //`, `L2197:c74105│ //`, … for 32,000 tokens) are a loop once that has held for 16 rounds and
+512 tokens, far longer than a numbered list. A reply returned whole (not streamed) that the guard stopped comes back as its
+first round, finished (`stop` / `completed`), since it said what it had to say once and a client that sees
+`length` asks for more. The log says when it acts. Hydra's request that looped on one `this.Controls.Add(...)`
+line for 32,000 tokens now ends after 424, in 4.7 s. `--no-loop-guard` turns it off; structured output is exempt
+(its grammar bounds it).
 
 ### Structured output
 

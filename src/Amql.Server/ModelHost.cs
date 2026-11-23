@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Amql.Cli;
 using Amql.Entail;
 using Amql.Hf;
@@ -57,6 +58,24 @@ public sealed class ModelHost : IDisposable
     /// <summary>The names of the Entail adapters running beside the model.</summary>
     public IReadOnlyList<string> AdapterNames { get; private init; } = Array.Empty<string>();
 
+    /// <summary>The n-gram packs in the container's <c>ngram/</c> folder, kept current while the
+    /// server runs (null for a model that does not generate).</summary>
+    public NGramLibrary? NGram { get; private init; }
+
+    /// <summary>A tokenizer's fingerprint as n-gram packs record it (as <c>amql-cli ngram build</c> computes it).</summary>
+    public static string TokenizerFingerprint(HfTokenizer tokenizer) =>
+        Amql.Inference.NGram.NGramPack.Fingerprint(tokenizer.VocabSize, id =>
+        {
+            try
+            {
+                return tokenizer.DecodeText(new[] { id }, skipSpecialTokens: false);
+            }
+            catch (TokenizerException)
+            {
+                return "";
+            }
+        });
+
     public VonDecisionEngine? Decisions { get; }
     public TextGenerator? Generator { get; }
     public Embedder? Embedder { get; }
@@ -93,8 +112,14 @@ public sealed class ModelHost : IDisposable
     public static ModelHost Load(string id, string path, IReadOnlyList<string>? adapters = null, ModelDefaults? defaults = null)
     {
         var host = LoadEngines(id, path, adapters);
+        var library = host.Generator is { } g
+            ? new NGramLibrary(path, TokenizerFingerprint(g.Tokenizer), line => Console.Error.WriteLine($"{DateTime.Now:HH:mm:ss.fff} {id}: {line}"))
+            : null;
         return new ModelHost(host, defaults ?? new ModelDefaults(),
-            (adapters ?? Array.Empty<string>()).Select(d => System.IO.Path.GetFileName(System.IO.Path.GetFullPath(d).TrimEnd('/', '\\'))).ToList());
+            (adapters ?? Array.Empty<string>()).Select(d => System.IO.Path.GetFileName(System.IO.Path.GetFullPath(d).TrimEnd('/', '\\'))).ToList())
+        {
+            NGram = library,
+        };
     }
 
     private ModelHost(ModelHost loaded, ModelDefaults defaults, IReadOnlyList<string> adapterNames)
@@ -228,6 +253,7 @@ public sealed class ModelHost : IDisposable
 
     public void Dispose()
     {
+        NGram?.Dispose();
         Generator?.Dispose();
         foreach (var adapter in Generator?.Adapters ?? Array.Empty<IEntailAdapter>())
         {
@@ -331,8 +357,19 @@ public sealed record GenerationParams(
     /// <summary>The request's tools (chat form): a call the reply opens is held to them.</summary>
     public IReadOnlyList<System.Text.Json.JsonElement>? Tools { get; init; }
 
-    /// <summary>The user's latest message and the tool results since, for the mentioned-parameter rule.</summary>
+    /// <summary>The reply may not open a call (it must answer in words from what it has).</summary>
+    public bool NoCalls { get; init; }
+
+    /// <summary>The user's latest message, for the mentioned-parameter rule.</summary>
     public string? Recent { get; init; }
+
+    /// <summary>The tool results since the user's latest message, for the mentioned-parameter rule,
+    /// where only a suggestion counts ("Pass overwrite: true"), not a field or a warning.</summary>
+    public string? RecentResults { get; init; }
+
+    /// <summary>The reply's start the client wrote (<c>continue_final_message</c>): part of the
+    /// reply for the rules that read it, though not repeated in the output.</summary>
+    public string? Prefill { get; init; }
 
     /// <summary>N-gram packs blended into the logits outside thinking (null: none).</summary>
     public Amql.Inference.NGram.NGramPrior? NGram { get; init; }
@@ -340,6 +377,10 @@ public sealed record GenerationParams(
 
 public sealed record GenerationResult(string Text, string FinishReason, int PromptTokens, int CompletionTokens)
 {
+    /// <summary>When the loop guard stopped the reply: its text with the repeats after the first
+    /// round removed (what the reply had to say, once).</summary>
+    public string? Looped { get; init; }
+
     /// <summary>The generated token ids (stop token excluded).</summary>
     public IReadOnlyList<int> Tokens { get; init; } = Array.Empty<int>();
 
@@ -372,6 +413,29 @@ public sealed class TextGenerator : IDisposable
     private readonly SideBySideSession _session;
     private readonly IReadOnlySet<int> _stopTokens;
     private readonly BatchScheduler? _batch;
+
+    /// <summary>The share of the model's probability the way to a call must have for the
+    /// announced-call rule to open it (default 1e-4, as for mentioned parameters).</summary>
+    public static double AnnounceFloor { get; set; } = 1e-4;
+
+    private static readonly Regex Intent = new(
+        @"\b(let me|let's|i'll|i will|i'm going to|i am going to|i need to|now i|next i|i'm now|i shall)\b",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
+
+    /// <summary>Whether a tool result tells the next call to pass a parameter: "Pass overwrite:
+    /// true", "set 'force' to true", "use background=true"; not a field of the result
+    /// (<c>"handle": "bg-95c9"</c>) nor a warning ("'handle' means poll or stop").</summary>
+    public static bool SuggestsParameter(string results, string name) => Regex.IsMatch(results,
+        $@"\b(?:pass|set|use|add|include|specify|with)\s+(?:the\s+)?[`'""]?{Regex.Escape(name)}[`'""]?\s*(?::|=|to\b)",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    /// <summary>Whether the sentence that ends at a colon says the reply is about to act
+    /// ("Now let me build it", not "Here's what was done").</summary>
+    public static bool AnnouncesAction(string beforeColon)
+    {
+        int start = beforeColon.LastIndexOfAny(['.', '!', '?', '\n']) + 1;
+        return Intent.IsMatch(beforeColon[start..].Replace('’', '\''));
+    }
 
     /// <summary>Set false (<c>--no-mention-rule</c>) to let calls leave out optional parameters the
     /// reply or the newest messages name.</summary>
@@ -558,9 +622,32 @@ public static class LoopGuard
 {
     public const int Repeats = 4, Tokens = 192, LongestPeriod = 256;
 
+    /// <summary>A counting loop (lines that differ only in a number or hash) must be held much
+    /// longer before it counts: a numbered list is fine, the same line numbered 2,000 times is not.</summary>
+    public const int CountingRepeats = 16, CountingTokens = 512;
+
+    /// <summary>The key a number or hash token has in a loose sequence.</summary>
+    public const int Counter = -1;
+
+    /// <summary>Whether a token's text is a number or a piece of a hash (hex with a digit).</summary>
+    public static bool IsCounter(string piece)
+    {
+        string t = piece.Trim();
+        return t.Length > 0 && t.Any(char.IsDigit) && t.All(Uri.IsHexDigit);
+    }
+
+    /// <summary>The loop a loose sequence (number and hash tokens keyed <see cref="Counter"/>)
+    /// is in: "L2196:c74105│ //", "L2197:…" over and over. Needs <see cref="CountingRepeats"/>
+    /// rounds and <see cref="CountingTokens"/> tokens.</summary>
+    public static (int Period, int Repeats)? FindCounting(IReadOnlyList<int> loose, int from = 0) =>
+        Find(loose, from, CountingRepeats, CountingTokens);
+
     /// <summary>The loop the tail of <paramref name="reply"/> is in, looking no further back
     /// than <paramref name="from"/>; null when it is in none.</summary>
-    public static (int Period, int Repeats)? Find(IReadOnlyList<int> reply, int from = 0)
+    public static (int Period, int Repeats)? Find(IReadOnlyList<int> reply, int from = 0) =>
+        Find(reply, from, Repeats, Tokens);
+
+    private static (int Period, int Repeats)? Find(IReadOnlyList<int> reply, int from, int Repeats, int Tokens)
     {
         int n = reply.Count;
         if (n - from < Tokens)
@@ -601,6 +688,7 @@ internal sealed class GenerationRun
     private readonly int _holdBack;
     private readonly Queue<int> _forced = new();
     private readonly List<int> _generated = new();
+    private readonly List<int> _loose = new();   // _generated with number and hash tokens as one
     private readonly List<LogprobsResult>? _logprobs;
     private bool _forcePending;
     private string _emitted = string.Empty;
@@ -648,6 +736,10 @@ internal sealed class GenerationRun
         if (p.Tools is { Count: > 0 } tools && TextGenerator.ToolGrammarEnabled)
         {
             _toolGrammar = ToolGrammar.Compile(tools);
+            if (p.Prefill is { Length: > 0 } started && !p.Thinking)
+            {
+                WatchForCall(started);   // a started reply may already have opened a call
+            }
         }
         // Forced text goes in after the thinking block, or at once without one.
         _forcePending = p.Forced is not null;
@@ -685,7 +777,7 @@ internal sealed class GenerationRun
         }
         _blendedNow = false;
         if (_p.NGram is { } prior && _forced.Count == 0 && (!_p.Thinking || _thinkClosed) &&
-            (prior.Scope == "all" || _call is not null || Amql.Inference.NGram.NGramPrior.InFencedCode(_stableText)))
+            (prior.Scope == "all" || _call is not null || Amql.Inference.NGram.NGramPrior.InFencedCode((_p.Prefill ?? "") + _stableText)))
         {
             var raw = _logits();
             _blended ??= new float[raw.Length];
@@ -704,6 +796,14 @@ internal sealed class GenerationRun
         else if (_call is not null)
         {
             token = Constrained(_call);
+        }
+        else if (AnnouncedCall() is { } announced)
+        {
+            token = Constrained(announced);
+        }
+        else if (_p.NoCalls && (!_p.Thinking || _thinkClosed))
+        {
+            token = Constrained(NoCallOpen.After((_p.Prefill ?? "") + _stableText));
         }
         else if (_verdict.Silent)
         {
@@ -742,6 +842,7 @@ internal sealed class GenerationRun
             WatchForCall(piece);
         }
         _generated.Add(token);
+        _loose.Add(LoopGuard.IsCounter(piece) ? LoopGuard.Counter : token);
         if (token == _g.ThinkClose)
         {
             _thinkClosed = true;
@@ -769,7 +870,8 @@ internal sealed class GenerationRun
         }
         safe = Math.Max(_emitted.Length, safe - _holdBack);
         Emit(text[..safe]);
-        if (TextGenerator.LoopGuardEnabled && _json is null && _generated.Count % 8 == 0 && LoopGuard.Find(_generated, _loopFrom) is { } loop)
+        if (TextGenerator.LoopGuardEnabled && _json is null && _generated.Count % 8 == 0 &&
+            (LoopGuard.Find(_generated, _loopFrom) ?? LoopGuard.FindCounting(_loose, _loopFrom)) is { } loop)
         {
             if (_p.Thinking && !_thinkClosed && _g.ThinkClose is not null && _forced.Count == 0)
             {
@@ -785,7 +887,11 @@ internal sealed class GenerationRun
             {
                 Console.Error.WriteLine($"{DateTime.Now:HH:mm:ss.fff} loop guard: the reply repeats a {loop.Period}-token stretch {loop.Repeats} times; " +
                                         $"stopped at {_generated.Count} tokens");
-                return Finish("length");
+                int keep = _generated.Count - loop.Period * (loop.Repeats - 1);
+                string once = _g.Tokenizer.DecodeText(_generated.GetRange(0, keep)).TrimEnd('�');
+                Finish("length");
+                Result = Result! with { Looped = once };
+                return null;
             }
         }
         return _generated.Count >= _budget ? Finish("length") : token;
@@ -813,6 +919,133 @@ internal sealed class GenerationRun
     }
 
     private const string CallOpen = "<tool_call>";
+
+    /// <summary>Set false (<c>--no-announce-rule</c>) to let a reply end on "…let me build it:".</summary>
+    internal static bool AnnounceRuleEnabled = true;
+
+    /// <summary>
+    /// The announced-call rule. A reply with tools on offer whose text, outside thinking, ends with
+    /// a colon ("Now let me build the project:") has said that something follows; ending the turn
+    /// there leaves the harness a promise and no call, and a small model then goes on to claim the
+    /// build succeeded. So there, when the model gives opening a call at least
+    /// <see cref="MentionFloor"/>, the call opens (whitespace may come first); when it does not,
+    /// nothing is forced. Returns the grammar for this step, or null when the rule does not act.
+    /// </summary>
+    private ITokenConstraint? AnnouncedCall()
+    {
+        if (!AnnounceRuleEnabled || _toolGrammar is null || _json is not null || (_p.Thinking && !_thinkClosed))
+        {
+            return null;
+        }
+        string text = (_p.Prefill ?? "") + _stableText;
+        int close = text.LastIndexOf("</think>", StringComparison.Ordinal);
+        string visible = (close >= 0 ? text[(close + "</think>".Length)..] : text).TrimEnd();
+        // A colon in prose announces; in a code block it is code ("def f():", "case 1:"). After the
+        // colon: whitespace, then perhaps the call's opening already begun (a tokenizer without a
+        // "<tool_call>" token writes it a piece at a time), which the rule sees through to the end.
+        if (Amql.Inference.NGram.NGramPrior.InFencedCode(visible))
+        {
+            return null;
+        }
+        int colon = visible.LastIndexOf(':');
+        if (colon < 0)
+        {
+            return null;
+        }
+        string after = visible[(colon + 1)..];
+        string begun = after.TrimStart(' ', '\n', '\r', '\t');
+        if (begun.Length >= CallOpen.Length || !CallOpen.StartsWith(begun, StringComparison.Ordinal))
+        {
+            return null;
+        }
+        var way = new OpensCall(CallOpen[begun.Length..], begun.Length == 0);
+        if (begun.Length > 0)
+        {
+            return way;   // the opening is under way: finish it
+        }
+        // Only an announced action of the reply's own ("let me build it:", "I'll run the tests:")
+        // promises a call. "Here's what was done:" promises the list that follows, and forcing a
+        // call there sends the agent round again; the reply may only not end on it.
+        if (!TextGenerator.AnnouncesAction(visible[..colon]))
+        {
+            return NotTheEnd.Instance;
+        }
+        var row = Row();
+        float max = float.NegativeInfinity;
+        foreach (float v in row)
+        {
+            max = Math.Max(max, v);
+        }
+        double sum = 0, on = 0;
+        for (int id = 0; id < row.Length; id++)
+        {
+            double e = Math.Exp(row[id] - max);
+            sum += e;
+            if (e > 1e-12 && !_g.StopTokenIds.Contains(id) && _g.TokenText(id, row.Length) is { Length: > 0 } t && way.Accepts(t) && t.Trim().Length > 0)
+            {
+                on += e;
+            }
+        }
+        if (Environment.GetEnvironmentVariable("AMQL_DEBUG_RULES") is "1")
+        {
+            Console.Error.WriteLine($"announce rule: '{visible[^Math.Min(30, visible.Length)..]}' p(call) = {on / sum:G3}");
+        }
+        return on / sum >= TextGenerator.AnnounceFloor ? way : null;
+    }
+
+    /// <summary>Anything but a call's markup, whole or written a piece at a time (a reply that must
+    /// answer from what it has would otherwise write the call out as text).</summary>
+    private sealed class NoCallOpen(string tail) : ITokenConstraint
+    {
+        private static readonly string[] Markup =
+            [CallOpen, "</tool_call>", "<function=", "</function>", "<parameter=", "</parameter>"];
+
+        public static NoCallOpen After(string text) => new(text.Length > 16 ? text[^16..] : text);
+
+        public bool Accepts(string t)
+        {
+            string s = tail + t;
+            return !Markup.Any(m => s.IndexOf(m, StringComparison.Ordinal) is var i && i >= 0 && i + m.Length > tail.Length);
+        }
+
+        public void Advance(string text)
+        {
+        }
+
+        public bool CanEnd => true;
+    }
+
+    /// <summary>Anything but the end of the reply.</summary>
+    private sealed class NotTheEnd : ITokenConstraint
+    {
+        public static readonly NotTheEnd Instance = new();
+
+        public bool Accepts(string t) => true;
+
+        public void Advance(string text)
+        {
+        }
+
+        public bool CanEnd => false;
+    }
+
+    /// <summary>The rest of the way to "&lt;tool_call&gt;" (whitespace first, if the opening has not
+    /// begun); never the end of the reply.</summary>
+    private sealed class OpensCall(string remaining, bool spaceFirst) : ITokenConstraint
+    {
+        public bool Accepts(string t)
+        {
+            string rest = spaceFirst ? t.TrimStart(' ', '\n', '\r', '\t') : t;
+            return rest.Length == 0 ? spaceFirst
+                : remaining.StartsWith(rest, StringComparison.Ordinal) || rest.StartsWith(remaining, StringComparison.Ordinal);
+        }
+
+        public void Advance(string text)
+        {
+        }
+
+        public bool CanEnd => false;
+    }
 
     /// <summary>The reply opens a call when its text, outside thinking, reaches "&lt;tool_call&gt;":
     /// from there to "&lt;/tool_call&gt;" it is held to the tools. What the same token says after
@@ -909,8 +1142,12 @@ internal sealed class GenerationRun
         string context = (_p.Recent ?? "") + "\n" + Reasoning();
         foreach (string name in call.OptionalLeft())
         {
-            if (call.PathTo(name) is not { } path ||
-                !System.Text.RegularExpressions.Regex.IsMatch(context, $@"(?<![\w-]){System.Text.RegularExpressions.Regex.Escape(name)}(?![\w-])"))
+            string word = Regex.Escape(name);
+            // A tool result names many fields ("handle": "bg-95c9") and warns about some ("'handle'
+            // means poll or stop"); only one that tells the call what to pass counts.
+            bool mentioned = Regex.IsMatch(context, $@"(?<![\w-]){word}(?![\w-])") ||
+                (_p.RecentResults is { } results && TextGenerator.SuggestsParameter(results, name));
+            if (call.PathTo(name) is not { } path || !mentioned)
             {
                 continue;
             }

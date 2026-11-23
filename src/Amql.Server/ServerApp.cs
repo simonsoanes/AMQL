@@ -195,6 +195,7 @@ public static class ServerApp
             o["thinking"] = g.Thinks;
             o["adapters"] = new JsonArray(m.AdapterNames.Select(a => (JsonNode?)a).ToArray());
             o["concurrency"] = g.Concurrency;
+            o["ngram_packs"] = new JsonArray(AvailablePacks(m, settings).Keys.Order(StringComparer.Ordinal).Select(n => (JsonNode?)n).ToArray());
             if (g.BatchRefusal is { } why)
             {
                 o["batching"] = why;
@@ -1117,7 +1118,12 @@ public static class ServerApp
 
     /// <summary>One turn to generate: the prompt, how to sample it, and how to
     /// read the reply.</summary>
-    private sealed record ChatTurn(int[] Prompt, GenerationParams Params, IReadOnlyList<JsonElement>? Tools, bool Parallel);
+    private sealed record ChatTurn(int[] Prompt, GenerationParams Params, IReadOnlyList<JsonElement>? Tools, bool Parallel,
+        LineDecoration? Decoration = null, IReadOnlySet<string>? Stale = null);
+
+    /// <summary>Set false (<c>--allow-repeated-calls</c>) to let a reply make a call that has already
+    /// returned the same result twice.</summary>
+    internal static bool RefuseStaleCalls = true;
 
     /// <summary>Renders a request into a turn: thinking from
     /// <c>chat_template_kwargs.enable_thinking</c>, then the reasoning effort
@@ -1266,13 +1272,20 @@ public static class ServerApp
         // The current task, for the mentioned-parameter rule: the user's latest message and every
         // tool result since (a harness's hint such as "pass overwrite: true" may be a few calls back).
         int lastUser = messages.FindLastIndex(m => m.Role == "user");
-        string recent = string.Join("\n", messages.Skip(Math.Max(lastUser, 0)).Where(m => m.Role is "user" or "tool").Select(m => m.Content));
+        var since = messages.Skip(Math.Max(lastUser, 0)).ToList();
+        string recent = string.Join("\n", since.Where(m => m.Role is "user" or "tool").Select(m => m.Content));
         var p = Sampling(body, maxTokens, settings, model.Defaults) with
         {
-            Forced = forced, Thinking = thinking, Json = format?.Schema, Tools = tools, Recent = recent,
-            NGram = Packs(body, model, settings, recent),
+            Forced = forced, Thinking = thinking, Json = format?.Schema, Tools = tools,
+            Recent = string.Join("\n", since.Where(m => m.Role == "user").Select(m => m.Content)),
+            RecentResults = string.Join("\n", since.Where(m => m.Role == "tool").Select(m => m.Content)),
+            NGram = Packs(body, model, settings, recent), Prefill = prefill,
         };
-        return new ChatTurn(prompt, p, tools, parallel);
+        // The line decoration of the tool results (line numbers, hashes), so a value that copies
+        // a file as it was shown is written as the file.
+        var decoration = tools is { Count: > 0 } ? LineDecoration.Learn(messages.Where(m => m.Role == "tool").Select(m => m.Content)) : null;
+        var stale = tools is { Count: > 0 } && RefuseStaleCalls ? RepeatedCalls.Stale(messages) : null;
+        return new ChatTurn(prompt, p, tools, parallel, decoration, stale);
     }
 
     /// <summary>
@@ -1282,24 +1295,27 @@ public static class ServerApp
     /// </summary>
     private static Amql.Inference.NGram.NGramPrior? Packs(JsonElement body, ModelHost model, ServerSettings settings, string recent)
     {
-        if (settings.NGramPacks.Count == 0)
+        // The server's packs (--ngram-pack) and the model's container's (ngram/, as they are now);
+        // a container pack of the same name wins.
+        var available = AvailablePacks(model, settings);
+        if (available.Count == 0)
         {
             return null;
         }
         List<Amql.Inference.NGram.NGramPack> chosen;
         if (body.TryGetProperty("ngram_packs", out var named) && named.ValueKind == JsonValueKind.Array)
         {
-            chosen = named.EnumerateArray().Select(n => n.GetString() is { } id && settings.NGramPacks.TryGetValue(id, out var pack)
+            chosen = named.EnumerateArray().Select(n => n.GetString() is { } id && available.TryGetValue(id, out var pack)
                 ? pack
-                : throw new ApiException(400, $"no n-gram pack named '{n}' is loaded ({string.Join(", ", settings.NGramPacks.Keys)})", param: "ngram_packs")).ToList();
+                : throw new ApiException(400, $"no n-gram pack named '{n}' is loaded for this model ({string.Join(", ", available.Keys)})", param: "ngram_packs")).ToList();
         }
         else if (model.Defaults.NGramPacks is { } own)
         {
-            chosen = own.Where(settings.NGramPacks.ContainsKey).Select(id => settings.NGramPacks[id]).ToList();
+            chosen = own.Where(available.ContainsKey).Select(id => available[id]).ToList();
         }
         else
         {
-            chosen = settings.NGramPacks.Values.Where(p => p.Keywords.Any(k => recent.Contains(k, StringComparison.OrdinalIgnoreCase))).ToList();
+            chosen = available.Values.Where(p => p.Keywords.Any(k => recent.Contains(k, StringComparison.OrdinalIgnoreCase))).ToList();
         }
         if (chosen.Count == 0)
         {
@@ -1324,22 +1340,97 @@ public static class ServerApp
         };
     }
 
+    private static Dictionary<string, Amql.Inference.NGram.NGramPack> AvailablePacks(ModelHost model, ServerSettings settings)
+    {
+        var all = new Dictionary<string, Amql.Inference.NGram.NGramPack>(settings.NGramPacks, StringComparer.Ordinal);
+        foreach (var (name, pack) in model.NGram?.Packs ?? new Dictionary<string, Amql.Inference.NGram.NGramPack>())
+        {
+            all[name] = pack;
+        }
+        return all;
+    }
+
     private static string? ToolName(JsonElement tool) =>
         tool.TryGetProperty("function", out var f) && f.TryGetProperty("name", out var n) ? n.GetString() : null;
+
+    /// <summary>
+    /// The reply again, after it made a call that has already returned the same result twice: what
+    /// it said before the call stands, and it goes on from there with calls closed, so it answers
+    /// from the results it has. What was sent of the first reply is not sent again.
+    /// </summary>
+    private static (GenerationResult Result, ReplyParser Reply) Answer(ModelHost model, ChatTurn turn,
+        GenerationResult first, string refused, Action<ReplyEvent>? onEvent, CancellationToken cancel)
+    {
+        var generator = model.Generator!;
+        int open = first.Text.IndexOf("<tool_call>", StringComparison.Ordinal);
+        string before = (open >= 0 ? first.Text[..open] : first.Text).TrimEnd();
+        Log($"{model.Id}: refused a repeated {refused} call (the same result twice already); answering without calls");
+        var reply = new ReplyParser(turn.Params.Thinking, null, turn.Decoration);
+        reply.Feed(before);   // sent already, or part of the reply that is returned whole
+        // Closing calls alone leaves a small model in the middle of writing one (it writes the markup
+        // out as text); a lead-in that says why puts it on to the answer. It is part of the reply.
+        string lead = (before.Length > 0 && !before.EndsWith("</think>") ? "\n\n" : "") +
+            $"That {refused} call has already returned the same result twice, so instead of running it again, here is what it showed:";
+        before += lead;
+        foreach (var e in reply.Feed(lead))
+        {
+            onEvent?.Invoke(e);
+        }
+        int[] prompt = turn.Prompt.Concat(generator.Tokenizer.EncodeToIds(before)).ToArray();
+        var p = turn.Params with
+        {
+            Tools = null, NoCalls = true, Thinking = false, Forced = null,
+            Prefill = (turn.Params.Prefill ?? "") + before,
+            MaxTokens = Math.Max(1, turn.Params.MaxTokens - first.CompletionTokens),
+        };
+        GenerationResult more;
+        try
+        {
+            more = generator.Generate(prompt, p, d =>
+            {
+                foreach (var e in reply.Feed(d))
+                {
+                    onEvent?.Invoke(e);
+                }
+            }, cancel, null);
+        }
+        catch (ArgumentException e)
+        {
+            throw new ApiException(400, e.Message, code: "context_length_exceeded");
+        }
+        foreach (var e in reply.Finish())
+        {
+            onEvent?.Invoke(e);
+        }
+        return (more with
+        {
+            Text = before + more.Text,
+            Looped = more.Looped is { } once ? before + once : null,
+            PromptTokens = first.PromptTokens,
+            CompletionTokens = first.CompletionTokens + more.CompletionTokens,
+        }, reply);
+    }
 
     /// <summary>Generates a turn and reads the reply as it comes. Without
     /// parallel calls, generation stops once the first call closes.</summary>
     private static (GenerationResult Result, ReplyParser Reply) Run(ModelHost model, ChatTurn turn,
         Action<ReplyEvent>? onEvent, CancellationToken cancel, int? logprobsTopK)
     {
-        var reply = new ReplyParser(turn.Params.Thinking, turn.Tools);
+        var reply = new ReplyParser(turn.Params.Thinking, turn.Tools, turn.Decoration);
         using var enough = CancellationTokenSource.CreateLinkedTokenSource(cancel);
+        string? refused = null;
         void Read(IReadOnlyList<ReplyEvent> events)
         {
             foreach (var e in events)
             {
-                if (e is ReplyEvent.ToolCall && !turn.Parallel && reply.ToolCalls.Count > 1)
+                if (refused is not null || (e is ReplyEvent.ToolCall && !turn.Parallel && reply.ToolCalls.Count > 1))
                 {
+                    continue;
+                }
+                if (e is ReplyEvent.ToolCall stale && turn.Stale is { Count: > 0 } s && s.Contains(RepeatedCalls.Key(stale.Call.Name, stale.Call.Arguments)))
+                {
+                    refused = stale.Call.Name;   // nothing more of this reply is sent: it is generated again
+                    enough.Cancel();
                     continue;
                 }
                 onEvent?.Invoke(e);
@@ -1359,6 +1450,18 @@ public static class ServerApp
             throw new ApiException(400, e.Message, code: "context_length_exceeded");
         }
         Read(reply.Finish());
+        if (refused is not null && !cancel.IsCancellationRequested)
+        {
+            (result, reply) = Answer(model, turn, result, refused, onEvent, cancel);
+        }
+        // A reply the loop guard stopped said what it had to say in its first round; returned whole,
+        // it is returned as that, finished, so a client does not take it for a reply cut short and
+        // ask for more. (A streamed reply has been sent as it came.)
+        if (result.Looped is { } once && onEvent is null)
+        {
+            reply = ReplyParser.Parse(once, turn.Params.Thinking, refused is null ? turn.Tools : null, turn.Decoration);
+            result = result with { Text = once, FinishReason = "stop" };
+        }
         if (result.FinishReason == "cancelled" && !cancel.IsCancellationRequested)
         {
             result = result with { FinishReason = "stop" };
@@ -1367,6 +1470,14 @@ public static class ServerApp
         {
             reply.KeepFirstCall();
         }
+        // What was answered, beside the access line: enough to see a promise without a call.
+        string tail = reply.Content.Length > 60 ? "…" + reply.Content[^60..] : reply.Content;
+        if (reply.Undecorated > 0)
+        {
+            Log($"{model.Id}: removed the tool results' line decoration /{turn.Decoration!.Pattern}/ from {reply.Undecorated} copied value(s)");
+        }
+        Log($"{model.Id}: {result.CompletionTokens} tokens, {result.FinishReason}, " +
+            $"calls [{string.Join(", ", reply.ToolCalls.Select(c => c.Name))}], says {System.Text.Json.JsonSerializer.Serialize(tail)}");
         return (result, reply);
     }
 

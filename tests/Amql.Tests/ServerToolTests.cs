@@ -546,6 +546,15 @@ public sealed class ServerToolTests : IClassFixture<ServerToolTests.ToolHost>
         Assert.Null(LoopGuard.Find(prefix.Concat(Enumerable.Repeat(line, 8).SelectMany(x => x)).ToList()));
         // ... and nothing before `from` counts (after thinking was closed for circling).
         Assert.Null(LoopGuard.Find(looping, from: looping.Count - 100));
+
+        // A counting loop: the numbered line keyed loosely, it is found, but only once it is long.
+        var counted = numbered.Select(t => t >= 5000 ? LoopGuard.Counter : t).ToList();
+        int found = Enumerable.Range(1, counted.Count).First(n => LoopGuard.FindCounting(counted.Take(n).ToList()) is not null);
+        Assert.True(found >= 60 + 16 * 23, $"found at {found}");
+        var shortList = counted.Take(60 + 10 * 23).ToList();   // ten numbered lines: a list, not a loop
+        Assert.Null(LoopGuard.FindCounting(shortList));
+        Assert.True(LoopGuard.IsCounter("2196") && LoopGuard.IsCounter("c74105") && LoopGuard.IsCounter(" 7"));
+        Assert.False(LoopGuard.IsCounter("face") || LoopGuard.IsCounter("L") || LoopGuard.IsCounter(" "));
     }
 
     // ── the tool-call grammar over HTTP ─────────────────────────────────
@@ -597,5 +606,119 @@ public sealed class ServerToolTests : IClassFixture<ServerToolTests.ToolHost>
             {"model":"lm","continue_final_message":true,"messages":[{"role":"user","content":"hello"}]}
             """);
         Assert.Equal(HttpStatusCode.BadRequest, bad);
+    }
+
+    [Fact]
+    public async Task A_Pack_Dropped_Into_A_Running_Models_Ngram_Folder_Is_Served()
+    {
+        var host = _h.Models.Single(m => m.Id == "lm-engine");
+        var tokenizer = host.Generator!.Tokenizer;
+        var docs = new[] { tokenizer.EncodeToIds("Console.WriteLine(\"hi\"); Console.WriteLine(\"hi\");").ToArray() };
+        string folder = Path.Combine(host.Path, Amql.Server.NGramLibrary.Folder);
+        Directory.CreateDirectory(folder);
+        string file = Path.Combine(folder, "hello.ngram");
+        Amql.Inference.NGram.NGramPack.Build("hello", docs, 4, ModelHost.TokenizerFingerprint(tokenizer)).Save(file + ".tmp");
+        File.Move(file + ".tmp", file);
+        try
+        {
+            JsonNode listed = null!;
+            for (int i = 0; i < 100; i++)
+            {
+                listed = JsonNode.Parse(await _h.Client.GetStringAsync("/v1/models/lm-engine"))!;
+                if (listed["ngram_packs"]!.AsArray().Any(n => n!.GetValue<string>() == "hello"))
+                {
+                    break;
+                }
+                await Task.Delay(100);
+            }
+            Assert.Contains("hello", listed["ngram_packs"]!.AsArray().Select(n => n!.GetValue<string>()));
+            var (status, body) = await Post("/v1/chat/completions", """
+                {"model":"lm-engine","max_tokens":8,"ngram_packs":["hello"],"ngram_lambda":0.5,"ngram_scope":"all","messages":[{"role":"user","content":"x"}]}
+                """);
+            Assert.True(status == HttpStatusCode.OK, body.ToJsonString());
+        }
+        finally
+        {
+            File.Delete(file);
+        }
+        for (int i = 0; i < 100; i++)
+        {
+            var listed = JsonNode.Parse(await _h.Client.GetStringAsync("/v1/models/lm-engine"))!;
+            if (!listed["ngram_packs"]!.AsArray().Any(n => n!.GetValue<string>() == "hello"))
+            {
+                return;
+            }
+            await Task.Delay(100);
+        }
+        Assert.Fail("the pack was not dropped after its file was deleted");
+    }
+
+    [Theory]
+    [InlineData("lm")]
+    [InlineData("lm-engine")]
+    public async Task A_Reply_That_Announces_An_Action_Opens_The_Call(string model)
+    {
+        // The reply so far says what it will do and stops on a colon. Where the model gives a call any
+        // chance, the call opens, and an opening once begun is finished (this tokenizer writes
+        // "<tool_call>" a character at a time).
+        // A random model gives "<" little probability, so the floor is lowered here to see the rule act.
+        double floor = TextGenerator.AnnounceFloor;
+        TextGenerator.AnnounceFloor = 1e-9;
+        int opened = 0;
+        try
+        {
+        for (int seed = 0; seed < 8; seed++)
+        {
+            var (status, body) = await Post("/v1/chat/completions", $$$"""
+                {"model":"{{{model}}}","max_tokens":120,"temperature":1,"seed":{{{seed}}},"tools":[{{{SwitchTool}}}],"continue_final_message":true,
+                 "messages":[{"role":"user","content":"flip it"},{"role":"assistant","content":"Now let me flip the switch:"}]}
+                """);
+            Assert.True(status == HttpStatusCode.OK, body.ToJsonString());
+            var message = body["choices"]![0]!["message"]!;
+            string content = (message["content"]?.GetValue<string>() ?? "").TrimStart();
+            bool called = message["tool_calls"] is JsonArray { Count: > 0 };
+            if (content.StartsWith('<'))
+            {
+                Assert.True(called || content.StartsWith("<tool_call>"), body.ToJsonString());
+            }
+            opened += called || content.StartsWith("<tool_call>") ? 1 : 0;
+        }
+        }
+        finally
+        {
+            TextGenerator.AnnounceFloor = floor;
+        }
+        Assert.True(opened == 8, $"only {opened} of 8 replies opened the call");
+
+        // A colon that introduces a list, not an action: no call is forced, but the reply goes on.
+        TextGenerator.AnnounceFloor = 1e-9;
+        try
+        {
+            for (int seed = 0; seed < 4; seed++)
+            {
+                var (status, body) = await Post("/v1/chat/completions", $$$"""
+                    {"model":"{{{model}}}","max_tokens":12,"temperature":1,"seed":{{{seed}}},"tools":[{{{SwitchTool}}}],"continue_final_message":true,
+                     "messages":[{"role":"user","content":"flip it"},{"role":"assistant","content":"The switch is flipped. Here's what was done:"}]}
+                    """);
+                Assert.True(status == HttpStatusCode.OK, body.ToJsonString());
+                var message = body["choices"]![0]!["message"]!;
+                string content = message["content"]?.GetValue<string>() ?? "";
+                bool called = message["tool_calls"] is JsonArray { Count: > 0 };
+                Assert.True(!called && content.Trim().Length > 0, body.ToJsonString());
+                Assert.True(body["usage"]!["completion_tokens"]!.GetValue<int>() > 1, body.ToJsonString());
+            }
+        }
+        finally
+        {
+            TextGenerator.AnnounceFloor = floor;
+        }
+
+        // A colon inside a code block is code, not an announcement.
+        var (s2, plain) = await Post("/v1/chat/completions", $$$"""
+            {"model":"{{{model}}}","max_tokens":3,"temperature":0,"tools":[{{{SwitchTool}}}],"continue_final_message":true,
+             "messages":[{"role":"user","content":"x"},{"role":"assistant","content":"```python\ndef f():"}]}
+            """);
+        Assert.Equal(HttpStatusCode.OK, s2);
+        Assert.False(plain["choices"]![0]!["message"]!["content"]!.GetValue<string>().TrimStart().StartsWith("<tool_call>"));
     }
 }

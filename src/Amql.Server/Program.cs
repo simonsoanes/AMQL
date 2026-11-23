@@ -51,6 +51,8 @@ for (int i = 0; i < args.Length; i++)
         case "--no-loop-guard": TextGenerator.LoopGuardEnabled = false; break;
         case "--free-tool-calls": TextGenerator.ToolGrammarEnabled = false; break;
         case "--no-mention-rule": TextGenerator.MentionRuleEnabled = false; break;
+        case "--no-announce-rule": GenerationRun.AnnounceRuleEnabled = false; break;
+        case "--allow-repeated-calls": ServerApp.RefuseStaleCalls = false; break;
         case "--ngram-pack":
         {
             var pack = Amql.Inference.NGram.NGramPack.Load(Next());
@@ -114,6 +116,10 @@ for (int i = 0; i < args.Length; i++)
                                 one of its keywords is in the current task
                   --ngram-lambda, --ngram-min-context, --ngram-model-confident, --ngram-pack-confident
                                 how a chosen pack is blended (a request may set "ngram_lambda")
+                  --allow-repeated-calls  let a reply make a call that has already returned the same result twice
+                                (by default it is generated again with calls closed, and answers)
+                  --no-announce-rule  let a reply with tools end on a colon ("now let me build it:") with no
+                                call (by default the call opens there when the model gives it any chance)
                   --no-loop-guard  let a reply repeat itself to its token limit (by default a reply whose
                                 own tail repeats a stretch 4+ times, 192+ tokens, is stopped, or its thinking closed)
                   --batch-bf16  batches of 4+ on tensor cores, activations rounded to BF16: ~1.6x the

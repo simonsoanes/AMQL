@@ -51,6 +51,7 @@ public sealed class ReplyParser
     private readonly bool _promptOpenedThink;
     private readonly bool _parseTools;
     private readonly IReadOnlyDictionary<string, JsonElement> _schemas;
+    private readonly LineDecoration? _decoration;
     private string _text = string.Empty;
     private int _reasoningSent;
     private int _contentSent;
@@ -62,9 +63,12 @@ public sealed class ReplyParser
     /// (<c>{"type":"function","function":{name, parameters}}</c>), whose
     /// parameter types decide how each value is read; null when the request
     /// offered none, and then a <c>&lt;tool_call&gt;</c> is ordinary text.</param>
-    public ReplyParser(bool promptOpenedThink, IReadOnlyList<JsonElement>? tools)
+    /// <param name="decoration">The tool results' per-line decoration, removed from a value that
+    /// copied it (null: values are read as written).</param>
+    public ReplyParser(bool promptOpenedThink, IReadOnlyList<JsonElement>? tools, LineDecoration? decoration = null)
     {
         _promptOpenedThink = promptOpenedThink;
+        _decoration = decoration;
         _parseTools = tools is { Count: > 0 };
         var schemas = new Dictionary<string, JsonElement>(StringComparer.Ordinal);
         foreach (var t in tools ?? Array.Empty<JsonElement>())
@@ -84,6 +88,9 @@ public sealed class ReplyParser
     public string Content { get; private set; } = string.Empty;
 
     public IReadOnlyList<ParsedToolCall> ToolCalls => _calls;
+
+    /// <summary>How many call values had a tool result's line decoration removed.</summary>
+    public int Undecorated { get; private set; }
 
     /// <summary>Whether the reply had a thinking block at all.</summary>
     public bool Thought { get; private set; }
@@ -108,9 +115,9 @@ public sealed class ReplyParser
     public IReadOnlyList<ReplyEvent> Finish() => Read(final: true);
 
     /// <summary>Parses a whole reply at once.</summary>
-    public static ReplyParser Parse(string text, bool promptOpenedThink, IReadOnlyList<JsonElement>? tools)
+    public static ReplyParser Parse(string text, bool promptOpenedThink, IReadOnlyList<JsonElement>? tools, LineDecoration? decoration = null)
     {
-        var parser = new ReplyParser(promptOpenedThink, tools);
+        var parser = new ReplyParser(promptOpenedThink, tools, decoration);
         parser.Feed(text);
         parser.Finish();
         return parser;
@@ -284,6 +291,11 @@ public sealed class ReplyParser
             string? type = properties.ValueKind == JsonValueKind.Object && properties.TryGetProperty(key, out var ps)
                 ? TypeOf(ps)
                 : null;
+            if (_decoration is not null && value.Contains('\n') && type is null or "string")
+            {
+                value = _decoration.Strip(value, out bool stripped);
+                Undecorated += stripped ? 1 : 0;
+            }
             args[key] = Value(value, type);
         }
         return new ParsedToolCall(name, args.ToJsonString(Relaxed));

@@ -47,6 +47,14 @@ amql-server ... --ngram-pack dotnet.ngram [--ngram-lambda 0.3] [--ngram-min-cont
     [--ngram-model-confident 0.5] [--ngram-pack-confident 0.5] [--ngram-members-only]
 ```
 
+**A container's own packs.** Each model's container may hold packs in an `ngram/` folder beside its weights. The
+server loads them at startup and keeps the folder current while it runs: a pack is loaded when its file is added
+or replaced and dropped when the file is deleted, with no restart (copy a pack in and the next request can use it).
+A file still being written is retried until it reads whole; a pack counted in another tokenizer, or a file that is
+not a pack, is refused with a log line; requests see a consistent set, never a pack half-swapped. The folder need not
+exist at startup. Container packs sit beside `--ngram-pack` ones (a container pack of the same name wins), and
+`/v1/models` lists each chat model's packs as `ngram_packs`.
+
 A request chooses packs with `"ngram_packs": ["dotnet"]` (`[]` for none), else the model's own (`"ngram_packs"` in
 `--config`), else every loaded pack one of whose keywords appears in the current task (the user's latest message and
 the tool results since). `"ngram_lambda"` and `"ngram_scope"` (`code`, `members`, `all`) override per request. The
