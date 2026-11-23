@@ -360,6 +360,9 @@ public sealed class TextGenerator : IDisposable
     private readonly IReadOnlySet<int> _stopTokens;
     private readonly BatchScheduler? _batch;
 
+    /// <summary>Set false (<c>--no-loop-guard</c>) to let a reply repeat itself until its token limit.</summary>
+    public static bool LoopGuardEnabled { get; set; } = true;
+
     /// <summary>Set false (<c>--no-batch</c>) to run one request at a time even on the GPU engine.</summary>
     public static bool BatchingEnabled { get; set; } =
         Environment.GetEnvironmentVariable("AMQL_SERVER_BATCH")?.Trim() is not ("0" or "off" or "false");
@@ -506,6 +509,44 @@ public sealed class TextGenerator : IDisposable
 /// token budget or cancellation. Who runs the model (one session, or a batch of
 /// sequences) is not its concern.
 /// </summary>
+/// <summary>
+/// Whether a reply's own tail is one stretch said again and again, back to back: at least
+/// <see cref="Repeats"/> times and <see cref="Tokens"/> tokens in all, for a stretch of up to
+/// <see cref="LongestPeriod"/> tokens. Only the reply is read, never the prompt, so copying a
+/// path or a command from the conversation is never mistaken for a loop; and code that merely
+/// resembles itself line to line does not repeat token for token for that long.
+/// </summary>
+public static class LoopGuard
+{
+    public const int Repeats = 4, Tokens = 192, LongestPeriod = 256;
+
+    /// <summary>The loop the tail of <paramref name="reply"/> is in, looking no further back
+    /// than <paramref name="from"/>; null when it is in none.</summary>
+    public static (int Period, int Repeats)? Find(IReadOnlyList<int> reply, int from = 0)
+    {
+        int n = reply.Count;
+        if (n - from < Tokens)
+        {
+            return null;
+        }
+        for (int period = 1; period <= LongestPeriod && period * Repeats <= n - from; period++)
+        {
+            // How far back the tail keeps its period.
+            int k = 0;
+            while (n - 1 - k - period >= from && reply[n - 1 - k] == reply[n - 1 - k - period])
+            {
+                k++;
+            }
+            int span = k + period;
+            if (span >= Tokens && span / period >= Repeats)
+            {
+                return (period, span / period);
+            }
+        }
+        return null;
+    }
+}
+
 /// <summary>The current next-token logits of one reply, wherever they are.</summary>
 internal delegate ReadOnlySpan<float> LogitsRow();
 
@@ -526,6 +567,8 @@ internal sealed class GenerationRun
     private bool _forcePending;
     private string _emitted = string.Empty;
     private readonly JsonConstraint? _json;
+    private bool _thinkClosed;
+    private int _loopFrom;   // the loop guard looks only at tokens from here on
     private float[]? _masked;
     private LogitsRow _logits = null!;
     private EntailVerdict _verdict = EntailVerdict.Silence;
@@ -626,6 +669,10 @@ internal sealed class GenerationRun
         }
         _json?.Advance(_g.TokenText(token, _logits().Length));
         _generated.Add(token);
+        if (token == _g.ThinkClose)
+        {
+            _thinkClosed = true;
+        }
         if (_forcePending && _p.Thinking && token == _g.ThinkClose)
         {
             Enqueue("\n\n" + _p.Forced);
@@ -649,6 +696,25 @@ internal sealed class GenerationRun
         }
         safe = Math.Max(_emitted.Length, safe - _holdBack);
         Emit(text[..safe]);
+        if (TextGenerator.LoopGuardEnabled && _json is null && _generated.Count % 8 == 0 && LoopGuard.Find(_generated, _loopFrom) is { } loop)
+        {
+            if (_p.Thinking && !_thinkClosed && _g.ThinkClose is not null && _forced.Count == 0)
+            {
+                // Thinking that circles is closed, and the answer goes on from there.
+                Console.Error.WriteLine($"{DateTime.Now:HH:mm:ss.fff} loop guard: thinking repeats a {loop.Period}-token stretch {loop.Repeats} times; closing it");
+                foreach (int id in _g.Tokenizer.EncodeToIds("\n</think>\n\n"))
+                {
+                    _forced.Enqueue(id);
+                }
+                _loopFrom = _generated.Count;
+            }
+            else
+            {
+                Console.Error.WriteLine($"{DateTime.Now:HH:mm:ss.fff} loop guard: the reply repeats a {loop.Period}-token stretch {loop.Repeats} times; " +
+                                        $"stopped at {_generated.Count} tokens");
+                return Finish("length");
+            }
+        }
         return _generated.Count >= _budget ? Finish("length") : token;
     }
 

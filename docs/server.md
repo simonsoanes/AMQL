@@ -156,6 +156,19 @@ tools, calls and tool results), plain ChatML and Llama 3 — and tokenised witho
 - **Refused** (400, OpenAI error shape), rather than silently ignored: legacy `functions`, `n > 1`, audio, image
   or other non-text content parts, tool types other than functions, and the Responses API's `conversation`.
 
+### The loop guard
+
+A small model can fall into repeating itself: the same line of a file, again and again, until the token limit,
+which at a long agent context (47k tokens, ~140 tok/s) is minutes of nothing visible, since text inside an
+open call is only sent once the call closes. The server watches each reply's own tail: once one stretch (up to
+256 tokens) has repeated back to back at least 4 times and 192 tokens in all, a reply outside thinking ends
+there (`length` / `incomplete`; an open call comes back as text and is never run), and thinking is closed
+instead so the answer can follow. Only the reply is read, never the prompt, so copying a path or command from
+the conversation is never taken for a loop (what broke `no-copy`); lines that vary, even by one token, are not a
+loop either. The log says when it acts. Hydra's request that looped on one `this.Controls.Add(...)` line for
+32,000 tokens now ends after 424, in 4.7 s. `--no-loop-guard` turns it off; structured output is exempt (its
+grammar bounds it).
+
 ### Structured output
 
 `response_format` (chat: `{"type":"json_schema","json_schema":{"name","schema","strict"}}` or

@@ -45,6 +45,7 @@ for (int i = 0; i < args.Length; i++)
         case "--max-tokens": maxTokens = int.Parse(Next()); break;
         case "--no-warm": warm = false; break;
         case "--no-batch": TextGenerator.BatchingEnabled = false; break;
+        case "--no-loop-guard": TextGenerator.LoopGuardEnabled = false; break;
         case "--batch-bf16":
             // Batches of 4 or more run their projections on tensor cores (activations
             // rounded to BF16), as prompts already do: ~1.6x the throughput, but a reply
@@ -69,7 +70,7 @@ for (int i = 0; i < args.Length; i++)
                 amql-server --model [id=]<container-dir> [--model …] [--urls http://127.0.0.1:8000]
                             [--api-key KEY] [--max-tokens N] [--no-warm]
                             [--adapter [id=]<dir>[,<dir>…]] [--think] [--temperature T] [--top-p P] [--top-k K]
-                            [--config <models.json>] [--no-batch] [--batch-bf16]
+                            [--config <models.json>] [--no-batch] [--batch-bf16] [--no-loop-guard]
 
                 Serves each container on the endpoints it can answer:
                   Von decision model          POST /v1/decisions, /v1/systemone, /api/v1/decisions (jevai envelope)
@@ -88,6 +89,8 @@ for (int i = 0; i < args.Length; i++)
                   --temperature, --top-p, --top-k   sampling defaults for requests that leave them out
                   --no-batch    one request at a time per model, even on the GPU engine (which otherwise
                                 batches up to 8 requests per step)
+                  --no-loop-guard  let a reply repeat itself to its token limit (by default a reply whose
+                                own tail repeats a stretch 4+ times, 192+ tokens, is stopped, or its thinking closed)
                   --batch-bf16  batches of 4+ on tensor cores, activations rounded to BF16: ~1.6x the
                                 throughput, but a reply then depends slightly on what shares its batch
 

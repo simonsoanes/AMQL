@@ -519,4 +519,32 @@ public sealed class ServerToolTests : IClassFixture<ServerToolTests.ToolHost>
         Assert.Equal(HttpStatusCode.BadRequest, status);
         Assert.Contains("$ref", body["error"]!["message"]!.GetValue<string>());
     }
+
+    // ── the loop guard ──────────────────────────────────────────────────
+
+    [Fact]
+    public void The_Loop_Guard_Finds_A_Reply_Repeating_Itself_And_Nothing_Else()
+    {
+        var rng = new Random(5);
+        var prefix = Enumerable.Range(0, 60).Select(_ => rng.Next(1000)).ToList();
+        var line = Enumerable.Range(0, 23).Select(_ => rng.Next(1000)).ToList();   // a 23-token line
+
+        // The same line again and again: found once 4 rounds cover 192 tokens (9 rounds, 207).
+        var looping = prefix.Concat(Enumerable.Repeat(line, 12).SelectMany(x => x)).ToList();
+        int first = Enumerable.Range(1, looping.Count).First(n => LoopGuard.Find(looping.Take(n).ToList()) is not null);
+        Assert.Equal(60 + 192, first);
+        Assert.Equal((23, 8), LoopGuard.Find(looping.Take(first).ToList()));
+
+        // A one-token stutter is a loop too.
+        Assert.Equal(1, LoopGuard.Find(prefix.Concat(Enumerable.Repeat(7, 200)).ToList())?.Period);
+
+        // Lines that differ in one token each time (a counter, a name) are not a loop ...
+        var numbered = prefix.Concat(Enumerable.Range(0, 40).SelectMany(i => line.Take(22).Append(5000 + i))).ToList();
+        Assert.Null(LoopGuard.Find(numbered));
+        // ... nor a stretch repeated only 3 times, nor a long one under 192 tokens in all.
+        Assert.Null(LoopGuard.Find(prefix.Concat(Enumerable.Repeat(Enumerable.Range(0, 70).ToList(), 3).SelectMany(x => x)).ToList()));
+        Assert.Null(LoopGuard.Find(prefix.Concat(Enumerable.Repeat(line, 8).SelectMany(x => x)).ToList()));
+        // ... and nothing before `from` counts (after thinking was closed for circling).
+        Assert.Null(LoopGuard.Find(looping, from: looping.Count - 100));
+    }
 }
