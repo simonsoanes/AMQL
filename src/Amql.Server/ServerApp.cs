@@ -29,7 +29,42 @@ public sealed class ApiException : Exception
     }
 }
 
-public sealed record ServerSettings(string? ApiKey = null, int DefaultMaxTokens = 1024);
+/// <param name="Think">Think before answering when a request does not say.</param>
+/// <param name="Temperature">Sampling defaults for requests that leave them out.</param>
+public sealed record ServerSettings(string? ApiKey = null, int DefaultMaxTokens = 1024, bool Think = false,
+    float? Temperature = null, float? TopP = null, int? TopK = null);
+
+/// <summary>Responses kept for <c>previous_response_id</c>: each response's
+/// conversation (its instructions excluded), the newest few hundred, in memory.</summary>
+public sealed class ResponseStore
+{
+    private readonly int _capacity;
+    private readonly Dictionary<string, IReadOnlyList<ChatMessage>> _kept = new(StringComparer.Ordinal);
+    private readonly Queue<string> _order = new();
+
+    public ResponseStore(int capacity = 512) => _capacity = capacity;
+
+    public IReadOnlyList<ChatMessage>? Get(string id)
+    {
+        lock (_kept)
+        {
+            return _kept.GetValueOrDefault(id);
+        }
+    }
+
+    public void Put(string id, IReadOnlyList<ChatMessage> conversation)
+    {
+        lock (_kept)
+        {
+            _kept[id] = conversation;
+            _order.Enqueue(id);
+            while (_order.Count > _capacity)
+            {
+                _kept.Remove(_order.Dequeue());
+            }
+        }
+    }
+}
 
 /// <summary>
 /// The HTTP surface of amql-server. Every endpoint is offered only for models
@@ -91,15 +126,11 @@ public static class ServerApp
         app.MapGet("/v1/models", () => Results.Json(new JsonObject
         {
             ["object"] = "list",
-            ["data"] = new JsonArray(models.Select(m => (JsonNode?)new JsonObject
-            {
-                ["id"] = m.Id,
-                ["object"] = "model",
-                ["created"] = m.Created,
-                ["owned_by"] = "amql",
-                ["capabilities"] = new JsonArray(CapabilityNames(m.Capabilities).Select(c => (JsonNode?)c).ToArray()),
-            }).ToArray()),
+            ["data"] = new JsonArray(models.Select(m => (JsonNode?)ModelJson(m, settings)).ToArray()),
         }, Json));
+        app.MapGet("/v1/models/{id}", (string id) => models.FirstOrDefault(m => m.Id == id) is { } model
+            ? Results.Json(ModelJson(model, settings), Json)
+            : throw new ApiException(404, $"The model '{id}' does not exist", code: "model_not_found", param: "model"));
 
         // Cast to Delegate: a lambda over HttpContext alone otherwise binds as a
         // RequestDelegate, which discards the returned IResult (an empty 200).
@@ -109,9 +140,52 @@ public static class ServerApp
         app.MapPost("/v1/embeddings", (Delegate)((HttpContext ctx) => Embeddings(ctx, models)));
         app.MapPost("/v1/classify", (Delegate)((HttpContext ctx) => Classify(ctx, models)));
         app.MapPost("/v1/chat/completions", (HttpContext ctx) => ChatCompletions(ctx, models, settings));
-        app.MapPost("/v1/responses", (HttpContext ctx) => Responses(ctx, models, settings));
+        var responses = new ResponseStore();
+        app.MapPost("/v1/responses", (HttpContext ctx) => Responses(ctx, models, settings, responses));
         return app;
     }
+
+    /// <summary>A model as <c>/v1/models</c> lists it: OpenAI's fields, then
+    /// what it serves and, for a chat model, its context, whether it takes
+    /// tools and thinks, its adapters, and the defaults it applies.</summary>
+    private static JsonObject ModelJson(ModelHost m, ServerSettings settings)
+    {
+        var o = new JsonObject
+        {
+            ["id"] = m.Id,
+            ["object"] = "model",
+            ["created"] = m.Created,
+            ["owned_by"] = "amql",
+            ["capabilities"] = new JsonArray(CapabilityNames(m.Capabilities).Select(c => (JsonNode?)c).ToArray()),
+        };
+        if (m.Generator is { } g)
+        {
+            o["context_length"] = g.ContextLength == int.MaxValue ? null : g.ContextLength;
+            o["tools"] = g.RendersTools;
+            o["thinking"] = g.Thinks;
+            o["adapters"] = new JsonArray(m.AdapterNames.Select(a => (JsonNode?)a).ToArray());
+            o["concurrency"] = g.Concurrency;
+            if (g.BatchRefusal is { } why)
+            {
+                o["batching"] = why;
+            }
+            o["defaults"] = new JsonObject
+            {
+                ["think"] = g.Thinks && Think(m, settings),
+                ["max_tokens"] = MaxTokens(m, settings),
+                ["temperature"] = m.Defaults.Temperature ?? settings.Temperature ?? 1f,
+                ["top_p"] = m.Defaults.TopP ?? settings.TopP ?? 1f,
+                ["top_k"] = m.Defaults.TopK ?? settings.TopK ?? 0,
+            };
+        }
+        return o;
+    }
+
+    private static bool Think(ModelHost m, ServerSettings settings) => m.Defaults.Think ?? settings.Think;
+
+    /// <summary>A model that thinks by default gets room to think: 4096 unless it or the server says otherwise.</summary>
+    private static int MaxTokens(ModelHost m, ServerSettings settings) =>
+        m.Defaults.MaxTokens ?? (m.Defaults.Think == true && !settings.Think && settings.DefaultMaxTokens < 4096 ? 4096 : settings.DefaultMaxTokens);
 
     public static IEnumerable<string> CapabilityNames(Capability c)
     {
@@ -392,7 +466,7 @@ public static class ServerApp
         using var doc = await ReadBody(ctx);
         var body = doc.RootElement;
         var model = Route(models, body, Capability.Chat);
-        RefuseUnsupported(body, "tools", "functions", "audio", "prediction");
+        RefuseUnsupported(body, "functions", "audio", "prediction");
         if (body.TryGetProperty("n", out var n) && n.ValueKind == JsonValueKind.Number && n.GetInt32() != 1)
         {
             throw new ApiException(400, "only n=1 is supported", param: "n");
@@ -407,8 +481,7 @@ public static class ServerApp
             throw new ApiException(400, "'messages' must be a non-empty array", param: "messages");
         }
         var messages = msgs.EnumerateArray().Select((m, i) => ChatMessageFrom(m, $"messages[{i}]")).ToList();
-        int maxTokens = IntField(body, "max_completion_tokens") ?? IntField(body, "max_tokens") ?? settings.DefaultMaxTokens;
-        var p = Sampling(body, maxTokens);
+        int maxTokens = IntField(body, "max_completion_tokens") ?? IntField(body, "max_tokens") ?? MaxTokens(model, settings);
 
         // logprobs: accepts both { "logprobs": true } and { "logprobs": true, "top_logprobs": K }.
         int? logprobsTopK = null;
@@ -427,18 +500,39 @@ public static class ServerApp
             }
         }
 
-        bool thinking = body.TryGetProperty("chat_template_kwargs", out var kw) && kw.ValueKind == JsonValueKind.Object &&
-                        kw.TryGetProperty("enable_thinking", out var et) && et.ValueKind == JsonValueKind.True;
-        int[] prompt = Prompt(model, messages, thinking);
+        var tools = ChatTools(body, model);
+        var turn = Turn(model, body, settings, messages, tools, maxTokens, ChatEffort(body));
 
         string id = "chatcmpl-" + Guid.NewGuid().ToString("N");
         long created = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         bool stream = body.TryGetProperty("stream", out var s) && s.ValueKind == JsonValueKind.True;
+        var callIds = new List<string>();
+        string CallId(int index)
+        {
+            while (callIds.Count <= index)
+            {
+                callIds.Add("call_" + Guid.NewGuid().ToString("N")[..24]);
+            }
+            return callIds[index];
+        }
 
         if (!stream)
         {
-            var result = await Locked(model, ctx.RequestAborted,
-                () => Run(model, prompt, p, null, ctx.RequestAborted, logprobsTopK));
+            var (result, reply) = await Locked(model, ctx.RequestAborted, () => Run(model, turn, null, ctx.RequestAborted, logprobsTopK));
+            var message = new JsonObject
+            {
+                ["role"] = "assistant",
+                ["content"] = reply.Content.Length == 0 && reply.ToolCalls.Count > 0 ? null : reply.Content,
+                ["refusal"] = null,
+            };
+            if (reply.Thought && reply.Reasoning.Length > 0)
+            {
+                message["reasoning_content"] = reply.Reasoning;
+            }
+            if (reply.ToolCalls.Count > 0)
+            {
+                message["tool_calls"] = new JsonArray(reply.ToolCalls.Select((c, i) => (JsonNode?)ToolCallJson(c, CallId(i), null)).ToArray());
+            }
             await ctx.Response.WriteAsJsonAsync(new JsonObject
             {
                 ["id"] = id,
@@ -448,9 +542,9 @@ public static class ServerApp
                 ["choices"] = new JsonArray(new JsonObject
                 {
                     ["index"] = 0,
-                    ["message"] = new JsonObject { ["role"] = "assistant", ["content"] = result.Text, ["refusal"] = null },
+                    ["message"] = message,
                     ["logprobs"] = ChatLogprobsJson(result, model.Generator!.Tokenizer),
-                    ["finish_reason"] = result.FinishReason,
+                    ["finish_reason"] = FinishReason(result, reply),
                 }),
                 ["usage"] = ChatUsage(result),
             }, Json);
@@ -470,22 +564,54 @@ public static class ServerApp
                 ["index"] = 0, ["delta"] = delta, ["logprobs"] = null, ["finish_reason"] = finish,
             }),
         };
-        await StreamSse(ctx, model, prompt, p, logprobsTopK,
-            start: w => w(null, Chunk(new JsonObject { ["role"] = "assistant", ["content"] = "" }, null)),
-            delta: (w, text) => w(null, Chunk(new JsonObject { ["content"] = text }, null)),
-            finish: (w, result) =>
+        await StreamSse(ctx, model, write =>
+        {
+            write(null, Chunk(new JsonObject { ["role"] = "assistant", ["content"] = "" }, null));
+            var (result, reply) = Run(model, turn, e =>
             {
-                w(null, Chunk(new JsonObject(), result.FinishReason));
-                if (includeUsage)
+                switch (e)
                 {
-                    var usage = Chunk(new JsonObject(), null);
-                    usage["choices"] = new JsonArray();
-                    usage["usage"] = ChatUsage(result);
-                    w(null, usage);
+                    case ReplyEvent.Reasoning r:
+                        write(null, Chunk(new JsonObject { ["reasoning_content"] = r.Delta }, null));
+                        break;
+                    case ReplyEvent.Content c:
+                        write(null, Chunk(new JsonObject { ["content"] = c.Delta }, null));
+                        break;
+                    case ReplyEvent.ToolCall t:
+                        write(null, Chunk(new JsonObject
+                        {
+                            ["tool_calls"] = new JsonArray(ToolCallJson(t.Call, CallId(t.Index), t.Index)),
+                        }, null));
+                        break;
                 }
-            },
-            done: true);
+            }, ctx.RequestAborted, logprobsTopK);
+            write(null, Chunk(new JsonObject(), FinishReason(result, reply)));
+            if (includeUsage)
+            {
+                var usage = Chunk(new JsonObject(), null);
+                usage["choices"] = new JsonArray();
+                usage["usage"] = ChatUsage(result);
+                write(null, usage);
+            }
+            return true;
+        });
     }
+
+    private static JsonObject ToolCallJson(ParsedToolCall call, string callId, int? index)
+    {
+        var o = new JsonObject();
+        if (index is { } i)
+        {
+            o["index"] = i;
+        }
+        o["id"] = callId;
+        o["type"] = "function";
+        o["function"] = new JsonObject { ["name"] = call.Name, ["arguments"] = call.Arguments };
+        return o;
+    }
+
+    private static string FinishReason(GenerationResult result, ReplyParser reply) =>
+        reply.ToolCalls.Count > 0 ? "tool_calls" : result.FinishReason;
 
     private static JsonObject ChatUsage(GenerationResult r) => new()
     {
@@ -494,78 +620,84 @@ public static class ServerApp
         ["total_tokens"] = r.PromptTokens + r.CompletionTokens,
     };
 
+    /// <summary>A chat request's tools, as the template renders them: each
+    /// <c>{"type":"function","function":{…}}</c> exactly as the client sent it.</summary>
+    private static List<JsonElement>? ChatTools(JsonElement body, ModelHost model)
+    {
+        if (!body.TryGetProperty("tools", out var tools) || tools.ValueKind == JsonValueKind.Null)
+        {
+            return null;
+        }
+        if (tools.ValueKind != JsonValueKind.Array)
+        {
+            throw new ApiException(400, "'tools' must be an array", param: "tools");
+        }
+        var list = new List<JsonElement>();
+        int i = 0;
+        foreach (var t in tools.EnumerateArray())
+        {
+            if (t.ValueKind != JsonValueKind.Object || !t.TryGetProperty("type", out var type) || type.GetString() != "function"
+                || !t.TryGetProperty("function", out var f) || f.ValueKind != JsonValueKind.Object
+                || !f.TryGetProperty("name", out var name) || name.ValueKind != JsonValueKind.String)
+            {
+                throw new ApiException(400, $"tools[{i}] must be {{\"type\":\"function\",\"function\":{{\"name\":…}}}}", param: $"tools[{i}]");
+            }
+            list.Add(t.Clone());
+            i++;
+        }
+        return list.Count == 0 ? null : list;
+    }
+
     // ── responses ────────────────────────────────────────────────────────
 
-    private static async Task Responses(HttpContext ctx, IReadOnlyList<ModelHost> models, ServerSettings settings)
+    private static async Task Responses(HttpContext ctx, IReadOnlyList<ModelHost> models, ServerSettings settings, ResponseStore store)
     {
         using var doc = await ReadBody(ctx);
         var body = doc.RootElement;
         var model = Route(models, body, Capability.Chat);
-        RefuseUnsupported(body, "tools", "previous_response_id", "conversation", "prompt", "reasoning");
+        RefuseUnsupported(body, "conversation", "prompt");
         if (body.TryGetProperty("text", out var textOpt) && textOpt.ValueKind == JsonValueKind.Object &&
             textOpt.TryGetProperty("format", out var fmt) && fmt.TryGetProperty("type", out var ft) && ft.GetString() != "text")
         {
             throw new ApiException(400, "structured output (text.format) is not supported", param: "text.format");
         }
 
+        // An earlier response's conversation continues, without its instructions.
         var messages = new List<ChatMessage>();
-        if (body.TryGetProperty("instructions", out var ins) && ins.ValueKind == JsonValueKind.String)
+        string? previous = body.TryGetProperty("previous_response_id", out var prev) && prev.ValueKind == JsonValueKind.String ? prev.GetString() : null;
+        if (previous is not null)
         {
-            messages.Add(new ChatMessage("system", ins.GetString()!));
+            messages.AddRange(store.Get(previous)
+                ?? throw new ApiException(404, $"Previous response with id '{previous}' not found.", code: "previous_response_not_found",
+                    param: "previous_response_id"));
         }
         if (!body.TryGetProperty("input", out var input))
         {
             throw new ApiException(400, "'input' is required", param: "input");
         }
-        if (input.ValueKind == JsonValueKind.String)
+        messages.AddRange(ResponseInput(input));
+        string? instructions = body.TryGetProperty("instructions", out var ins) && ins.ValueKind == JsonValueKind.String ? ins.GetString() : null;
+        var history = messages.Where(m => m.Role != "system").ToList();
+        var systems = messages.Where(m => m.Role == "system").Select(m => m.Content).ToList();
+        if (instructions is not null)
         {
-            messages.Add(new ChatMessage("user", input.GetString()!));
+            systems.Insert(0, instructions);
         }
-        else if (input.ValueKind == JsonValueKind.Array)
-        {
-            int i = 0;
-            foreach (var item in input.EnumerateArray())
-            {
-                if (item.TryGetProperty("type", out var type) && type.GetString() is { } t && t != "message")
-                {
-                    throw new ApiException(400, $"input item type '{t}' is not supported (only messages)", param: $"input[{i}]");
-                }
-                var m = ChatMessageFrom(item, $"input[{i}]");
-                messages.Add(m.Role == "developer" ? m with { Role = "system" } : m);
-                i++;
-            }
-        }
-        else
-        {
-            throw new ApiException(400, "'input' must be a string or an array of messages", param: "input");
-        }
-        if (messages.Count(m => m.Role == "system") > 1)
-        {
-            // instructions + a system/developer message: one system turn, in order.
-            string merged = string.Join("\n\n", messages.Where(m => m.Role == "system").Select(m => m.Content));
-            messages = messages.Where(m => m.Role != "system").Prepend(new ChatMessage("system", merged)).ToList();
-        }
+        var conversation = systems.Count == 0 ? history
+            : history.Prepend(new ChatMessage("system", string.Join("\n\n", systems))).ToList();
 
-        int maxTokens = IntField(body, "max_output_tokens") ?? settings.DefaultMaxTokens;
-        var p = Sampling(body, maxTokens);
-        int[] prompt = Prompt(model, messages, enableThinking: false);
+        int maxTokens = IntField(body, "max_output_tokens") ?? MaxTokens(model, settings);
+        var tools = ResponseTools(body);
+        string? effort = body.TryGetProperty("reasoning", out var reasoningOpt) && reasoningOpt.ValueKind == JsonValueKind.Object
+            && reasoningOpt.TryGetProperty("effort", out var eff) && eff.ValueKind == JsonValueKind.String ? eff.GetString() : null;
+        var turn = Turn(model, body, settings, conversation, tools, maxTokens, effort);
+        bool keep = !(body.TryGetProperty("store", out var st) && st.ValueKind == JsonValueKind.False);
 
         string id = "resp_" + Guid.NewGuid().ToString("N");
-        string itemId = "msg_" + Guid.NewGuid().ToString("N");
         long created = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         bool stream = body.TryGetProperty("stream", out var s) && s.ValueKind == JsonValueKind.True;
+        var output = new ResponseOutput();
 
-        JsonObject Message(string text, string status) => new()
-        {
-            ["type"] = "message",
-            ["id"] = itemId,
-            ["status"] = status,
-            ["role"] = "assistant",
-            ["content"] = new JsonArray(new JsonObject
-            {
-                ["type"] = "output_text", ["text"] = text, ["annotations"] = new JsonArray(),
-            }),
-        };
         JsonObject Response(string status, GenerationResult? result) => new()
         {
             ["id"] = id,
@@ -573,12 +705,17 @@ public static class ServerApp
             ["created_at"] = created,
             ["status"] = status,
             ["model"] = model.Id,
-            ["output"] = result is null ? new JsonArray() : new JsonArray(Message(result.Text, status == "incomplete" ? "incomplete" : "completed")),
+            ["output"] = result is null ? new JsonArray() : output.Items(),
             ["incomplete_details"] = status == "incomplete" ? new JsonObject { ["reason"] = "max_output_tokens" } : null,
-            ["instructions"] = body.TryGetProperty("instructions", out var i2) && i2.ValueKind == JsonValueKind.String ? i2.GetString() : null,
+            ["instructions"] = instructions,
             ["max_output_tokens"] = IntField(body, "max_output_tokens"),
-            ["temperature"] = p.Temperature,
-            ["top_p"] = p.TopP,
+            ["previous_response_id"] = previous,
+            ["temperature"] = turn.Params.Temperature,
+            ["top_p"] = turn.Params.TopP,
+            ["parallel_tool_calls"] = turn.Parallel,
+            ["tool_choice"] = body.TryGetProperty("tool_choice", out var tc) ? JsonNode.Parse(tc.GetRawText()) : "auto",
+            ["tools"] = body.TryGetProperty("tools", out var tl) && tl.ValueKind == JsonValueKind.Array ? JsonNode.Parse(tl.GetRawText()) : new JsonArray(),
+            ["store"] = keep,
             ["error"] = null,
             ["usage"] = result is null ? null : new JsonObject
             {
@@ -587,122 +724,489 @@ public static class ServerApp
                 ["total_tokens"] = result.PromptTokens + result.CompletionTokens,
             },
         };
-        static string StatusOf(GenerationResult r) => r.FinishReason == "length" ? "incomplete" : "completed";
+        string StatusOf(GenerationResult r, ReplyParser reply) =>
+            reply.ToolCalls.Count == 0 && r.FinishReason == "length" ? "incomplete" : "completed";
+        void Remember(ReplyParser reply)
+        {
+            if (keep)
+            {
+                store.Put(id, history.Append(new ChatMessage("assistant", reply.Content)
+                {
+                    Reasoning = reply.Thought ? reply.Reasoning : null,
+                    ToolCalls = reply.ToolCalls.Select(c => new ChatToolCall(c.Name, JsonDocument.Parse(c.Arguments).RootElement.Clone())).ToList(),
+                }).ToList());
+            }
+        }
 
         if (!stream)
         {
-            var result = await Locked(model, ctx.RequestAborted, () => Run(model, prompt, p, null, ctx.RequestAborted, null));
-            await ctx.Response.WriteAsJsonAsync(Response(StatusOf(result), result), Json);
+            var (result, reply) = await Locked(model, ctx.RequestAborted, () => Run(model, turn, null, ctx.RequestAborted, null));
+            output.Complete(reply, StatusOf(result, reply));
+            Remember(reply);
+            await ctx.Response.WriteAsJsonAsync(Response(StatusOf(result, reply), result), Json);
             return;
         }
 
         int sequence = 0;
-        JsonObject Event(string type, JsonObject fields)
+        await StreamSse(ctx, model, write =>
         {
-            fields["type"] = type;
-            fields["sequence_number"] = sequence++;
-            return fields;
+            void Event(string type, JsonObject fields)
+            {
+                fields["type"] = type;
+                fields["sequence_number"] = sequence++;
+                write(type, fields);
+            }
+            Event("response.created", new JsonObject { ["response"] = Response("in_progress", null) });
+            Event("response.in_progress", new JsonObject { ["response"] = Response("in_progress", null) });
+            var (result, reply) = Run(model, turn, e => output.Stream(e, Event), ctx.RequestAborted, null);
+            string status = StatusOf(result, reply);
+            output.Finish(reply, status, Event);
+            Remember(reply);
+            string type = status == "incomplete" ? "response.incomplete" : "response.completed";
+            Event(type, new JsonObject { ["response"] = Response(status, result) });
+            return false;
+        });
+    }
+
+    /// <summary>The Responses API's input: a string, or items — messages,
+    /// <c>function_call</c>, <c>function_call_output</c> and <c>reasoning</c>
+    /// — folded into chat turns: calls join the assistant turn before them,
+    /// reasoning the assistant turn after it.</summary>
+    private static List<ChatMessage> ResponseInput(JsonElement input)
+    {
+        if (input.ValueKind == JsonValueKind.String)
+        {
+            return new List<ChatMessage> { new("user", input.GetString()!) };
         }
-        var text = new StringBuilder();
-        await StreamSse(ctx, model, prompt, p, null,
-            start: w =>
+        if (input.ValueKind != JsonValueKind.Array)
+        {
+            throw new ApiException(400, "'input' must be a string or an array of items", param: "input");
+        }
+        var messages = new List<ChatMessage>();
+        string? reasoning = null;
+        int i = 0;
+        foreach (var item in input.EnumerateArray())
+        {
+            string where = $"input[{i++}]";
+            string type = item.TryGetProperty("type", out var t) && t.ValueKind == JsonValueKind.String ? t.GetString()! : "message";
+            switch (type)
             {
-                w("response.created", Event("response.created", new JsonObject { ["response"] = Response("in_progress", null) }));
-                w("response.in_progress", Event("response.in_progress", new JsonObject { ["response"] = Response("in_progress", null) }));
-                w("response.output_item.added", Event("response.output_item.added", new JsonObject
+                case "message":
                 {
-                    ["output_index"] = 0, ["item"] = Message("", "in_progress"),
-                }));
-                w("response.content_part.added", Event("response.content_part.added", new JsonObject
+                    var m = ChatMessageFrom(item, where);
+                    if (m.Role == "assistant" && reasoning is not null)
+                    {
+                        m = m with { Reasoning = reasoning };
+                        reasoning = null;
+                    }
+                    messages.Add(m);
+                    break;
+                }
+                case "function_call":
                 {
-                    ["item_id"] = itemId, ["output_index"] = 0, ["content_index"] = 0,
-                    ["part"] = new JsonObject { ["type"] = "output_text", ["text"] = "", ["annotations"] = new JsonArray() },
-                }));
-            },
-            delta: (w, d) =>
+                    string name = item.TryGetProperty("name", out var nm) && nm.ValueKind == JsonValueKind.String ? nm.GetString()!
+                        : throw new ApiException(400, $"{where}: a function_call needs a 'name'", param: where);
+                    var call = new ChatToolCall(name, Arguments(item.TryGetProperty("arguments", out var a) ? a : default, where));
+                    if (messages.Count > 0 && messages[^1].Role == "assistant")
+                    {
+                        var last = messages[^1];
+                        messages[^1] = last with { ToolCalls = (last.ToolCalls ?? Array.Empty<ChatToolCall>()).Append(call).ToList() };
+                    }
+                    else
+                    {
+                        messages.Add(new ChatMessage("assistant", "") { ToolCalls = new[] { call }, Reasoning = reasoning });
+                        reasoning = null;
+                    }
+                    break;
+                }
+                case "function_call_output":
+                {
+                    var o = item.TryGetProperty("output", out var ov) ? ov : default;
+                    messages.Add(new ChatMessage("tool", o.ValueKind switch
+                    {
+                        JsonValueKind.String => o.GetString()!,
+                        JsonValueKind.Array => PartsText(o, where),
+                        _ => throw new ApiException(400, $"{where}: 'output' must be a string or text parts", param: where),
+                    }));
+                    break;
+                }
+                case "reasoning":
+                {
+                    var sb = new StringBuilder();
+                    foreach (string field in new[] { "content", "summary" })
+                    {
+                        if (sb.Length == 0 && item.TryGetProperty(field, out var parts) && parts.ValueKind == JsonValueKind.Array)
+                        {
+                            foreach (var part in parts.EnumerateArray())
+                            {
+                                if (part.TryGetProperty("text", out var tx) && tx.ValueKind == JsonValueKind.String)
+                                {
+                                    sb.Append(tx.GetString());
+                                }
+                            }
+                        }
+                    }
+                    reasoning = sb.ToString();
+                    break;
+                }
+                default:
+                    throw new ApiException(400, $"input item type '{type}' is not supported (message, function_call, function_call_output, reasoning)", param: where);
+            }
+        }
+        return messages;
+    }
+
+    /// <summary>The Responses API's function tools, in the chat form the
+    /// template renders.</summary>
+    private static List<JsonElement>? ResponseTools(JsonElement body)
+    {
+        if (!body.TryGetProperty("tools", out var tools) || tools.ValueKind == JsonValueKind.Null)
+        {
+            return null;
+        }
+        if (tools.ValueKind != JsonValueKind.Array)
+        {
+            throw new ApiException(400, "'tools' must be an array", param: "tools");
+        }
+        var list = new List<JsonElement>();
+        int i = 0;
+        foreach (var t in tools.EnumerateArray())
+        {
+            string type = t.TryGetProperty("type", out var ty) && ty.ValueKind == JsonValueKind.String ? ty.GetString()! : "";
+            if (type != "function")
             {
-                text.Append(d);
-                w("response.output_text.delta", Event("response.output_text.delta", new JsonObject
-                {
-                    ["item_id"] = itemId, ["output_index"] = 0, ["content_index"] = 0, ["delta"] = d,
-                }));
-            },
-            finish: (w, result) =>
+                throw new ApiException(400, $"tools[{i}]: tool type '{type}' is not supported (function only)", param: $"tools[{i}]");
+            }
+            if (!t.TryGetProperty("name", out var name) || name.ValueKind != JsonValueKind.String)
             {
-                w("response.output_text.done", Event("response.output_text.done", new JsonObject
-                {
-                    ["item_id"] = itemId, ["output_index"] = 0, ["content_index"] = 0, ["text"] = result.Text,
-                }));
-                w("response.content_part.done", Event("response.content_part.done", new JsonObject
-                {
-                    ["item_id"] = itemId, ["output_index"] = 0, ["content_index"] = 0,
-                    ["part"] = new JsonObject { ["type"] = "output_text", ["text"] = result.Text, ["annotations"] = new JsonArray() },
-                }));
-                string status = StatusOf(result);
-                w("response.output_item.done", Event("response.output_item.done", new JsonObject
-                {
-                    ["output_index"] = 0, ["item"] = Message(result.Text, status == "incomplete" ? "incomplete" : "completed"),
-                }));
-                string type = status == "incomplete" ? "response.incomplete" : "response.completed";
-                w(type, Event(type, new JsonObject { ["response"] = Response(status, result) }));
-            },
-            done: false);
+                throw new ApiException(400, $"tools[{i}] needs a 'name'", param: $"tools[{i}]");
+            }
+            var function = new JsonObject { ["name"] = name.GetString() };
+            if (t.TryGetProperty("description", out var d) && d.ValueKind == JsonValueKind.String)
+            {
+                function["description"] = d.GetString();
+            }
+            if (t.TryGetProperty("parameters", out var p) && p.ValueKind == JsonValueKind.Object)
+            {
+                function["parameters"] = JsonNode.Parse(p.GetRawText());
+            }
+            list.Add(JsonDocument.Parse(new JsonObject { ["type"] = "function", ["function"] = function }.ToJsonString(Json)).RootElement.Clone());
+            i++;
+        }
+        return list.Count == 0 ? null : list;
+    }
+
+    /// <summary>The output items of one response as they are generated —
+    /// reasoning, then the message, then each call — and the stream events
+    /// that open, fill and close them.</summary>
+    private sealed class ResponseOutput
+    {
+        private readonly List<JsonObject> _items = new();
+        private readonly StringBuilder _reasoning = new();
+        private readonly StringBuilder _text = new();
+        private int _reasoningAt = -1, _messageAt = -1;
+        private bool _reasoningOpen, _messageOpen;
+
+        public JsonArray Items() => new(_items.Select(i => (JsonNode?)i.DeepClone()).ToArray());
+
+        private static JsonObject Reasoning(string id, string text, string status) => new()
+        {
+            ["type"] = "reasoning", ["id"] = id, ["status"] = status, ["summary"] = new JsonArray(),
+            ["content"] = new JsonArray(new JsonObject { ["type"] = "reasoning_text", ["text"] = text }),
+        };
+
+        private static JsonObject Message(string id, string text, string status) => new()
+        {
+            ["type"] = "message", ["id"] = id, ["status"] = status, ["role"] = "assistant",
+            ["content"] = new JsonArray(new JsonObject { ["type"] = "output_text", ["text"] = text, ["annotations"] = new JsonArray() }),
+        };
+
+        private static JsonObject Call(ParsedToolCall c, string status) => new()
+        {
+            ["type"] = "function_call", ["id"] = "fc_" + Guid.NewGuid().ToString("N"), ["status"] = status,
+            ["call_id"] = "call_" + Guid.NewGuid().ToString("N")[..24], ["name"] = c.Name, ["arguments"] = c.Arguments,
+        };
+
+        private static string Id(string prefix) => prefix + Guid.NewGuid().ToString("N");
+
+        /// <summary>The whole output at once, for a response that is not streamed.</summary>
+        public void Complete(ReplyParser reply, string status)
+        {
+            if (reply.Thought && reply.Reasoning.Length > 0)
+            {
+                _items.Add(Reasoning(Id("rs_"), reply.Reasoning, "completed"));
+            }
+            if (reply.Content.Length > 0 || reply.ToolCalls.Count == 0)
+            {
+                _items.Add(Message(Id("msg_"), reply.Content, status == "incomplete" ? "incomplete" : "completed"));
+            }
+            foreach (var c in reply.ToolCalls)
+            {
+                _items.Add(Call(c, "completed"));
+            }
+        }
+
+        public void Stream(ReplyEvent e, Action<string, JsonObject> emit)
+        {
+            switch (e)
+            {
+                case ReplyEvent.Reasoning r:
+                    if (!_reasoningOpen)
+                    {
+                        _reasoningOpen = true;
+                        _reasoningAt = _items.Count;
+                        _items.Add(Reasoning(Id("rs_"), "", "in_progress"));
+                        emit("response.output_item.added", new JsonObject { ["output_index"] = _reasoningAt, ["item"] = _items[_reasoningAt].DeepClone() });
+                        emit("response.content_part.added", Part(_reasoningAt, new JsonObject { ["type"] = "reasoning_text", ["text"] = "" }));
+                    }
+                    _reasoning.Append(r.Delta);
+                    emit("response.reasoning_text.delta", Delta(_reasoningAt, r.Delta));
+                    break;
+                case ReplyEvent.Content c:
+                    CloseReasoning(emit);
+                    if (!_messageOpen)
+                    {
+                        OpenMessage(emit);
+                    }
+                    _text.Append(c.Delta);
+                    emit("response.output_text.delta", Delta(_messageAt, c.Delta));
+                    break;
+                case ReplyEvent.ToolCall t:
+                    CloseReasoning(emit);
+                    CloseMessage(emit, "completed");
+                    var call = Call(t.Call, "in_progress");
+                    int at = _items.Count;
+                    _items.Add(call);
+                    var added = call.DeepClone().AsObject();
+                    added["arguments"] = "";
+                    emit("response.output_item.added", new JsonObject { ["output_index"] = at, ["item"] = added });
+                    emit("response.function_call_arguments.delta", new JsonObject
+                    {
+                        ["item_id"] = call["id"]!.GetValue<string>(), ["output_index"] = at, ["delta"] = t.Call.Arguments,
+                    });
+                    emit("response.function_call_arguments.done", new JsonObject
+                    {
+                        ["item_id"] = call["id"]!.GetValue<string>(), ["output_index"] = at, ["name"] = t.Call.Name, ["arguments"] = t.Call.Arguments,
+                    });
+                    call["status"] = "completed";
+                    emit("response.output_item.done", new JsonObject { ["output_index"] = at, ["item"] = call.DeepClone() });
+                    break;
+            }
+        }
+
+        /// <summary>Closes what is still open; a reply that said nothing still gets its (empty) message.</summary>
+        public void Finish(ReplyParser reply, string status, Action<string, JsonObject> emit)
+        {
+            CloseReasoning(emit);
+            if (_messageAt < 0 && reply.ToolCalls.Count == 0)
+            {
+                OpenMessage(emit);
+            }
+            CloseMessage(emit, status == "incomplete" ? "incomplete" : "completed");
+        }
+
+        private void OpenMessage(Action<string, JsonObject> emit)
+        {
+            _messageOpen = true;
+            _messageAt = _items.Count;
+            _items.Add(Message(Id("msg_"), "", "in_progress"));
+            emit("response.output_item.added", new JsonObject { ["output_index"] = _messageAt, ["item"] = _items[_messageAt].DeepClone() });
+            emit("response.content_part.added", Part(_messageAt, new JsonObject { ["type"] = "output_text", ["text"] = "", ["annotations"] = new JsonArray() }));
+        }
+
+        private void CloseReasoning(Action<string, JsonObject> emit)
+        {
+            if (!_reasoningOpen)
+            {
+                return;
+            }
+            _reasoningOpen = false;
+            string text = _reasoning.ToString();
+            var done = Part(_reasoningAt, null);
+            done["text"] = text;
+            emit("response.reasoning_text.done", done);
+            emit("response.content_part.done", Part(_reasoningAt, new JsonObject { ["type"] = "reasoning_text", ["text"] = text }));
+            _items[_reasoningAt] = Reasoning(_items[_reasoningAt]["id"]!.GetValue<string>(), text, "completed");
+            emit("response.output_item.done", new JsonObject { ["output_index"] = _reasoningAt, ["item"] = _items[_reasoningAt].DeepClone() });
+        }
+
+        private void CloseMessage(Action<string, JsonObject> emit, string status)
+        {
+            if (!_messageOpen)
+            {
+                return;
+            }
+            _messageOpen = false;
+            string text = _text.ToString();
+            var done = Part(_messageAt, null);
+            done["text"] = text;
+            emit("response.output_text.done", done);
+            emit("response.content_part.done", Part(_messageAt, new JsonObject { ["type"] = "output_text", ["text"] = text, ["annotations"] = new JsonArray() }));
+            _items[_messageAt] = Message(_items[_messageAt]["id"]!.GetValue<string>(), text, status);
+            emit("response.output_item.done", new JsonObject { ["output_index"] = _messageAt, ["item"] = _items[_messageAt].DeepClone() });
+        }
+
+        private JsonObject Part(int at, JsonObject? part)
+        {
+            var o = new JsonObject { ["item_id"] = _items[at]["id"]!.GetValue<string>(), ["output_index"] = at, ["content_index"] = 0 };
+            if (part is not null)
+            {
+                o["part"] = part;
+            }
+            return o;
+        }
+
+        private JsonObject Delta(int at, string delta)
+        {
+            var o = Part(at, null);
+            o["delta"] = delta;
+            return o;
+        }
     }
 
     // ── shared generation plumbing ───────────────────────────────────────
 
-    private static int[] Prompt(ModelHost model, IReadOnlyList<ChatMessage> messages, bool enableThinking)
+    /// <summary>One turn to generate: the prompt, how to sample it, and how to
+    /// read the reply.</summary>
+    private sealed record ChatTurn(int[] Prompt, GenerationParams Params, IReadOnlyList<JsonElement>? Tools, bool Parallel);
+
+    /// <summary>Renders a request into a turn: thinking from
+    /// <c>chat_template_kwargs.enable_thinking</c>, then the reasoning effort
+    /// (<c>none</c>/<c>minimal</c> turn it off), then the server's default;
+    /// tools unless <c>tool_choice</c> is <c>none</c>, with <c>required</c> or a
+    /// named function enforced by writing the start of the call for the model.</summary>
+    private static ChatTurn Turn(ModelHost model, JsonElement body, ServerSettings settings, List<ChatMessage> messages,
+        List<JsonElement>? tools, int maxTokens, string? effort)
     {
+        var generator = model.Generator!;
+        bool thinking = Think(model, settings);
+        if (effort is not null)
+        {
+            thinking = effort is not ("none" or "minimal");
+        }
+        if (body.TryGetProperty("chat_template_kwargs", out var kw) && kw.ValueKind == JsonValueKind.Object &&
+            kw.TryGetProperty("enable_thinking", out var et) && et.ValueKind is JsonValueKind.True or JsonValueKind.False)
+        {
+            thinking = et.ValueKind == JsonValueKind.True;
+        }
+        thinking &= generator.Thinks;
+
+        string? forced = null;
+        if (body.TryGetProperty("tool_choice", out var choice) && choice.ValueKind != JsonValueKind.Null)
+        {
+            string? named = choice.ValueKind == JsonValueKind.Object
+                ? (choice.TryGetProperty("function", out var cf) && cf.TryGetProperty("name", out var cn) ? cn.GetString()
+                    : choice.TryGetProperty("name", out var rn) ? rn.GetString() : null)
+                  ?? throw new ApiException(400, "'tool_choice' names no function", param: "tool_choice")
+                : null;
+            string mode = choice.ValueKind == JsonValueKind.String ? choice.GetString()! : "function";
+            switch (mode)
+            {
+                case "none":
+                    tools = null;
+                    break;
+                case "auto":
+                    break;
+                case "required" when tools is not null:
+                    forced = "<tool_call>\n<function=";
+                    break;
+                case "function" when tools is not null:
+                    if (!tools.Any(t => ToolName(t) == named))
+                    {
+                        throw new ApiException(400, $"'tool_choice' names '{named}', which is not among the tools", param: "tool_choice");
+                    }
+                    forced = $"<tool_call>\n<function={named}>\n";
+                    break;
+                case "required" or "function":
+                    throw new ApiException(400, "'tool_choice' asks for a call but the request has no tools", param: "tool_choice");
+                default:
+                    throw new ApiException(400, $"unknown 'tool_choice' '{mode}' (none, auto, required, or a function)", param: "tool_choice");
+            }
+        }
+        if (tools is not null && !generator.RendersTools)
+        {
+            throw new ApiException(400, $"model '{model.Id}' has no chat template for tools", param: "tools");
+        }
+        bool parallel = !(body.TryGetProperty("parallel_tool_calls", out var pc) && pc.ValueKind == JsonValueKind.False);
+
+        int[] prompt;
         try
         {
-            return model.Generator!.EncodePrompt(messages, enableThinking);
+            prompt = generator.EncodePrompt(messages, thinking, tools);
         }
         catch (ChatTemplateException e)
         {
             throw new ApiException(400, e.Message, param: "messages");
         }
+        var p = Sampling(body, maxTokens, settings, model.Defaults) with { Forced = forced, Thinking = thinking };
+        return new ChatTurn(prompt, p, tools, parallel);
     }
 
-    private static GenerationResult Run(ModelHost model, int[] prompt, GenerationParams p,
-        Action<string>? onDelta, CancellationToken cancel, int? logprobsTopK = null)
+    private static string? ToolName(JsonElement tool) =>
+        tool.TryGetProperty("function", out var f) && f.TryGetProperty("name", out var n) ? n.GetString() : null;
+
+    /// <summary>Generates a turn and reads the reply as it comes. Without
+    /// parallel calls, generation stops once the first call closes.</summary>
+    private static (GenerationResult Result, ReplyParser Reply) Run(ModelHost model, ChatTurn turn,
+        Action<ReplyEvent>? onEvent, CancellationToken cancel, int? logprobsTopK)
     {
+        var reply = new ReplyParser(turn.Params.Thinking, turn.Tools);
+        using var enough = CancellationTokenSource.CreateLinkedTokenSource(cancel);
+        void Read(IReadOnlyList<ReplyEvent> events)
+        {
+            foreach (var e in events)
+            {
+                if (e is ReplyEvent.ToolCall && !turn.Parallel && reply.ToolCalls.Count > 1)
+                {
+                    continue;
+                }
+                onEvent?.Invoke(e);
+                if (e is ReplyEvent.ToolCall && !turn.Parallel)
+                {
+                    enough.Cancel();
+                }
+            }
+        }
+        GenerationResult result;
         try
         {
-            return model.Generator!.Generate(prompt, p, onDelta, cancel, logprobsTopK);
+            result = model.Generator!.Generate(turn.Prompt, turn.Params, d => Read(reply.Feed(d)), enough.Token, logprobsTopK);
         }
         catch (ArgumentException e)
         {
             throw new ApiException(400, e.Message, code: "context_length_exceeded");
         }
+        Read(reply.Finish());
+        if (result.FinishReason == "cancelled" && !cancel.IsCancellationRequested)
+        {
+            result = result with { FinishReason = "stop" };
+        }
+        if (!turn.Parallel && reply.ToolCalls.Count > 1)
+        {
+            reply.KeepFirstCall();
+        }
+        return (result, reply);
     }
 
     /// <summary>
     /// Runs a generation under the model's lock and streams it as server-sent
     /// events. Generation is CPU-bound and synchronous; it pushes events into
     /// a channel that this request drains to the socket, and a client that
-    /// disconnects cancels the generation at its next token.
+    /// disconnects cancels the generation at its next token. The work returns
+    /// whether the stream ends with <c>data: [DONE]</c>.
     /// </summary>
-    private static async Task StreamSse(
-        HttpContext ctx, ModelHost model, int[] prompt, GenerationParams p,
-        int? logprobsTopK,
-        Action<Action<string?, JsonObject>> start,
-        Action<Action<string?, JsonObject>, string> delta,
-        Action<Action<string?, JsonObject>, GenerationResult> finish,
-        bool done)
+    private static async Task StreamSse(HttpContext ctx, ModelHost model, Func<Action<string?, JsonObject>, bool> work)
     {
         var channel = Channel.CreateUnbounded<string>(new UnboundedChannelOptions { SingleReader = true });
         void Write(string? eventName, JsonObject data) =>
             channel.Writer.TryWrite((eventName is null ? "" : $"event: {eventName}\n") + $"data: {data.ToJsonString(Json)}\n\n");
 
         await model.Gate.WaitAsync(ctx.RequestAborted);
-        var work = Task.Run(() =>
+        var running = Task.Run(() =>
         {
             try
             {
-                start(Write);
-                var result = model.Generator!.Generate(prompt, p, d => delta(Write, d), ctx.RequestAborted, logprobsTopK);
-                finish(Write, result);
-                if (done)
+                if (work(Write))
                 {
                     channel.Writer.TryWrite("data: [DONE]\n\n");
                 }
@@ -734,17 +1238,18 @@ public static class ServerApp
             var error = new JsonObject { ["error"] = new JsonObject { ["message"] = e.Message, ["type"] = "server_error" } };
             await ctx.Response.WriteAsync($"data: {error.ToJsonString(Json)}\n\n");
         }
-        await work;
+        await running;
     }
 
-    private static GenerationParams Sampling(JsonElement body, int maxTokens)
+    private static GenerationParams Sampling(JsonElement body, int maxTokens, ServerSettings settings, ModelDefaults defaults)
     {
         if (maxTokens < 1)
         {
             throw new ApiException(400, "the token limit must be at least 1", param: "max_tokens");
         }
-        float temperature = FloatField(body, "temperature") ?? 1f;
-        float topP = FloatField(body, "top_p") ?? 1f;
+        float temperature = FloatField(body, "temperature") ?? defaults.Temperature ?? settings.Temperature ?? 1f;
+        float topP = FloatField(body, "top_p") ?? defaults.TopP ?? settings.TopP ?? 1f;
+        int topK = IntField(body, "top_k") ?? defaults.TopK ?? settings.TopK ?? 0;
         if (temperature is < 0 or > 2)
         {
             throw new ApiException(400, "'temperature' must be between 0 and 2", param: "temperature");
@@ -752,6 +1257,10 @@ public static class ServerApp
         if (topP is <= 0 or > 1)
         {
             throw new ApiException(400, "'top_p' must be in (0, 1]", param: "top_p");
+        }
+        if (topK < 0)
+        {
+            throw new ApiException(400, "'top_k' must be 0 (off) or more", param: "top_k");
         }
         int seed = IntField(body, "seed") ?? Random.Shared.Next();
         var stop = new List<string>();
@@ -770,12 +1279,14 @@ public static class ServerApp
                 throw new ApiException(400, "'stop' takes up to 4 non-empty strings", param: "stop");
             }
         }
-        return new GenerationParams(maxTokens, temperature, topP, seed, stop);
+        return new GenerationParams(maxTokens, temperature, topP, seed, stop) { TopK = topK };
     }
 
-    /// <summary>A chat message's role and its content flattened to text:
-    /// a string, or an array of text parts (<c>text</c>, <c>input_text</c>,
-    /// <c>output_text</c>). Images and audio are refused, not dropped.</summary>
+    /// <summary>A chat message's role and its content flattened to text: a
+    /// string, or an array of text parts (<c>text</c>, <c>input_text</c>,
+    /// <c>output_text</c>). An assistant turn keeps its <c>tool_calls</c> and
+    /// its <c>reasoning_content</c>; a <c>tool</c> turn is a call's result.
+    /// Images and audio are refused, not dropped.</summary>
     private static ChatMessage ChatMessageFrom(JsonElement m, string where)
     {
         if (m.ValueKind != JsonValueKind.Object || !m.TryGetProperty("role", out var role) || role.ValueKind != JsonValueKind.String)
@@ -785,28 +1296,104 @@ public static class ServerApp
         string r = role.GetString()! switch
         {
             "developer" => "system",
-            "system" or "user" or "assistant" => role.GetString()!,
-            var other => throw new ApiException(400, $"{where}: role '{other}' is not supported (system, developer, user, assistant)", param: where),
+            "system" or "user" or "assistant" or "tool" => role.GetString()!,
+            var other => throw new ApiException(400, $"{where}: role '{other}' is not supported (system, developer, user, assistant, tool)", param: where),
         };
-        if (m.TryGetProperty("tool_calls", out _))
-        {
-            throw new ApiException(400, $"{where}: tool calls are not supported", param: where);
-        }
+        string text;
         if (!m.TryGetProperty("content", out var content) || content.ValueKind == JsonValueKind.Null)
         {
-            return new ChatMessage(r, "");
+            text = "";
         }
-        if (content.ValueKind == JsonValueKind.String)
+        else if (content.ValueKind == JsonValueKind.String)
         {
-            return new ChatMessage(r, content.GetString()!);
+            text = content.GetString()!;
         }
-        if (content.ValueKind != JsonValueKind.Array)
+        else if (content.ValueKind == JsonValueKind.Array)
+        {
+            text = PartsText(content, where);
+        }
+        else
         {
             throw new ApiException(400, $"{where}.content must be a string or an array of parts", param: where);
         }
-        var sb = new StringBuilder();
-        foreach (var part in content.EnumerateArray())
+
+        var message = new ChatMessage(r, text);
+        if (r == "assistant")
         {
+            foreach (string field in new[] { "reasoning_content", "reasoning" })
+            {
+                if (m.TryGetProperty(field, out var rc) && rc.ValueKind == JsonValueKind.String)
+                {
+                    message = message with { Reasoning = rc.GetString() };
+                    break;
+                }
+            }
+        }
+        if (m.TryGetProperty("tool_calls", out var calls) && calls.ValueKind == JsonValueKind.Array && calls.GetArrayLength() > 0)
+        {
+            if (r != "assistant")
+            {
+                throw new ApiException(400, $"{where}: only an assistant message carries tool_calls", param: where);
+            }
+            var list = new List<ChatToolCall>();
+            int i = 0;
+            foreach (var call in calls.EnumerateArray())
+            {
+                string at = $"{where}.tool_calls[{i++}]";
+                var f = call.TryGetProperty("function", out var fn) && fn.ValueKind == JsonValueKind.Object ? fn
+                    : throw new ApiException(400, $"{at} needs a 'function'", param: at);
+                string name = f.TryGetProperty("name", out var nm) && nm.ValueKind == JsonValueKind.String ? nm.GetString()!
+                    : throw new ApiException(400, $"{at}.function needs a 'name'", param: at);
+                list.Add(new ChatToolCall(name, Arguments(f.TryGetProperty("arguments", out var a) ? a : default, at)));
+            }
+            message = message with { ToolCalls = list };
+        }
+        return message;
+    }
+
+    /// <summary>A call's arguments as a JSON object: the API sends them as a
+    /// JSON string, some clients as the object itself.</summary>
+    private static JsonElement Arguments(JsonElement arguments, string where)
+    {
+        switch (arguments.ValueKind)
+        {
+            case JsonValueKind.Undefined or JsonValueKind.Null:
+                return JsonDocument.Parse("{}").RootElement.Clone();
+            case JsonValueKind.Object:
+                return arguments.Clone();
+            case JsonValueKind.String:
+                string s = arguments.GetString()!;
+                if (s.Trim().Length == 0)
+                {
+                    return JsonDocument.Parse("{}").RootElement.Clone();
+                }
+                try
+                {
+                    using var parsed = JsonDocument.Parse(s);
+                    if (parsed.RootElement.ValueKind == JsonValueKind.Object)
+                    {
+                        return parsed.RootElement.Clone();
+                    }
+                }
+                catch (JsonException)
+                {
+                }
+                throw new ApiException(400, $"{where}: 'arguments' must be a JSON object", param: where);
+            default:
+                throw new ApiException(400, $"{where}: 'arguments' must be a JSON object", param: where);
+        }
+    }
+
+    private static string PartsText(JsonElement parts, string where)
+    {
+        var sb = new StringBuilder();
+        foreach (var part in parts.EnumerateArray())
+        {
+            if (part.ValueKind == JsonValueKind.String)
+            {
+                sb.Append(part.GetString());
+                continue;
+            }
             string type = part.TryGetProperty("type", out var t) ? t.GetString() ?? "" : "";
             if (type is not ("text" or "input_text" or "output_text") || !part.TryGetProperty("text", out var text))
             {
@@ -814,8 +1401,14 @@ public static class ServerApp
             }
             sb.Append(text.GetString());
         }
-        return new ChatMessage(r, sb.ToString());
+        return sb.ToString();
     }
+
+    /// <summary>Effort for chat completions: <c>reasoning_effort</c>, or <c>reasoning.effort</c>.</summary>
+    private static string? ChatEffort(JsonElement body) =>
+        body.TryGetProperty("reasoning_effort", out var e) && e.ValueKind == JsonValueKind.String ? e.GetString()
+        : body.TryGetProperty("reasoning", out var r) && r.ValueKind == JsonValueKind.Object && r.TryGetProperty("effort", out var re)
+          && re.ValueKind == JsonValueKind.String ? re.GetString() : null;
 
     /// <summary>Builds the OpenAI-format <c>logprobs</c> object from the
     /// generation result's per-token statistics. Returns null (JSON null)

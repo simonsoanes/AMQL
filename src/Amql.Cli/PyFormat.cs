@@ -262,22 +262,22 @@ internal static class PyFormat
         return negative ? "-" + body : body;
     }
 
-    /// <summary><c>json.dumps(value, sort_keys=sortKeys)</c> with Python's
-    /// defaults: <c>", "</c> / <c>": "</c> separators and
-    /// <c>ensure_ascii=True</c>.</summary>
-    public static string JsonDumps(JsonElement value, bool sortKeys)
+    /// <summary><c>json.dumps(value, sort_keys=sortKeys, ensure_ascii=ensureAscii)</c>
+    /// with Python's <c>", "</c> / <c>": "</c> separators. HF chat templates'
+    /// <c>tojson</c> filter is this with <c>ensure_ascii=False</c>.</summary>
+    public static string JsonDumps(JsonElement value, bool sortKeys, bool ensureAscii = true)
     {
         var sb = new StringBuilder();
-        AppendJson(sb, value, sortKeys);
+        AppendJson(sb, value, sortKeys, ensureAscii);
         return sb.ToString();
     }
 
-    private static void AppendJson(StringBuilder sb, JsonElement value, bool sortKeys)
+    private static void AppendJson(StringBuilder sb, JsonElement value, bool sortKeys, bool ensureAscii)
     {
         switch (value.ValueKind)
         {
             case JsonValueKind.String:
-                AppendJsonString(sb, value.GetString()!);
+                AppendJsonString(sb, value.GetString()!, ensureAscii);
                 break;
             case JsonValueKind.Number:
                 sb.Append(NumberRepr(value));
@@ -302,7 +302,7 @@ internal static class PyFormat
                         sb.Append(", ");
                     }
                     first = false;
-                    AppendJson(sb, item, sortKeys);
+                    AppendJson(sb, item, sortKeys, ensureAscii);
                 }
                 sb.Append(']');
                 break;
@@ -324,9 +324,9 @@ internal static class PyFormat
                         sb.Append(", ");
                     }
                     first = false;
-                    AppendJsonString(sb, key);
+                    AppendJsonString(sb, key, ensureAscii);
                     sb.Append(": ");
-                    AppendJson(sb, item, sortKeys);
+                    AppendJson(sb, item, sortKeys, ensureAscii);
                 }
                 sb.Append('}');
                 break;
@@ -353,7 +353,7 @@ internal static class PyFormat
         }
     }
 
-    private static void AppendJsonString(StringBuilder sb, string s)
+    private static void AppendJsonString(StringBuilder sb, string s, bool ensureAscii)
     {
         sb.Append('"');
         foreach (char c in s)
@@ -368,7 +368,7 @@ internal static class PyFormat
                 case '\b': sb.Append("\\b"); break;
                 case '\f': sb.Append("\\f"); break;
                 default:
-                    if (c < 0x20 || c > 0x7e)
+                    if (c < 0x20 || (ensureAscii && c > 0x7e))
                     {
                         // ensure_ascii: UTF-16 code units, so astral characters
                         // come out as surrogate pairs, exactly as Python writes them.

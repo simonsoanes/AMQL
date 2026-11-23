@@ -1,0 +1,5 @@
+{
+ "tokenizer_class": "PreTrainedTokenizerFast",
+ "eos_token": "<|im_end|>",
+ "pad_token": "<|endoftext|>"
+}

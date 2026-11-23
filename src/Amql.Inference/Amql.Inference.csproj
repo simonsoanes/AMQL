@@ -10,6 +10,8 @@
     <TargetFramework>net11.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <!-- GpuEngine.HostLogits: a span over the pinned buffer the device writes logits into. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 
   <!-- The locally built CUDA backend (native/amql_cuda, gitignored) beside the

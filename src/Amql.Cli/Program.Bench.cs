@@ -9,7 +9,7 @@ namespace Amql.Cli;
 internal static partial class Program
 {
     /// <summary>
-    /// <c>bench &lt;container&gt; [--prompt-tokens N] [--steps M] [--repeat R] [--weights mode] [--profile] [--compare]</c>.
+    /// <c>bench &lt;container&gt; [--prompt-tokens N] [--steps M] [--repeat R] [--weights mode] [--profile] [--compare] [--batch N]</c>.
     /// Loads the model, runs one untimed warm-up request (so weights are
     /// resident and the kernels compiled — "once loaded"), then R timed
     /// requests of an N-token prefill followed by M greedy decode steps.
@@ -74,6 +74,12 @@ internal static partial class Program
             Profile(session, prompt, steps);
         }
 
+        if (OptionValue(args, "--batch") is { } batchText)
+        {
+            BatchBench(session, prompt, steps, int.Parse(batchText));
+            return 0;
+        }
+
         var prefillRates = new List<double>();
         var decodeRates = new List<double>();
         ulong checksum = 0;
@@ -93,6 +99,42 @@ internal static partial class Program
         }
         Console.WriteLine($"memory:    {ProcessMemoryLine()}");
         return 0;
+    }
+
+    /// <summary>
+    /// <c>--batch N</c>: decode throughput with 1, 2, 4 … N sequences stepping
+    /// together on the GPU engine (as the server batches requests), each with its
+    /// own prompt and greedy tokens. Reports total and per-sequence tokens per
+    /// second, and the time of one step.
+    /// </summary>
+    private static void BatchBench(DecodeSession session, int[] prompt, int steps, int max)
+    {
+        var engine = session.DeviceEngine() ?? throw new CliException($"--batch needs the GPU engine ({session.GpuRefusal})");
+        max = Math.Clamp(max, 1, GpuEngine.MaxBatch);
+        for (int b = 1; b <= max; b = b < max && b * 2 > max ? max : b * 2)
+        {
+            var seqs = Enumerable.Range(0, b).Select(_ => engine.NewSequence()).ToList();
+            var tokens = new int[b];
+            for (int i = 0; i < b; i++)
+            {
+                var own = prompt.Select((t, k) => k == 0 ? t + i : t).ToArray();
+                tokens[i] = Sampler.ArgMax(engine.Prefill(seqs[i], own));
+            }
+            engine.StepInPlace(seqs, tokens);   // capture the graph outside the timing
+            var sw = Stopwatch.StartNew();
+            for (int s = 0; s < steps; s++)
+            {
+                for (int i = 0; i < b; i++)
+                {
+                    tokens[i] = Sampler.ArgMax(engine.HostLogits(i));
+                }
+                engine.StepInPlace(seqs, tokens);
+            }
+            double seconds = sw.Elapsed.TotalSeconds;
+            Console.WriteLine($"batch {b}:   {b * steps / seconds,8:F1} tok/s total   {steps / seconds,7:F1} tok/s each   " +
+                              $"{seconds * 1000.0 / steps:F2} ms/step");
+            seqs.ForEach(engine.Release);
+        }
     }
 
     /// <summary>One prefill and one decode run with each layer operator's

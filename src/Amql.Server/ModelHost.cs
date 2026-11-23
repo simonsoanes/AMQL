@@ -1,6 +1,7 @@
 using System.Text;
 using System.Text.Json;
 using Amql.Cli;
+using Amql.Entail;
 using Amql.Hf;
 using Amql.Inference;
 using Amql.Vindex3;
@@ -34,7 +35,27 @@ public sealed class ModelHost : IDisposable
     public string Path { get; }
     public Capability Capabilities { get; }
     public long Created { get; }
-    public SemaphoreSlim Gate { get; } = new(1, 1);
+    public SemaphoreSlim Gate { get; }
+
+    /// <summary>Requests a batching model accepts at once: a batch running and
+    /// the rest waiting their turn inside the scheduler.</summary>
+    public const int BatchQueue = 64;
+
+    /// <summary>One request at a time across every model while CUDA is on: the
+    /// native kernels stage through process-wide device buffers, so two
+    /// sessions on the GPU at once would overwrite each other's activations.
+    /// On the CPU each model has its own gate and different models run in parallel.</summary>
+    public static SemaphoreSlim DeviceGate { get; } = new(1, 1);
+
+    /// <summary>Whether this model waits behind the others (see <see cref="DeviceGate"/>).</summary>
+    public bool SharesDevice => ReferenceEquals(Gate, DeviceGate);
+
+    /// <summary>This model's own defaults for requests that leave a setting
+    /// out; what it leaves unset falls back to the server's.</summary>
+    public ModelDefaults Defaults { get; init; } = new();
+
+    /// <summary>The names of the Entail adapters running beside the model.</summary>
+    public IReadOnlyList<string> AdapterNames { get; private init; } = Array.Empty<string>();
 
     public VonDecisionEngine? Decisions { get; }
     public TextGenerator? Generator { get; }
@@ -62,9 +83,29 @@ public sealed class ModelHost : IDisposable
                        (embedder is null ? Capability.None : Capability.Embeddings) |
                        (classifier is null ? Capability.None : Capability.Classification);
         Created = new DateTimeOffset(Directory.GetCreationTimeUtc(path)).ToUnixTimeSeconds();
+        // A batching model takes many requests and schedules the device itself;
+        // anything else on the GPU waits its turn behind every other model.
+        Gate = generator?.Concurrency > 1 ? new SemaphoreSlim(BatchQueue, BatchQueue) : CudaShim.Enabled ? DeviceGate : new SemaphoreSlim(1, 1);
     }
 
-    public static ModelHost Load(string id, string path)
+    /// <param name="adapters">Entail adapter directories to run beside a
+    /// generative model; each must have been built for this model's tokenizer.</param>
+    public static ModelHost Load(string id, string path, IReadOnlyList<string>? adapters = null, ModelDefaults? defaults = null)
+    {
+        var host = LoadEngines(id, path, adapters);
+        return new ModelHost(host, defaults ?? new ModelDefaults(),
+            (adapters ?? Array.Empty<string>()).Select(d => System.IO.Path.GetFileName(System.IO.Path.GetFullPath(d).TrimEnd('/', '\\'))).ToList());
+    }
+
+    private ModelHost(ModelHost loaded, ModelDefaults defaults, IReadOnlyList<string> adapterNames)
+        : this(loaded.Id, loaded.Path, loaded._container, loaded._store, loaded.Decisions, loaded.Generator, loaded.Embedder,
+            loaded.Classifier, loaded.Notes.ToList())
+    {
+        Defaults = defaults;
+        AdapterNames = loaded.Generator is null ? Array.Empty<string>() : adapterNames;
+    }
+
+    private static ModelHost LoadEngines(string id, string path, IReadOnlyList<string>? adapters)
     {
         var container = Vindex3Container.Open(path);
         var notes = new List<string>();
@@ -154,8 +195,20 @@ public sealed class ModelHost : IDisposable
                 notes.Add($"chat template not rendered by this build: {e.Message}");
                 return new ModelHost(id, path, container, store, null, null, null, null, notes);
             }
-            var generator = new TextGenerator(new DecodeSession(plan, store), tokenizer, template,
+            var loaded = new List<IEntailAdapter>();
+            foreach (string dir in adapters ?? Array.Empty<string>())
+            {
+                loaded.Add(EntailAdapterRunner.Load(dir, path));
+                notes.Add($"entail adapter {System.IO.Path.GetFileName(System.IO.Path.GetFullPath(dir).TrimEnd('/', '\\'))} runs beside the model");
+            }
+            var prior = tokenizer.AddedTokenId("<|im_start|>") is { } start && tokenizer.AddedTokenId("<|im_end|>") is { } end
+                ? ChatPrior.ForChatMl(t => tokenizer.EncodeToIds(t), ids => tokenizer.DecodeText(ids, skipSpecialTokens: false), start, end)
+                : null;
+            var generator = new TextGenerator(new DecodeSession(plan, store), loaded, prior, tokenizer, template,
                 StopTokens.Resolve(path, tokenizer, template), (int)(surface?.ContextLength ?? int.MaxValue));
+            notes.Add(generator.BatchRefusal is null
+                ? $"continuous batching: up to {generator.Concurrency} requests generate together on the GPU"
+                : $"one request at a time: {generator.BatchRefusal}");
             return new ModelHost(id, path, container, store, null, generator, null, null, notes);
         }
         catch
@@ -175,9 +228,17 @@ public sealed class ModelHost : IDisposable
 
     public void Dispose()
     {
+        Generator?.Dispose();
+        foreach (var adapter in Generator?.Adapters ?? Array.Empty<IEntailAdapter>())
+        {
+            adapter.Dispose();
+        }
         _store?.Dispose();
         _container.Dispose();
-        Gate.Dispose();
+        if (!SharesDevice)
+        {
+            Gate.Dispose();
+        }
     }
 }
 
@@ -238,12 +299,28 @@ public static class StopTokens
     }
 }
 
+/// <summary>Defaults one model applies to requests that leave them out
+/// (null: the server's default).</summary>
+public sealed record ModelDefaults(bool? Think = null, int? MaxTokens = null, float? Temperature = null, float? TopP = null, int? TopK = null);
+
 public sealed record GenerationParams(
     int MaxTokens,
     float Temperature,
     float TopP,
     int Seed,
-    IReadOnlyList<string> Stop);
+    IReadOnlyList<string> Stop)
+{
+    /// <summary>Keep only the k most probable tokens before sampling (0: all).</summary>
+    public int TopK { get; init; }
+
+    /// <summary>Text written for the model at the start of its answer — after
+    /// its thinking block when it thinks — and continued from there: how
+    /// <c>tool_choice</c> required or a named function is enforced.</summary>
+    public string? Forced { get; init; }
+
+    /// <summary>The prompt ended inside an open think block.</summary>
+    public bool Thinking { get; init; }
+}
 
 public sealed record GenerationResult(string Text, string FinishReason, int PromptTokens, int CompletionTokens)
 {
@@ -264,31 +341,97 @@ public sealed record GenerationResult(string Text, string FinishReason, int Prom
 /// Autoregressive generation over a decoder container: prefill the rendered
 /// prompt, then sample until a stop token, a stop string, the token budget or
 /// the context runs out. Text is decoded from the accumulated bytes each step,
-/// so a character split across tokens is emitted once, whole.
+/// so a character split across tokens is emitted once, whole. Entail adapters,
+/// when the server was given any, run beside the model and rule on each next
+/// token; with none, every token is the model's own draw.
+/// <para>
+/// On the GPU engine, requests are batched continuously (<see cref="BatchScheduler"/>):
+/// each joins the running batch when it arrives, leaves it when it finishes, and
+/// every step advances up to <see cref="GpuEngine.MaxBatch"/> of them in one
+/// pass over the weights. Elsewhere one request runs at a time.
+/// </para>
 /// </summary>
-public sealed class TextGenerator
+public sealed class TextGenerator : IDisposable
 {
-    private readonly DecodeSession _session;
+    private readonly SideBySideSession _session;
     private readonly IReadOnlySet<int> _stopTokens;
+    private readonly BatchScheduler? _batch;
+
+    /// <summary>Set false (<c>--no-batch</c>) to run one request at a time even on the GPU engine.</summary>
+    public static bool BatchingEnabled { get; set; } =
+        Environment.GetEnvironmentVariable("AMQL_SERVER_BATCH")?.Trim() is not ("0" or "off" or "false");
 
     public HfTokenizer Tokenizer { get; }
     public string Template { get; }
     public int ContextLength { get; }
+    internal int? ThinkClose { get; }
+    internal IReadOnlySet<int> StopTokenIds => _stopTokens;
+
+    /// <summary>The adapters running beside the model.</summary>
+    public IReadOnlyList<IEntailAdapter> Adapters { get; }
+
+    /// <summary>Whether the template renders tools, calls and tool results.</summary>
+    public bool RendersTools => ChatTemplate.RendersTools(Template);
+
+    /// <summary>Whether the template has a thinking switch.</summary>
+    public bool Thinks => Template.Contains("enable_thinking", StringComparison.Ordinal);
+
+    /// <summary>Requests that can generate at once: the batch size on the GPU engine, else 1.</summary>
+    public int Concurrency => _batch is null ? 1 : GpuEngine.MaxBatch;
+
+    /// <summary>Why requests are not batched, when they are not.</summary>
+    public string? BatchRefusal { get; }
 
     public TextGenerator(DecodeSession session, HfTokenizer tokenizer, string template, IReadOnlySet<int> stopTokens, int contextLength)
+        : this(session, Array.Empty<IEntailAdapter>(), null, tokenizer, template, stopTokens, contextLength)
     {
-        _session = session;
+    }
+
+    public TextGenerator(DecodeSession partner, IReadOnlyList<IEntailAdapter> adapters, Func<int[], int[]?>? priorPrompt,
+        HfTokenizer tokenizer, string template, IReadOnlySet<int> stopTokens, int contextLength)
+    {
+        _session = new SideBySideSession(partner, adapters) { PriorPrompt = priorPrompt };
+        Adapters = adapters;
         Tokenizer = tokenizer;
         Template = template;
         _stopTokens = stopTokens;
         ContextLength = contextLength;
+        ThinkClose = tokenizer.AddedTokenId("</think>");
+
+        if (!BatchingEnabled)
+        {
+            BatchRefusal = "batching is off (--no-batch)";
+        }
+        else if (!CudaShim.Enabled)
+        {
+            BatchRefusal = "no CUDA device";
+        }
+        else if (partner.DeviceEngine() is not { } engine)
+        {
+            BatchRefusal = $"the GPU engine does not run this model ({partner.GpuRefusal})";
+        }
+        else
+        {
+            try
+            {
+                foreach (var adapter in adapters)
+                {
+                    adapter.Sibling().Dispose();
+                }
+                _batch = new BatchScheduler(engine, this, adapters, priorPrompt);
+            }
+            catch (InvalidOperationException e)
+            {
+                BatchRefusal = $"an adapter cannot run once per request: {e.Message}";
+            }
+        }
     }
 
     /// <summary>The prompt as token ids. The rendered template already carries
     /// every special token it needs, so no post-processor template is added —
     /// HF tokenises chat prompts with <c>add_special_tokens=False</c>.</summary>
-    public int[] EncodePrompt(IReadOnlyList<ChatMessage> messages, bool enableThinking) =>
-        Tokenizer.EncodeToIds(ChatTemplate.ApplyMessages(Template, messages, enableThinking)).ToArray();
+    public int[] EncodePrompt(IReadOnlyList<ChatMessage> messages, bool enableThinking, IReadOnlyList<System.Text.Json.JsonElement>? tools = null) =>
+        Tokenizer.EncodeToIds(ChatTemplate.ApplyMessages(Template, messages, enableThinking, tools)).ToArray();
 
     public void Warm()
     {
@@ -297,89 +440,223 @@ public sealed class TextGenerator
         _session.Reset();
     }
 
+    /// <summary>Generates a reply. Safe to call from several threads at once
+    /// when requests are batched; otherwise the caller runs one at a time.</summary>
     public GenerationResult Generate(int[] prompt, GenerationParams p, Action<string>? onDelta,
         CancellationToken cancel, int? logprobsTopK = null)
+    {
+        var run = new GenerationRun(this, prompt, p, onDelta, cancel, logprobsTopK);
+        if (_batch is not null)
+        {
+            return _batch.Run(run);
+        }
+        _session.Reset();
+        _session.Prefill(prompt);
+        LogitsRow logits = () => _session.Logits.Row(0);
+        run.Begin(logits, _session.Verdict, _session.Prior);
+        while (run.Next() is { } token)
+        {
+            _session.Step(token);
+            run.Fed(logits, _session.Verdict);
+        }
+        return run.Result!;
+    }
+
+    public void Dispose() => _batch?.Dispose();
+}
+
+/// <summary>
+/// One reply being generated, step by step: given the next-token logits (and
+/// what the adapters require), it picks the next token, decodes and emits the
+/// text, and says when the reply is over — a stop token, a stop string, the
+/// token budget or cancellation. Who runs the model (one session, or a batch of
+/// sequences) is not its concern.
+/// </summary>
+/// <summary>The current next-token logits of one reply, wherever they are.</summary>
+internal delegate ReadOnlySpan<float> LogitsRow();
+
+internal sealed class GenerationRun
+{
+    private readonly TextGenerator _g;
+    private readonly GenerationParams _p;
+    private readonly Action<string>? _onDelta;
+    private readonly CancellationToken _cancel;
+    private readonly int? _logprobsTopK;
+    private readonly SamplingConfig _config;
+    private readonly Random _rng;
+    private readonly int _budget;
+    private readonly int _holdBack;
+    private readonly Queue<int> _forced = new();
+    private readonly List<int> _generated = new();
+    private readonly List<LogprobsResult>? _logprobs;
+    private bool _forcePending;
+    private string _emitted = string.Empty;
+    private LogitsRow _logits = null!;
+    private EntailVerdict _verdict = EntailVerdict.Silence;
+    private IReadOnlyList<double>? _prior;
+
+    public int[] Prompt { get; }
+
+    /// <summary>The finished reply, once <see cref="Next"/> has returned null.</summary>
+    public GenerationResult? Result { get; private set; }
+
+    public GenerationRun(TextGenerator g, int[] prompt, GenerationParams p, Action<string>? onDelta,
+        CancellationToken cancel, int? logprobsTopK)
     {
         if (prompt.Length == 0)
         {
             throw new ArgumentException("the prompt renders to no tokens");
         }
-        int budget = Math.Min(p.MaxTokens, ContextLength - prompt.Length);
-        if (budget <= 0)
+        _budget = Math.Min(p.MaxTokens, g.ContextLength - prompt.Length);
+        if (_budget <= 0)
         {
-            throw new ArgumentException($"the prompt is {prompt.Length} tokens, which fills the {ContextLength}-token context");
+            throw new ArgumentException($"the prompt is {prompt.Length} tokens, which fills the {g.ContextLength}-token context");
+        }
+        _g = g;
+        Prompt = prompt;
+        _p = p;
+        _onDelta = onDelta;
+        _cancel = cancel;
+        _logprobsTopK = logprobsTopK;
+        _config = new SamplingConfig(p.Seed, p.Temperature, TopK: p.TopK, TopP: p.TopP >= 1f ? 0f : p.TopP);
+        _rng = new Random(p.Seed);
+        _logprobs = logprobsTopK is > 0 ? new List<LogprobsResult>() : null;
+        _holdBack = p.Stop.Count == 0 ? 0 : p.Stop.Max(s => s.Length) - 1;
+        // Forced text goes in after the thinking block, or at once without one.
+        _forcePending = p.Forced is not null;
+        if (_forcePending && !p.Thinking)
+        {
+            Enqueue(p.Forced!);
+        }
+    }
+
+    /// <summary>The logits after the prompt, and what the adapters require of the first token.</summary>
+    public void Begin(LogitsRow logits, EntailVerdict verdict, IReadOnlyList<double>? prior)
+    {
+        _logits = logits;
+        _verdict = verdict;
+        _prior = prior;
+    }
+
+    /// <summary>The logits after the token <see cref="Next"/> returned.</summary>
+    public void Fed(LogitsRow logits, EntailVerdict verdict)
+    {
+        _logits = logits;
+        _verdict = verdict;
+    }
+
+    /// <summary>The next token to run the model on, or null when the reply is over.</summary>
+    public int? Next()
+    {
+        if (Result is not null)
+        {
+            return null;
+        }
+        if (_generated.Count >= _budget || _cancel.IsCancellationRequested)
+        {
+            return Finish("length");
+        }
+        int token;
+        if (_forced.Count > 0)
+        {
+            token = _forced.Dequeue();
+        }
+        else if (_verdict.Silent)
+        {
+            LogprobsResult? lp;
+            (token, lp) = Sampler.SampleWithLogprobs(_logits(), _config, _rng, _logprobsTopK);
+            if (lp is not null)
+            {
+                _logprobs!.Add(lp);
+            }
+        }
+        else
+        {
+            // An adapter rules on this token; logprobs still describe the model's own distribution.
+            (token, _) = _verdict.Choose(_logits(), _prior, r => Sampler.Sample(r, _config, _rng));
+            if (_logprobs is not null && Sampler.SampleWithLogprobs(_logits(), _config, new Random(0), _logprobsTopK).Logprobs is { } lp)
+            {
+                _logprobs.Add(lp);
+            }
+        }
+        if (_g.StopTokenIds.Contains(token))
+        {
+            return Finish("stop");
+        }
+        _generated.Add(token);
+        if (_forcePending && _p.Thinking && token == _g.ThinkClose)
+        {
+            Enqueue("\n\n" + _p.Forced);
         }
 
-        var config = new SamplingConfig(p.Seed, p.Temperature, TopK: 0, TopP: p.TopP >= 1f ? 0f : p.TopP);
-        var rng = new Random(p.Seed);
-        _session.Reset();
-        var logits = _session.Prefill(prompt);
-
-        var generated = new List<int>();
-        var logprobsList = logprobsTopK is { } lpTk && lpTk > 0
-            ? new List<LogprobsResult>()
-            : null;
-        string emitted = string.Empty;
-        string finish = "length";
-        int holdBack = p.Stop.Count == 0 ? 0 : p.Stop.Max(s => s.Length) - 1;
-
-        while (generated.Count < budget && !cancel.IsCancellationRequested)
+        string text = Text();
+        int stopAt = FirstStop(text, _p.Stop);
+        if (stopAt >= 0)
         {
-            int token;
-            LogprobsResult? stepLp = null;
-
-            if (logprobsTopK is { } lpTk2 && lpTk2 > 0)
-            {
-                (token, stepLp) = Sampler.SampleWithLogprobs(logits, config, rng, lpTk2);
-                logprobsList!.Add(stepLp!);
-            }
-            else
-            {
-                token = Sampler.Sample(logits, config, rng);
-            }
-            if (_stopTokens.Contains(token))
-            {
-                finish = "stop";
-                break;
-            }
-            generated.Add(token);
-
-            string text = Tokenizer.DecodeText(generated);
-            int stopAt = FirstStop(text, p.Stop);
-            if (stopAt >= 0)
-            {
-                Emit(text[..stopAt]);
-                finish = "stop";
-                emitted = text[..stopAt];
-                return BuildResult(emitted, finish, prompt.Length, generated, logprobsList);
-            }
-            // Hold back a trailing partial character, and enough text that a
-            // stop string straddling the next token is never half-sent.
-            int safe = text.Length;
-            while (safe > 0 && text[safe - 1] == '�')
-            {
-                safe--;
-            }
-            safe = Math.Max(emitted.Length, safe - holdBack);
-            Emit(text[..safe]);
-
-            if (generated.Count < budget)
-            {
-                logits = _session.Step(token);
-            }
+            Emit(text[..stopAt]);
+            _emitted = text[..stopAt];
+            Result = Build(_emitted, "stop");
+            return null;
         }
+        // Hold back a trailing partial character, and enough text that a
+        // stop string straddling the next token is never half-sent.
+        int safe = text.Length;
+        while (safe > 0 && text[safe - 1] == '�')
+        {
+            safe--;
+        }
+        safe = Math.Max(_emitted.Length, safe - _holdBack);
+        Emit(text[..safe]);
+        return _generated.Count >= _budget ? Finish("length") : token;
+    }
 
-        string final = Tokenizer.DecodeText(generated);
+    // The reply's text so far, decoded incrementally: the text of the first
+    // _stableTokens tokens (which end on a whole character) is kept, and only
+    // the tokens after it are decoded each step. UTF-8 cut at a character
+    // boundary decodes the same in pieces as whole, so this is the full decode.
+    private string _stableText = string.Empty;
+    private int _stableTokens;
+
+    private string Text()
+    {
+        var tail = _generated.GetRange(_stableTokens, _generated.Count - _stableTokens);
+        string text = _stableText + _g.Tokenizer.DecodeText(tail);
+        // A tail ending mid-character waits for its next token; one that never
+        // completes (invalid bytes) is kept as decoded after 64 tokens.
+        if (tail.Count > 0 && (text.Length == 0 || text[^1] != '�' || tail.Count > 64))
+        {
+            _stableText = text;
+            _stableTokens = _generated.Count;
+        }
+        return text;
+    }
+
+    /// <summary>Ends the reply now, for a failure in the model under it.</summary>
+    public void Abort(string reason) => Result ??= Build(Text(), reason);
+
+    private int? Finish(string finish)
+    {
+        string final = Text();
         Emit(final);
-        return BuildResult(final, cancel.IsCancellationRequested ? "cancelled" : finish, prompt.Length, generated, logprobsList);
+        Result = Build(final, _cancel.IsCancellationRequested && finish != "stop" ? "cancelled" : finish);
+        return null;
+    }
 
-        void Emit(string upTo)
+    private void Emit(string upTo)
+    {
+        if (upTo.Length > _emitted.Length && upTo.StartsWith(_emitted, StringComparison.Ordinal))
         {
-            if (upTo.Length > emitted.Length && upTo.StartsWith(emitted, StringComparison.Ordinal))
-            {
-                onDelta?.Invoke(upTo[emitted.Length..]);
-                emitted = upTo;
-            }
+            _onDelta?.Invoke(upTo[_emitted.Length..]);
+            _emitted = upTo;
+        }
+    }
+
+    private void Enqueue(string text)
+    {
+        _forcePending = false;
+        foreach (int id in _g.Tokenizer.EncodeToIds(text))
+        {
+            _forced.Enqueue(id);
         }
     }
 
@@ -397,24 +674,294 @@ public sealed class TextGenerator
         return best;
     }
 
-    private static GenerationResult BuildResult(string text, string finish, int promptTokens,
-        List<int> generated, List<LogprobsResult>? logprobsList)
+    private GenerationResult Build(string text, string finish)
     {
         float? perplexity = null;
         float? meanEntropy = null;
-        if (logprobsList is { Count: > 0 })
+        if (_logprobs is { Count: > 0 })
         {
-            double nllSum = logprobsList.Sum(lp => -(double)lp.TokenLogprob);
-            perplexity = (float)Math.Exp(nllSum / logprobsList.Count);
-            meanEntropy = logprobsList.Average(lp => lp.Entropy);
+            double nllSum = _logprobs.Sum(lp => -(double)lp.TokenLogprob);
+            perplexity = (float)Math.Exp(nllSum / _logprobs.Count);
+            meanEntropy = _logprobs.Average(lp => lp.Entropy);
         }
-        return new GenerationResult(text, finish, promptTokens, generated.Count)
+        return new GenerationResult(text, finish, Prompt.Length, _generated.Count)
         {
-            Tokens = generated,
-            Logprobs = logprobsList,
+            Tokens = _generated.ToList(),
+            Logprobs = _logprobs,
             Perplexity = perplexity,
             MeanEntropy = meanEntropy,
         };
+    }
+}
+
+/// <summary>
+/// Continuous batching on the GPU engine. One thread owns the engine: it admits
+/// waiting requests (each gets a sequence of its own and is prefilled), then
+/// steps every running request together, one token each, and repeats; a request
+/// leaves the batch the moment it finishes, and the next waiting one takes its
+/// place. Each request has its own copy of the adapters. Every call into the
+/// device holds <see cref="ModelHost.DeviceGate"/>, so other models on the GPU
+/// interleave with this one a step at a time.
+/// </summary>
+internal sealed class BatchScheduler : IDisposable
+{
+    private sealed class Job(GenerationRun run)
+    {
+        public readonly GenerationRun Run = run;
+        public readonly TaskCompletionSource<GenerationResult> Done = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public GpuSequence? Seq;
+        public IEntailAdapter[] Adapters = Array.Empty<IEntailAdapter>();
+        public int Token;
+        public int Row;     // its row in the last step
+    }
+
+    private readonly GpuEngine _engine;
+    private readonly TextGenerator _g;
+    private readonly IReadOnlyList<IEntailAdapter> _adapters;
+    private readonly Func<int[], int[]?>? _priorPrompt;
+    private readonly System.Collections.Concurrent.BlockingCollection<Job> _waiting = new();
+    private readonly Stack<GpuSequence> _free = new();
+    private readonly Thread _thread;
+
+    // AMQL_SERVER_TIMING=1: where a batch step's time goes, printed every 500 steps.
+    private static readonly bool Timing = Environment.GetEnvironmentVariable("AMQL_SERVER_TIMING") is "1";
+    private long _tChoose, _tDevice, _tFeed, _steps, _rows;
+
+    public BatchScheduler(GpuEngine engine, TextGenerator g, IReadOnlyList<IEntailAdapter> adapters, Func<int[], int[]?>? priorPrompt)
+    {
+        _engine = engine;
+        _g = g;
+        _adapters = adapters;
+        _priorPrompt = priorPrompt;
+        _thread = new Thread(Loop) { IsBackground = true, Name = "amql batch" };
+        _thread.Start();
+    }
+
+    /// <summary>Queues a reply and waits for it.</summary>
+    public GenerationResult Run(GenerationRun run)
+    {
+        var job = new Job(run);
+        _waiting.Add(job);
+        return job.Done.Task.GetAwaiter().GetResult();
+    }
+
+    private static T Device<T>(Func<T> work)
+    {
+        ModelHost.DeviceGate.Wait();
+        try
+        {
+            return work();
+        }
+        finally
+        {
+            ModelHost.DeviceGate.Release();
+        }
+    }
+
+    private void Loop()
+    {
+        var active = new List<Job>();
+        while (!_waiting.IsCompleted)
+        {
+            try
+            {
+                if (active.Count == 0 && _waiting.TryTake(out var first, Timeout.Infinite))
+                {
+                    Admit(first, active);
+                }
+                while (active.Count < GpuEngine.MaxBatch && _waiting.TryTake(out var waiting))
+                {
+                    Admit(waiting, active);
+                }
+
+                long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+                // Each reply picks its next token on its own core: sampling reads the
+                // whole vocabulary, and the replies share nothing but the device.
+                var next = new int?[active.Count];
+                if (active.Count > 1)
+                {
+                    Parallel.For(0, active.Count, i => next[i] = active[i].Run.Next());
+                }
+                else
+                {
+                    next[0] = active[0].Run.Next();
+                }
+                for (int i = active.Count - 1; i >= 0; i--)
+                {
+                    var job = active[i];
+                    if (next[i] is { } token)
+                    {
+                        job.Token = token;
+                    }
+                    else
+                    {
+                        active.RemoveAt(i);
+                        Complete(job);
+                    }
+                }
+                if (active.Count == 0)
+                {
+                    continue;
+                }
+
+                var seqs = active.Select(j => j.Seq!).ToList();
+                var tokens = active.Select(j => j.Token).ToArray();
+                long t1 = System.Diagnostics.Stopwatch.GetTimestamp();
+                Device(() =>
+                {
+                    _engine.StepInPlace(seqs, tokens);
+                    return 0;
+                });
+                long t2 = System.Diagnostics.Stopwatch.GetTimestamp();
+                void Feed(int i)
+                {
+                    var job = active[i];
+                    job.Row = i;
+                    var verdict = EntailVerdict.Merge(job.Adapters.Select(a => a.Step(job.Token)).ToList());
+                    // Read in place, before the next step overwrites it: no copy of the vocabulary per row.
+                    job.Run.Fed(() => _engine.HostLogits(job.Row), verdict);
+                }
+                if (active.Count > 1 && active[0].Adapters.Length > 0)
+                {
+                    Parallel.For(0, active.Count, Feed);
+                }
+                else
+                {
+                    for (int i = 0; i < active.Count; i++)
+                    {
+                        Feed(i);
+                    }
+                }
+                if (Timing)
+                {
+                    _tChoose += t1 - t0;
+                    _tDevice += t2 - t1;
+                    _tFeed += System.Diagnostics.Stopwatch.GetTimestamp() - t2;
+                    _rows += active.Count;
+                    if (++_steps % 500 == 0)
+                    {
+                        double us(long t) => t * 1e6 / System.Diagnostics.Stopwatch.Frequency / _steps;
+                        Console.Error.WriteLine($"batch: {_steps} steps, {(double)_rows / _steps:F1} rows/step; per step choose {us(_tChoose):F0} us, " +
+                            $"device {us(_tDevice):F0} us, feed {us(_tFeed):F0} us");
+                        _tChoose = _tDevice = _tFeed = _steps = _rows = 0;
+                    }
+                }
+            }
+            catch (InvalidOperationException) when (_waiting.IsAddingCompleted)
+            {
+                break;
+            }
+            catch (Exception e)
+            {
+                // The device failed under the batch: every running reply ends with the error.
+                foreach (var job in active)
+                {
+                    job.Run.Abort("error");
+                    Release(job);
+                    job.Done.TrySetException(e);
+                }
+                active.Clear();
+            }
+        }
+        foreach (var job in active)
+        {
+            job.Run.Abort("cancelled");
+            Complete(job);
+        }
+    }
+
+    /// <summary>Gives a waiting reply a sequence and prefills its prompt (and,
+    /// for an adapter that weighs tokens against the prior, the blank prompt first).</summary>
+    private void Admit(Job job, List<Job> active)
+    {
+        try
+        {
+            job.Seq = Device(() =>
+            {
+                var seq = _free.Count > 0 ? _free.Pop() : _engine.NewSequence();
+                _engine.Reset(seq);
+                return seq;
+            });
+            job.Adapters = _adapters.Select(a => a.Sibling()).ToArray();
+            int[] prompt = job.Run.Prompt;
+            double[]? prior = null;
+            if (job.Adapters.Any(a => a.Manifest.NeedsPrior) && _priorPrompt?.Invoke(prompt) is { } blank)
+            {
+                prior = Softmax(Device(() =>
+                {
+                    var l = _engine.Prefill(job.Seq, blank);
+                    _engine.Reset(job.Seq);
+                    return l;
+                }));
+            }
+            var logits = Device(() => _engine.Prefill(job.Seq, prompt));
+            var verdict = EntailVerdict.Merge(job.Adapters.Select(a =>
+            {
+                a.Reset();
+                return a.Prefill(prompt);
+            }).ToList());
+            job.Run.Begin(() => logits, verdict, prior);
+            active.Add(job);
+        }
+        catch (Exception e)
+        {
+            Release(job);
+            job.Done.TrySetException(e);
+        }
+    }
+
+    private void Complete(Job job)
+    {
+        Release(job);
+        job.Done.TrySetResult(job.Run.Result!);
+    }
+
+    private void Release(Job job)
+    {
+        foreach (var a in job.Adapters)
+        {
+            a.Dispose();
+        }
+        job.Adapters = Array.Empty<IEntailAdapter>();
+        if (job.Seq is { } seq)
+        {
+            job.Seq = null;
+            // Keep a batch's worth of sequences for the next requests; free the rest.
+            if (_free.Count < GpuEngine.MaxBatch)
+            {
+                _free.Push(seq);
+            }
+            else
+            {
+                Device(() =>
+                {
+                    _engine.Release(seq);
+                    return 0;
+                });
+            }
+        }
+    }
+
+    private static double[] Softmax(float[] logits)
+    {
+        float max = logits.Max();
+        var p = new double[logits.Length];
+        double sum = 0;
+        for (int i = 0; i < logits.Length; i++)
+        {
+            sum += p[i] = Math.Exp(logits[i] - max);
+        }
+        for (int i = 0; i < p.Length; i++)
+        {
+            p[i] /= sum;
+        }
+        return p;
+    }
+
+    public void Dispose()
+    {
+        _waiting.CompleteAdding();
+        _thread.Join(TimeSpan.FromSeconds(10));
     }
 }
 

@@ -500,20 +500,39 @@ __global__ void __launch_bounds__(256) gemv_kernel(GemvArgs a)
 
 static int gSms = 0;
 
-template <typename WT, int SPLIT>
-static void launch_gemv_split(Engine* e, const GemvArgs& a, int rows, int blocks, size_t smem)
+// RW output rows per warp: each activation load then serves RW weight rows.
+template <typename WT, int SPLIT, int RW>
+static void launch_gemv_rows(Engine* e, const GemvArgs& a, int rows, int blocks, size_t smem)
 {
     switch (rows)
     {
-        case 1: launch(gemv_kernel<WT, 1, SPLIT, 2>, blocks, 256, smem, e->stream, a); break;
-        case 2: launch(gemv_kernel<WT, 2, SPLIT, 2>, blocks, 256, smem, e->stream, a); break;
-        case 3: launch(gemv_kernel<WT, 3, SPLIT, 1>, blocks, 256, smem, e->stream, a); break;
-        case 4: launch(gemv_kernel<WT, 4, SPLIT, 1>, blocks, 256, smem, e->stream, a); break;
-        case 5: launch(gemv_kernel<WT, 5, SPLIT, 1>, blocks, 256, smem, e->stream, a); break;
-        case 6: launch(gemv_kernel<WT, 6, SPLIT, 1>, blocks, 256, smem, e->stream, a); break;
-        case 7: launch(gemv_kernel<WT, 7, SPLIT, 1>, blocks, 256, smem, e->stream, a); break;
-        default: launch(gemv_kernel<WT, 8, SPLIT, 1>, blocks, 256, smem, e->stream, a); break;
+        case 3: launch(gemv_kernel<WT, 3, SPLIT, RW>, blocks, 256, smem, e->stream, a); break;
+        case 4: launch(gemv_kernel<WT, 4, SPLIT, RW>, blocks, 256, smem, e->stream, a); break;
+        case 5: launch(gemv_kernel<WT, 5, SPLIT, RW>, blocks, 256, smem, e->stream, a); break;
+        case 6: launch(gemv_kernel<WT, 6, SPLIT, RW>, blocks, 256, smem, e->stream, a); break;
+        case 7: launch(gemv_kernel<WT, 7, SPLIT, RW>, blocks, 256, smem, e->stream, a); break;
+        default: launch(gemv_kernel<WT, 8, SPLIT, RW>, blocks, 256, smem, e->stream, a); break;
     }
+}
+
+template <typename WT, int SPLIT>
+static void launch_gemv_split(Engine* e, const GemvArgs& a, int rows, int rw, int blocks, size_t smem)
+{
+    if (rows == 1) { launch(gemv_kernel<WT, 1, SPLIT, 2>, blocks, 256, smem, e->stream, a); return; }
+    if (rows == 2) { launch(gemv_kernel<WT, 2, SPLIT, 2>, blocks, 256, smem, e->stream, a); return; }
+    if (rw >= 4) launch_gemv_rows<WT, SPLIT, 4>(e, a, rows, blocks, smem);
+    else if (rw == 2) launch_gemv_rows<WT, SPLIT, 2>(e, a, rows, blocks, smem);
+    else launch_gemv_rows<WT, SPLIT, 1>(e, a, rows, blocks, smem);
+}
+
+// Output rows per warp for 3+ activation rows: 2, or 4 from 6 rows (measured on
+// Qwen3.5 0.8B, RTX 5090); AMQE_GEMV_RW=1, 2 or 4 fixes it. Each output keeps
+// its own accumulation order, so the values do not depend on it.
+static int gemv_rw(int rows)
+{
+    static int rw = -1;
+    if (rw < 0) { const char* v = getenv("AMQE_GEMV_RW"); rw = v ? atoi(v) : 0; if (rw != 1 && rw != 2 && rw != 4) rw = 0; }
+    return rw ? rw : (rows >= 6 ? 4 : 2);
 }
 
 template <typename WT>
@@ -537,7 +556,8 @@ static int launch_gemv(Engine* e, const GemvArgs& a, int rows)
     // Enough warps per row that the machine holds ~32 warps per SM.
     int split = a.n >= gSms * 32 ? 1 : (a.n >= gSms * 12 ? 2 : 4);
     if (a.k < 256 * split) split = 1;
-    int perGroup = (8 / split) * (rows <= 2 ? 2 : 1);
+    int rw = rows <= 2 ? 2 : gemv_rw(rows);
+    int perGroup = (8 / split) * rw;
     long long groups = ((long long)a.n + perGroup - 1) / perGroup;
     // With the norm fused every block re-reads x, so a wide matrix runs on a
     // bounded grid and its blocks loop over rows instead.
@@ -547,9 +567,9 @@ static int launch_gemv(Engine* e, const GemvArgs& a, int rows)
     if (smem > 48 * 1024) return -101;
     switch (split)
     {
-        case 1: launch_gemv_split<WT, 1>(e, a, rows, blocks, smem); break;
-        case 2: launch_gemv_split<WT, 2>(e, a, rows, blocks, smem); break;
-        default: launch_gemv_split<WT, 4>(e, a, rows, blocks, smem); break;
+        case 1: launch_gemv_split<WT, 1>(e, a, rows, rw, blocks, smem); break;
+        case 2: launch_gemv_split<WT, 2>(e, a, rows, rw, blocks, smem); break;
+        default: launch_gemv_split<WT, 4>(e, a, rows, rw, blocks, smem); break;
     }
     return ok(cudaGetLastError());
 }
@@ -623,8 +643,11 @@ AMQE_EXPORT int amqe_linear(Engine* e, const void* w, int wType, int n, int k,
     if (prefetch < 0) { const char* v = getenv("AMQE_GEMV_PREFETCH"); prefetch = v ? atoi(v) : 1; }
     GemvArgs a{ w, n, k, x, ldx, y, ldy, bias, residual, ldr, resScale, act, glu,
                 normW, normOff, normBias, normEps, normKind, prefetch };
-    if (normW && rows > 8) return -101;
-    if (rows <= 8)
+    // AMQE_GEMM_FROM=N: N rows or more go to cuBLAS instead of the GEMV (default 9).
+    static int gemmFrom = -1;
+    if (gemmFrom < 0) { const char* v = getenv("AMQE_GEMM_FROM"); gemmFrom = v ? atoi(v) : 9; if (gemmFrom < 2) gemmFrom = 9; }
+    if (normW && rows >= gemmFrom) return -101;
+    if (rows < gemmFrom)
     {
         return wType == 0 ? launch_gemv<__nv_bfloat16>(e, a, rows) : launch_gemv<float>(e, a, rows);
     }
@@ -799,6 +822,8 @@ struct AttnPrepArgs
     const float* qNormW; float qNormOff; float qNormEps;
     const float* kNormW; float kNormOff; float kNormEps;
     const float* invFreq; int pairs; double ropeScale; int interleaved; int rope;
+    // A batch (null otherwise): row r is its own sequence, with its own caches and position.
+    float* const* kCaches; float* const* vCaches; const int* const* poss;
 };
 
 __global__ void attn_prep_kernel(AttnPrepArgs a)
@@ -815,7 +840,9 @@ __global__ void attn_prep_kernel(AttnPrepArgs a)
     int qw = a.hq * d * (a.gated ? 2 : 1);
     int kvDim = a.hkv * d;
     const float* src = isQ ? row + (long long)h * d * (a.gated ? 2 : 1) : row + qw + (long long)h * d;
-    int position = *a.pos + r;
+    int position = a.poss ? *a.poss[r] : *a.pos + r;
+    float* kCache = a.kCaches ? a.kCaches[r] : a.kCache;
+    float* vCache = a.vCaches ? a.vCaches[r] : a.vCache;
 
     for (int c = threadIdx.x; c < d; c += blockDim.x) buf[c] = src[c];
     if (isQ && a.gated)
@@ -860,8 +887,8 @@ __global__ void attn_prep_kernel(AttnPrepArgs a)
         const float* vsrc = row + qw + kvDim + (long long)h * d;
         for (int c = threadIdx.x; c < d; c += blockDim.x)
         {
-            a.kCache[dst + c] = buf[c];
-            a.vCache[dst + c] = vsrc[c];
+            kCache[dst + c] = buf[c];
+            vCache[dst + c] = vsrc[c];
         }
     }
 }
@@ -873,8 +900,26 @@ AMQE_EXPORT int amqe_attn_prep(Engine* e, const float* qkv, int ldqkv, int rows,
     const float* invFreq, int pairs, double ropeScale, int interleaved, int rope)
 {
     AttnPrepArgs a{ qkv, ldqkv, rows, hq, hkv, d, gated, q, gate, kCache, vCache, pos,
-        qNormW, qNormOff, qNormEps, kNormW, kNormOff, kNormEps, invFreq, pairs, ropeScale, interleaved, rope };
+        qNormW, qNormOff, qNormEps, kNormW, kNormOff, kNormEps, invFreq, pairs, ropeScale, interleaved, rope,
+        nullptr, nullptr, nullptr };
     dim3 grid(rows, hq + hkv);
+    int threads = d >= 128 ? 128 : 64;
+    launch(attn_prep_kernel, grid, threads, d * sizeof(float), e->stream, a);
+    return ok(cudaGetLastError());
+}
+
+// One decode row for each of `batch` sequences: row r appends to kCaches[r] and
+// vCaches[r] at position *poss[r].
+AMQE_EXPORT int amqe_attn_prep_batch(Engine* e, const float* qkv, int ldqkv, int batch, int hq, int hkv, int d, int gated,
+    float* q, float* gate, float* const* kCaches, float* const* vCaches, const int* const* poss,
+    const float* qNormW, float qNormOff, float qNormEps,
+    const float* kNormW, float kNormOff, float kNormEps,
+    const float* invFreq, int pairs, double ropeScale, int interleaved, int rope)
+{
+    AttnPrepArgs a{ qkv, ldqkv, batch, hq, hkv, d, gated, q, gate, nullptr, nullptr, nullptr,
+        qNormW, qNormOff, qNormEps, kNormW, kNormOff, kNormEps, invFreq, pairs, ropeScale, interleaved, rope,
+        kCaches, vCaches, poss };
+    dim3 grid(batch, hq + hkv);
     int threads = d >= 128 ? 128 : 64;
     launch(attn_prep_kernel, grid, threads, d * sizeof(float), e->stream, a);
     return ok(cudaGetLastError());
@@ -925,7 +970,8 @@ __device__ __forceinline__ float softcapped(float s, float softcap)
 template <int DPL>
 __global__ void __launch_bounds__(SPLIT_THREADS) attention_split_kernel(const float* q, const float* kCache,
     const float* vCache, float* part, const int* pos, int hq, int hkv, int nsplit,
-    float scale, float softcap, int window, int d)
+    float scale, float softcap, int window, int d,
+    const float* const* kCaches, const float* const* vCaches, const int* const* poss)
 {
     pdl_enter();
     const int D = d;   // DPL = ceil(d / 32) dims per lane
@@ -934,7 +980,9 @@ __global__ void __launch_bounds__(SPLIT_THREADS) attention_split_kernel(const fl
     __shared__ float red[32];
     int h = blockIdx.x, r = blockIdx.y, split = blockIdx.z;
     int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    int qPos = *pos + r;
+    // A batch: row r is its own sequence, with its own caches and position.
+    if (kCaches) { kCache = kCaches[r]; vCache = vCaches[r]; }
+    int qPos = poss ? *poss[r] : *pos + r;
     int first = window > 0 ? max(0, qPos - window + 1) : 0;
     int k0 = max(split * SPLIT_KEYS, first);
     int k1 = min(split * SPLIT_KEYS + SPLIT_KEYS, qPos + 1);
@@ -1143,7 +1191,8 @@ static int launch_attention(Engine* e, const float* q, const float* kCache, cons
     if (rows <= 8)
     {
         dim3 grid(hq, rows, nsplit);
-        launch(attention_split_kernel<DPL>, grid, SPLIT_THREADS, 0, e->stream, q, kCache, vCache, part, pos, hq, hkv, nsplit, scale, softcap, window, d);
+        launch(attention_split_kernel<DPL>, grid, SPLIT_THREADS, 0, e->stream, q, kCache, vCache, part, pos, hq, hkv, nsplit, scale, softcap, window, d,
+            (const float* const*)nullptr, (const float* const*)nullptr, (const int* const*)nullptr);
         launch(attention_combine_kernel, dim3(hq, rows), D < 128 ? 128 : D, nsplit * sizeof(float), e->stream, part, gate, out, hq, D, nsplit);
         return ok(cudaGetLastError());
     }
@@ -1272,6 +1321,35 @@ AMQE_EXPORT int amqe_attention(Engine* e, const float* q, const float* kCache, c
     switch ((d + 31) / 32)
     {
 #define ATTN_CASE(n) case n: return launch_attention<n>(e, q, kCache, vCache, gate, out, pos, rows, hq, hkv, scale, softcap, window, part, nsplit, d);
+        ATTN_CASE(1) ATTN_CASE(2) ATTN_CASE(3) ATTN_CASE(4) ATTN_CASE(5) ATTN_CASE(6) ATTN_CASE(7) ATTN_CASE(8)
+#undef ATTN_CASE
+        default: return -100;
+    }
+}
+
+template <int DPL>
+static int launch_attention_batch(Engine* e, const float* q, const float* const* kCaches, const float* const* vCaches,
+    const float* gate, float* out, const int* const* poss, int batch, int hq, int hkv,
+    float scale, float softcap, int window, float* part, int nsplit, int d)
+{
+    dim3 grid(hq, batch, nsplit);
+    launch(attention_split_kernel<DPL>, grid, SPLIT_THREADS, 0, e->stream, q, (const float*)nullptr, (const float*)nullptr, part,
+        (const int*)nullptr, hq, hkv, nsplit, scale, softcap, window, d, kCaches, vCaches, poss);
+    launch(attention_combine_kernel, dim3(hq, batch), d < 128 ? 128 : d, nsplit * sizeof(float), e->stream, part, gate, out, hq, d, nsplit);
+    return ok(cudaGetLastError());
+}
+
+// One decode row for each of up to 8 sequences: row r attends over its own
+// caches up to *poss[r]. nsplit covers the longest cache; a slice past a row's
+// position exits at once.
+AMQE_EXPORT int amqe_attention_batch(Engine* e, const float* q, const float* const* kCaches, const float* const* vCaches,
+    const float* gate, float* out, const int* const* poss, int batch, int hq, int hkv, int d,
+    float scale, float softcap, int window, float* part, int nsplit)
+{
+    if (d < 1 || d > 256 || batch < 1 || batch > 8) return -100;
+    switch ((d + 31) / 32)
+    {
+#define ATTN_CASE(n) case n: return launch_attention_batch<n>(e, q, kCaches, vCaches, gate, out, poss, batch, hq, hkv, scale, softcap, window, part, nsplit, d);
         ATTN_CASE(1) ATTN_CASE(2) ATTN_CASE(3) ATTN_CASE(4) ATTN_CASE(5) ATTN_CASE(6) ATTN_CASE(7) ATTN_CASE(8)
 #undef ATTN_CASE
         default: return -100;
@@ -2130,6 +2208,162 @@ AMQE_EXPORT int amqe_gdn(Engine* e, const float* proj, int ldp, int rows, int ke
     }
     if (!fused)
         launch(gdn_gate_norm_kernel, dim3(rows, nv), vd < 64 ? 64 : (vd > 256 ? 256 : vd), 0, e->stream, out, valueDim, vd, proj, ldp, zOff, normW, normEps);
+    return ok(cudaGetLastError());
+}
+
+// ── Gated DeltaNet, a batch of sequences ───────────────────────────────────
+//
+// One decode token for each of B independent sequences (row r of proj, conv,
+// qk, gb and out is sequence r), each with its own conv history and recurrent
+// state: histories[r] and states[r]. The arithmetic is gdn_conv_prep_kernel's
+// and gdn_scan_kernel's for one row; the sequence is the grid's last
+// dimension, so the whole batch is two launches instead of two per sequence.
+
+__global__ void gdn_conv_prep_batch_kernel(const float* proj, int ldp, int channels, int keyDim, int nk,
+    const float* w, int kernel, float* const* histories, float* conv, float* qk,
+    int bOff, int aOff, int nv, const float* aLog, const float* dtBias, float* gb)
+{
+    pdl_enter();
+    __shared__ float red[32];
+    int r = blockIdx.y;
+    const float* pr = proj + (long long)r * ldp;
+    if (blockIdx.x == gridDim.x - 1)
+    {
+        for (int v = threadIdx.x; v < nv; v += blockDim.x)
+        {
+            float x = pr[aOff + v] + dtBias[v];
+            float sp = x > 20.f ? x : log1pf(expf(x));
+            gb[(long long)r * 2 * nv + v] = expf(-expf(aLog[v]) * sp);
+            gb[(long long)r * 2 * nv + nv + v] = sigmoidf_(pr[bOff + v]);
+        }
+        return;
+    }
+    float* history = histories[r];
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    bool live = c < channels;
+    bool isQk = blockIdx.x < 2 * nk;   // block-uniform
+    int hl = kernel - 1;
+    float y = 0.f;
+    if (live)
+    {
+        float x = pr[c];
+        float acc = 0.f;
+        float* hc = history + (long long)c * hl;
+        for (int i = 0; i < hl; i++) acc += w[(long long)c * kernel + i] * hc[hl - 1 - i];
+        acc += w[(long long)c * kernel + hl] * x;
+        y = silu(acc);
+        conv[(long long)r * channels + c] = y;
+        for (int i = hl - 1; i >= 1; i--) hc[i] = hc[i - 1];
+        if (hl > 0) hc[0] = x;
+    }
+    if (isQk)
+    {
+        float ss = block_sum(y * y, red);
+        qk[(long long)r * 2 * keyDim + c] = y * rsqrtf(ss + 1e-6f);
+    }
+}
+
+template <int KD, bool FUSED>
+__global__ void __launch_bounds__(FUSED ? 512 : 128) gdn_scan_batch_kernel(const float* conv, const float* qk, const float* gb,
+    int keyDim, int convDim, int nk, int nv, int vd, float* const* states, float* out, int valueDim,
+    const float* proj, int ldp, int zOff, const float* normW, float normEps)
+{
+    pdl_enter();
+    constexpr int KP = KD / 4;
+    __shared__ float red[32];
+    int r = blockIdx.z;
+    int h = blockIdx.x;
+    int col = blockIdx.y * 32 + (threadIdx.x >> 2);
+    int part = threadIdx.x & 3;
+    int kh = h / (nv / nk);
+    float S[KP];
+    float* st = states[r] + (long long)h * KD * vd;
+    #pragma unroll
+    for (int i = 0; i < KP; i++) S[i] = st[(long long)(part * KP + i) * vd + col];
+    const float qScale = rsqrtf((float)KD);
+
+    const float* qr = qk + (long long)r * 2 * keyDim + kh * KD + part * KP;
+    const float* kr = qr + keyDim;
+    float decay = gb[(long long)r * 2 * nv + h];
+    float beta = gb[(long long)r * 2 * nv + nv + h];
+    float v = conv[(long long)r * convDim + 2 * keyDim + h * vd + col];
+    float kv[KP], qv[KP];
+    #pragma unroll
+    for (int i = 0; i < KP; i += 4)
+    {
+        float4 a = *reinterpret_cast<const float4*>(kr + i);
+        float4 b = *reinterpret_cast<const float4*>(qr + i);
+        kv[i] = a.x; kv[i + 1] = a.y; kv[i + 2] = a.z; kv[i + 3] = a.w;
+        qv[i] = b.x; qv[i + 1] = b.y; qv[i + 2] = b.z; qv[i + 3] = b.w;
+    }
+    float m0 = 0.f, m1 = 0.f;
+    #pragma unroll
+    for (int i = 0; i < KP; i += 2)
+    {
+        S[i] *= decay; S[i + 1] *= decay;
+        m0 = fmaf(S[i], kv[i], m0);
+        m1 = fmaf(S[i + 1], kv[i + 1], m1);
+    }
+    float kvMem = m0 + m1;
+    kvMem += __shfl_xor_sync(0xffffffffu, kvMem, 1);
+    kvMem += __shfl_xor_sync(0xffffffffu, kvMem, 2);
+    float delta = (v - kvMem) * beta;
+    float o0 = 0.f, o1 = 0.f;
+    #pragma unroll
+    for (int i = 0; i < KP; i += 2)
+    {
+        S[i] = fmaf(kv[i], delta, S[i]);
+        S[i + 1] = fmaf(kv[i + 1], delta, S[i + 1]);
+        o0 = fmaf(S[i], qv[i], o0);
+        o1 = fmaf(S[i + 1], qv[i + 1], o1);
+    }
+    float o = o0 + o1;
+    o += __shfl_xor_sync(0xffffffffu, o, 1);
+    o += __shfl_xor_sync(0xffffffffu, o, 2);
+    o *= qScale;
+    if (FUSED)
+    {
+        float ss = block_sum(part == 0 ? o * o : 0.f, red);
+        if (part == 0)
+        {
+            float z = proj[(long long)r * ldp + zOff + h * vd + col];
+            out[(long long)r * valueDim + h * vd + col] = o * rsqrtf(ss / vd + normEps) * normW[col] * silu(z);
+        }
+    }
+    else if (part == 0)
+    {
+        out[(long long)r * valueDim + h * vd + col] = o;
+    }
+    #pragma unroll
+    for (int i = 0; i < KP; i++) st[(long long)(part * KP + i) * vd + col] = S[i];
+}
+
+AMQE_EXPORT int amqe_gdn_batch(Engine* e, const float* proj, int ldp, int batch, int keyDim, int valueDim,
+    int nk, int nv, int kd, int vd, const float* convW, int kernel, float* const* histories,
+    const float* aLog, const float* dtBias, const float* normW, float normEps,
+    float* const* states, float* conv, float* qk, float* gb, float* out)
+{
+    if (vd % 32 != 0 || (kd != 64 && kd != 128) || kernel < 1 || kernel > 9 || batch < 1) return -100;
+    int convDim = 2 * keyDim + valueDim;
+    int zOff = convDim, bOff = convDim + valueDim, aOff = convDim + valueDim + nv;
+    int blocks = (convDim + kd - 1) / kd + 1;
+    launch(gdn_conv_prep_batch_kernel, dim3(blocks, batch), kd, 0, e->stream, proj, ldp, convDim, keyDim, nk, convW, kernel,
+        histories, conv, qk, bOff, aOff, nv, aLog, dtBias, gb);
+    bool fused = vd * 4 <= 512;
+    dim3 grid(nv, fused ? 1 : vd / 32, batch);
+    int threads = fused ? vd * 4 : 128;
+    if (kd == 128)
+    {
+        if (fused) launch(gdn_scan_batch_kernel<128, true>, grid, threads, 0, e->stream, conv, qk, gb, keyDim, convDim, nk, nv, vd, states, out, valueDim, proj, ldp, zOff, normW, normEps);
+        else launch(gdn_scan_batch_kernel<128, false>, grid, threads, 0, e->stream, conv, qk, gb, keyDim, convDim, nk, nv, vd, states, out, valueDim, proj, ldp, zOff, normW, normEps);
+    }
+    else
+    {
+        if (fused) launch(gdn_scan_batch_kernel<64, true>, grid, threads, 0, e->stream, conv, qk, gb, keyDim, convDim, nk, nv, vd, states, out, valueDim, proj, ldp, zOff, normW, normEps);
+        else launch(gdn_scan_batch_kernel<64, false>, grid, threads, 0, e->stream, conv, qk, gb, keyDim, convDim, nk, nv, vd, states, out, valueDim, proj, ldp, zOff, normW, normEps);
+    }
+    if (!fused)
+        launch(gdn_gate_norm_kernel, dim3(batch, nv), vd < 64 ? 64 : (vd > 256 ? 256 : vd), 0, e->stream, out, valueDim, vd, proj, ldp, zOff, normW, normEps);
     return ok(cudaGetLastError());
 }
 

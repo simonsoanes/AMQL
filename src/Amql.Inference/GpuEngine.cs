@@ -51,14 +51,27 @@ public sealed class GpuEngine : IDisposable
     private readonly int _finalNormKind;
 
     // Activations, [ChunkRows × width] each.
-    private readonly IntPtr _pos, _tokens, _x, _hn, _proj, _q, _gate, _ctx, _conv, _gdn, _qk, _gb, _ffn, _branch, _branch2, _raw, _logits;
+    private readonly IntPtr _tokens, _x, _hn, _proj, _q, _gate, _ctx, _conv, _gdn, _qk, _gb, _ffn, _branch, _branch2, _raw, _logits;
     private IntPtr _attnPart;
-    private int _attnSplits;
+    private int _attnPartSplits;
     private readonly int _maxHeads, _maxHeadDim;
-    private readonly IntPtr _hostToken, _hostLogits;
+    private readonly IntPtr _hostToken, _hostLogits, _hostPrefillLogits;
 
-    private int _kvCapacity;
-    private int _position;
+    /// <summary>The most sequences one <see cref="Step(IReadOnlyList{GpuSequence}, ReadOnlySpan{int})"/>
+    /// advances together: the decode GEMV reads each weight once for up to 8 rows.</summary>
+    public const int MaxBatch = 8;
+
+    // The sequence the single-sequence API (Prefill, Step, Reset, Position) runs.
+    private readonly GpuSequence _main;
+    private readonly List<GpuSequence> _sequences = new();
+
+    // The captured decode graph and the sequences it was captured for, in order.
+    private GpuSequence[]? _graphFor;
+
+    // A batch's per-sequence pointers, by layer: K caches, V caches, positions,
+    // recurrent states, conv histories, MaxBatch of each (see BatchTable).
+    private readonly IntPtr _batchTable;
+    private const int TableKinds = 5;
     private bool _graphReady;
     private bool _disposed;
 
@@ -66,7 +79,7 @@ public sealed class GpuEngine : IDisposable
     /// were read at.</summary>
     internal int WeightsVersion { get; }
 
-    public int Position => _position;
+    public int Position => _main.Position;
 
     private static readonly bool RowsAttention = Environment.GetEnvironmentVariable("AMQE_ATTN_ROWS") is not "0";
     private static readonly bool Timing = Environment.GetEnvironmentVariable("AMQL_GPU_ENGINE_TIMING") is "1";
@@ -144,9 +157,7 @@ public sealed class GpuEngine : IDisposable
                     ld.DtBias = Vector(weights, lin.DtBias, lin.NumVHeads);
                     ld.GdnNormW = Vector(weights, lin.NormWeight, lin.HeadVDim);
                     ld.Out = Matrix(weights, lin.OutProj, _hidden, lin.ValueDim);
-                    ld.State = Alloc((long)lin.NumVHeads * lin.HeadKDim * lin.HeadVDim * 4);
                     ld.StateBytes = (long)lin.NumVHeads * lin.HeadKDim * lin.HeadVDim * 4;
-                    ld.ConvHistory = Alloc((long)lin.ConvDim * (lin.ConvKernel - 1) * 4);
                     ld.ConvHistoryBytes = (long)lin.ConvDim * (lin.ConvKernel - 1) * 4;
                     projWidth = Math.Max(projWidth, ld.In.Rows);
                     convWidth = Math.Max(convWidth, lin.ConvDim);
@@ -183,7 +194,6 @@ public sealed class GpuEngine : IDisposable
             }
 
             long rows = ChunkRows;
-            _pos = Alloc(16);
             _tokens = Alloc(rows * 4);
             _x = Alloc(rows * _hidden * 4);
             _hn = Alloc(rows * _hidden * 4);
@@ -199,11 +209,12 @@ public sealed class GpuEngine : IDisposable
             _branch = Alloc(rows * _hidden * 4);
             _branch2 = Alloc(rows * _hidden * 4);
             _raw = Alloc(rows * projWidth * 4);
-            _logits = Alloc((long)_vocab * 4);
-            Check(Native.amqe_host_alloc(out _hostToken, 16), "host alloc");
-            Check(Native.amqe_host_alloc(out _hostLogits, (nuint)((long)_vocab * 4)), "host alloc");
-            EnsureKv(1024);
-            Reset();
+            _logits = Alloc((long)MaxBatch * _vocab * 4);
+            _batchTable = Alloc((long)_layers.Length * TableKinds * MaxBatch * 8);
+            Check(Native.amqe_host_alloc(out _hostToken, MaxBatch * 4), "host alloc");
+            Check(Native.amqe_host_alloc(out _hostLogits, (nuint)((long)MaxBatch * _vocab * 4)), "host alloc");
+            Check(Native.amqe_host_alloc(out _hostPrefillLogits, (nuint)((long)_vocab * 4)), "host alloc");
+            _main = NewSequence();
         }
         catch
         {
@@ -356,22 +367,76 @@ public sealed class GpuEngine : IDisposable
     // ── session ───────────────────────────────────────────────────────────
 
     /// <summary>A fresh sequence: position 0, zero recurrent state.</summary>
-    public void Reset()
+    public void Reset() => Reset(_main);
+
+    /// <summary>A sequence of its own beside the others: its KV cache,
+    /// recurrent state and position, over the engine's one copy of the weights.
+    /// Release it when done.</summary>
+    public GpuSequence NewSequence()
     {
-        Check(Native.amqe_memset(_engine, _pos, 0, 16), "reset");
-        foreach (var l in _layers)
+        var seq = new GpuSequence(_layers.Length) { Pos = Alloc(16) };
+        for (int i = 0; i < _layers.Length; i++)
         {
-            if (l.State != IntPtr.Zero)
+            if (_layers[i].StateBytes > 0)
             {
-                Check(Native.amqe_memset(_engine, l.State, 0, (nuint)l.StateBytes), "reset");
-                if (l.ConvHistoryBytes > 0)
+                seq.State[i] = Alloc(_layers[i].StateBytes);
+                seq.Conv[i] = _layers[i].ConvHistoryBytes > 0 ? Alloc(_layers[i].ConvHistoryBytes) : IntPtr.Zero;
+            }
+        }
+        _sequences.Add(seq);
+        EnsureKv(seq, 1024);
+        Reset(seq);
+        return seq;
+    }
+
+    /// <summary>Frees a sequence's state.</summary>
+    public void Release(GpuSequence seq)
+    {
+        if (ReferenceEquals(seq, _main) || !_sequences.Remove(seq))
+        {
+            return;
+        }
+        Check(Native.amqe_sync(_engine), "release");
+        if (_graphFor is not null && _graphFor.Contains(seq))
+        {
+            _graphReady = false;
+        }
+        foreach (var ptr in seq.K.Concat(seq.V).Concat(seq.State).Concat(seq.Conv).Append(seq.Pos))
+        {
+            if (ptr != IntPtr.Zero)
+            {
+                Free(ptr);
+            }
+        }
+        seq.Released = true;
+    }
+
+    /// <summary>Starts a sequence again: position 0, zero recurrent state.</summary>
+    public void Reset(GpuSequence seq)
+    {
+        Live(seq);
+        Check(Native.amqe_memset(_engine, seq.Pos, 0, 16), "reset");
+        for (int i = 0; i < _layers.Length; i++)
+        {
+            if (seq.State[i] != IntPtr.Zero)
+            {
+                Check(Native.amqe_memset(_engine, seq.State[i], 0, (nuint)_layers[i].StateBytes), "reset");
+                if (seq.Conv[i] != IntPtr.Zero)
                 {
-                    Check(Native.amqe_memset(_engine, l.ConvHistory, 0, (nuint)l.ConvHistoryBytes), "reset");
+                    Check(Native.amqe_memset(_engine, seq.Conv[i], 0, (nuint)_layers[i].ConvHistoryBytes), "reset");
                 }
             }
         }
         Check(Native.amqe_sync(_engine), "reset");
-        _position = 0;
+        seq.Position = 0;
+    }
+
+    private static void Live(GpuSequence seq)
+    {
+        if (seq.Released)
+        {
+            throw new InvalidOperationException("the sequence was released");
+        }
     }
 
     /// <summary>True runs prompt projections as FP32 SGEMM over widened
@@ -392,15 +457,20 @@ public sealed class GpuEngine : IDisposable
 
     /// <summary>Runs the tokens through every layer from the current position
     /// and returns the last token's logits.</summary>
-    public float[] Prefill(ReadOnlySpan<int> tokens)
+    public float[] Prefill(ReadOnlySpan<int> tokens) => Prefill(_main, tokens);
+
+    /// <summary>Runs the tokens through every layer from the sequence's
+    /// position and returns the last token's logits.</summary>
+    public float[] Prefill(GpuSequence seq, ReadOnlySpan<int> tokens)
     {
+        Live(seq);
         if (tokens.Length == 0)
         {
             throw new ArgumentException("prefill requires at least one token", nameof(tokens));
         }
         // Growing moves the KV buffers, and the captured decode graph holds their old
         // addresses: replaying it after a long prefill read freed memory (status -700).
-        if (EnsureKv(_position + tokens.Length))
+        if (EnsureKv(seq, seq.Position + tokens.Length))
         {
             _graphReady = false;
         }
@@ -417,29 +487,79 @@ public sealed class GpuEngine : IDisposable
             {
                 handle.Free();
             }
-            Forward(rows, head: start + rows == ids.Length);
-            _position += rows;
+            Forward(new[] { seq }, rows, head: start + rows == ids.Length);
+            seq.Position += rows;
         }
         Check(Native.amqe_sync(_engine), "prefill");
-        return ReadLogits(fromDevice: true);
+        return ReadLogits(0, fromDevice: true);
     }
 
     /// <summary>One token at the current position; returns its logits.</summary>
-    public float[] Step(int token)
+    public float[] Step(int token) => Step(new[] { _main }, new[] { token })[0];
+
+    /// <summary>
+    /// One token for each of up to <see cref="MaxBatch"/> sequences, in one pass:
+    /// the projections and the head read every weight once for all of them, while
+    /// attention and the recurrence run per sequence over its own state. Returns
+    /// each sequence's logits, in order. The pass is captured as a graph and
+    /// replayed while the same sequences step together.
+    /// </summary>
+    public float[][] Step(IReadOnlyList<GpuSequence> seqs, ReadOnlySpan<int> tokens)
     {
-        if (EnsureKv(_position + 1))
+        StepInPlace(seqs, tokens);
+        var logits = new float[seqs.Count][];
+        for (int i = 0; i < logits.Length; i++)
+        {
+            logits[i] = HostLogits(i).ToArray();
+        }
+        return logits;
+    }
+
+    /// <summary>
+    /// <see cref="Step(IReadOnlyList{GpuSequence}, ReadOnlySpan{int})"/> without copying the
+    /// logits out: row i of the step is <see cref="HostLogits"/>(i), read where the device
+    /// wrote it, until the next step on this engine. (A prefill writes elsewhere.)
+    /// </summary>
+    public void StepInPlace(IReadOnlyList<GpuSequence> seqs, ReadOnlySpan<int> tokens)
+    {
+        int b = seqs.Count;
+        if (b < 1 || b > MaxBatch || tokens.Length != b)
+        {
+            throw new ArgumentException($"a step takes 1 to {MaxBatch} sequences, one token each");
+        }
+        if (seqs.Distinct().Count() != b)
+        {
+            throw new ArgumentException("a sequence can only step once per pass");
+        }
+        var batch = seqs.ToArray();
+        foreach (var seq in batch)
+        {
+            Live(seq);
+            if (EnsureKv(seq, seq.Position + 1))
+            {
+                _graphReady = false;
+            }
+        }
+        if (_graphFor is null || !_graphFor.SequenceEqual(batch))
         {
             _graphReady = false;
         }
-        Marshal.WriteInt32(_hostToken, token);
+        for (int i = 0; i < b; i++)
+        {
+            Marshal.WriteInt32(_hostToken, i * 4, tokens[i]);
+        }
         if (!_graphReady)
         {
+            if (b > 1)
+            {
+                UploadBatchTable(batch);
+            }
             Check(Native.amqe_capture_begin(_engine), "capture");
             try
             {
-                Check(Native.amqe_copy_async(_engine, _tokens, _hostToken, 4, 1), "token");
-                Forward(1, head: true);
-                Check(Native.amqe_copy_async(_engine, _hostLogits, _logits, (nuint)((long)_vocab * 4), 2), "logits");
+                Check(Native.amqe_copy_async(_engine, _tokens, _hostToken, (nuint)(b * 4), 1), "token");
+                Forward(batch, b, head: true);
+                Check(Native.amqe_copy_async(_engine, _hostLogits, _logits, (nuint)((long)b * _vocab * 4), 2), "logits");
             }
             catch
             {
@@ -449,94 +569,164 @@ public sealed class GpuEngine : IDisposable
             }
             Check(Native.amqe_capture_end(_engine), "capture");
             _graphReady = true;
+            _graphFor = batch;
         }
         long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
         Check(Native.amqe_graph_launch_async(_engine), "step");
         long t1 = System.Diagnostics.Stopwatch.GetTimestamp();
         Check(Native.amqe_sync(_engine), "step");
         long t2 = System.Diagnostics.Stopwatch.GetTimestamp();
-        _position++;
-        var logits = ReadLogits(fromDevice: false);
+        foreach (var seq in batch)
+        {
+            seq.Position++;
+        }
+        _lastRows = b;
         if (Timing)
         {
             long t3 = System.Diagnostics.Stopwatch.GetTimestamp();
             _launchTicks += t1 - t0;
             _syncTicks += t2 - t1;
             _copyTicks += t3 - t2;
-            _timedSteps++;
+            if (++_timedSteps % 500 == 0)
+            {
+                double us(long t) => t * 1e6 / System.Diagnostics.Stopwatch.Frequency / _timedSteps;
+                Console.Error.WriteLine($"gpu engine: {_timedSteps} steps of {b}, per step launch {us(_launchTicks):F1} us, " +
+                                        $"wait {us(_syncTicks):F1} us, logits copy {us(_copyTicks):F1} us");
+                _launchTicks = _syncTicks = _copyTicks = _timedSteps = 0;
+            }
         }
-        return logits;
     }
 
-    private float[] ReadLogits(bool fromDevice)
+    private int _lastRows;
+
+    /// <summary>Row <paramref name="row"/> of the last step's logits, in the pinned host
+    /// buffer the device copied them to; valid until the next step on this engine.</summary>
+    public unsafe ReadOnlySpan<float> HostLogits(int row)
     {
+        if ((uint)row >= (uint)_lastRows)
+        {
+            throw new ArgumentOutOfRangeException(nameof(row), $"the last step had {_lastRows} rows");
+        }
+        return new ReadOnlySpan<float>((float*)(_hostLogits + (nint)((long)row * _vocab * 4)), _vocab);
+    }
+
+    private float[] ReadLogits(int row, bool fromDevice)
+    {
+        IntPtr host = fromDevice ? _hostPrefillLogits : _hostLogits;
         if (fromDevice)
         {
-            Check(Native.amqe_download(_engine, _hostLogits, _logits, (nuint)((long)_vocab * 4)), "logits");
+            Check(Native.amqe_download(_engine, _hostPrefillLogits, _logits, (nuint)((long)_vocab * 4)), "logits");
         }
         var logits = GC.AllocateUninitializedArray<float>(_vocab);
-        Marshal.Copy(_hostLogits, logits, 0, _vocab);
+        Marshal.Copy(host + row * _vocab * 4, logits, 0, _vocab);
         return logits;
     }
 
-    /// <summary>Grows every KV cache to hold <paramref name="needed"/> rows;
-    /// true when the buffers moved (a captured graph is then stale).</summary>
-    private bool EnsureKv(int needed)
+    /// <summary>Grows a sequence's KV caches to hold <paramref name="needed"/> rows;
+    /// true when buffers moved (a captured graph is then stale).</summary>
+    private bool EnsureKv(GpuSequence seq, int needed)
     {
-        if (needed <= _kvCapacity)
+        if (needed <= seq.KvCapacity)
         {
             return false;
         }
-        int capacity = Math.Max(1024, _kvCapacity);
+        int capacity = Math.Max(1024, seq.KvCapacity);
         while (capacity < needed)
         {
             capacity *= 2;
         }
-        foreach (var l in _layers)
+        for (int i = 0; i < _layers.Length; i++)
         {
-            if (l.Plan.Attention is not { } attn)
+            if (_layers[i].Plan.Attention is not { } attn)
             {
                 continue;
             }
             long bytes = (long)capacity * attn.KvDim * 4;
             var k = Alloc(bytes);
             var v = Alloc(bytes);
-            if (l.KCache != IntPtr.Zero)
+            if (seq.K[i] != IntPtr.Zero)
             {
-                long used = (long)_position * attn.KvDim * 4;
+                long used = (long)seq.Position * attn.KvDim * 4;
                 if (used > 0)
                 {
-                    Check(Native.amqe_copy_async(_engine, k, l.KCache, (nuint)used, 3), "kv grow");
-                    Check(Native.amqe_copy_async(_engine, v, l.VCache, (nuint)used, 3), "kv grow");
+                    Check(Native.amqe_copy_async(_engine, k, seq.K[i], (nuint)used, 3), "kv grow");
+                    Check(Native.amqe_copy_async(_engine, v, seq.V[i], (nuint)used, 3), "kv grow");
                 }
                 Check(Native.amqe_sync(_engine), "kv grow");
-                Free(l.KCache);
-                Free(l.VCache);
+                Free(seq.K[i]);
+                Free(seq.V[i]);
             }
-            l.KCache = k;
-            l.VCache = v;
+            seq.K[i] = k;
+            seq.V[i] = v;
         }
-        _kvCapacity = capacity;
+        seq.KvCapacity = capacity;
         // The decode attention's partial softmaxes: one slice per
-        // amqe_attention_split_keys keys of capacity, for up to 8 query rows.
-        if (_maxHeads > 0)
+        // amqe_attention_split_keys keys of capacity, for up to 8 query rows,
+        // sized for the longest sequence (they run one after another).
+        if (_maxHeads > 0 && Splits(seq) > _attnPartSplits)
         {
+            Check(Native.amqe_sync(_engine), "kv grow");
             if (_attnPart != IntPtr.Zero)
             {
                 Free(_attnPart);
             }
-            int keys = Native.amqe_attention_split_keys();
-            _attnSplits = (capacity + keys - 1) / keys;
-            _attnPart = Alloc(8L * _maxHeads * _attnSplits * (_maxHeadDim + 2) * 4);
+            _attnPartSplits = Splits(seq);
+            _attnPart = Alloc(8L * _maxHeads * _attnPartSplits * (_maxHeadDim + 2) * 4);
         }
         return true;
     }
 
+    /// <summary>Writes the batch's pointers where the batched kernels read them:
+    /// for layer i and kind k, MaxBatch pointers at (i·TableKinds + k)·MaxBatch.
+    /// The captured graph reads this table, so it is written before each capture.</summary>
+    private void UploadBatchTable(GpuSequence[] batch)
+    {
+        var table = new long[_layers.Length * TableKinds * MaxBatch];
+        for (int i = 0; i < _layers.Length; i++)
+        {
+            for (int r = 0; r < batch.Length; r++)
+            {
+                int at = i * TableKinds * MaxBatch + r;
+                table[at] = batch[r].K[i];
+                table[at + MaxBatch] = batch[r].V[i];
+                table[at + 2 * MaxBatch] = batch[r].Pos;
+                table[at + 3 * MaxBatch] = batch[r].State[i];
+                table[at + 4 * MaxBatch] = batch[r].Conv[i];
+            }
+        }
+        var handle = GCHandle.Alloc(table, GCHandleType.Pinned);
+        try
+        {
+            Check(Native.amqe_upload(_engine, _batchTable, handle.AddrOfPinnedObject(), (nuint)(table.Length * 8)), "batch table");
+        }
+        finally
+        {
+            handle.Free();
+        }
+    }
+
+    private IntPtr Table(int layer, int kind) => _batchTable + (layer * TableKinds + kind) * MaxBatch * 8;
+
+    private static int Splits(GpuSequence seq)
+    {
+        int keys = Native.amqe_attention_split_keys();
+        return (seq.KvCapacity + keys - 1) / keys;
+    }
+
     // ── the forward pass ────────────────────────────────────────────────────
 
-    private void Forward(int rows, bool head)
+    /// <summary>
+    /// The layers over <paramref name="rows"/> rows: one sequence's next
+    /// <paramref name="rows"/> tokens, or (several sequences) one token each,
+    /// row i belonging to <paramref name="seqs"/>[i]. Everything but attention
+    /// and the recurrence treats the rows alike; those two run per sequence.
+    /// The head reads the last row of one sequence, or every row of a batch.
+    /// </summary>
+    private void Forward(GpuSequence[] seqs, int rows, bool head)
     {
         int hidden = _hidden;
+        bool batch = seqs.Length > 1;
+        var one = seqs[0];
         float residualScale = (float)_plan.ResidualScale;
         Check(Native.amqe_embed(_engine, _embed.Ptr, _embed.Type, _tokens, rows, hidden, _embedScale, _hasEmbedScale ? 1 : 0, _x), "embed");
 
@@ -580,29 +770,49 @@ public sealed class GpuEngine : IDisposable
                     Check(Native.amqe_norm(_engine, k, qkvWidth, k, qkvWidth, rows, attn.KvDim,
                         l.KNormW, l.KNormOff, IntPtr.Zero, l.KNormEps, 0), "k norm");
                 }
-                Check(Native.amqe_attn_prep(_engine, _proj, qkvWidth, rows, attn.NumQHeads, attn.NumKvHeads, attn.HeadDim,
-                    attn.OutputGate ? 1 : 0, _q, _gate, l.KCache, l.VCache, _pos,
-                    l.QNormRow ? IntPtr.Zero : l.QNormW, l.QNormOff, l.QNormEps,
-                    l.KNormRow ? IntPtr.Zero : l.KNormW, l.KNormOff, l.KNormEps,
-                    l.InvFreq, l.RopePairs, l.RopeScale, attn.RopeInterleaved ? 1 : 0, l.InvFreq != IntPtr.Zero ? 1 : 0), "attn prep");
-                IntPtr gate = attn.OutputGate ? _gate : IntPtr.Zero;
                 float softcap = attn.LogitSoftcapping ?? 0f;
                 int window = attn.Window is { } w ? (int)w : 0;
-                // A prompt chunk goes through cuBLAS (its position is known on
-                // the host: prompts are never captured); decode steps, and
-                // chunks whose scores would pass the scratch budget, use the
-                // attention kernels.
-                int rc = rows > 8 && RowsAttention
-                    ? Native.amqe_attention_rows(_engine, _q, l.KCache, l.VCache, gate, _ctx, _position,
-                        rows, attn.NumQHeads, attn.NumKvHeads, attn.HeadDim, (float)attn.ScoreScale, softcap, window)
-                    : -200;
-                if (rc == -200)
+                long qRow = (long)attn.NumQHeads * attn.HeadDim * 4;
+                if (batch)
                 {
-                    rc = Native.amqe_attention(_engine, _q, l.KCache, l.VCache, gate, _ctx, _pos,
-                        rows, attn.NumQHeads, attn.NumKvHeads, attn.HeadDim, (float)attn.ScoreScale,
-                        softcap, window, _attnPart, _attnSplits);
+                    // Every sequence in one launch each: row r reads its own cache and position.
+                    Check(Native.amqe_attn_prep_batch(_engine, _proj, qkvWidth, rows, attn.NumQHeads, attn.NumKvHeads, attn.HeadDim,
+                        attn.OutputGate ? 1 : 0, _q, _gate, Table(i, 0), Table(i, 1), Table(i, 2),
+                        l.QNormRow ? IntPtr.Zero : l.QNormW, l.QNormOff, l.QNormEps,
+                        l.KNormRow ? IntPtr.Zero : l.KNormW, l.KNormOff, l.KNormEps,
+                        l.InvFreq, l.RopePairs, l.RopeScale, attn.RopeInterleaved ? 1 : 0, l.InvFreq != IntPtr.Zero ? 1 : 0), "attn prep");
+                    Check(Native.amqe_attention_batch(_engine, _q, Table(i, 0), Table(i, 1), attn.OutputGate ? _gate : IntPtr.Zero, _ctx,
+                        Table(i, 2), rows, attn.NumQHeads, attn.NumKvHeads, attn.HeadDim, (float)attn.ScoreScale, softcap, window,
+                        _attnPart, seqs.Max(Splits)), "attention");
                 }
-                Check(rc, "attention");
+                for (int s = 0; s < (batch ? 0 : seqs.Length); s++)
+                {
+                    var seq = seqs[s];
+                    int n = batch ? 1 : rows;
+                    long at = batch ? s : 0;
+                    IntPtr q = _q + (nint)(at * qRow), gateRow = _gate + (nint)(at * qRow), ctx = _ctx + (nint)(at * qRow);
+                    Check(Native.amqe_attn_prep(_engine, _proj + (nint)(at * qkvWidth * 4), qkvWidth, n, attn.NumQHeads, attn.NumKvHeads,
+                        attn.HeadDim, attn.OutputGate ? 1 : 0, q, gateRow, seq.K[i], seq.V[i], seq.Pos,
+                        l.QNormRow ? IntPtr.Zero : l.QNormW, l.QNormOff, l.QNormEps,
+                        l.KNormRow ? IntPtr.Zero : l.KNormW, l.KNormOff, l.KNormEps,
+                        l.InvFreq, l.RopePairs, l.RopeScale, attn.RopeInterleaved ? 1 : 0, l.InvFreq != IntPtr.Zero ? 1 : 0), "attn prep");
+                    IntPtr gate = attn.OutputGate ? gateRow : IntPtr.Zero;
+                    // A prompt chunk goes through cuBLAS (its position is known on
+                    // the host: prompts are never captured); decode steps, and
+                    // chunks whose scores would pass the scratch budget, use the
+                    // attention kernels.
+                    int rc = n > 8 && RowsAttention
+                        ? Native.amqe_attention_rows(_engine, q, seq.K[i], seq.V[i], gate, ctx, seq.Position,
+                            n, attn.NumQHeads, attn.NumKvHeads, attn.HeadDim, (float)attn.ScoreScale, softcap, window)
+                        : -200;
+                    if (rc == -200)
+                    {
+                        rc = Native.amqe_attention(_engine, q, seq.K[i], seq.V[i], gate, ctx, seq.Pos,
+                            n, attn.NumQHeads, attn.NumKvHeads, attn.HeadDim, (float)attn.ScoreScale,
+                            softcap, window, _attnPart, Splits(seq));
+                    }
+                    Check(rc, "attention");
+                }
                 Linear(l.O!, _ctx, attn.QDim, rows, mixerOut, hidden, l.OBias,
                     residual: mixerDirect ? _x : IntPtr.Zero, resScale: residualScale);
             }
@@ -611,9 +821,20 @@ public sealed class GpuEngine : IDisposable
                 var lin = lp.LinearAttention!;
                 int inWidth = l.In!.Rows;
                 Linear(l.In!, hIn, hidden, rows, _proj, inWidth, IntPtr.Zero, norm: inNorm);
-                Check(Native.amqe_gdn(_engine, _proj, inWidth, rows, lin.KeyDim, lin.ValueDim,
-                    lin.NumKHeads, lin.NumVHeads, lin.HeadKDim, lin.HeadVDim, l.ConvW, lin.ConvKernel, l.ConvHistory,
-                    l.ALog, l.DtBias, l.GdnNormW, (float)lin.NormEps, l.State, _conv, _qk, _gb, _gdn), "gated deltanet");
+                if (batch)
+                {
+                    Check(Native.amqe_gdn_batch(_engine, _proj, inWidth, rows, lin.KeyDim, lin.ValueDim,
+                        lin.NumKHeads, lin.NumVHeads, lin.HeadKDim, lin.HeadVDim, l.ConvW, lin.ConvKernel, Table(i, 4),
+                        l.ALog, l.DtBias, l.GdnNormW, (float)lin.NormEps, Table(i, 3), _conv, _qk, _gb, _gdn), "gated deltanet");
+                }
+                for (int s = 0; s < (batch ? 0 : seqs.Length); s++)
+                {
+                    long at = batch ? s : 0;
+                    Check(Native.amqe_gdn(_engine, _proj + (nint)(at * inWidth * 4), inWidth, batch ? 1 : rows, lin.KeyDim, lin.ValueDim,
+                        lin.NumKHeads, lin.NumVHeads, lin.HeadKDim, lin.HeadVDim, l.ConvW, lin.ConvKernel, seqs[s].Conv[i],
+                        l.ALog, l.DtBias, l.GdnNormW, (float)lin.NormEps, seqs[s].State[i], _conv, _qk, _gb,
+                        _gdn + (nint)(at * lin.ValueDim * 4)), "gated deltanet");
+                }
                 Linear(l.Out!, _gdn, lin.ValueDim, rows, mixerOut, hidden, IntPtr.Zero,
                     residual: mixerDirect ? _x : IntPtr.Zero, resScale: residualScale);
             }
@@ -679,26 +900,31 @@ public sealed class GpuEngine : IDisposable
 
         if (head)
         {
-            // Only the last row goes through the final norm and the head.
+            // One sequence: only its last row goes through the final norm and
+            // the head. A batch: every row, each its own sequence's next token.
             var finalNorm = (_finalNormW, _finalNormB, _finalNormOff, _finalNormEps, _finalNormKind);
-            IntPtr last = _x + (rows - 1) * hidden * 4;
-            if (FusesNorm(1))
+            int headRows = batch ? rows : 1;
+            IntPtr first = batch ? _x : _x + (rows - 1) * hidden * 4;
+            if (FusesNorm(headRows))
             {
-                Linear(_head, last, hidden, 1, _logits, _vocab, IntPtr.Zero, norm: finalNorm);
+                Linear(_head, first, hidden, headRows, _logits, _vocab, IntPtr.Zero, norm: finalNorm);
             }
             else
             {
-                ApplyNorm(finalNorm, last, _hn, 1);
-                Linear(_head, _hn, hidden, 1, _logits, _vocab, IntPtr.Zero);
+                ApplyNorm(finalNorm, first, _hn, headRows);
+                Linear(_head, _hn, hidden, headRows, _logits, _vocab, IntPtr.Zero);
             }
             var output = _plan.Output!;
             if (output.Multiplier is not null || output.LogitSoftcapping is not null)
             {
-                Check(Native.amqe_logit_post(_engine, _logits, _vocab, (float)(output.Multiplier ?? 1.0),
+                Check(Native.amqe_logit_post(_engine, _logits, (long)headRows * _vocab, (float)(output.Multiplier ?? 1.0),
                     output.Multiplier is null ? 0 : 1, output.LogitSoftcapping ?? 0f), "logit post");
             }
         }
-        Check(Native.amqe_advance(_engine, _pos, rows), "advance");
+        foreach (var seq in seqs)
+        {
+            Check(Native.amqe_advance(_engine, seq.Pos, batch ? 1 : rows), "advance");
+        }
     }
 
     /// <summary>y = epilogue(x · Wᵀ); with <paramref name="norm"/> the rows of
@@ -717,7 +943,11 @@ public sealed class GpuEngine : IDisposable
 
     /// <summary>Whether a norm can run inside the projection that reads it: a
     /// few rows (the GEMV path), whose normalised copy fits in shared memory.</summary>
-    private bool FusesNorm(int rows) => rows <= 8 && (long)rows * _hidden * 4 <= 48 * 1024;
+    private bool FusesNorm(int rows) => rows < GemmFrom && (long)rows * _hidden * 4 <= 48 * 1024;
+
+    // Rows from which a projection runs on cuBLAS rather than the GEMV (AMQE_GEMM_FROM, as the native side reads it).
+    private static readonly int GemmFrom =
+        int.TryParse(Environment.GetEnvironmentVariable("AMQE_GEMM_FROM"), out int g) && g >= 2 ? g : 9;
 
     private void ApplyNorm((IntPtr W, IntPtr B, float Off, float Eps, int Kind) norm, IntPtr x, IntPtr output, int rows)
     {
@@ -750,8 +980,7 @@ public sealed class GpuEngine : IDisposable
         public IntPtr InvFreq;
         public int RopePairs;
         public double RopeScale = 1.0;
-        public IntPtr KCache, VCache;
-        public IntPtr ConvW, ALog, DtBias, GdnNormW, State, ConvHistory;
+        public IntPtr ConvW, ALog, DtBias, GdnNormW;
         public long StateBytes, ConvHistoryBytes;
         public int Act;
     }
@@ -925,6 +1154,10 @@ public sealed class GpuEngine : IDisposable
         {
             Native.amqe_host_free(_hostToken);
         }
+        if (_hostPrefillLogits != IntPtr.Zero)
+        {
+            Native.amqe_host_free(_hostPrefillLogits);
+        }
         if (_hostLogits != IntPtr.Zero)
         {
             Native.amqe_host_free(_hostLogits);
@@ -996,6 +1229,24 @@ public sealed class GpuEngine : IDisposable
         public static extern int amqe_logit_post(IntPtr e, IntPtr logits, long count, float mult, int hasMult, float cap);
 
         [DllImport(Lib)] public static extern int amqe_advance(IntPtr e, IntPtr pos, int by);
+
+        [DllImport(Lib)]
+        public static extern int amqe_attn_prep_batch(IntPtr e, IntPtr qkv, int ldqkv, int batch, int hq, int hkv, int d, int gated,
+            IntPtr q, IntPtr gate, IntPtr kCaches, IntPtr vCaches, IntPtr poss,
+            IntPtr qNormW, float qNormOff, float qNormEps,
+            IntPtr kNormW, float kNormOff, float kNormEps,
+            IntPtr invFreq, int pairs, double ropeScale, int interleaved, int rope);
+
+        [DllImport(Lib)]
+        public static extern int amqe_attention_batch(IntPtr e, IntPtr q, IntPtr kCaches, IntPtr vCaches,
+            IntPtr gate, IntPtr output, IntPtr poss, int batch, int hq, int hkv, int d,
+            float scale, float softcap, int window, IntPtr part, int nsplit);
+
+        [DllImport(Lib)]
+        public static extern int amqe_gdn_batch(IntPtr e, IntPtr proj, int ldp, int batch, int keyDim, int valueDim,
+            int nk, int nv, int kd, int vd, IntPtr convW, int kernel, IntPtr histories,
+            IntPtr aLog, IntPtr dtBias, IntPtr normW, float normEps,
+            IntPtr states, IntPtr conv, IntPtr qk, IntPtr gb, IntPtr output);
         [DllImport(Lib)] public static extern int amqe_attention_split_keys();
 
         [DllImport(Lib)]
@@ -1003,4 +1254,26 @@ public sealed class GpuEngine : IDisposable
             IntPtr gate, IntPtr output, int pos0, int rows, int hq, int hkv, int d,
             float scale, float softcap, int window);
     }
+}
+
+/// <summary>One sequence on a <see cref="GpuEngine"/>: its KV caches, recurrent
+/// state and position, beside the engine's other sequences and over its one
+/// copy of the weights.</summary>
+public sealed class GpuSequence
+{
+    internal GpuSequence(int layers)
+    {
+        K = new IntPtr[layers];
+        V = new IntPtr[layers];
+        State = new IntPtr[layers];
+        Conv = new IntPtr[layers];
+    }
+
+    internal IntPtr Pos;
+    internal readonly IntPtr[] K, V, State, Conv;
+    internal int KvCapacity;
+    internal bool Released;
+
+    /// <summary>Tokens the sequence has consumed.</summary>
+    public int Position { get; internal set; }
 }

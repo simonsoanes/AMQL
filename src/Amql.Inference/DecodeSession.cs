@@ -224,6 +224,12 @@ public sealed class DecodeSession : IDisposable
         }
     }
 
+    /// <summary>The device engine this session would run on, built on first
+    /// use; null without one (see <see cref="GpuRefusal"/>). Its own sequences
+    /// (<see cref="GpuEngine.NewSequence"/>) run beside this session's, over the
+    /// same uploaded weights, and can step together in one batch.</summary>
+    public GpuEngine? DeviceEngine() => Gpu();
+
     /// <summary>Which path the current sequence runs on: <c>gpu</c> for the
     /// device engine, <c>cpu</c> otherwise.</summary>
     public string Backend => _onGpu ? "gpu" : "cpu";

@@ -335,8 +335,10 @@ drafter).*
 
 `amql-server --model <container> [--model …]` serves containers over HTTP: TypeSafe `/v1/decisions` for Von
 decision models, and OpenAI-compatible `/v1/embeddings`, `/v1/chat/completions`, `/v1/responses`
-(streaming included), and `/v1/classify` for classifier containers — each endpoint only where the
-container can serve it. See [Server](docs/server.md).
+(streaming included; tools, reasoning and `previous_response_id` for Qwen3.5-family models), and
+`/v1/classify` for classifier containers — each endpoint only where the container can serve it.
+`--adapter` runs Entail adapters beside a chat model, so an agent harness can use the model with, for
+example, `stop-circling`. See [Server](docs/server.md).
 
 ### Decisions (Von)
 

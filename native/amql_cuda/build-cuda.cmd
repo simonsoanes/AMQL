@@ -8,6 +8,7 @@ rem Environment overrides:
 rem   CUDA_ROOT  — path to the CUDA Toolkit (default: auto-detect v13.x)
 rem   CUDA_ARCH  — target SM architecture (default: sm_120; e.g. sm_121)
 rem   VCVARS     — path to vcvars64.bat (default: VS 2022 Enterprise)
+rem   VCVARS_VER — MSVC toolset for vcvars64.bat, e.g. 14.44 (nvcc 13.3's cudafe++ crashes on 14.52's headers)
 rem   CLI_OUT    — optional deployment directory (default: src\Amql.Cli\bin\Release\net10.0)
 
 setlocal
@@ -53,7 +54,11 @@ if not defined CUDA_ARCH (
 rem ── Output ───────────────────────────────────────────────────────────
 if not exist "bin" mkdir bin
 
-call "%VCVARS%" >nul 2>&1
+if defined VCVARS_VER (
+    call "%VCVARS%" -vcvars_ver=%VCVARS_VER% >nul 2>&1
+) else (
+    call "%VCVARS%" >nul 2>&1
+)
 if errorlevel 1 (
     echo [amql-cuda] vcvars64.bat failed.
     exit /b 1

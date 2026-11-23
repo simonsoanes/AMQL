@@ -1,0 +1,409 @@
+{
+ "cases": [
+  {
+   "name": "tools-system",
+   "thinking": false,
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "create_file",
+      "description": "Create a file — the whole content, no placeholders",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string",
+         "description": "Where"
+        },
+        "content": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "path",
+        "content"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "run_terminal",
+      "description": "Run a command",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "command": {
+         "type": "string"
+        },
+        "timeout": {
+         "type": "integer"
+        },
+        "env": {
+         "type": "object"
+        },
+        "args": {
+         "type": "array"
+        },
+        "elevated": {
+         "type": "boolean"
+        },
+        "ratio": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "command"
+       ]
+      }
+     }
+    }
+   ],
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are Hydra.\n"
+    },
+    {
+     "role": "user",
+     "content": "Write fizzbuzz.py"
+    }
+   ],
+   "rendered": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"create_file\", \"description\": \"Create a file — the whole content, no placeholders\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\", \"description\": \"Where\"}, \"content\": {\"type\": \"string\"}}, \"required\": [\"path\", \"content\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"run_terminal\", \"description\": \"Run a command\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"integer\"}, \"env\": {\"type\": \"object\"}, \"args\": {\"type\": \"array\"}, \"elevated\": {\"type\": \"boolean\"}, \"ratio\": {\"type\": \"number\"}}, \"required\": [\"command\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are Hydra.<|im_end|>\n<|im_start|>user\nWrite fizzbuzz.py<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "name": "tools-no-system-thinking",
+   "thinking": true,
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "create_file",
+      "description": "Create a file — the whole content, no placeholders",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string",
+         "description": "Where"
+        },
+        "content": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "path",
+        "content"
+       ]
+      }
+     }
+    }
+   ],
+   "messages": [
+    {
+     "role": "user",
+     "content": "Écris un fichier, s'il te plaît"
+    }
+   ],
+   "rendered": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"create_file\", \"description\": \"Create a file — the whole content, no placeholders\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\", \"description\": \"Where\"}, \"content\": {\"type\": \"string\"}}, \"required\": [\"path\", \"content\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nÉcris un fichier, s'il te plaît<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "name": "tools-empty-system",
+   "thinking": false,
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "run_terminal",
+      "description": "Run a command",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "command": {
+         "type": "string"
+        },
+        "timeout": {
+         "type": "integer"
+        },
+        "env": {
+         "type": "object"
+        },
+        "args": {
+         "type": "array"
+        },
+        "elevated": {
+         "type": "boolean"
+        },
+        "ratio": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "command"
+       ]
+      }
+     }
+    }
+   ],
+   "messages": [
+    {
+     "role": "system",
+     "content": "  "
+    },
+    {
+     "role": "user",
+     "content": "ls"
+    }
+   ],
+   "rendered": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"run_terminal\", \"description\": \"Run a command\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"integer\"}, \"env\": {\"type\": \"object\"}, \"args\": {\"type\": \"array\"}, \"elevated\": {\"type\": \"boolean\"}, \"ratio\": {\"type\": \"number\"}}, \"required\": [\"command\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nls<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "name": "agent-loop",
+   "thinking": true,
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "create_file",
+      "description": "Create a file — the whole content, no placeholders",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string",
+         "description": "Where"
+        },
+        "content": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "path",
+        "content"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "run_terminal",
+      "description": "Run a command",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "command": {
+         "type": "string"
+        },
+        "timeout": {
+         "type": "integer"
+        },
+        "env": {
+         "type": "object"
+        },
+        "args": {
+         "type": "array"
+        },
+        "elevated": {
+         "type": "boolean"
+        },
+        "ratio": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "command"
+       ]
+      }
+     }
+    }
+   ],
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are Hydra."
+    },
+    {
+     "role": "user",
+     "content": "Make a script and run it."
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning_content": "I should write it first.",
+     "tool_calls": [
+      {
+       "type": "function",
+       "function": {
+        "name": "create_file",
+        "arguments": {
+         "path": "a.py",
+         "content": "print('hi')\nprint(2)"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "created a.py (2 lines)"
+    },
+    {
+     "role": "assistant",
+     "content": "Now I run it.",
+     "tool_calls": [
+      {
+       "type": "function",
+       "function": {
+        "name": "run_terminal",
+        "arguments": {
+         "command": "python a.py",
+         "timeout": 30,
+         "env": {
+          "A": "1",
+          "B": [
+           1,
+           2
+          ]
+         },
+         "args": [
+          "-u",
+          3
+         ],
+         "elevated": false,
+         "ratio": 0.5
+        }
+       }
+      },
+      {
+       "type": "function",
+       "function": {
+        "name": "run_terminal",
+        "arguments": {
+         "command": "echo done"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "hi\n2"
+    },
+    {
+     "role": "tool",
+     "content": "done"
+    }
+   ],
+   "rendered": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"create_file\", \"description\": \"Create a file — the whole content, no placeholders\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\", \"description\": \"Where\"}, \"content\": {\"type\": \"string\"}}, \"required\": [\"path\", \"content\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"run_terminal\", \"description\": \"Run a command\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"integer\"}, \"env\": {\"type\": \"object\"}, \"args\": {\"type\": \"array\"}, \"elevated\": {\"type\": \"boolean\"}, \"ratio\": {\"type\": \"number\"}}, \"required\": [\"command\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are Hydra.<|im_end|>\n<|im_start|>user\nMake a script and run it.<|im_end|>\n<|im_start|>assistant\n<think>\nI should write it first.\n</think>\n\n<tool_call>\n<function=create_file>\n<parameter=path>\na.py\n</parameter>\n<parameter=content>\nprint('hi')\nprint(2)\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\ncreated a.py (2 lines)\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nNow I run it.\n\n<tool_call>\n<function=run_terminal>\n<parameter=command>\npython a.py\n</parameter>\n<parameter=timeout>\n30\n</parameter>\n<parameter=env>\n{\"A\": \"1\", \"B\": [1, 2]}\n</parameter>\n<parameter=args>\n[\"-u\", 3]\n</parameter>\n<parameter=elevated>\nFalse\n</parameter>\n<parameter=ratio>\n0.5\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=run_terminal>\n<parameter=command>\necho done\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nhi\n2\n</tool_response>\n<tool_response>\ndone\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  {
+   "name": "history-before-query",
+   "thinking": false,
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "run_terminal",
+      "description": "Run a command",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "command": {
+         "type": "string"
+        },
+        "timeout": {
+         "type": "integer"
+        },
+        "env": {
+         "type": "object"
+        },
+        "args": {
+         "type": "array"
+        },
+        "elevated": {
+         "type": "boolean"
+        },
+        "ratio": {
+         "type": "number"
+        }
+       },
+       "required": [
+        "command"
+       ]
+      }
+     }
+    }
+   ],
+   "messages": [
+    {
+     "role": "user",
+     "content": "first"
+    },
+    {
+     "role": "assistant",
+     "content": "<think>\nold thoughts\n</think>\n\nold answer",
+     "tool_calls": [
+      {
+       "type": "function",
+       "function": {
+        "name": "run_terminal",
+        "arguments": {
+         "command": "dir"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "a.txt"
+    },
+    {
+     "role": "assistant",
+     "content": "There is a.txt."
+    },
+    {
+     "role": "user",
+     "content": "second"
+    }
+   ],
+   "rendered": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"run_terminal\", \"description\": \"Run a command\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, \"timeout\": {\"type\": \"integer\"}, \"env\": {\"type\": \"object\"}, \"args\": {\"type\": \"array\"}, \"elevated\": {\"type\": \"boolean\"}, \"ratio\": {\"type\": \"number\"}}, \"required\": [\"command\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nfirst<|im_end|>\n<|im_start|>assistant\nold answer\n\n<tool_call>\n<function=run_terminal>\n<parameter=command>\ndir\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\na.txt\n</tool_response><|im_end|>\n<|im_start|>assistant\nThere is a.txt.<|im_end|>\n<|im_start|>user\nsecond<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "name": "tool-turns-without-tools",
+   "thinking": false,
+   "tools": null,
+   "messages": [
+    {
+     "role": "system",
+     "content": "sys"
+    },
+    {
+     "role": "user",
+     "content": "q"
+    },
+    {
+     "role": "assistant",
+     "content": "calling",
+     "tool_calls": [
+      {
+       "type": "function",
+       "function": {
+        "name": "x",
+        "arguments": {}
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "r"
+    }
+   ],
+   "rendered": "<|im_start|>system\nsys<|im_end|>\n<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\ncalling\n\n<tool_call>\n<function=x>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nr\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  }
+ ]
+}

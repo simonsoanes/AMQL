@@ -171,7 +171,7 @@ public static class Sampler
             return (token, new LogprobsResult(0f, greedyEntropy, greedyMargin, greedyTopLogprobs));
         }
 
-        var probs = SoftmaxAndFilter(logits, config, out int[]? sortedIndices);
+        var probs = SoftmaxAndFilter(logits, config, out int[]? sortedIndices, wantSorted: true);
         if (probs is null)
         {
             int fallback = ArgMaxOf(logits);
@@ -220,7 +220,7 @@ public static class Sampler
     /// Returns the probability array (some entries zeroed by filtering) and,
     /// when top-p ran, the sorted indices it already computed.</summary>
     private static float[]? SoftmaxAndFilter(ReadOnlySpan<float> logits, SamplingConfig config,
-        out int[]? sortedIndices)
+        out int[]? sortedIndices, bool wantSorted = false)
     {
         sortedIndices = null;
         int n = logits.Length;
@@ -283,28 +283,68 @@ public static class Sampler
         // Top-p filter (cumulative, descending).
         if (config.TopP is > 0f and < 1f)
         {
-            // Only non-zero entries can be kept, so only they are sorted: after a top-k
-            // filter that is k entries rather than the whole vocabulary. Zeros follow, in
-            // index order, as a stable sort would leave them.
-            var nonZero = Enumerable.Range(0, n).Where(i => probs[i] > 0f).OrderByDescending(i => probs[i]);
-            sortedIndices = nonZero.Concat(Enumerable.Range(0, n).Where(i => probs[i] <= 0f)).ToArray();
-            float cumulative = 0f;
-            var keep = new HashSet<int>();
-            foreach (var i in sortedIndices)
+            // Only non-zero entries can be kept, so only they are ranked: after a top-k
+            // filter that is k entries rather than the whole vocabulary. The order is a
+            // stable sort by descending probability (ties in index order).
+            var candidates = new List<int>(config.TopK is > 0 and < 4096 ? config.TopK + 8 : 1024);
+            for (int i = 0; i < n; i++)
             {
-                cumulative += probs[i];
-                keep.Add(i);
+                if (probs[i] > 0f)
+                {
+                    candidates.Add(i);
+                }
+            }
+            var ranked = candidates.ToArray();
+            var keys = ranked.Select(i => -probs[i]).ToArray();
+            Array.Sort(keys, ranked);   // not stable: restore index order among equal keys below
+            for (int lo = 0; lo < ranked.Length;)
+            {
+                int hi = lo + 1;
+                while (hi < ranked.Length && keys[hi] == keys[lo])
+                {
+                    hi++;
+                }
+                if (hi - lo > 1)
+                {
+                    Array.Sort(ranked, lo, hi - lo);
+                }
+                lo = hi;
+            }
+            // Keep the shortest prefix whose mass reaches top-p; zero the other candidates.
+            float cumulative = 0f;
+            int keep = ranked.Length;
+            for (int r = 0; r < ranked.Length; r++)
+            {
+                cumulative += probs[ranked[r]];
                 if (cumulative >= config.TopP)
                 {
+                    keep = r + 1;
                     break;
                 }
             }
-            for (int i = 0; i < n; i++)
+            for (int r = keep; r < ranked.Length; r++)
             {
-                if (!keep.Contains(i))
+                probs[ranked[r]] = 0f;
+            }
+            if (wantSorted)
+            {
+                // The whole vocabulary in that order, zeros after in index order, for logprobs.
+                var sorted = new int[n];
+                Array.Copy(ranked, sorted, ranked.Length);
+                int at = ranked.Length;
+                var isCandidate = new bool[n];
+                foreach (int i in ranked)
                 {
-                    probs[i] = 0f;
+                    isCandidate[i] = true;
                 }
+                for (int i = 0; i < n; i++)
+                {
+                    if (!isCandidate[i])
+                    {
+                        sorted[at++] = i;
+                    }
+                }
+                sortedIndices = sorted;
             }
         }
 

@@ -1,44 +1,73 @@
+using System.Text.Json;
+
 namespace Amql.Cli;
 
+/// <summary>One call an assistant turn made: the function's name and its
+/// arguments as a JSON object, in the order the caller gave them.</summary>
+public sealed record ChatToolCall(string Name, JsonElement Arguments);
+
+/// <summary>One chat turn, already flattened to text. An assistant turn may
+/// carry the calls it made and its reasoning; a <c>tool</c> turn carries a
+/// call's result as its content.</summary>
+public sealed record ChatMessage(string Role, string Content)
+{
+    public IReadOnlyList<ChatToolCall>? ToolCalls { get; init; }
+
+    /// <summary>The assistant's reasoning, when the client sends it apart
+    /// from the content (<c>reasoning_content</c>).</summary>
+    public string? Reasoning { get; init; }
+}
+
 /// <summary>
-/// Minimal chat-template renderer for the <c>generate --chat</c> path.
-/// Full Jinja2 is out of scope; this recognises the two most common
+/// Minimal chat-template renderer for the <c>generate --chat</c> path and the
+/// server. Full Jinja2 is out of scope; this recognises the two most common
 /// families — ChatML (Granite, Qwen, MiniCPM) and Llama 3 — plus a
 /// generic fallback that applies token substitution on the raw template
 /// for less common formats.
 /// </summary>
-/// <summary>One chat turn, already flattened to text.</summary>
-public sealed record ChatMessage(string Role, string Content);
-
 public static class ChatTemplate
 {
     /// <summary>
     /// Renders a whole conversation with the generation prompt appended — what
-    /// HF's <c>apply_chat_template(messages, add_generation_prompt=True)</c>
+    /// HF's <c>apply_chat_template(messages, tools=tools, add_generation_prompt=True)</c>
     /// produces for the template families recognised here:
     /// <list type="bullet">
     /// <item>Qwen3-style ChatML (the template tracks <c>last_query_index</c>):
     /// contents trimmed; <c>&lt;think&gt;</c> blocks stripped from assistant
-    /// turns before the last user query and re-rendered after it; the prompt
-    /// ends with an empty think block unless thinking is enabled.</item>
+    /// turns before the last user query and re-rendered after it; tools in the
+    /// system turn, calls as <c>&lt;tool_call&gt;</c> XML, results as
+    /// <c>&lt;tool_response&gt;</c> in a user turn; the prompt ends with an
+    /// empty think block unless thinking is enabled.</item>
     /// <item>Plain ChatML (<c>&lt;|im_start|&gt;</c>).</item>
     /// <item>Llama 3 (<c>&lt;|start_header_id|&gt;</c>).</item>
     /// </list>
     /// Any other template is refused rather than approximated: a mis-rendered
-    /// prompt silently degrades every answer.
+    /// prompt silently degrades every answer. Tools, calls and tool turns are
+    /// rendered for the Qwen3 family only, and refused for the others.
     /// </summary>
-    public static string ApplyMessages(string template, IReadOnlyList<ChatMessage> messages, bool enableThinking = false)
+    public static string ApplyMessages(string template, IReadOnlyList<ChatMessage> messages, bool enableThinking = false,
+        IReadOnlyList<JsonElement>? tools = null)
     {
         if (messages.Count == 0)
         {
             throw new ChatTemplateException("no messages provided");
         }
+        bool qwen3 = template.Contains("<|im_start|>") && template.Contains("last_query_index");
+        bool rendersTools = RendersTools(template);
         foreach (var m in messages)
         {
-            if (m.Role is not ("system" or "user" or "assistant"))
+            if (m.Role is not ("system" or "user" or "assistant" or "tool"))
             {
-                throw new ChatTemplateException($"message role '{m.Role}' is not supported (system, user, assistant)");
+                throw new ChatTemplateException($"message role '{m.Role}' is not supported (system, user, assistant, tool)");
             }
+            if (!rendersTools && (m.Role == "tool" || m.ToolCalls is { Count: > 0 }))
+            {
+                throw new ChatTemplateException("this model's chat template does not render tool calls");
+            }
+        }
+        if (!rendersTools && tools is { Count: > 0 })
+        {
+            throw new ChatTemplateException("this model's chat template does not render tools");
         }
         for (int i = 1; i < messages.Count; i++)
         {
@@ -50,8 +79,8 @@ public static class ChatTemplate
 
         if (template.Contains("<|im_start|>"))
         {
-            return template.Contains("last_query_index")
-                ? RenderQwen3(template, messages, enableThinking)
+            return qwen3
+                ? RenderQwen3(messages, enableThinking, tools)
                 : RenderChatMl(template, messages);
         }
         if (template.Contains("<|start_header_id|>"))
@@ -70,6 +99,11 @@ public static class ChatTemplate
             "the container's chat template is not a family this build renders (Qwen3 ChatML, ChatML, Llama 3)");
     }
 
+    /// <summary>True for a template this renderer can give tools: the Qwen3.5
+    /// family, which writes calls as <c>&lt;function=…&gt;</c> XML.</summary>
+    public static bool RendersTools(string template) =>
+        template.Contains("<|im_start|>") && template.Contains("last_query_index") && template.Contains("<function=");
+
     private static string RenderChatMl(string template, IReadOnlyList<ChatMessage> messages)
     {
         var sb = new System.Text.StringBuilder();
@@ -85,21 +119,32 @@ public static class ChatTemplate
         return sb.ToString();
     }
 
-    /// <summary>The Qwen3 / Qwen3.5 template, statement for statement (tools
-    /// and vision content excluded — the server refuses those upstream).</summary>
-    private static string RenderQwen3(string template, IReadOnlyList<ChatMessage> messages, bool enableThinking)
+    private const string ToolsPreamble = "# Tools\n\nYou have access to the following functions:\n\n<tools>";
+
+    private const string ToolsInstructions =
+        "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n" +
+        "<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\n" +
+        "that can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n" +
+        "- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n" +
+        "- Required parameters MUST be specified\n" +
+        "- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n" +
+        "- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n" +
+        "</IMPORTANT>";
+
+    /// <summary>The Qwen3 / Qwen3.5 template, statement for statement (vision
+    /// content excluded — the server refuses it upstream).</summary>
+    private static string RenderQwen3(IReadOnlyList<ChatMessage> messages, bool enableThinking, IReadOnlyList<JsonElement>? tools)
     {
+        static bool IsResponse(string c) =>
+            c.StartsWith("<tool_response>", StringComparison.Ordinal) && c.EndsWith("</tool_response>", StringComparison.Ordinal);
+
         int lastQuery = -1;
         for (int i = messages.Count - 1; i >= 0; i--)
         {
-            if (messages[i].Role == "user")
+            if (messages[i].Role == "user" && !IsResponse(PyFormat.Strip(messages[i].Content)))
             {
-                string c = PyFormat.Strip(messages[i].Content);
-                if (!(c.StartsWith("<tool_response>", StringComparison.Ordinal) && c.EndsWith("</tool_response>", StringComparison.Ordinal)))
-                {
-                    lastQuery = i;
-                    break;
-                }
+                lastQuery = i;
+                break;
             }
         }
         if (lastQuery < 0)
@@ -108,23 +153,42 @@ public static class ChatTemplate
         }
 
         var sb = new System.Text.StringBuilder();
+        if (tools is { Count: > 0 })
+        {
+            sb.Append("<|im_start|>system\n").Append(ToolsPreamble);
+            foreach (var tool in tools)
+            {
+                sb.Append('\n').Append(PyFormat.JsonDumps(tool, sortKeys: false, ensureAscii: false));
+            }
+            sb.Append("\n</tools>").Append(ToolsInstructions);
+            if (messages[0].Role == "system" && PyFormat.Strip(messages[0].Content) is { Length: > 0 } system)
+            {
+                sb.Append("\n\n").Append(system);
+            }
+            sb.Append("<|im_end|>\n");
+        }
+        else if (messages[0].Role == "system")
+        {
+            sb.Append("<|im_start|>system\n").Append(PyFormat.Strip(messages[0].Content)).Append("<|im_end|>\n");
+        }
+
         for (int i = 0; i < messages.Count; i++)
         {
             var m = messages[i];
             string content = PyFormat.Strip(m.Content);
             switch (m.Role)
             {
-                case "system":
-                    sb.Append("<|im_start|>system\n").Append(content).Append("<|im_end|>\n");
-                    break;
                 case "user":
                     sb.Append("<|im_start|>user\n").Append(content).Append("<|im_end|>\n");
                     break;
                 case "assistant":
                 {
                     string reasoning = string.Empty;
-                    int close = content.IndexOf("</think>", StringComparison.Ordinal);
-                    if (close >= 0)
+                    if (m.Reasoning is { } given)
+                    {
+                        reasoning = given;
+                    }
+                    else if (content.Contains("</think>", StringComparison.Ordinal))
                     {
                         string before = content[..content.IndexOf("</think>", StringComparison.Ordinal)].TrimEnd('\n');
                         int open = before.LastIndexOf("<think>", StringComparison.Ordinal);
@@ -137,9 +201,43 @@ public static class ChatTemplate
                     {
                         sb.Append("<think>\n").Append(reasoning).Append("\n</think>\n\n");
                     }
-                    sb.Append(content).Append("<|im_end|>\n");
+                    sb.Append(content);
+                    if (m.ToolCalls is { Count: > 0 } calls)
+                    {
+                        for (int c = 0; c < calls.Count; c++)
+                        {
+                            sb.Append(c > 0 ? "\n<tool_call>\n<function="
+                                    : PyFormat.Strip(content).Length > 0 ? "\n\n<tool_call>\n<function=" : "<tool_call>\n<function=")
+                              .Append(calls[c].Name).Append(">\n");
+                            if (calls[c].Arguments.ValueKind == JsonValueKind.Object)
+                            {
+                                foreach (var (name, value) in PyFormat.LastWins(calls[c].Arguments))
+                                {
+                                    // Objects and lists as JSON; everything else as Python's str().
+                                    sb.Append("<parameter=").Append(name).Append(">\n")
+                                      .Append(value.ValueKind is JsonValueKind.Object or JsonValueKind.Array
+                                          ? PyFormat.JsonDumps(value, sortKeys: false, ensureAscii: false)
+                                          : PyFormat.Str(value))
+                                      .Append("\n</parameter>\n");
+                                }
+                            }
+                            sb.Append("</function>\n</tool_call>");
+                        }
+                    }
+                    sb.Append("<|im_end|>\n");
                     break;
                 }
+                case "tool":
+                    if (i > 0 && messages[i - 1].Role != "tool")
+                    {
+                        sb.Append("<|im_start|>user");
+                    }
+                    sb.Append("\n<tool_response>\n").Append(content).Append("\n</tool_response>");
+                    if (i == messages.Count - 1 || messages[i + 1].Role != "tool")
+                    {
+                        sb.Append("<|im_end|>\n");
+                    }
+                    break;
             }
         }
         sb.Append("<|im_start|>assistant\n");
