@@ -156,6 +156,39 @@ tools, calls and tool results), plain ChatML and Llama 3 — and tokenised witho
 - **Refused** (400, OpenAI error shape), rather than silently ignored: legacy `functions`, `n > 1`, audio, image
   or other non-text content parts, tool types other than functions, and the Responses API's `conversation`.
 
+### Calls held to the tools
+
+A small model writes calls the harness cannot run: a parameter the tool does not have (`edit_file` with
+`content`), an array parameter whose JSON does not parse, a tool that does not exist. So once a reply writes
+`<tool_call>` (outside thinking), the rest of the call is held to the request's tools by the same constrained
+decoding as structured output, until `</tool_call>`:
+
+- `<function=NAME>` names a declared tool; each `<parameter=K>` is one of its parameters, not given yet;
+  `</function>` comes only once every required parameter is there.
+- A string parameter (or an untyped one) is free text up to `</parameter>`; a string enum is one of its values,
+  bare; any other type (array, object, integer, number, boolean) is JSON its schema allows, then `</parameter>`.
+- Calls the model writes are therefore always ones the harness can parse: on a random model forced to call a
+  tool (`tool_choice: required`), every reply is a call with the declared name and typed, parseable arguments.
+
+`--free-tool-calls` turns it off.
+
+**Mentioned parameters.** A small model plans in words and then writes the call by habit: asked to replace a file
+that exists, Qwen 3.5 0.8B said "I'll overwrite it", the tool answered "Pass overwrite: true", the user said so
+too, and still, measured, it chose `content` over `overwrite` at 0.995 to 0.005, and after `content` closed the
+call at 0.999, so the call failed the same way every time. So where a call can open a parameter, an optional
+parameter not given yet that the current task names, as a whole word, in the user's latest message, a tool
+result since, or the reply's own thinking, is opened next, provided the model gives the way there at least
+1e-4 of its probability. Its value is still the model's, under the grammar. In the agent session it took
+`create_file … overwrite: true` from failing five times in a row to succeeding first time. `--no-mention-rule`
+turns it off.
+
+### Continuing a reply
+
+`continue_final_message: true` (vLLM's name) on chat completions treats the last message, an assistant message
+with text, as the start of the reply: the prompt is the conversation's generation prompt followed by that text,
+and the model carries on from it. The reply holds only the continuation. With `logprobs`, it shows what a model
+would write at any point of a reply, which is how the call habits above were measured.
+
 ### The loop guard
 
 A small model can fall into repeating itself: the same line of a file, again and again, until the token limit,
@@ -250,6 +283,11 @@ dotnet bin/Release/amql-server.dll --model qwen=<qwen3.5-0.8b container> --think
   `apply_chat_template` with Qwen3.5's template (6 conversations, from `fixtures/make_tool_chat_golden.py`);
 - a reply splits into reasoning, content and typed calls, and fed one character at a time gives the same result
   without ever sending part of a marker; a cut-off call is content; without tools a `<tool_call>` is text;
+- calls held to the tools (`ToolCallConstraintTests`, `ServerToolTests`): an agent harness's `create_file` and
+  `edit_file` calls accepted however split, and refused for an unknown tool or parameter, a parameter given twice,
+  a required one missing, a trailing comma or wrong type in a JSON value, a value outside a string enum, or
+  anything but the close after a value; a random model's forced calls always name the tool with typed arguments;
+  the way to an optional parameter from every point a parameter can open; `continue_final_message`'s prompt;
 - structured output (`JsonConstraintTests`, `ServerToolTests`): Hydra's assessment schema accepted however a reply
   is split and refused for a skipped required property, an early close, an undeclared property, a value outside
   an enum, a wrong type, a bad escape, text after the value or a code fence; numbers end only when whole; a random

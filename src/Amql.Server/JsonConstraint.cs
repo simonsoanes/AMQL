@@ -159,7 +159,7 @@ public sealed class JsonSchemaNode
 /// a string without <c>maxLength</c> is capped, so a reply cannot spin forever.
 /// The reply may end only where the value is complete.
 /// </summary>
-public sealed class JsonConstraint
+public sealed class JsonConstraint : ITokenConstraint
 {
     private const int MaxWhitespace = 24;
     private const int DefaultMaxString = 8000;
@@ -167,6 +167,16 @@ public sealed class JsonConstraint
     private Frame _state;
 
     public JsonConstraint(JsonSchemaNode schema) => _state = new RootFrame(schema, 0);
+
+    /// <summary>A value about to start, as an opaque immutable state, for a grammar that embeds
+    /// JSON (a tool call's typed parameter): <see cref="Step"/> it a character at a time.</summary>
+    public static object Begin(JsonSchemaNode schema) => new RootFrame(schema, 0);
+
+    /// <summary>The state after one more character, or null when it breaks the value.</summary>
+    public static object? Step(object state, char c) => ((Frame)state).Feed(c);
+
+    /// <summary>Whether the value is whole at this state.</summary>
+    public static bool Complete(object state) => ((Frame)state).CanEnd;
 
     /// <summary>Whether the value is complete, so the reply may end here.</summary>
     public bool CanEnd => _state.CanEnd;
@@ -423,11 +433,13 @@ public sealed class JsonConstraint
 
     private enum NumberState { Start, Minus, Zero, Int, Dot, Frac, Exp, ExpSign, ExpDigits }
 
-    private sealed class NumberFrame(bool integer, NumberState state, Frame after) : Frame
+    private sealed class NumberFrame(bool integer, NumberState state, Frame after, int length = 0) : Frame
     {
+        private const int MaxLength = 32;   // a number has no business being longer
+
         private bool Complete => state is NumberState.Zero or NumberState.Int or NumberState.Frac or NumberState.ExpDigits;
 
-        private Frame To(NumberState s) => new NumberFrame(integer, s, after);
+        private Frame? To(NumberState s) => length < MaxLength ? new NumberFrame(integer, s, after, length + 1) : null;
 
         public override Frame? Feed(char c)
         {

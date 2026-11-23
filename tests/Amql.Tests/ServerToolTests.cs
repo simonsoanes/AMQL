@@ -547,4 +547,55 @@ public sealed class ServerToolTests : IClassFixture<ServerToolTests.ToolHost>
         // ... and nothing before `from` counts (after thinking was closed for circling).
         Assert.Null(LoopGuard.Find(looping, from: looping.Count - 100));
     }
+
+    // ── the tool-call grammar over HTTP ─────────────────────────────────
+
+    private const string SwitchTool = """{"type":"function","function":{"name":"set_switch","parameters":{"type":"object","properties":{"on":{"type":"boolean"},"mode":{"type":"string","enum":["fast","slow"]},"level":{"type":"integer"}},"required":["on","mode"]}}}""";
+
+    [Theory]
+    [InlineData("lm")]
+    [InlineData("lm-engine")]
+    public async Task A_Required_Call_From_A_Random_Model_Is_Still_A_Call_The_Tool_Declares(string model)
+    {
+        for (int seed = 0; seed < 4; seed++)
+        {
+            var (status, body) = await Post("/v1/chat/completions", $$$"""
+                {"model":"{{{model}}}","max_tokens":200,"temperature":1,"seed":{{{seed}}},"tools":[{{{SwitchTool}}}],"tool_choice":"required",
+                 "messages":[{"role":"user","content":"flip it"}]}
+                """);
+            Assert.True(status == HttpStatusCode.OK, body.ToJsonString());
+            var choice = body["choices"]![0]!;
+            Assert.True(choice["finish_reason"]!.GetValue<string>() == "tool_calls", body.ToJsonString());
+            var call = choice["message"]!["tool_calls"]![0]!["function"]!;
+            Assert.Equal("set_switch", call["name"]!.GetValue<string>());
+            using var args = JsonDocument.Parse(call["arguments"]!.GetValue<string>());
+            Assert.Contains(args.RootElement.GetProperty("on").ValueKind, new[] { JsonValueKind.True, JsonValueKind.False });
+            Assert.Contains(args.RootElement.GetProperty("mode").GetString(), new[] { "fast", "slow" });
+            if (args.RootElement.TryGetProperty("level", out var level))
+            {
+                Assert.True(level.ValueKind == JsonValueKind.Number, call["arguments"]!.GetValue<string>());
+            }
+        }
+    }
+
+    [Fact]
+    public async Task Continue_Final_Message_Carries_On_From_A_Started_Reply()
+    {
+        var g = _h.Models.Single(m => m.Id == "lm").Generator!;
+        // The prompt is the conversation's generation prompt plus the started reply, token for token.
+        string started = "The capital of france is";
+        string rendered = ChatTemplate.ApplyMessages(g.Template, new[] { new ChatMessage("user", "hello") }, false) + started;
+        int expected = g.Tokenizer.EncodeToIds(rendered).Count;
+        var (status, body) = await Post("/v1/chat/completions", $$$"""
+            {"model":"lm","max_tokens":4,"temperature":0,"continue_final_message":true,
+             "messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"{{{started}}}"}]}
+            """);
+        Assert.True(status == HttpStatusCode.OK, body.ToJsonString());
+        Assert.Equal(expected, body["usage"]!["prompt_tokens"]!.GetValue<int>());
+
+        var (bad, _) = await Post("/v1/chat/completions", """
+            {"model":"lm","continue_final_message":true,"messages":[{"role":"user","content":"hello"}]}
+            """);
+        Assert.Equal(HttpStatusCode.BadRequest, bad);
+    }
 }

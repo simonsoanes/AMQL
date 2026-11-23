@@ -1227,16 +1227,39 @@ public static class ServerApp
                 : messages.Prepend(new ChatMessage("system", format.Instruction)).ToList();
         }
 
+        // continue_final_message (vLLM's name): the last assistant message is the start of the reply,
+        // which the model carries on from instead of starting a new turn. Its text is not repeated
+        // in the reply, and the reply is read (calls, thinking) from the continuation alone.
+        string? prefill = null;
+        if (body.TryGetProperty("continue_final_message", out var cfm) && cfm.ValueKind == JsonValueKind.True)
+        {
+            if (messages.Count == 0 || messages[^1].Role != "assistant" || messages[^1].ToolCalls is { Count: > 0 })
+            {
+                throw new ApiException(400, "'continue_final_message' needs the last message to be an assistant message with text", param: "messages");
+            }
+            prefill = messages[^1].Content;
+            messages = messages.Take(messages.Count - 1).ToList();
+        }
+
         int[] prompt;
         try
         {
-            prompt = generator.EncodePrompt(messages, thinking, tools);
+            prompt = prefill is null
+                ? generator.EncodePrompt(messages, thinking, tools)
+                : generator.Tokenizer.EncodeToIds(ChatTemplate.ApplyMessages(generator.Template, messages, thinking, tools) + prefill).ToArray();
         }
         catch (ChatTemplateException e)
         {
             throw new ApiException(400, e.Message, param: "messages");
         }
-        var p = Sampling(body, maxTokens, settings, model.Defaults) with { Forced = forced, Thinking = thinking, Json = format?.Schema };
+        // The current task, for the mentioned-parameter rule: the user's latest message and every
+        // tool result since (a harness's hint such as "pass overwrite: true" may be a few calls back).
+        int lastUser = messages.FindLastIndex(m => m.Role == "user");
+        string recent = string.Join("\n", messages.Skip(Math.Max(lastUser, 0)).Where(m => m.Role is "user" or "tool").Select(m => m.Content));
+        var p = Sampling(body, maxTokens, settings, model.Defaults) with
+        {
+            Forced = forced, Thinking = thinking, Json = format?.Schema, Tools = tools, Recent = recent,
+        };
         return new ChatTurn(prompt, p, tools, parallel);
     }
 

@@ -46,6 +46,8 @@ for (int i = 0; i < args.Length; i++)
         case "--no-warm": warm = false; break;
         case "--no-batch": TextGenerator.BatchingEnabled = false; break;
         case "--no-loop-guard": TextGenerator.LoopGuardEnabled = false; break;
+        case "--free-tool-calls": TextGenerator.ToolGrammarEnabled = false; break;
+        case "--no-mention-rule": TextGenerator.MentionRuleEnabled = false; break;
         case "--batch-bf16":
             // Batches of 4 or more run their projections on tensor cores (activations
             // rounded to BF16), as prompts already do: ~1.6x the throughput, but a reply
@@ -70,7 +72,7 @@ for (int i = 0; i < args.Length; i++)
                 amql-server --model [id=]<container-dir> [--model …] [--urls http://127.0.0.1:8000]
                             [--api-key KEY] [--max-tokens N] [--no-warm]
                             [--adapter [id=]<dir>[,<dir>…]] [--think] [--temperature T] [--top-p P] [--top-k K]
-                            [--config <models.json>] [--no-batch] [--batch-bf16] [--no-loop-guard]
+                            [--config <models.json>] [--no-batch] [--batch-bf16] [--no-loop-guard] [--free-tool-calls] [--no-mention-rule]
 
                 Serves each container on the endpoints it can answer:
                   Von decision model          POST /v1/decisions, /v1/systemone, /api/v1/decisions (jevai envelope)
@@ -89,6 +91,10 @@ for (int i = 0; i < args.Length; i++)
                   --temperature, --top-p, --top-k   sampling defaults for requests that leave them out
                   --no-batch    one request at a time per model, even on the GPU engine (which otherwise
                                 batches up to 8 requests per step)
+                  --free-tool-calls  do not hold calls to the request's tools (by default a call names a
+                                declared tool and its parameters, gives the required ones, and typed values parse)
+                  --no-mention-rule  do not open an optional parameter the reply's thinking or the newest
+                                user/tool message names (by default it is opened when the model gives it any chance)
                   --no-loop-guard  let a reply repeat itself to its token limit (by default a reply whose
                                 own tail repeats a stretch 4+ times, 192+ tokens, is stopped, or its thinking closed)
                   --batch-bf16  batches of 4+ on tensor cores, activations rounded to BF16: ~1.6x the

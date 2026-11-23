@@ -315,6 +315,8 @@ public sealed class ReplyParser
         {
             case "integer" when long.TryParse(t, NumberStyles.Integer, CultureInfo.InvariantCulture, out long l):
                 return JsonValue.Create(l);
+            case "integer" or "number" when JsonNumber(t) is { } big:
+                return big;   // a valid JSON number too large for a long or double, kept as written
             case "number" when double.TryParse(t, NumberStyles.Float, CultureInfo.InvariantCulture, out double d) && double.IsFinite(d):
                 return t.Contains('.') || t.Contains('e') || t.Contains('E') ? JsonValue.Create(d)
                     : long.TryParse(t, NumberStyles.Integer, CultureInfo.InvariantCulture, out long whole) ? JsonValue.Create(whole) : JsonValue.Create(d);
@@ -337,6 +339,18 @@ public sealed class ReplyParser
                 return null;
             default:
                 return JsonValue.Create(text);
+        }
+    }
+
+    private static JsonNode? JsonNumber(string t)
+    {
+        try
+        {
+            return JsonNode.Parse(t) is JsonValue v && v.GetValueKind() == JsonValueKind.Number ? v : null;
+        }
+        catch (JsonException)
+        {
+            return null;
         }
     }
 

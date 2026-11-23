@@ -323,6 +323,12 @@ public sealed record GenerationParams(
 
     /// <summary>Structured output: the reply must be a JSON value this schema allows.</summary>
     public JsonSchemaNode? Json { get; init; }
+
+    /// <summary>The request's tools (chat form): a call the reply opens is held to them.</summary>
+    public IReadOnlyList<System.Text.Json.JsonElement>? Tools { get; init; }
+
+    /// <summary>The user's latest message and the tool results since, for the mentioned-parameter rule.</summary>
+    public string? Recent { get; init; }
 }
 
 public sealed record GenerationResult(string Text, string FinishReason, int PromptTokens, int CompletionTokens)
@@ -359,6 +365,13 @@ public sealed class TextGenerator : IDisposable
     private readonly SideBySideSession _session;
     private readonly IReadOnlySet<int> _stopTokens;
     private readonly BatchScheduler? _batch;
+
+    /// <summary>Set false (<c>--no-mention-rule</c>) to let calls leave out optional parameters the
+    /// reply or the newest messages name.</summary>
+    public static bool MentionRuleEnabled { get; set; } = true;
+
+    /// <summary>Set false (<c>--free-tool-calls</c>) to let a reply write calls the tools do not declare.</summary>
+    public static bool ToolGrammarEnabled { get; set; } = true;
 
     /// <summary>Set false (<c>--no-loop-guard</c>) to let a reply repeat itself until its token limit.</summary>
     public static bool LoopGuardEnabled { get; set; } = true;
@@ -567,6 +580,9 @@ internal sealed class GenerationRun
     private bool _forcePending;
     private string _emitted = string.Empty;
     private readonly JsonConstraint? _json;
+    private readonly ToolGrammar? _toolGrammar;
+    private ToolCallConstraint? _call;
+    private int _openMatch;   // how much of "<tool_call>" the reply's text ends with
     private bool _thinkClosed;
     private int _loopFrom;   // the loop guard looks only at tokens from here on
     private float[]? _masked;
@@ -602,6 +618,10 @@ internal sealed class GenerationRun
         _logprobs = logprobsTopK is > 0 ? new List<LogprobsResult>() : null;
         _holdBack = p.Stop.Count == 0 ? 0 : p.Stop.Max(s => s.Length) - 1;
         _json = p.Json is null ? null : new JsonConstraint(p.Json);
+        if (p.Tools is { Count: > 0 } tools && TextGenerator.ToolGrammarEnabled)
+        {
+            _toolGrammar = ToolGrammar.Compile(tools);
+        }
         // Forced text goes in after the thinking block, or at once without one.
         _forcePending = p.Forced is not null;
         if (_forcePending && !p.Thinking)
@@ -643,7 +663,11 @@ internal sealed class GenerationRun
         }
         else if (_json is not null)
         {
-            token = ChooseJson();
+            token = Constrained(_json);
+        }
+        else if (_call is not null)
+        {
+            token = Constrained(_call);
         }
         else if (_verdict.Silent)
         {
@@ -667,7 +691,20 @@ internal sealed class GenerationRun
         {
             return Finish("stop");
         }
-        _json?.Advance(_g.TokenText(token, _logits().Length));
+        string piece = _g.TokenText(token, _logits().Length);
+        _json?.Advance(piece);
+        if (_call is not null)
+        {
+            _call.Advance(piece);
+            if (_call.Done)
+            {
+                _call = null;
+            }
+        }
+        else if (_toolGrammar is not null && (!_p.Thinking || _thinkClosed))
+        {
+            WatchForCall(piece);
+        }
         _generated.Add(token);
         if (token == _g.ThinkClose)
         {
@@ -739,19 +776,52 @@ internal sealed class GenerationRun
         return text;
     }
 
+    private const string CallOpen = "<tool_call>";
+
+    /// <summary>The reply opens a call when its text, outside thinking, reaches "&lt;tool_call&gt;":
+    /// from there to "&lt;/tool_call&gt;" it is held to the tools. What the same token says after
+    /// the opening goes to the call; if that already breaks it, the call is left unheld.</summary>
+    private void WatchForCall(string piece)
+    {
+        for (int i = 0; i < piece.Length; i++)
+        {
+            char c = piece[i];
+            _openMatch = c == CallOpen[_openMatch] ? _openMatch + 1 : c == CallOpen[0] ? 1 : 0;
+            if (_openMatch < CallOpen.Length)
+            {
+                continue;
+            }
+            _openMatch = 0;
+            var call = new ToolCallConstraint(_toolGrammar!);
+            string rest = piece[(i + 1)..];
+            if (rest.Length == 0 || call.Accepts(rest))
+            {
+                if (rest.Length > 0)
+                {
+                    call.Advance(rest);
+                }
+                _call = call.Done ? null : call;
+            }
+            return;
+        }
+    }
+
     /// <summary>
-    /// The next token of a structured reply: the request's own sampling over just
-    /// the tokens that keep the reply valid JSON for its schema. The 256 likeliest
-    /// tokens are checked first, the whole vocabulary only when none of them fits;
-    /// a stop token is valid once the value is complete.
+    /// The next token under a grammar (structured output, or a tool call): the request's
+    /// own sampling over just the tokens the grammar allows. The 256 likeliest tokens are
+    /// checked first, the whole vocabulary only when none of them fits; a stop token is
+    /// valid where the grammar may end.
     /// </summary>
-    private int ChooseJson()
+    private int Constrained(ITokenConstraint grammar)
     {
         var row = _logits();
         int n = row.Length;
         _masked ??= new float[n];
         Array.Fill(_masked, float.NegativeInfinity);
-        bool Valid(int id) => _g.StopTokenIds.Contains(id) ? _json!.CanEnd : _g.TokenText(id, n) is { Length: > 0 } t && _json!.Accepts(t);
+        Func<string, bool>? onPath = grammar is ToolCallConstraint call ? MentionedPath(call) : null;
+        bool Valid(int id) => _g.StopTokenIds.Contains(id)
+            ? grammar.CanEnd && onPath is null
+            : _g.TokenText(id, n) is { Length: > 0 } t && grammar.Accepts(t) && (onPath is null || onPath(t));
 
         bool any = false;
         foreach (int id in TopIndices(row, 256))
@@ -775,9 +845,79 @@ internal sealed class GenerationRun
         }
         if (!any)
         {
-            throw new InvalidOperationException("no token continues the JSON");
+            throw new InvalidOperationException("no token continues what the grammar allows");
         }
         return Sampler.Sample(_masked, _config, _rng);
+    }
+
+    /// <summary>The smallest share of the model's probability that the tokens towards a mentioned
+    /// parameter must have for the rule to act: it follows the model, never overrides it outright.</summary>
+    private const double MentionFloor = 1e-4;
+
+    /// <summary>
+    /// The mentioned-parameter rule. A small model plans in words ("I'll set overwrite to true")
+    /// and then writes the call by habit: the required parameters in schema order, then
+    /// &lt;/function&gt;, at 0.99+ even when the tool's last error said "Pass overwrite: true".
+    /// So where the call can open a parameter, an optional parameter not given yet whose name
+    /// the reply's own thinking or the newest user or tool message mentions (as a whole word) is
+    /// opened next, provided the model gives the way there at least <see cref="MentionFloor"/>.
+    /// Its value is the model's own, under the grammar. Returns a filter for the tokens on that
+    /// way, or null when the rule does not act here.
+    /// </summary>
+    private Func<string, bool>? MentionedPath(ToolCallConstraint call)
+    {
+        if (!TextGenerator.MentionRuleEnabled)
+        {
+            return null;
+        }
+        string context = (_p.Recent ?? "") + "\n" + Reasoning();
+        foreach (string name in call.OptionalLeft())
+        {
+            if (call.PathTo(name) is not { } path ||
+                !System.Text.RegularExpressions.Regex.IsMatch(context, $@"(?<![\w-]){System.Text.RegularExpressions.Regex.Escape(name)}(?![\w-])"))
+            {
+                continue;
+            }
+            // Whitespace may come first; then the text must stay on the way to "<parameter=NAME>".
+            bool OnPath(string t)
+            {
+                string rest = t.TrimStart(' ', '\n', '\r', '\t');
+                return rest.Length == 0 || path.StartsWith(rest, StringComparison.Ordinal) || rest.StartsWith(path, StringComparison.Ordinal);
+            }
+            var row = _logits();
+            float max = float.NegativeInfinity;
+            foreach (float v in row)
+            {
+                max = Math.Max(max, v);
+            }
+            double sum = 0, on = 0;
+            for (int id = 0; id < row.Length; id++)
+            {
+                double e = Math.Exp(row[id] - max);
+                sum += e;
+                if (e > 1e-12 && !_g.StopTokenIds.Contains(id) && _g.TokenText(id, row.Length) is { Length: > 0 } t && OnPath(t) && t.Trim().Length > 0)
+                {
+                    on += e;
+                }
+            }
+            if (on / sum >= MentionFloor)
+            {
+                return OnPath;
+            }
+        }
+        return null;
+    }
+
+    /// <summary>The reply's thinking so far (all of it, when the prompt opened a think block).</summary>
+    private string Reasoning()
+    {
+        if (!_p.Thinking)
+        {
+            return "";
+        }
+        string text = _stableText;
+        int close = text.IndexOf("</think>", StringComparison.Ordinal);
+        return close >= 0 ? text[..close] : text;
     }
 
     private static int[] TopIndices(ReadOnlySpan<float> row, int k)
