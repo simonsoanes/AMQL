@@ -198,6 +198,143 @@ public class Fp4EngineTests
         Assert.Equal(logits[6], engine.Step(new[] { spec }, new[] { tokens[5] })[0]);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Gptq_Keeps_A_Layers_Output_Closer_Than_Rounding_To_Nearest(bool mx)
+    {
+        CudaShim.Reset();
+        if (!CudaShim.Enabled)
+        {
+            return;
+        }
+        using var dir = new TempDir();
+        using var container = Vindex3Container.Open(Encode(dir, "qwen3_5-gdn"));
+        using var store = container.CreateOperandStore();
+        using var host = new DecodeSession(Planner.Plan(container, "target", store), store);
+        host.Prefill(new[] { 0 });
+        var engine = host.DeviceEngine()!;
+
+        // Inputs as activations are: correlated columns, a few far louder than the rest.
+        const int rows = 96, cols = 256, samples = 2048, rank = 24;
+        var rng = new Random(5);
+        double Normal() => Math.Sqrt(-2 * Math.Log(1 - rng.NextDouble())) * Math.Cos(2 * Math.PI * rng.NextDouble());
+        var basis = Enumerable.Range(0, cols * rank).Select(_ => Normal()).ToArray();
+        var loud = Enumerable.Range(0, cols).Select(c => c % 37 == 0 ? 8.0 : 1.0).ToArray();
+        var x = new double[samples * cols];
+        for (int s = 0; s < samples; s++)
+        {
+            var z = Enumerable.Range(0, rank).Select(_ => Normal()).ToArray();
+            for (int c = 0; c < cols; c++)
+            {
+                double v = 0.1 * Normal();
+                for (int j = 0; j < rank; j++)
+                {
+                    v += z[j] * basis[c * rank + j];
+                }
+                x[s * cols + c] = v * loud[c];
+            }
+        }
+        var h = new double[cols * cols];
+        Parallel.For(0, cols, i =>
+        {
+            for (int j = 0; j < cols; j++)
+            {
+                double sum = 0;
+                for (int s = 0; s < samples; s++)
+                {
+                    sum += x[s * cols + i] * x[s * cols + j];
+                }
+                h[i * cols + j] = sum;
+            }
+        });
+        var w = Enumerable.Range(0, rows * cols).Select(_ => (float)(0.05 * Normal())).ToArray();
+        float global = mx ? 1f : w.Max(MathF.Abs) / (BitPattern.Fp4MaxValue * 448f);
+        int group = mx ? 32 : 16;
+
+        float[] Decode(byte[] codes, byte[] scaleBytes) => new ScaledMatrix(Dtype.FP4, codes, rows, cols,
+            scaleBytes.Select(b => mx ? BitPattern.DecodeF8E8M0(b) : BitPattern.DecodeF8E4M3(b)).ToArray(),
+            rows, cols / group, global).Dequant();
+        // The layer's output error over the inputs: Σ‖X (W − Q)ᵀ‖² = Σ_r d_r H d_rᵀ.
+        double OutputError(float[] q)
+        {
+            double total = 0;
+            for (int r = 0; r < rows; r++)
+            {
+                var d = Enumerable.Range(0, cols).Select(c => (double)w[r * cols + c] - q[r * cols + c]).ToArray();
+                for (int i = 0; i < cols; i++)
+                {
+                    double hd = 0;
+                    for (int j = 0; j < cols; j++)
+                    {
+                        hd += h[i * cols + j] * d[j];
+                    }
+                    total += d[i] * hd;
+                }
+            }
+            return total;
+        }
+        double WeightError(float[] q) => w.Zip(q).Sum(p => (double)(p.First - p.Second) * (p.First - p.Second));
+
+        float[] nearest;
+        if (mx)
+        {
+            var m = Mxfp4.Quantize(w, rows, cols);
+            nearest = Decode(m.Packed, m.BlockScales);
+        }
+        else
+        {
+            nearest = Nvfp4.Quantize(w, rows, cols).Dequant();
+        }
+        var (sc, ss) = engine.QuantiseFp4(w, rows, cols, null, mx, global);
+        var searched = Decode(sc, ss);
+        var (gc, gs) = engine.QuantiseFp4(w, rows, cols, h.Select(v => (float)v).ToArray(), mx, global);
+        var gptq = Decode(gc, gs);
+
+        // Searching the scale can only help the weights; GPTQ trades weight
+        // error for output error, and wins on the output by a wide margin.
+        Assert.True(WeightError(searched) <= WeightError(nearest) * 1.0001,
+            $"searched scales {WeightError(searched)} vs nearest {WeightError(nearest)}");
+        double eNear = OutputError(nearest), eGptq = OutputError(gptq);
+        Assert.True(eGptq < 0.7 * eNear, $"GPTQ output error {eGptq} vs nearest {eNear}");
+    }
+
+    [Theory]
+    [InlineData(Fp4Format.Nvfp4)]
+    [InlineData(Fp4Format.Mxfp4)]
+    public void A_Gptq_Container_Runs_On_The_Engine_As_The_Managed_Path_Does(Fp4Format format)
+    {
+        CudaShim.Reset();
+        if (!CudaShim.Enabled)
+        {
+            return;
+        }
+        const string family = "qwen3_5-gdn";
+        using var dir = new TempDir();
+        string quantised = Path.Combine(dir.Path, "q");
+        var (ids, _) = ArchZooTests.Golden(family);
+        var calibration = Enumerable.Range(0, 256).Select(i => ids[(i * 7) % ids.Length]).ToArray();
+        var report = QuantiseContainer.Transform(Encode(dir, family), quantised, new QuantiseOptions(format)
+        {
+            Rounding = Fp4Rounding.Gptq,
+            CalibrationIds = calibration,
+            SequenceTokens = 64,
+        });
+        Assert.True(report.Quantised > 0);
+        Assert.Contains("\"rounding\":\"gptq\"", File.ReadAllText(Path.Combine(quantised, "index.json")));
+
+        using var container = Vindex3Container.Open(quantised);
+        using var store = container.CreateOperandStore();
+        var plan = Planner.Plan(container, "target", store);
+        var prompt = Enumerable.Range(0, 30).Select(i => ids[i % ids.Length]).ToArray();
+        using var gpu = new DecodeSession(plan, store) { ExactGpuPrefill = true };
+        using var cpu = new DecodeSession(plan, store) { AllowGpuEngine = false };
+        var a = gpu.Prefill(prompt).FirstRow().ToArray();
+        var b = cpu.Prefill(prompt).FirstRow().ToArray();
+        Assert.True(gpu.DeviceEngine()!.Fp4Matrices > 0);
+        AssertClose(b, a, $"gptq {format}", 1e-3);
+    }
+
     private static void AssertClose(float[] expected, float[] actual, string what, double tolerance)
     {
         Assert.Equal(expected.Length, actual.Length);

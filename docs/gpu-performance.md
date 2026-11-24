@@ -324,6 +324,52 @@ tokens of this repo's docs and C#:
 Speculation gains less at 4 bits, because each verify row costs about 1 ms against
 0.2 ms at BF16. Two drafts do best.
 
+### Rounding: GPTQ
+
+Rounding each weight to its nearest 4-bit value keeps the *weights* close.
+What matters is the *layer's output*. With `--calibration <file-or-folder>`,
+`amql-cli quantise` rounds by GPTQ (Frantar et al., 2022):
+
+- The source model reads the calibration text on the GPU one layer at a time.
+  For each input a projection reads, it collects H = XᵀX. Those inputs are the
+  normed residual for q/k/v, the GDN in-projections, gate and up; the attention
+  context or GDN output for o/out; and the gated activation for down.
+- Each row is rounded a column at a time. Every column's rounding error is
+  carried onto the columns still to come, weighted by H⁻¹, so the output over
+  those inputs moves least. Rows are independent: a thread takes one row of a
+  32-column block, and a cuBLAS rank-32 update carries the block's error on.
+- Each block's scale is chosen when the block is reached, from its corrected
+  values. NVFP4 tries six E4M3 scales around the peak's and MXFP4 tries two
+  powers of two; the one with the least weighted error wins.
+- `--rounding search` does the scale search alone, without calibration.
+- On the 4B the whole thing takes about 70 s: 1.2 s of Grams per layer, H⁻¹ and
+  rounding on the GPU. The stored layout is unchanged, so every runtime reads it
+  as before. `index.json` records the rounding used.
+
+`amql-cli quantise compare <reference> <candidate>... --text <file> [--tokens 4096]`
+measures a quantisation where it matters. For each candidate it reports the KL
+from the reference's next-token distribution at every position, perplexity, and
+top-1 agreement. Perplexity alone hides a lot: a model can keep its average loss
+while changing its choices.
+
+Qwen 3.5 4B, calibrated on 32k tokens of this repo's other docs and C#.
+Evaluated on 4,096 tokens of held-out docs and C#, and on 4,096 tokens of
+Python (vLLM model code, a domain the calibration never saw):
+
+| Weights | Docs/C#: perplexity | KL | Top-1 as BF16 | Python: perplexity | KL | Top-1 |
+|---|---|---|---|---|---|---|
+| BF16 | 7.533 | — | — | 3.352 | — | — |
+| NVFP4, nearest | 7.856 (+4.3%) | 0.046 | 90.4% | 3.517 (+4.9%) | 0.054 | 92.4% |
+| NVFP4, searched scales | 7.790 (+3.4%) | 0.038 | 91.7% | 3.485 (+4.0%) | 0.042 | 93.4% |
+| NVFP4, GPTQ | **7.618 (+1.1%)** | **0.013** | **95.3%** | **3.395 (+1.3%)** | **0.019** | **95.4%** |
+| MXFP4, nearest | 8.240 (+9.4%) | 0.081 | 88.0% | 4.062 (+21%) | 0.167 | 86.5% |
+| MXFP4, GPTQ (16k tokens) | 7.691 (+2.1%) | 0.027 | 92.5% | 3.492 (+4.2%) | 0.042 | 93.8% |
+
+GPTQ cuts the KL to a third on NVFP4 and MXFP4 alike, on the held-out domain as
+well as the calibrated one. The worst position's KL falls from 5.3 to 0.5. Decode
+speed is that of the format: the weights are the same size and are read the same
+way. Calibration on 16k tokens instead of 32k gave KL 0.0149 / 0.0211.
+
 The 4-bit kernels move fewer bytes per second than BF16: the decode is work BF16
 does not do. A 4-bit row also finishes in a quarter of the time, so its fixed
 costs show.
@@ -339,6 +385,13 @@ costs show.
 - **A cheaper verify.** A row costs ~0.55 ms: four rows run at 7.4 ms against 5.7 ms
   for one. Part of that is the decode split rule at 3+ rows, and part is a verify
   launched kernel by kernel rather than from a captured graph.
+
+- **Closer 4-bit weights.** GPTQ calibrates each layer on the full-precision
+  model's inputs. Calibrating on the inputs the already-quantised earlier layers
+  produce would let each layer correct what came before it. Past that,
+  distillation from the BF16 model (training the 4-bit model's scales or a
+  low-rank correction against BF16 logits) is how NVIDIA's QAD checkpoints get
+  within noise of full precision.
 
 - **Smaller weights.** Decode is bound by the bytes streamed per token. 8-bit or FP4
   weights read in the GEMV would roughly halve or quarter them, at the cost of

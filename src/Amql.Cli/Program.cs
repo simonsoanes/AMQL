@@ -1865,6 +1865,10 @@ internal static partial class Program
     /// the container's projections compiled to 4 bits, once, for every runtime.</summary>
     private static int Quantise(string[] args)
     {
+        if (Arg(args, 0) == "compare")
+        {
+            return QuantiseCompare(args.Skip(1).ToArray());
+        }
         var containerDir = Arg(args, 0) ?? throw new CliException(
             "quantise requires a container directory, e.g. 'amql-cli quantise <container-dir> --out <out> --format nvfp4'");
         string outDir = OptionValue(args, "--out") ?? throw new CliException("quantise requires '--out <out>'");
@@ -1874,12 +1878,55 @@ internal static partial class Program
             "mxfp4" => Amql.Merge.Fp4Format.Mxfp4,
             var other => throw new CliException($"unknown format '{other}': use nvfp4 or mxfp4"),
         };
-        var report = Amql.Merge.QuantiseContainer.Transform(containerDir, outDir, format);
-        Console.WriteLine($"quantised:  {report.Quantised} projections to {report.Format}, {report.Kept} tensors kept");
+        string? calibration = OptionValue(args, "--calibration");
+        var rounding = (OptionValue(args, "--rounding") ?? (calibration is null ? "nearest" : "gptq")).ToLowerInvariant() switch
+        {
+            "nearest" => Amql.Merge.Fp4Rounding.Nearest,
+            "search" => Amql.Merge.Fp4Rounding.ScaleSearch,
+            "gptq" => Amql.Merge.Fp4Rounding.Gptq,
+            var other => throw new CliException($"unknown rounding '{other}': use nearest, search or gptq"),
+        };
+        if (rounding == Amql.Merge.Fp4Rounding.Gptq && calibration is null)
+        {
+            throw new CliException("gptq rounding needs '--calibration <file-or-folder>' (text the model reads)");
+        }
+        var options = new Amql.Merge.QuantiseOptions(format)
+        {
+            Rounding = rounding,
+            CalibrationText = calibration is null ? null : ReadText(calibration),
+            CalibrationTokens = IntOption(args, "--calibration-tokens", 32768),
+            SequenceTokens = IntOption(args, "--sequence-tokens", 1024),
+            Damp = DoubleOption(args, "--damp", 0.01),
+            Log = line => Console.WriteLine($"            {line}"),
+        };
+        var report = Amql.Merge.QuantiseContainer.Transform(containerDir, outDir, options);
+        Console.WriteLine($"quantised:  {report.Quantised} projections to {report.Format} ({rounding}), {report.Kept} tensors kept");
         Console.WriteLine($"payload:    {report.BytesBefore / 1e9:F2} GB -> {report.BytesAfter / 1e9:F2} GB (stack and drafter)");
         Console.WriteLine($"wrote:      {report.OutDir}");
         return 0;
     }
+
+    /// <summary>amql-cli quantise compare &lt;reference&gt; &lt;candidate&gt;... --text &lt;file-or-folder&gt;
+    /// [--tokens 4096]: each candidate's KL from the reference, perplexity and
+    /// top-1 agreement over the text.</summary>
+    private static int QuantiseCompare(string[] args)
+    {
+        var dirs = args.TakeWhile(a => !a.StartsWith("--", StringComparison.Ordinal)).ToList();
+        if (dirs.Count < 2)
+        {
+            throw new CliException("quantise compare requires a reference and at least one candidate, e.g. " +
+                "'amql-cli quantise compare <reference> <candidate> --text <file>'");
+        }
+        string text = ReadText(OptionValue(args, "--text") ?? throw new CliException("quantise compare requires '--text <file-or-folder>'"));
+        Amql.Merge.QuantCompare.Run(dirs[0], dirs.Skip(1).ToList(), text, IntOption(args, "--tokens", 4096), Console.WriteLine);
+        return 0;
+    }
+
+    /// <summary>A file's text, or every file's under a folder, joined.</summary>
+    private static string ReadText(string path) =>
+        Directory.Exists(path)
+            ? string.Join("\n\n", Directory.EnumerateFiles(path, "*", SearchOption.AllDirectories).Order(StringComparer.Ordinal).Select(File.ReadAllText))
+            : File.ReadAllText(path);
 
     private static int GenerateMtp(string[] args)
     {

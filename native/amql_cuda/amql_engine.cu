@@ -23,6 +23,7 @@
 #include <cuda_fp8.h>
 #include <cuda_fp4.h>
 #include <cublas_v2.h>
+#include <cusolverDn.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -2857,4 +2858,197 @@ AMQE_EXPORT int amqe_set_row_invariant(Engine* e, int on)
 {
     e->rowInvariant = on ? 1 : 0;
     return 0;
+}
+
+// ── 4-bit quantisation with calibration (GPTQ) ─────────────────────────────
+//
+// Rounding a weight to the nearest 4-bit value ignores what the rounding
+// costs the layer's output. GPTQ (Frantar et al., 2022) rounds a row's columns
+// one at a time and moves each column's error onto the columns still to come,
+// weighted by how the layer's inputs correlate (H = XᵀX over calibration
+// tokens), so the output error, not the weight error, is what stays small.
+// Rows are independent: each thread takes one row of a 32-column block, with
+// the block's piece of U (the upper Cholesky factor of H⁻¹) in shared memory;
+// a cuBLAS rank-32 update then carries the block's errors to the rest of the
+// row. The block scale of each group (16 for NVFP4, 32 for MXFP4) is chosen
+// when the group is reached, from its error-corrected values, by trying the
+// scales near the peak's and keeping the one with the least weighted error.
+
+/// H += XᵀX over the rows of x (row-major [rows × k], stride ldx); H is k × k.
+AMQE_EXPORT int amqe_gram(Engine* e, const float* x, int ldx, int rows, int k, float* h)
+{
+    if (rows <= 0) return 0;
+    const float one = 1.f;
+    auto st = cublasSgemm(e->blas, CUBLAS_OP_N, CUBLAS_OP_T, k, k, rows, &one, x, ldx, x, ldx, &one, h, k);
+    return st == CUBLAS_STATUS_SUCCESS ? 0 : -1000 - (int)st;
+}
+
+/// From a damped H (k × k, symmetric, device; overwritten), U: the upper
+/// Cholesky factor of H⁻¹, into u (column-major; only the upper triangle is
+/// meaningful). Returns 0, or a positive cuSOLVER info when a factorisation
+/// fails (the caller damps more and tries again).
+AMQE_EXPORT int amqe_gptq_prepare(Engine* e, float* h, int k, float* u)
+{
+    cusolverDnHandle_t s = nullptr;
+    if (cusolverDnCreate(&s) != CUSOLVER_STATUS_SUCCESS) return -1;
+    cusolverDnSetStream(s, e->stream);
+    int lwork = 0, lwork2 = 0, info = 0, rc = 0;
+    int* dInfo = nullptr;
+    float* work = nullptr;
+    const float one = 1.f;
+    cusolverDnSpotrf_bufferSize(s, CUBLAS_FILL_MODE_LOWER, k, h, k, &lwork);
+    cusolverDnSpotrf_bufferSize(s, CUBLAS_FILL_MODE_UPPER, k, u, k, &lwork2);
+    if (lwork2 > lwork) lwork = lwork2;
+    if (cudaMalloc(&dInfo, sizeof(int)) != cudaSuccess || cudaMalloc(&work, (size_t)lwork * 4 + 16) != cudaSuccess)
+    {
+        rc = -2;
+    }
+    // H = L Lᵀ; H⁻¹ by solving against the identity; H⁻¹ = Uᵀ U.
+    if (rc == 0 && cusolverDnSpotrf(s, CUBLAS_FILL_MODE_LOWER, k, h, k, work, lwork, dInfo) != CUSOLVER_STATUS_SUCCESS) rc = -3;
+    if (rc == 0)
+    {
+        cudaMemcpyAsync(&info, dInfo, sizeof(int), cudaMemcpyDeviceToHost, e->stream);
+        cudaStreamSynchronize(e->stream);
+        if (info != 0) rc = info;
+    }
+    if (rc == 0)
+    {
+        cudaMemsetAsync(u, 0, (size_t)k * k * 4, e->stream);
+        cudaMemcpyAsync(work, &one, 4, cudaMemcpyHostToDevice, e->stream);
+        if (cublasScopy(e->blas, k, work, 0, u, k + 1) != CUBLAS_STATUS_SUCCESS) rc = -4;
+        cudaStreamSynchronize(e->stream);
+    }
+    if (rc == 0 && cusolverDnSpotrs(s, CUBLAS_FILL_MODE_LOWER, k, k, h, k, u, k, dInfo) != CUSOLVER_STATUS_SUCCESS) rc = -5;
+    if (rc == 0 && cusolverDnSpotrf(s, CUBLAS_FILL_MODE_UPPER, k, u, k, work, lwork, dInfo) != CUSOLVER_STATUS_SUCCESS) rc = -6;
+    if (rc == 0)
+    {
+        cudaMemcpyAsync(&info, dInfo, sizeof(int), cudaMemcpyDeviceToHost, e->stream);
+        cudaStreamSynchronize(e->stream);
+        if (info != 0) rc = info;
+    }
+    if (dInfo) cudaFree(dInfo);
+    if (work) cudaFree(work);
+    cusolverDnDestroy(s);
+    if (rc == 0) rc = ok(cudaGetLastError());
+    return rc;
+}
+
+/// The E2M1 code nearest to x (ties to the smaller magnitude, as the managed
+/// encoder rounds).
+__device__ __forceinline__ unsigned int e2m1_code(float x)
+{
+    float a = fabsf(x);
+    unsigned int m = a <= 0.25f ? 0u : a < 0.75f ? 1u : a <= 1.25f ? 2u : a < 1.75f ? 3u
+                   : a <= 2.5f ? 4u : a < 3.5f ? 5u : a <= 5.f ? 6u : 7u;
+    return m | (x < 0.f ? 8u : 0u);
+}
+
+__device__ __forceinline__ float e2m1_of(unsigned int code)
+{
+    unsigned int m = code & 7u;
+    float v = m < 4 ? 0.5f * m : m == 4 ? 2.f : m == 5 ? 3.f : m == 6 ? 4.f : 6.f;
+    return (code & 8u) ? -v : v;
+}
+
+constexpr int GPTQ_B = 32;   // columns a block takes; both group sizes divide it
+
+template <int G>
+__global__ void gptq_block_kernel(float* __restrict__ w, int n, int k, const float* __restrict__ u, int c0,
+    float global, int mx, unsigned char* __restrict__ packed, unsigned char* __restrict__ scales, float* __restrict__ err)
+{
+    __shared__ float su[GPTQ_B][GPTQ_B + 1];
+    for (int t = threadIdx.x; t < GPTQ_B * GPTQ_B; t += blockDim.x)
+    {
+        int i = t / GPTQ_B, j = t % GPTQ_B;
+        su[i][j] = j >= i ? u[(size_t)(c0 + i) + (size_t)(c0 + j) * k] : 0.f;
+    }
+    __syncthreads();
+    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n) return;
+    float* row = w + (size_t)r * k + c0;
+    float v[GPTQ_B];
+    #pragma unroll
+    for (int j = 0; j < GPTQ_B; j++) v[j] = row[j];
+    unsigned int codes[GPTQ_B];
+    #pragma unroll
+    for (int g = 0; g < GPTQ_B / G; g++)
+    {
+        // The group's scale, from its values as corrected so far.
+        float amax = 0.f;
+        #pragma unroll
+        for (int j = g * G; j < g * G + G; j++) amax = fmaxf(amax, fabsf(v[j]));
+        float best = 0.f, bestErr = INFINITY;
+        unsigned char bestByte = mx ? 127 : 0;   // a zero group: any scale serves
+        if (amax > 0.f)
+        {
+            int first, last;   // the candidate scale codes
+            if (mx)
+            {
+                int e0 = (int)ceilf(log2f(amax / 6.f));
+                last = min(max(e0 + 127, 2), 254);
+                first = last - 1;
+            }
+            else
+            {
+                int c = (int)__nv_cvt_float_to_fp8(amax / 6.f / global, __NV_SATFINITE, __NV_E4M3);
+                first = max(c - 4, 1); last = min(c + 1, 0x7E);
+            }
+            for (int c = first; c <= last; c++)
+            {
+                float s = mx ? e8m0_value((unsigned char)c) : e4m3_value((unsigned char)c) * global;
+                if (!(s > 0.f)) continue;
+                float inv = 1.f / s, se = 0.f;
+                #pragma unroll
+                for (int j = g * G; j < g * G + G; j++)
+                {
+                    float d = v[j] - e2m1_of(e2m1_code(v[j] * inv)) * s;
+                    se = fmaf(d * d, 1.f / (su[j][j] * su[j][j]), se);
+                }
+                if (se < bestErr) { bestErr = se; best = s; bestByte = (unsigned char)c; }
+            }
+        }
+        scales[(size_t)r * (k / G) + (c0 + g * G) / G] = bestByte;
+        float inv = best > 0.f ? 1.f / best : 0.f;
+        #pragma unroll
+        for (int j = g * G; j < g * G + G; j++)
+        {
+            unsigned int code = best > 0.f ? e2m1_code(v[j] * inv) : 0u;
+            codes[j] = code;
+            float e = (v[j] - e2m1_of(code) * best) / su[j][j];
+            err[(size_t)r * GPTQ_B + j] = e;
+            #pragma unroll
+            for (int l = j + 1; l < GPTQ_B; l++) v[l] = fmaf(-e, su[j][l], v[l]);
+        }
+    }
+    unsigned char* out = packed + ((size_t)r * k + c0) / 2;
+    #pragma unroll
+    for (int j = 0; j < GPTQ_B; j += 2) out[j / 2] = (unsigned char)(codes[j] | (codes[j + 1] << 4));
+}
+
+/// GPTQ over W (row-major [n × k] f32, device, overwritten) with U from
+/// amqe_gptq_prepare: FP4 codes into packed ([n × k/2]) and block scales into
+/// scales (E4M3 per 16 for NVFP4, with the tensor scale global; E8M0 per 32
+/// for MXFP4). err is scratch of n × 32 floats. With U the identity this is
+/// rounding to nearest, each group at its best scale.
+AMQE_EXPORT int amqe_gptq(Engine* e, float* w, int n, int k, const float* u, int mx, float global,
+    unsigned char* packed, unsigned char* scales, float* err)
+{
+    if (k % GPTQ_B != 0) return -1;
+    const float one = 1.f, minus = -1.f;
+    for (int c0 = 0; c0 < k; c0 += GPTQ_B)
+    {
+        int threads = 128, blocks = (n + threads - 1) / threads;
+        if (mx) gptq_block_kernel<32><<<blocks, threads, 0, e->stream>>>(w, n, k, u, c0, global, 1, packed, scales, err);
+        else gptq_block_kernel<16><<<blocks, threads, 0, e->stream>>>(w, n, k, u, c0, global, 0, packed, scales, err);
+        int rest = k - c0 - GPTQ_B;
+        if (rest > 0)
+        {
+            // Wᵀ[c0+B.., :] -= U[c0..c0+B, c0+B..]ᵀ · Errᵀ, column-major views of the row-major W and Err.
+            auto st = cublasSgemm(e->blas, CUBLAS_OP_T, CUBLAS_OP_N, rest, n, GPTQ_B, &minus,
+                u + c0 + (size_t)(c0 + GPTQ_B) * k, k, err, GPTQ_B, &one, w + c0 + GPTQ_B, k);
+            if (st != CUBLAS_STATUS_SUCCESS) return -1000 - (int)st;
+        }
+    }
+    cudaStreamSynchronize(e->stream);
+    return ok(cudaGetLastError());
 }

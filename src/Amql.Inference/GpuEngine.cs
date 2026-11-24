@@ -1161,6 +1161,218 @@ public sealed class GpuEngine : IDisposable
         }
     }
 
+    // ── calibration and 4-bit rounding ──────────────────────────────────────
+
+    /// <summary>The inputs a layer's projections read, by what reads them: the
+    /// mixer's in-projections (the normed residual), its out-projection (the
+    /// attention context or Gated DeltaNet output), the FFN's gate and up (the
+    /// normed residual again), and its down-projection (the gated activation).</summary>
+    public const int GramMixerIn = 0, GramMixerOut = 1, GramFfnIn = 2, GramDownIn = 3;
+
+    private int _gramLayer = -1;
+    private readonly IntPtr[] _grams = new IntPtr[4];
+    private readonly int[] _gramDims = new int[4];
+    private long _gramRows;
+
+    /// <summary>
+    /// Starts collecting XᵀX of the inputs each projection of layer
+    /// <paramref name="layer"/> reads, over every row prompts then run through
+    /// it (<see cref="Prefill(GpuSequence, ReadOnlySpan{int})"/> with chunks of
+    /// more than 8 rows, where norms run apart from the projections).
+    /// <see cref="EndGrams"/> returns them.
+    /// </summary>
+    public void BeginGrams(int layer)
+    {
+        EndGrams(out _);
+        _gramLayer = layer;
+        _gramRows = 0;
+    }
+
+    /// <summary>The Grams collected since <see cref="BeginGrams"/> (k × k each,
+    /// indexed by <see cref="GramMixerIn"/> and the rest; null where no row
+    /// reached that input), and how many rows they sum.</summary>
+    public float[]?[] EndGrams(out long rows)
+    {
+        var result = new float[]?[4];
+        Check(Native.amqe_sync(_engine), "grams");
+        for (int kind = 0; kind < 4; kind++)
+        {
+            if (_grams[kind] == IntPtr.Zero)
+            {
+                continue;
+            }
+            int k = _gramDims[kind];
+            var h = new float[(long)k * k];
+            Download(h, _grams[kind]);
+            Native.amqe_free(_grams[kind]);
+            _grams[kind] = IntPtr.Zero;
+            result[kind] = h;
+        }
+        rows = _gramRows;
+        _gramLayer = -1;
+        return result;
+    }
+
+    private void Gram(int kind, IntPtr x, int ldx, int rows, int k)
+    {
+        if (_grams[kind] == IntPtr.Zero)
+        {
+            nuint bytes = (nuint)((long)k * k * 4);
+            Check(Native.amqe_alloc(out _grams[kind], bytes), "gram");
+            Check(Native.amqe_memset(_engine, _grams[kind], 0, bytes), "gram");
+            _gramDims[kind] = k;
+        }
+        else if (_gramDims[kind] != k)
+        {
+            throw new InvalidOperationException($"gram {kind} is {_gramDims[kind]} wide, a projection read {k}");
+        }
+        Check(Native.amqe_gram(_engine, x, ldx, rows, k, _grams[kind]), "gram");
+    }
+
+    /// <summary>
+    /// A weight ([rows × cols] f32, row-major) in 4 bits: FP4 codes two to a
+    /// byte (low nibble first) and a scale byte per block (NVFP4: E4M3 per 16,
+    /// times <paramref name="global"/>; MXFP4: E8M0 per 32).
+    /// <para>With a Gram <paramref name="hessian"/> (cols × cols, from
+    /// <see cref="EndGrams"/>) this is GPTQ: each column's rounding error is
+    /// carried onto the columns after it, so the layer's output over those
+    /// inputs moves least; <paramref name="damp"/> × the mean diagonal is added
+    /// to keep H invertible. Without one, each element rounds to nearest.
+    /// Either way each block takes the scale, among those near its peak's,
+    /// that leaves the least (weighted) error.</para>
+    /// </summary>
+    public (byte[] Codes, byte[] Scales) QuantiseFp4(float[] weights, int rows, int cols, float[]? hessian,
+        bool mx, float global, double damp = 0.01)
+    {
+        if (cols % 32 != 0 || weights.LongLength != (long)rows * cols)
+        {
+            throw new ArgumentException($"[{rows}, {cols}] needs a multiple of 32 columns and as many weights");
+        }
+        long kk = (long)cols * cols;
+        var w = weights;
+        var h = new float[kk];
+        if (hessian is null)
+        {
+            for (int i = 0; i < cols; i++)
+            {
+                h[(long)i * cols + i] = 1f;
+            }
+        }
+        else
+        {
+            if (hessian.LongLength != kk)
+            {
+                throw new ArgumentException($"a Gram for {cols} columns has {kk} entries");
+            }
+            Array.Copy(hessian, h, kk);
+            double mean = 0;
+            for (int i = 0; i < cols; i++)
+            {
+                mean += h[(long)i * cols + i];
+            }
+            mean /= cols;
+            for (int i = 0; i < cols; i++)
+            {
+                long d = (long)i * cols + i;
+                if (h[d] == 0f)
+                {
+                    // No input ever reached this column: its weight is never used.
+                    h[d] = 1f;
+                    if (w == weights)
+                    {
+                        w = (float[])weights.Clone();
+                    }
+                    for (int r = 0; r < rows; r++)
+                    {
+                        w[(long)r * cols + i] = 0f;
+                    }
+                }
+                h[d] += (float)(damp * mean);
+            }
+        }
+        int group = mx ? 32 : 16;
+        var codes = new byte[(long)rows * cols / 2];
+        var scales = new byte[(long)rows * cols / group];
+        IntPtr dw = IntPtr.Zero, dh = IntPtr.Zero, du = IntPtr.Zero, dc = IntPtr.Zero, ds = IntPtr.Zero, de = IntPtr.Zero;
+        try
+        {
+            Check(Native.amqe_alloc(out dh, (nuint)(kk * 4)), "gptq");
+            Check(Native.amqe_alloc(out du, (nuint)(kk * 4)), "gptq");
+            int rc = 1;
+            for (int attempt = 0; attempt < 4 && rc != 0; attempt++)
+            {
+                if (attempt > 0)
+                {
+                    // Not positive definite in f32: more damping.
+                    for (int i = 0; i < cols; i++)
+                    {
+                        h[(long)i * cols + i] *= 2f;
+                    }
+                }
+                Upload(dh, h);
+                rc = Native.amqe_gptq_prepare(_engine, dh, cols, du);
+                if (rc < 0)
+                {
+                    Check(rc, "gptq prepare");
+                }
+            }
+            if (rc != 0)
+            {
+                throw new InvalidOperationException($"the Gram for a [{rows}, {cols}] weight stayed singular after damping");
+            }
+            Native.amqe_free(dh);
+            dh = IntPtr.Zero;
+            Check(Native.amqe_alloc(out dw, (nuint)(w.LongLength * 4)), "gptq");
+            Check(Native.amqe_alloc(out dc, (nuint)codes.LongLength), "gptq");
+            Check(Native.amqe_alloc(out ds, (nuint)scales.LongLength), "gptq");
+            Check(Native.amqe_alloc(out de, (nuint)((long)rows * 32 * 4)), "gptq");
+            Upload(dw, w);
+            Check(Native.amqe_gptq(_engine, dw, rows, cols, du, mx ? 1 : 0, global, dc, ds, de), "gptq");
+            Download(codes, dc);
+            Download(scales, ds);
+        }
+        finally
+        {
+            foreach (var p in new[] { dw, dh, du, dc, ds, de })
+            {
+                if (p != IntPtr.Zero)
+                {
+                    Native.amqe_free(p);
+                }
+            }
+        }
+        return (codes, scales);
+    }
+
+    private void Upload<T>(IntPtr device, T[] host) where T : unmanaged
+    {
+        var handle = GCHandle.Alloc(host, GCHandleType.Pinned);
+        try
+        {
+            Check(Native.amqe_upload(_engine, device, handle.AddrOfPinnedObject(),
+                (nuint)(host.LongLength * System.Runtime.CompilerServices.Unsafe.SizeOf<T>())), "upload");
+        }
+        finally
+        {
+            handle.Free();
+        }
+    }
+
+    private void Download<T>(T[] host, IntPtr device) where T : unmanaged
+    {
+        var handle = GCHandle.Alloc(host, GCHandleType.Pinned);
+        try
+        {
+            Check(Native.amqe_download(_engine, handle.AddrOfPinnedObject(), device,
+                (nuint)(host.LongLength * System.Runtime.CompilerServices.Unsafe.SizeOf<T>())), "download");
+        }
+        finally
+        {
+            handle.Free();
+        }
+    }
+
+
     /// <summary>The drafter's attention target: its own KV cache and position
     /// in place of the sequence's layer <c>i</c>.</summary>
     private readonly record struct KvTarget(IntPtr K, IntPtr V, IntPtr Pos, int HostPos);
@@ -1196,6 +1408,16 @@ public sealed class GpuEngine : IDisposable
         // projection unless a post-norm or a parallel block needs it apart.
         bool mixerDirect = l.PostAttn is null && !parallel;
         IntPtr mixerOut = mixerDirect ? _x : _branch;
+        bool gram = _gramLayer >= 0 && i == _gramLayer;
+        if (gram)
+        {
+            if (inNorm is not null)
+            {
+                throw new InvalidOperationException("calibration needs prompt chunks (the norm runs apart)");
+            }
+            Gram(GramMixerIn, hIn, hidden, rows, hidden);
+            _gramRows += rows;
+        }
         if (lp.Attention is { } attn)
         {
             int qkvWidth = l.Qkv!.Rows;
@@ -1254,6 +1476,10 @@ public sealed class GpuEngine : IDisposable
                 }
                 Check(rc, "attention");
             }
+            if (gram)
+            {
+                Gram(GramMixerOut, _ctx, attn.QDim, rows, attn.QDim);
+            }
             Linear(l.O!, _ctx, attn.QDim, rows, mixerOut, hidden, l.OBias,
                 residual: mixerDirect ? _x : IntPtr.Zero, resScale: residualScale);
         }
@@ -1276,6 +1502,10 @@ public sealed class GpuEngine : IDisposable
                     l.ALog, l.DtBias, l.GdnNormW, (float)lin.NormEps, seqs[s].State[i], _conv, _qk, _gb,
                     _gdn + (nint)(at * lin.ValueDim * 4),
                     snap ? seqs[s].SnapState![i] : IntPtr.Zero, snap ? seqs[s].SnapConv![i] : IntPtr.Zero), "gated deltanet");
+            }
+            if (gram)
+            {
+                Gram(GramMixerOut, _gdn, lin.ValueDim, rows, lin.ValueDim);
             }
             Linear(l.Out!, _gdn, lin.ValueDim, rows, mixerOut, hidden, IntPtr.Zero,
                 residual: mixerDirect ? _x : IntPtr.Zero, resScale: residualScale);
@@ -1318,7 +1548,19 @@ public sealed class GpuEngine : IDisposable
         }
         var dense = lp.Ffn!.Dense!;
         int inter = dense.IntermediateSize;
+        if (gram)
+        {
+            if (ffnNorm is not null)
+            {
+                throw new InvalidOperationException("calibration needs prompt chunks (the norm runs apart)");
+            }
+            Gram(GramFfnIn, fIn, hidden, rows, hidden);
+        }
         Linear(l.Up, fIn, hidden, rows, _ffn, inter, l.UpBias, act: l.Act, glu: dense.IsGated, n: inter, norm: ffnNorm);
+        if (gram)
+        {
+            Gram(GramDownIn, _ffn, inter, rows, inter);
+        }
         bool ffnDirect = l.PostFfn is null && !parallel;
         Linear(l.Down!, _ffn, inter, rows, ffnDirect ? _x : _branch2, hidden, l.DownBias,
             residual: ffnDirect ? _x : IntPtr.Zero, resScale: residualScale);
@@ -1885,6 +2127,11 @@ public sealed class GpuEngine : IDisposable
         [DllImport(Lib)] public static extern int amqe_set_int(IntPtr e, IntPtr p, int v);
         [DllImport(Lib)] public static extern int amqe_argmax(IntPtr e, IntPtr x, int n, IntPtr output, IntPtr output2);
         [DllImport(Lib)] public static extern int amqe_set_row_invariant(IntPtr e, int on);
+        [DllImport(Lib)] public static extern int amqe_gram(IntPtr e, IntPtr x, int ldx, int rows, int k, IntPtr h);
+        [DllImport(Lib)] public static extern int amqe_gptq_prepare(IntPtr e, IntPtr h, int k, IntPtr u);
+        [DllImport(Lib)]
+        public static extern int amqe_gptq(IntPtr e, IntPtr w, int n, int k, IntPtr u, int mx, float global,
+            IntPtr packed, IntPtr scales, IntPtr err);
 
         [DllImport(Lib)]
         public static extern int amqe_logit_post(IntPtr e, IntPtr logits, long count, float mult, int hasMult, float cap);

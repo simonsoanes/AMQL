@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- **quality:** GPTQ rounding for 4-bit containers. `amql-cli quantise --calibration <text>` collects each layer's input Gram on the GPU and rounds each weight so the layer's output, not the weight, moves least. Block scales are searched against the same weighting. `--rounding search` searches the scales without calibration.
+  - On Qwen 3.5 4B with NVFP4, KL from BF16 drops from 0.046 to 0.013 and perplexity overhead from +4.3% to +1.1%. Top-1 agreement rises from 90.4% to 95.3%. On held-out Python the overhead drops from +4.9% to +1.3%. MXFP4 drops from +9.4% to +2.1%. The run takes about 70 s, with no change to the stored layout or decode speed.
+  - `amql-cli quantise compare <reference> <candidate>... --text <file>` reports per-position KL, perplexity and top-1 agreement against the reference.
 - **perf:** 4-bit weights (NVFP4 and MXFP4) on the GPU engine.
   - `amql-cli quantise <container> --out <dir> --format nvfp4|mxfp4` compiles a container's stack and MTP drafter projections to FP4 with their block scales, once. On Qwen 3.5 4B they go from 7.38 GB to 2.08 / 1.96 GB.
   - The managed path decodes those weights and the engine runs them as stored, so the two agree as at full precision. Entail adapters keep running their own programs at full precision.
