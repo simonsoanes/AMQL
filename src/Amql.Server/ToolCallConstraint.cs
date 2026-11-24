@@ -120,6 +120,29 @@ public sealed class ToolCallConstraint : ITokenConstraint
         };
     }
 
+    /// <summary>
+    /// What is left to write to name <paramref name="tool"/> as the tool called, from here: null when
+    /// the call's tool is chosen already or the text typed so far names another.
+    /// </summary>
+    public string? PathToTool(string tool)
+    {
+        var s = _state;
+        if (!s.Grammar.Tools.Any(t => t.Name == tool))
+        {
+            return null;
+        }
+        return s.Phase switch
+        {
+            Phase.BeforeFunction => FunctionOpen + tool + ">",
+            Phase.Literal when s.Next == Phase.FunctionName => s.Pending + tool + ">",
+            Phase.FunctionName when tool.StartsWith(s.Typed, StringComparison.Ordinal) => tool[s.Typed.Length..] + ">",
+            _ => null,
+        };
+    }
+
+    /// <summary>The names of the tools the call may name.</summary>
+    public IEnumerable<string> ToolNames => _state.Grammar.Tools.Select(t => t.Name);
+
     /// <summary>The optional parameters of the tool being called that are not given yet.</summary>
     public IEnumerable<string> OptionalLeft() =>
         _state.Tool?.Parameters.Where(p => !p.Required && !_state.Given!.Contains(p.Name)).Select(p => p.Name) ?? Enumerable.Empty<string>();

@@ -42,6 +42,34 @@ public class RepeatedCallsTests
     }
 
     [Fact]
+    public void A_Result_That_Comes_Back_After_Another_Is_Stale_Too()
+    {
+        // A harness answers a re-read with a note, then the file again, then the note again.
+        string file = """{"content":"using System;"}""", note = """{"unchanged":true,"same_as_call":"call_c73f79"}""";
+        var messages = new List<ChatMessage> { new("user", "go"), Call("read", """{"path":"P.cs"}"""), Result(file), Call("read", """{"path":"P.cs"}"""), Result(note) };
+        Assert.Empty(RepeatedCalls.Stale(messages));
+        messages.Add(Call("read", """{"path":"P.cs"}"""));
+        messages.Add(Result(file));
+        Assert.Single(RepeatedCalls.Stale(messages));
+    }
+
+    [Fact]
+    public void A_Turn_Begins_At_The_Users_Message_Not_At_Notes_After_It()
+    {
+        var messages = new List<ChatMessage>
+        {
+            new("system", "s"), new("assistant", "[Context cleared]"),
+            new("user", "write it with create_file"), new("user", "<|rag|> tool:edit_file"),   // the harness's notes
+            Call("read", "{}"), Result("x"),
+            new("user", "[System] same action 3 times"),   // a note inside the turn
+            Call("read", "{}"), Result("x"),
+        };
+        Assert.Equal(2, ServerApp.TurnStart(messages));
+        Assert.Equal(1, ServerApp.TurnStart([new("system", "s"), new("user", "hi")]));
+        Assert.Equal(-1, ServerApp.TurnStart([new("system", "s")]));
+    }
+
+    [Fact]
     public void Parallel_Calls_Pair_With_Their_Results_In_Order()
     {
         var two = new ChatMessage("assistant", "")

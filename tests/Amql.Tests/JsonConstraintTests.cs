@@ -42,6 +42,32 @@ public sealed class JsonConstraintTests
         return c.CanEnd;
     }
 
+    // Hydra's edit_file 'edits' items, descriptions shortened to the words that carry the rules.
+    private const string Edit = """
+        {"type":"array","items":{"type":"object","required":["op"],"properties":{
+          "op":{"type":"string","enum":["replace","delete","insert_after","insert_before","replace_text"],
+                "description":"replace: swap the anchored line. replace_text: unverified literal find/replace (escape hatch)."},
+          "anchor":{"type":"string","description":"The line to target, e.g. L42:a3f9c1. For replace/delete, the first line of the range."},
+          "end":{"type":"string","description":"Last line of a multi-line replace/delete range. Omit for one line."},
+          "content_lines":{"type":"array","items":{"type":"string"},"description":"New text for replace/insert_*. Set 'content_lines' or 'content', never both."},
+          "content":{"type":"string","description":"Legacy single-string alternative to 'content_lines' for replace/insert_* ops."},
+          "find":{"type":"string","description":"Text to find (replace_text only). Matched literally."},
+          "find_lines":{"type":"array","items":{"type":"string"},"description":"Multi-line form of 'find' (replace_text only). Set either 'find' or 'find_lines', never both."},
+          "replace":{"type":"string","description":"Replacement text (replace_text only)."},
+          "replace_lines":{"type":"array","items":{"type":"string"},"description":"Multi-line form of 'replace' (replace_text only). Set either 'replace' or 'replace_lines', never both."}}}}
+        """;
+
+    [Theory]
+    [InlineData("""[{"op":"replace_text","find":"a","replace":"b"}]""", true)]
+    [InlineData("""[{"op":"replace","anchor":"L4:e3b0c4","content_lines":["x"]}]""", true)]
+    [InlineData("""[{"op":"insert_after","anchor":"L4:e3b0c4","content":"x"}]""", true)]
+    [InlineData("""[{"op":"replace","end":"L4","find":"a","replace":"b"}]""", false)]   // find is for replace_text
+    [InlineData("""[{"op":"replace_text","find":"a","replace":"b","replace_lines":["b"]}]""", false)]   // never both
+    [InlineData("""[{"op":"replace","anchor":"L1:aa","content_lines":["x"],"content":"x"}]""", false)]
+    [InlineData("""[{"op":"replace_text","find":"a","replace":"b"},{"op":"delete","anchor":"L2:bb"}]""", true)]
+    public void A_Description_That_Says_Where_A_Property_Belongs_Is_Held_To(string text, bool valid) =>
+        Assert.Equal(valid, Valid(Edit, text));
+
     [Theory]
     [InlineData(1)]
     [InlineData(3)]

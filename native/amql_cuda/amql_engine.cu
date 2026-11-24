@@ -20,11 +20,14 @@
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
+#include <cuda_fp4.h>
 #include <cublas_v2.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <utility>
+#include <type_traits>
 
 #if defined(_WIN32)
   #define AMQE_EXPORT extern "C" __declspec(dllexport)
@@ -49,6 +52,7 @@ struct Engine
     size_t scoresElems = 0;
     float* chunk = nullptr;      // chunked Gated DeltaNet's W, U, G and P
     size_t chunkElems = 0;
+    int rowInvariant = 0;        // 1: a decode GEMV computes each row the same for 1 to 8 rows
 };
 
 static int ok(cudaError_t e) { return e == cudaSuccess ? 0 : -(int)e; }
@@ -281,6 +285,132 @@ __device__ __forceinline__ void load8(const float* w, long long idx, float* o)
 __device__ __forceinline__ float load1(const __nv_bfloat16* w, long long idx) { return __bfloat162float(w[idx]); }
 __device__ __forceinline__ float load1(const float* w, long long idx) { return w[idx]; }
 
+// ── 4-bit weights ──────────────────────────────────────────────────────────
+//
+// FP4 E2M1 elements two to a byte (low nibble first), row-major [rows × k],
+// then a block scale per 16 elements (NVFP4: an E4M3 byte) or per 32 (MXFP4:
+// an E8M0 exponent byte), row-major [rows × k/block]. A tensor scale (NVFP4's
+// weight_scale_2) is not folded in: it is one f32 per output row, applied to
+// the dot product (rows of stacked weights keep their own tensor's). Element
+// times block scale is exact in f32 (and in BF16): at most 6 significant bits.
+#ifndef FP4_UNROLL
+#define FP4_UNROLL 1   // past one activation row the 4-bit step loop is long already: unrolling it thrashed the instruction cache
+#endif
+struct Fp4Nv { unsigned char b; };   // tags: the pointer type picks the reader
+struct Fp4Mx { unsigned char b; };
+
+template <typename WT> struct WTraits
+{
+    static constexpr bool fp4 = false;
+    static constexpr int block = 1;
+    __host__ __device__ static long long rowBytes(int k) { return (long long)k * sizeof(WT); }
+};
+template <> struct WTraits<Fp4Nv>
+{
+    static constexpr bool fp4 = true;
+    static constexpr int block = 16;
+    __host__ __device__ static long long rowBytes(int k) { return k / 2; }
+};
+template <> struct WTraits<Fp4Mx>
+{
+    static constexpr bool fp4 = true;
+    static constexpr int block = 32;
+    __host__ __device__ static long long rowBytes(int k) { return k / 2; }
+};
+
+__device__ __forceinline__ float e4m3_value(unsigned char b)
+{
+    __half_raw h = __nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t)b, __NV_E4M3);
+    return __half2float(*reinterpret_cast<__half*>(&h));
+}
+
+__device__ __forceinline__ float e8m0_value(unsigned char b)
+{
+    // 2^(b − 127); b = 0 is 2^−127, below f32's normals.
+    return b == 0 ? __int_as_float(0x00400000) : __int_as_float((int)b << 23);
+}
+
+__device__ __forceinline__ float fp4_block_scale(const Fp4Nv*, const unsigned char* scales, long long idx)
+{
+    return e4m3_value(__ldg(scales + (idx >> 4)));
+}
+__device__ __forceinline__ float fp4_block_scale(const Fp4Mx*, const unsigned char* scales, long long idx)
+{
+    return e8m0_value(__ldg(scales + (idx >> 5)));
+}
+
+__device__ __forceinline__ float2 e2m1x2_value(unsigned char pair)
+{
+    __half2_raw raw = __nv_cvt_fp4x2_to_halfraw2((__nv_fp4x2_storage_t)pair, __NV_E2M1);
+    return __half22float2(*reinterpret_cast<__half2*>(&raw));
+}
+
+// Eight E2M1 elements packed in one word, as f32, unscaled. Integer work
+// only (conversion instructions run at a fraction of the integer rate): the
+// magnitudes 0, ½, 1, 1½, 2, 3, 4, 6 are f32s whose low two bytes are zero,
+// so a byte permute looks up their top two bytes for four elements at once,
+// and the element's sign bit moves to bit 31.
+__device__ __forceinline__ void decode8_e2m1(unsigned int word, float* o)
+{
+    const unsigned int topLo = 0x3F3F3F00u, topHi = 0x40404040u;   // byte 3, magnitudes 0..3 and 4..7
+    const unsigned int midLo = 0xC0800000u, midHi = 0xC0804000u;   // byte 2
+    #pragma unroll
+    for (int half = 0; half < 2; half++)
+    {
+        unsigned int nib = word >> (16 * half);
+        unsigned int sel = nib & 0x7777u;
+        unsigned int top = __byte_perm(topLo, topHi, sel);
+        unsigned int mid = __byte_perm(midLo, midHi, sel);
+        #pragma unroll
+        for (int j = 0; j < 4; j++)
+        {
+            unsigned int bits = __byte_perm(mid, top, j | ((4 + j) << 4)) << 16;
+            bits |= (nib << (28 - 4 * j)) & 0x80000000u;
+            o[4 * half + j] = __uint_as_float(bits);
+        }
+    }
+}
+
+// Eight elements packed in one word, times their block scale.
+__device__ __forceinline__ void decode8_fp4(unsigned int word, float s, float* o)
+{
+    decode8_e2m1(word, o);
+    #pragma unroll
+    for (int i = 0; i < 8; i++) o[i] *= s;
+}
+
+// Eight elements from idx (a multiple of 8, so one block scale covers them).
+template <typename F>
+__device__ __forceinline__ void load8_fp4(const F* w, const unsigned char* scales, long long idx, float* o)
+{
+    unsigned int word = __ldg(reinterpret_cast<const unsigned int*>(reinterpret_cast<const unsigned char*>(w) + (idx >> 1)));
+    float s = fp4_block_scale(w, scales, idx);
+    #pragma unroll
+    for (int i = 0; i < 4; i++)
+    {
+        float2 p = e2m1x2_value((unsigned char)(word >> (8 * i)));
+        o[2 * i] = p.x * s;
+        o[2 * i + 1] = p.y * s;
+    }
+}
+
+template <typename F>
+__device__ __forceinline__ float load1_fp4(const F* w, const unsigned char* scales, long long idx)
+{
+    unsigned char pair = __ldg(reinterpret_cast<const unsigned char*>(w) + (idx >> 1));
+    float2 p = e2m1x2_value(pair);
+    return ((idx & 1) ? p.y : p.x) * fp4_block_scale(w, scales, idx);
+}
+
+__device__ __forceinline__ void loadw(const __nv_bfloat16* w, const unsigned char*, long long idx, float* o) { load8(w, idx, o); }
+__device__ __forceinline__ void loadw(const float* w, const unsigned char*, long long idx, float* o) { load8(w, idx, o); }
+__device__ __forceinline__ void loadw(const Fp4Nv* w, const unsigned char* sc, long long idx, float* o) { load8_fp4(w, sc, idx, o); }
+__device__ __forceinline__ void loadw(const Fp4Mx* w, const unsigned char* sc, long long idx, float* o) { load8_fp4(w, sc, idx, o); }
+__device__ __forceinline__ float loadw1(const __nv_bfloat16* w, const unsigned char*, long long idx) { return load1(w, idx); }
+__device__ __forceinline__ float loadw1(const float* w, const unsigned char*, long long idx) { return load1(w, idx); }
+__device__ __forceinline__ float loadw1(const Fp4Nv* w, const unsigned char* sc, long long idx) { return load1_fp4(w, sc, idx); }
+__device__ __forceinline__ float loadw1(const Fp4Mx* w, const unsigned char* sc, long long idx) { return load1_fp4(w, sc, idx); }
+
 // ── GEMV: y[r, j] = epilogue(Σ_c W[j, c] · x[r, c]) for R ≤ 8 rows ─────────
 //
 // One warp per output row j (grid-stride, so a wide head reuses its blocks);
@@ -302,19 +432,22 @@ struct GemvArgs
     int glu;          // 1: rows j and n + j are gate and up; y = act(g)·u (n = intermediate)
     const float* normW; float normOff; const float* normBias; float normEps; int normKind;
     int prefetch;     // pull the first rows into L2 before waiting on the previous kernel
+    const unsigned char* wScales;   // 4-bit weights: the block scales
+    const float* rowScale;          // 4-bit weights: each output row's tensor scale (null: 1)
 };
 
 // SPLIT warps share each output row (each takes every SPLIT-th 256-column
 // run), so a narrow matrix — 1024 outputs over 170 SMs is six warps each —
 // still keeps enough loads in flight to saturate memory.
-template <typename WT, int R, int SPLIT, int RW>
+template <typename WT, int R, int SPLIT, int RW, bool RMS>
 __global__ void __launch_bounds__(256) gemv_kernel(GemvArgs a)
 {
     constexpr int WARPS = 8;
     constexpr int GROUP = WARPS / SPLIT * RW;   // output rows per block iteration
-    extern __shared__ float xs[];          // [R × k] when the norm is fused
+    extern __shared__ float xs[];          // [R × k] when a norm other than RMS is fused
     __shared__ float red[32];
     __shared__ float part[SPLIT > 1 ? WARPS : 1][RW][2][R];
+    __shared__ float partSs[SPLIT > 1 ? WARPS : 1][R];
     const WT* W = static_cast<const WT*>(a.w);
     int lane = threadIdx.x & 31;
     int warp = threadIdx.x >> 5;
@@ -326,7 +459,7 @@ __global__ void __launch_bounds__(256) gemv_kernel(GemvArgs a)
         // The weights are never written: pull this block's first rows into L2
         // while the kernel before is still finishing.
         int rowsW0 = a.glu ? 2 : 1;
-        long long rowBytes = (long long)k * sizeof(WT);
+        long long rowBytes = WTraits<WT>::rowBytes(k);
         int jb0 = blockIdx.x * GROUP + slot * RW;
         for (int q = 0; q < RW; q++)
         {
@@ -334,7 +467,7 @@ __global__ void __launch_bounds__(256) gemv_kernel(GemvArgs a)
             if (j >= a.n) break;
             for (int s0 = 0; s0 < rowsW0; s0++)
             {
-                const char* row = reinterpret_cast<const char*>(W + (long long)(s0 == 0 ? j : a.n + j) * k);
+                const char* row = reinterpret_cast<const char*>(a.w) + (long long)(s0 == 0 ? j : a.n + j) * rowBytes;
                 for (long long off = (long long)(sub * 32 + lane) * 128; off < rowBytes; off += 128LL * 32 * SPLIT)
                     asm volatile("prefetch.global.L2 [%0];" :: "l"(row + off));
             }
@@ -343,7 +476,12 @@ __global__ void __launch_bounds__(256) gemv_kernel(GemvArgs a)
     pdl_wait();
     const float* xb = a.x;
     int ldx = a.ldx;
-    if (a.normW)
+    // RMS norm without a bias (the common case): each warp reads x and the
+    // norm's weights straight from cache inside the dot loop and sums x² over
+    // its own columns; 1/rms is one number per row, applied in the epilogue.
+    // Nothing waits on a block-wide pass before the weights start streaming.
+    constexpr bool rms = RMS;
+    if (a.normW && !rms)
     {
         for (int r = 0; r < R; r++)
         {
@@ -369,15 +507,20 @@ __global__ void __launch_bounds__(256) gemv_kernel(GemvArgs a)
         xb = xs;
         ldx = k;
     }
+    const float* gw = a.normW;
+    const float off = a.normOff;
 
     const int rowsW = a.glu ? 2 : 1;
-    bool vec = (k & 7) == 0 && (ldx & 3) == 0;
+    bool vec = (k & (WTraits<WT>::fp4 ? 31 : 7)) == 0 && (ldx & 3) == 0;
     int kv = vec ? k : 0;
     int groups = (a.n + GROUP - 1) / GROUP;
     for (int grp = blockIdx.x; grp < groups; grp += gridDim.x)
     {
         int jb = grp * GROUP + slot * RW;
         float acc[RW][2][R];
+        float ssq[R];
+        #pragma unroll
+        for (int r = 0; r < R; r++) ssq[r] = 0.f;
         #pragma unroll
         for (int q = 0; q < RW; q++)
             #pragma unroll
@@ -395,44 +538,107 @@ __global__ void __launch_bounds__(256) gemv_kernel(GemvArgs a)
                 live[q] = jb + q < a.n;
                 rowBase[q] = (long long)(s == 0 ? jb + q : a.n + jb + q) * k;
             }
-            #pragma unroll 4
-            for (int c = (sub * 32 + lane) * 8; c < kv; c += 256 * SPLIT)
+            // A lane takes E columns a step: 8 BF16 or f32 (16 or 32 bytes), or
+            // 32 FP4 elements (16 bytes, one load for four groups of 8).
+            constexpr bool fp4 = WTraits<WT>::fp4;
+            constexpr int E = fp4 ? 32 : 8;
+            #pragma unroll (fp4 ? (R == 1 ? 2 : FP4_UNROLL) : 4)
+            for (int c0 = (sub * 32 + lane) * E; c0 < kv; c0 += 32 * E * SPLIT)
             {
+            uint4 packs[RW];
+            if constexpr (fp4)
+            {
+                #pragma unroll
+                for (int q = 0; q < RW; q++)
+                    packs[q] = live[q]
+                        ? __ldg(reinterpret_cast<const uint4*>(reinterpret_cast<const unsigned char*>(a.w) + ((rowBase[q] + c0) >> 1)))
+                        : make_uint4(0, 0, 0, 0);
+            }
+            #pragma unroll
+            for (int g = 0; g < E / 8; g++)
+            {
+                const int c = c0 + 8 * g;
                 float wv[RW][8];
+                float gsc[RW];   // 4-bit: the group's block scale, applied to its partial sum
                 #pragma unroll
                 for (int q = 0; q < RW; q++)
                 {
-                    if (live[q]) load8(W, rowBase[q] + c, wv[q]);
+                    if constexpr (fp4)
+                    {
+                        unsigned int word = g == 0 ? packs[q].x : g == 1 ? packs[q].y : g == 2 ? packs[q].z : packs[q].w;
+                        decode8_e2m1(word, wv[q]);
+                        gsc[q] = live[q] ? fp4_block_scale(W, a.wScales, rowBase[q] + c) : 0.f;
+                    }
+                    else if (live[q]) loadw(W, a.wScales, rowBase[q] + c, wv[q]);
                     else
                         #pragma unroll
                         for (int i = 0; i < 8; i++) wv[q][i] = 0.f;
+                }
+                float4 g0 = make_float4(1.f, 1.f, 1.f, 1.f), g1 = g0;
+                if (rms)
+                {
+                    g0 = *reinterpret_cast<const float4*>(gw + c);
+                    g1 = *reinterpret_cast<const float4*>(gw + c + 4);
+                    g0.x += off; g0.y += off; g0.z += off; g0.w += off;
+                    g1.x += off; g1.y += off; g1.z += off; g1.w += off;
                 }
                 #pragma unroll
                 for (int r = 0; r < R; r++)
                 {
                     const float4* xp = reinterpret_cast<const float4*>(xb + (long long)r * ldx + c);
                     float4 x0 = xp[0], x1 = xp[1];
+                    if (rms)
+                    {
+                        if (s == 0)
+                        {
+                            float t = ssq[r];
+                            t = fmaf(x0.x, x0.x, t); t = fmaf(x0.y, x0.y, t); t = fmaf(x0.z, x0.z, t); t = fmaf(x0.w, x0.w, t);
+                            t = fmaf(x1.x, x1.x, t); t = fmaf(x1.y, x1.y, t); t = fmaf(x1.z, x1.z, t); t = fmaf(x1.w, x1.w, t);
+                            ssq[r] = t;
+                        }
+                        x0.x *= g0.x; x0.y *= g0.y; x0.z *= g0.z; x0.w *= g0.w;
+                        x1.x *= g1.x; x1.y *= g1.y; x1.z *= g1.z; x1.w *= g1.w;
+                    }
                     #pragma unroll
                     for (int q = 0; q < RW; q++)
                     {
-                        float t = acc[q][s][r];
-                        t = fmaf(wv[q][0], x0.x, t); t = fmaf(wv[q][1], x0.y, t);
-                        t = fmaf(wv[q][2], x0.z, t); t = fmaf(wv[q][3], x0.w, t);
-                        t = fmaf(wv[q][4], x1.x, t); t = fmaf(wv[q][5], x1.y, t);
-                        t = fmaf(wv[q][6], x1.z, t); t = fmaf(wv[q][7], x1.w, t);
-                        acc[q][s][r] = t;
+                        if constexpr (fp4)
+                        {
+                            float t = wv[q][0] * x0.x;
+                            t = fmaf(wv[q][1], x0.y, t);
+                            t = fmaf(wv[q][2], x0.z, t); t = fmaf(wv[q][3], x0.w, t);
+                            t = fmaf(wv[q][4], x1.x, t); t = fmaf(wv[q][5], x1.y, t);
+                            t = fmaf(wv[q][6], x1.z, t); t = fmaf(wv[q][7], x1.w, t);
+                            acc[q][s][r] = fmaf(gsc[q], t, acc[q][s][r]);
+                        }
+                        else
+                        {
+                            float t = acc[q][s][r];
+                            t = fmaf(wv[q][0], x0.x, t); t = fmaf(wv[q][1], x0.y, t);
+                            t = fmaf(wv[q][2], x0.z, t); t = fmaf(wv[q][3], x0.w, t);
+                            t = fmaf(wv[q][4], x1.x, t); t = fmaf(wv[q][5], x1.y, t);
+                            t = fmaf(wv[q][6], x1.z, t); t = fmaf(wv[q][7], x1.w, t);
+                            acc[q][s][r] = t;
+                        }
                     }
                 }
             }
+            }
             for (int c = kv + sub * 32 + lane; c < k; c += 32 * SPLIT)
             {
+                float gc = rms ? gw[c] + off : 1.f;
                 #pragma unroll
-                for (int q = 0; q < RW; q++)
+                for (int r = 0; r < R; r++)
                 {
-                    if (!live[q]) continue;
-                    float wv = load1(W, rowBase[q] + c);
+                    float xv = xb[(long long)r * ldx + c];
+                    if (rms && s == 0) ssq[r] = fmaf(xv, xv, ssq[r]);
+                    xv *= gc;
                     #pragma unroll
-                    for (int r = 0; r < R; r++) acc[q][s][r] = fmaf(wv, xb[(long long)r * ldx + c], acc[q][s][r]);
+                    for (int q = 0; q < RW; q++)
+                    {
+                        if (!live[q]) continue;
+                        acc[q][s][r] = fmaf(loadw1(W, a.wScales, rowBase[q] + c), xv, acc[q][s][r]);
+                    }
                 }
             }
         }
@@ -442,33 +648,47 @@ __global__ void __launch_bounds__(256) gemv_kernel(GemvArgs a)
             for (int s = 0; s < 2; s++)
                 #pragma unroll
                 for (int r = 0; r < R; r++) acc[q][s][r] = (s == 0 || a.glu) ? warp_sum(acc[q][s][r]) : 0.f;
+        if (rms)
+            #pragma unroll
+            for (int r = 0; r < R; r++) ssq[r] = warp_sum(ssq[r]);
 
         if (SPLIT > 1)
         {
             if (lane == 0)
+            {
                 #pragma unroll
                 for (int q = 0; q < RW; q++)
                     #pragma unroll
                     for (int s = 0; s < 2; s++)
                         #pragma unroll
                         for (int r = 0; r < R; r++) part[warp][q][s][r] = acc[q][s][r];
+                #pragma unroll
+                for (int r = 0; r < R; r++) partSs[warp][r] = ssq[r];
+            }
             __syncthreads();
             if (sub == 0)
             {
                 #pragma unroll
                 for (int t = 1; t < SPLIT; t++)
+                {
                     #pragma unroll
                     for (int q = 0; q < RW; q++)
                         #pragma unroll
                         for (int s = 0; s < 2; s++)
                             #pragma unroll
                             for (int r = 0; r < R; r++) acc[q][s][r] += part[warp + t][q][s][r];
+                    #pragma unroll
+                    for (int r = 0; r < R; r++) ssq[r] += partSs[warp + t][r];
+                }
             }
             __syncthreads();
         }
 
         if (sub == 0 && lane == 0)
         {
+            float inv[R];
+            #pragma unroll
+            for (int r = 0; r < R; r++) inv[r] = rms ? rsqrtf(ssq[r] / k + a.normEps) : 1.f;
             #pragma unroll
             for (int q = 0; q < RW; q++)
             {
@@ -477,7 +697,8 @@ __global__ void __launch_bounds__(256) gemv_kernel(GemvArgs a)
                 #pragma unroll
                 for (int r = 0; r < R; r++)
                 {
-                    float g = acc[q][0][r], u = acc[q][1][r];
+                    float g = acc[q][0][r] * inv[r], u = acc[q][1][r] * inv[r];
+                    if (a.rowScale) { g *= a.rowScale[j]; if (a.glu) u *= a.rowScale[a.n + j]; }
                     float v;
                     if (a.glu)
                     {
@@ -501,28 +722,53 @@ __global__ void __launch_bounds__(256) gemv_kernel(GemvArgs a)
 static int gSms = 0;
 
 // RW output rows per warp: each activation load then serves RW weight rows.
-template <typename WT, int SPLIT, int RW>
+template <typename WT, int SPLIT, int RW, bool RMS>
 static void launch_gemv_rows(Engine* e, const GemvArgs& a, int rows, int blocks, size_t smem)
 {
     switch (rows)
     {
-        case 3: launch(gemv_kernel<WT, 3, SPLIT, RW>, blocks, 256, smem, e->stream, a); break;
-        case 4: launch(gemv_kernel<WT, 4, SPLIT, RW>, blocks, 256, smem, e->stream, a); break;
-        case 5: launch(gemv_kernel<WT, 5, SPLIT, RW>, blocks, 256, smem, e->stream, a); break;
-        case 6: launch(gemv_kernel<WT, 6, SPLIT, RW>, blocks, 256, smem, e->stream, a); break;
-        case 7: launch(gemv_kernel<WT, 7, SPLIT, RW>, blocks, 256, smem, e->stream, a); break;
-        default: launch(gemv_kernel<WT, 8, SPLIT, RW>, blocks, 256, smem, e->stream, a); break;
+        case 3: launch(gemv_kernel<WT, 3, SPLIT, RW, RMS>, blocks, 256, smem, e->stream, a); break;
+        case 4: launch(gemv_kernel<WT, 4, SPLIT, RW, RMS>, blocks, 256, smem, e->stream, a); break;
+        case 5: launch(gemv_kernel<WT, 5, SPLIT, RW, RMS>, blocks, 256, smem, e->stream, a); break;
+        case 6: launch(gemv_kernel<WT, 6, SPLIT, RW, RMS>, blocks, 256, smem, e->stream, a); break;
+        case 7: launch(gemv_kernel<WT, 7, SPLIT, RW, RMS>, blocks, 256, smem, e->stream, a); break;
+        default: launch(gemv_kernel<WT, 8, SPLIT, RW, RMS>, blocks, 256, smem, e->stream, a); break;
     }
 }
 
-template <typename WT, int SPLIT>
+template <typename WT, int SPLIT, bool RMS>
 static void launch_gemv_split(Engine* e, const GemvArgs& a, int rows, int rw, int blocks, size_t smem)
 {
-    if (rows == 1) { launch(gemv_kernel<WT, 1, SPLIT, 2>, blocks, 256, smem, e->stream, a); return; }
-    if (rows == 2) { launch(gemv_kernel<WT, 2, SPLIT, 2>, blocks, 256, smem, e->stream, a); return; }
-    if (rw >= 4) launch_gemv_rows<WT, SPLIT, 4>(e, a, rows, blocks, smem);
-    else if (rw == 2) launch_gemv_rows<WT, SPLIT, 2>(e, a, rows, blocks, smem);
-    else launch_gemv_rows<WT, SPLIT, 1>(e, a, rows, blocks, smem);
+    if (rows == 1)
+    {
+        if (rw >= 8) launch(gemv_kernel<WT, 1, SPLIT, 8, RMS>, blocks, 256, smem, e->stream, a);
+        else if (rw >= 4) launch(gemv_kernel<WT, 1, SPLIT, 4, RMS>, blocks, 256, smem, e->stream, a);
+        else launch(gemv_kernel<WT, 1, SPLIT, 2, RMS>, blocks, 256, smem, e->stream, a);
+        return;
+    }
+    if (rows == 2)
+    {
+        if (rw >= 4) launch(gemv_kernel<WT, 2, SPLIT, 4, RMS>, blocks, 256, smem, e->stream, a);
+        else launch(gemv_kernel<WT, 2, SPLIT, 2, RMS>, blocks, 256, smem, e->stream, a);
+        return;
+    }
+#ifndef AMQE_GEMV_BENCH_FEW_ROWS   // a benchmark build that only runs one or two rows
+    if (rw >= 4) launch_gemv_rows<WT, SPLIT, 4, RMS>(e, a, rows, blocks, smem);
+    else if (rw == 2) launch_gemv_rows<WT, SPLIT, 2, RMS>(e, a, rows, blocks, smem);
+    else launch_gemv_rows<WT, SPLIT, 1, RMS>(e, a, rows, blocks, smem);
+#endif
+}
+
+template <typename WT, bool RMS>
+static void launch_gemv_kernel(Engine* e, const GemvArgs& a, int rows, int split, int rw, int blocks, size_t smem)
+{
+    switch (split)
+    {
+        case 1: launch_gemv_split<WT, 1, RMS>(e, a, rows, rw, blocks, smem); break;
+        case 2: launch_gemv_split<WT, 2, RMS>(e, a, rows, rw, blocks, smem); break;
+        case 8: launch_gemv_split<WT, 8, RMS>(e, a, rows, rw, blocks, smem); break;
+        default: launch_gemv_split<WT, 4, RMS>(e, a, rows, rw, blocks, smem); break;
+    }
 }
 
 // Output rows per warp for 3+ activation rows: 2, or 4 from 6 rows (measured on
@@ -553,24 +799,54 @@ static int launch_gemv(Engine* e, const GemvArgs& a, int rows)
         perSm = env ? atoi(env) : 4;
         if (perSm <= 0) perSm = 4;
     }
-    // Enough warps per row that the machine holds ~32 warps per SM.
-    int split = a.n >= gSms * 32 ? 1 : (a.n >= gSms * 12 ? 2 : 4);
-    if (a.k < 256 * split) split = 1;
-    int rw = rows <= 2 ? 2 : gemv_rw(rows);
+    // Warps per output row. One or two activation rows (decode) are pure
+    // weight streaming: four warps a row keeps the most loads in flight, and
+    // eight when the matrix is so narrow (n = 1024) that four leave the SMs
+    // under ~24 warps each — within 2% of the best of 1/2/4/8 on every
+    // Qwen3.5 0.8B and 4B projection (RTX 5090). From three rows the FMAs per
+    // weight grow and fewer warps a row win: about 32 warps per SM.
+    // AMQE_GEMV_SPLIT=1, 2, 4 or 8 fixes it.
+    // Row-invariant (speculative decoding verifies drafts as extra rows and
+    // needs each row's logits exactly as one-row decode gives them): the
+    // one-row rule for every row count, since the split sets the order each
+    // output is summed in. RW and the grid do not.
+    // 4-bit weights: a row of k = 2560 is only 1,280 bytes, so the fixed cost
+    // of a row (the warps' reduction, the epilogue) weighs four times as much,
+    // and rows under 4096 take one warp each (four from 4096). Measured on
+    // Qwen 3.5 4B, RTX 5090: a GDN in-projection or the head gains most, and a
+    // verify of several rows (speculative decoding, which must keep the
+    // one-row split) runs a fifth faster than at four warps a row.
+    constexpr bool fp4w = WTraits<WT>::fp4;
+    int split;
+    if (fp4w && (rows <= 2 || e->rowInvariant)) split = a.k >= 4096 ? 4 : 1;
+    else if (rows <= 2 || e->rowInvariant) split = (long long)a.n * 4 / 2 < (long long)gSms * 24 ? 8 : 4;
+    else split = a.n >= gSms * 32 ? 1 : (a.n >= gSms * 12 ? 2 : 4);
+    static int splitEnv = -1;
+    if (splitEnv < 0) { const char* v = getenv("AMQE_GEMV_SPLIT"); splitEnv = v ? atoi(v) : 0; }
+    if (splitEnv == 1 || splitEnv == 2 || splitEnv == 4 || splitEnv == 8) split = splitEnv;
+    constexpr int stepCols = 32 * (WTraits<WT>::fp4 ? 32 : 8);   // columns one warp covers a step
+    while (split > 1 && a.k < stepCols * split) split /= 2;
+    static int rwDecode = -1;   // AMQE_GEMV_RW_DECODE=2|4: output rows per warp at one or two rows
+    if (rwDecode < 0) { const char* v = getenv("AMQE_GEMV_RW_DECODE"); rwDecode = v ? atoi(v) : 0; }
+    // Output rows per warp do not change any output's sum: 4 for 4-bit rows under 4096 wide.
+    int rwDefault = fp4w && a.k < 4096 ? 4 : 2;
+    int rw = rows <= 2 ? (rwDecode == 2 || rwDecode == 4 || rwDecode == 8 ? rwDecode : rwDefault)
+                       : (fp4w && !getenv("AMQE_GEMV_RW") ? 4 : gemv_rw(rows));
     int perGroup = (8 / split) * rw;
     long long groups = ((long long)a.n + perGroup - 1) / perGroup;
-    // With the norm fused every block re-reads x, so a wide matrix runs on a
-    // bounded grid and its blocks loop over rows instead.
-    long long cap = a.normW ? (long long)gSms * perSm : groups;
+    // An RMS norm (no bias) is applied inside the dot loop; any other norm is
+    // staged in shared memory by every block first, which re-reads x per
+    // block, so a wide matrix then runs on a bounded grid and its blocks loop
+    // over rows instead. The RMS path is bounded too, more loosely, so the
+    // head's ~60k row groups do not each re-read x and the norm weights.
+    bool rmsNorm = a.normW && a.normKind == 0 && !a.normBias;
+    bool staged = a.normW && !rmsNorm;
+    long long cap = staged ? (long long)gSms * perSm : (rmsNorm ? (long long)gSms * 8 : groups);
     int blocks = (int)(groups < cap ? groups : cap);
-    size_t smem = a.normW ? (size_t)rows * a.k * sizeof(float) : 0;
+    size_t smem = staged ? (size_t)rows * a.k * sizeof(float) : 0;
     if (smem > 48 * 1024) return -101;
-    switch (split)
-    {
-        case 1: launch_gemv_split<WT, 1>(e, a, rows, rw, blocks, smem); break;
-        case 2: launch_gemv_split<WT, 2>(e, a, rows, rw, blocks, smem); break;
-        default: launch_gemv_split<WT, 4>(e, a, rows, rw, blocks, smem); break;
-    }
+    if (rmsNorm) launch_gemv_kernel<WT, true>(e, a, rows, split, rw, blocks, smem);
+    else launch_gemv_kernel<WT, false>(e, a, rows, split, rw, blocks, smem);
     return ok(cudaGetLastError());
 }
 
@@ -608,7 +884,8 @@ __global__ void to_bf16_kernel(const float* x, int ldx, int rows, int k, __nv_bf
 
 // out[r, j] = epilogue(raw[r, j]) — raw is the GEMM's [rows, n or 2n] output.
 __global__ void epilogue_kernel(const float* raw, int ldraw, int rows, int n,
-    float* y, int ldy, const float* bias, const float* residual, int ldr, float resScale, int act, int glu)
+    float* y, int ldy, const float* bias, const float* residual, int ldr, float resScale, int act, int glu,
+    const float* rowScale)
 {
     pdl_enter();
     long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x;
@@ -618,12 +895,14 @@ __global__ void epilogue_kernel(const float* raw, int ldraw, int rows, int n,
     if (glu)
     {
         float g = raw[(long long)r * ldraw + j], u = raw[(long long)r * ldraw + n + j];
+        if (rowScale) { g *= rowScale[j]; u *= rowScale[n + j]; }
         if (bias) { g += bias[j]; u += bias[n + j]; }
         v = activate(g, act) * u;
     }
     else
     {
         v = raw[(long long)r * ldraw + j];
+        if (rowScale) v *= rowScale[j];
         if (bias) v += bias[j];
         v = activate(v, act);
     }
@@ -631,26 +910,65 @@ __global__ void epilogue_kernel(const float* raw, int ldraw, int rows, int n,
     y[(long long)r * ldy + j] = v;
 }
 
-/// y = epilogue(x · Wᵀ). wType 0 = BF16, 1 = f32. `raw` is scratch for the
-/// batched path, [rows × (glu ? 2n : n)] floats.
+// A 4-bit weight decoded, eight elements a thread: to BF16 (exact) without
+// the row scale, for the tensor-core GEMM whose epilogue applies it, or to
+// f32 with it, as the managed path decodes (element × block scale × tensor scale).
+template <typename F, typename OUT>
+__global__ void dequant_fp4_kernel(const F* w, const unsigned char* scales, const float* rowScale,
+    int k, long long count, OUT* out)
+{
+    pdl_enter();
+    long long i = (blockIdx.x * (long long)blockDim.x + threadIdx.x) * 8;
+    if (i >= count) return;
+    float v[8];
+    load8_fp4(w, scales, i, v);
+    float rs = rowScale ? rowScale[i / k] : 1.f;
+    #pragma unroll
+    for (int t = 0; t < 8; t++)
+    {
+        if constexpr (sizeof(OUT) == 2) out[i + t] = __float2bfloat16_rn(v[t]);
+        else out[i + t] = v[t] * rs;
+    }
+}
+
+static int linear_fp4_gemm(Engine* e, const void* w, int wType, const unsigned char* wScales, const float* rowScale,
+    int n, int k, const float* x, int ldx, int rows, float* y, int ldy,
+    const float* bias, const float* residual, int ldr, float resScale, int act, int glu, float* raw);
+
+/// y = epilogue(x · Wᵀ). wType 0 = BF16, 1 = f32, 2 = NVFP4, 3 = MXFP4 (the
+/// 4-bit layout above: wScales the block scales, rowScale each output row's
+/// tensor scale or null). `raw` is scratch for the batched path,
+/// [rows × (glu ? 2n : n)] floats.
 AMQE_EXPORT int amqe_linear(Engine* e, const void* w, int wType, int n, int k,
     const float* x, int ldx, int rows, float* y, int ldy,
     const float* bias, const float* residual, int ldr, float resScale, int act, int glu, float* raw,
-    const float* normW, float normOff, const float* normBias, float normEps, int normKind)
+    const float* normW, float normOff, const float* normBias, float normEps, int normKind,
+    const unsigned char* wScales, const float* rowScale)
 {
     if (rows <= 0) return 0;
+    if (wType >= 2 && (k % 32 != 0 || wScales == nullptr)) return -100;
     static int prefetch = -1;
     if (prefetch < 0) { const char* v = getenv("AMQE_GEMV_PREFETCH"); prefetch = v ? atoi(v) : 1; }
     GemvArgs a{ w, n, k, x, ldx, y, ldy, bias, residual, ldr, resScale, act, glu,
-                normW, normOff, normBias, normEps, normKind, prefetch };
+                normW, normOff, normBias, normEps, normKind, prefetch, wScales, rowScale };
     // AMQE_GEMM_FROM=N: N rows or more go to cuBLAS instead of the GEMV (default 9).
     static int gemmFrom = -1;
     if (gemmFrom < 0) { const char* v = getenv("AMQE_GEMM_FROM"); gemmFrom = v ? atoi(v) : 9; if (gemmFrom < 2) gemmFrom = 9; }
     if (normW && rows >= gemmFrom) return -101;
     if (rows < gemmFrom)
     {
-        return wType == 0 ? launch_gemv<__nv_bfloat16>(e, a, rows) : launch_gemv<float>(e, a, rows);
+        switch (wType)
+        {
+            case 0: return launch_gemv<__nv_bfloat16>(e, a, rows);
+            case 1: return launch_gemv<float>(e, a, rows);
+            case 2: return launch_gemv<Fp4Nv>(e, a, rows);
+            case 3: return launch_gemv<Fp4Mx>(e, a, rows);
+            default: return -100;
+        }
     }
+    if (wType >= 2)
+        return linear_fp4_gemm(e, w, wType, wScales, rowScale, n, k, x, ldx, rows, y, ldy, bias, residual, ldr, resScale, act, glu, raw);
+    if (rowScale) return -100;
 
     int outRows = glu ? 2 * n : n;
     bool direct = !glu && act == ACT_NONE && bias == nullptr &&
@@ -682,7 +1000,7 @@ AMQE_EXPORT int amqe_linear(Engine* e, const void* w, int wType, int n, int k,
         if (direct) return ok(cudaGetLastError());
         long long total = (long long)rows * n;
         launch(epilogue_kernel, (unsigned)((total + 255) / 256), 256, 0, e->stream,
-            raw, outRows, rows, n, y, ldy, bias, residual, ldr, resScale, act, glu);
+            raw, outRows, rows, n, y, ldy, bias, residual, ldr, resScale, act, glu, (const float*)nullptr);
         return ok(cudaGetLastError());
     }
     const float* wf = static_cast<const float*>(w);
@@ -717,8 +1035,74 @@ AMQE_EXPORT int amqe_linear(Engine* e, const void* w, int wType, int n, int k,
         &alpha, wf, k, x, ldx, &beta0, raw, outRows);
     if (st != CUBLAS_STATUS_SUCCESS) return -(1000 + (int)st);
     long long total = (long long)rows * n;
-    launch(epilogue_kernel, (unsigned)((total + 255) / 256), 256, 0, e->stream, 
-        raw, outRows, rows, n, y, ldy, bias, residual, ldr, resScale, act, glu);
+    launch(epilogue_kernel, (unsigned)((total + 255) / 256), 256, 0, e->stream,
+        raw, outRows, rows, n, y, ldy, bias, residual, ldr, resScale, act, glu, (const float*)nullptr);
+    return ok(cudaGetLastError());
+}
+
+// Batched rows over a 4-bit weight: decoded whole into scratch, then the BF16
+// path (exact BF16 weights, the row scale in the epilogue) or, with prefill at
+// f32, the SGEMM path over the f32 decode. The decode is a read of the 4-bit
+// weight and a write of its wide copy, small next to the GEMM over 512 rows.
+static int linear_fp4_gemm(Engine* e, const void* w, int wType, const unsigned char* wScales, const float* rowScale,
+    int n, int k, const float* x, int ldx, int rows, float* y, int ldy,
+    const float* bias, const float* residual, int ldr, float resScale, int act, int glu, float* raw)
+{
+    int outRows = glu ? 2 * n : n;
+    long long count = (long long)outRows * k;
+    unsigned blocks = (unsigned)((count / 8 + 255) / 256);
+    const float alpha = 1.f, beta0 = 0.f;
+    if (!e->prefillF32)
+    {
+        size_t need = (size_t)count;
+        if (need * 2 > e->widenElems * 4)
+        {
+            if (e->widen) cudaFree(e->widen);
+            e->widen = nullptr;
+            e->widenElems = 0;
+            if (cudaMalloc(&e->widen, need * sizeof(float)) != cudaSuccess) return -2;
+            e->widenElems = need;
+        }
+        __nv_bfloat16* wb = reinterpret_cast<__nv_bfloat16*>(e->widen);
+        if (wType == 2) launch(dequant_fp4_kernel<Fp4Nv, __nv_bfloat16>, blocks, 256, 0, e->stream, (const Fp4Nv*)w, wScales, (const float*)nullptr, k, count, wb);
+        else launch(dequant_fp4_kernel<Fp4Mx, __nv_bfloat16>, blocks, 256, 0, e->stream, (const Fp4Mx*)w, wScales, (const float*)nullptr, k, count, wb);
+        size_t needX = (size_t)rows * k;
+        if (needX > e->xbElems)
+        {
+            if (e->xb) cudaFree(e->xb);
+            e->xb = nullptr;
+            e->xbElems = 0;
+            if (cudaMalloc(&e->xb, needX * sizeof(__nv_bfloat16)) != cudaSuccess) return -2;
+            e->xbElems = needX;
+        }
+        long long pairs = (long long)rows * (k / 2);
+        launch(to_bf16_kernel, (unsigned)((pairs + 255) / 256), 256, 0, e->stream, x, ldx, rows, k, e->xb);
+        auto st = cublasGemmEx(e->blas, CUBLAS_OP_T, CUBLAS_OP_N, outRows, rows, k,
+            &alpha, wb, CUDA_R_16BF, k, e->xb, CUDA_R_16BF, k, &beta0, raw, CUDA_R_32F, outRows,
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+        if (st != CUBLAS_STATUS_SUCCESS) return -(1000 + (int)st);
+        long long total = (long long)rows * n;
+        launch(epilogue_kernel, (unsigned)((total + 255) / 256), 256, 0, e->stream,
+            raw, outRows, rows, n, y, ldy, bias, residual, ldr, resScale, act, glu, rowScale);
+        return ok(cudaGetLastError());
+    }
+    size_t need = (size_t)count;
+    if (need > e->widenElems)
+    {
+        if (e->widen) cudaFree(e->widen);
+        e->widen = nullptr;
+        e->widenElems = 0;
+        if (cudaMalloc(&e->widen, need * sizeof(float)) != cudaSuccess) return -2;
+        e->widenElems = need;
+    }
+    if (wType == 2) launch(dequant_fp4_kernel<Fp4Nv, float>, blocks, 256, 0, e->stream, (const Fp4Nv*)w, wScales, rowScale, k, count, e->widen);
+    else launch(dequant_fp4_kernel<Fp4Mx, float>, blocks, 256, 0, e->stream, (const Fp4Mx*)w, wScales, rowScale, k, count, e->widen);
+    auto st = cublasSgemm(e->blas, CUBLAS_OP_T, CUBLAS_OP_N, outRows, rows, k,
+        &alpha, e->widen, k, x, ldx, &beta0, raw, outRows);
+    if (st != CUBLAS_STATUS_SUCCESS) return -(1000 + (int)st);
+    long long total = (long long)rows * n;
+    launch(epilogue_kernel, (unsigned)((total + 255) / 256), 256, 0, e->stream,
+        raw, outRows, rows, n, y, ldy, bias, residual, ldr, resScale, act, glu, (const float*)nullptr);
     return ok(cudaGetLastError());
 }
 
@@ -1399,7 +1783,7 @@ __global__ void gdn_conv_advance_kernel(const float* proj, int ldp, int rows, in
 // head and normalises its own outputs; the last block computes decay and β.
 __global__ void gdn_conv_prep_kernel(const float* proj, int ldp, int rows, int channels, int keyDim, int nk,
     const float* w, int kernel, float* history, float* conv, float* qk,
-    int bOff, int aOff, int nv, const float* aLog, const float* dtBias, float* gb)
+    int bOff, int aOff, int nv, const float* aLog, const float* dtBias, float* gb, float* histSnap)
 {
     pdl_enter();
     __shared__ float red[32];
@@ -1440,6 +1824,9 @@ __global__ void gdn_conv_prep_kernel(const float* proj, int ldp, int rows, int c
             conv[(long long)r * channels + c] = y;
             for (int i = hl - 1; i >= 1; i--) hist[i] = hist[i - 1];
             if (hl > 0) hist[0] = x;
+            // The history after row r, for a verify that keeps only rows 0..r.
+            if (histSnap && r < rows - 1)
+                for (int i = 0; i < hl; i++) histSnap[((long long)r * channels + c) * hl + i] = hist[i];
         }
         if (isQk)
         {
@@ -1502,7 +1889,7 @@ __global__ void gdn_prep_kernel(const float* conv, int keyDim, int convDim, int 
 template <int KD, bool FUSED>
 __global__ void __launch_bounds__(FUSED ? 512 : 128) gdn_scan_kernel(const float* conv, const float* qk, const float* gb,
     int rows, int keyDim, int convDim, int nk, int nv, int vd, float* state, float* out, int valueDim,
-    const float* proj, int ldp, int zOff, const float* normW, float normEps)
+    const float* proj, int ldp, int zOff, const float* normW, float normEps, float* stateSnap)
 {
     pdl_enter();
     constexpr int KP = KD / 4;
@@ -1570,6 +1957,13 @@ __global__ void __launch_bounds__(FUSED ? 512 : 128) gdn_scan_kernel(const float
         else if (part == 0)
         {
             out[(long long)r * valueDim + h * vd + col] = o;
+        }
+        // The state after row r, for a verify that keeps only rows 0..r.
+        if (stateSnap && r < rows - 1)
+        {
+            float* sn = stateSnap + (long long)r * nv * KD * vd + (long long)h * KD * vd;
+            #pragma unroll
+            for (int i = 0; i < KP; i++) sn[(long long)(part * KP + i) * vd + col] = S[i];
         }
     }
     #pragma unroll
@@ -2142,12 +2536,15 @@ __global__ void gdn_gate_norm_kernel(float* o, int valueDim, int vd, const float
 AMQE_EXPORT int amqe_gdn(Engine* e, const float* proj, int ldp, int rows, int keyDim, int valueDim,
     int nk, int nv, int kd, int vd, const float* convW, int kernel, float* history,
     const float* aLog, const float* dtBias, const float* normW, float normEps,
-    float* state, float* conv, float* qk, float* gb, float* out)
+    float* state, float* conv, float* qk, float* gb, float* out, float* stateSnap, float* histSnap)
 {
     if (vd % 32 != 0 || (kd != 64 && kd != 128) || kernel < 1 || kernel > 9) return -100;
     int convDim = 2 * keyDim + valueDim;
     int zOff = convDim, bOff = convDim + valueDim, aOff = convDim + valueDim + nv;
-    bool few = rows <= 4;
+    // Up to 8 rows (decode, and a speculative verify) take the one-launch
+    // conv and the fused scan, whose arithmetic per row does not depend on
+    // how many rows there are.
+    bool few = rows <= 8;
     static int chunkMin = -1, chunkVt = -1;
     if (chunkMin < 0)
     {
@@ -2162,8 +2559,9 @@ AMQE_EXPORT int amqe_gdn(Engine* e, const float* proj, int ldp, int rows, int ke
     {
         int blocks = (convDim + kd - 1) / kd + 1;
         launch(gdn_conv_prep_kernel, blocks, kd, 0, e->stream, proj, ldp, rows, convDim, keyDim, nk, convW, kernel,
-            history, conv, qk, bOff, aOff, nv, aLog, dtBias, gb);
+            history, conv, qk, bOff, aOff, nv, aLog, dtBias, gb, histSnap);
     }
+    else if (stateSnap || histSnap) return -100;
     else
     {
         long long total = (long long)rows * convDim;
@@ -2172,6 +2570,7 @@ AMQE_EXPORT int amqe_gdn(Engine* e, const float* proj, int ldp, int rows, int ke
         launch(gdn_prep_kernel, dim3(rows, nk), kd, 0, e->stream, conv, keyDim, convDim, kd, proj, ldp, bOff, aOff, nv, aLog, dtBias, qk, gb, chunked ? 1 : 0);
     }
     bool fused = few && vd * 4 <= 512;
+    if ((stateSnap || histSnap) && !fused) return -100;
     static int rowsScan = -1;
     if (rowsScan < 0) { const char* v = getenv("AMQE_GDN_ROWS_SCAN"); rowsScan = v ? atoi(v) : 1; }
     if (chunked)
@@ -2198,13 +2597,13 @@ AMQE_EXPORT int amqe_gdn(Engine* e, const float* proj, int ldp, int rows, int ke
     int threads = fused ? vd * 4 : 128;
     if (kd == 128)
     {
-        if (fused) launch(gdn_scan_kernel<128, true>, grid, threads, 0, e->stream, conv, qk, gb, rows, keyDim, convDim, nk, nv, vd, state, out, valueDim, proj, ldp, zOff, normW, normEps);
-        else launch(gdn_scan_kernel<128, false>, grid, threads, 0, e->stream, conv, qk, gb, rows, keyDim, convDim, nk, nv, vd, state, out, valueDim, proj, ldp, zOff, normW, normEps);
+        if (fused) launch(gdn_scan_kernel<128, true>, grid, threads, 0, e->stream, conv, qk, gb, rows, keyDim, convDim, nk, nv, vd, state, out, valueDim, proj, ldp, zOff, normW, normEps, stateSnap);
+        else launch(gdn_scan_kernel<128, false>, grid, threads, 0, e->stream, conv, qk, gb, rows, keyDim, convDim, nk, nv, vd, state, out, valueDim, proj, ldp, zOff, normW, normEps, stateSnap);
     }
     else
     {
-        if (fused) launch(gdn_scan_kernel<64, true>, grid, threads, 0, e->stream, conv, qk, gb, rows, keyDim, convDim, nk, nv, vd, state, out, valueDim, proj, ldp, zOff, normW, normEps);
-        else launch(gdn_scan_kernel<64, false>, grid, threads, 0, e->stream, conv, qk, gb, rows, keyDim, convDim, nk, nv, vd, state, out, valueDim, proj, ldp, zOff, normW, normEps);
+        if (fused) launch(gdn_scan_kernel<64, true>, grid, threads, 0, e->stream, conv, qk, gb, rows, keyDim, convDim, nk, nv, vd, state, out, valueDim, proj, ldp, zOff, normW, normEps, stateSnap);
+        else launch(gdn_scan_kernel<64, false>, grid, threads, 0, e->stream, conv, qk, gb, rows, keyDim, convDim, nk, nv, vd, state, out, valueDim, proj, ldp, zOff, normW, normEps, stateSnap);
     }
     if (!fused)
         launch(gdn_gate_norm_kernel, dim3(rows, nv), vd < 64 ? 64 : (vd > 256 ? 256 : vd), 0, e->stream, out, valueDim, vd, proj, ldp, zOff, normW, normEps);
@@ -2392,4 +2791,70 @@ AMQE_EXPORT int amqe_advance(Engine* e, int* pos, int by)
 {
     launch(advance_kernel, 1, 1, 0, e->stream, pos, by);
     return ok(cudaGetLastError());
+}
+
+__global__ void set_int_kernel(int* p, int v) { pdl_enter(); *p = v; }
+
+/// *p = v, in stream order (a position a captured graph or a later kernel reads).
+AMQE_EXPORT int amqe_set_int(Engine* e, int* p, int v)
+{
+    launch(set_int_kernel, 1, 1, 0, e->stream, p, v);
+    return ok(cudaGetLastError());
+}
+
+// The index of the largest of n values (the lowest index on a tie), written
+// to out and, when given, to out2: a draft token the next kernel embeds.
+__global__ void __launch_bounds__(1024) argmax_kernel(const float* x, int n, int* out, int* out2)
+{
+    pdl_enter();
+    __shared__ float bv[32];
+    __shared__ int bi[32];
+    float best = -INFINITY;
+    int at = 0x7fffffff;
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+    {
+        float v = x[i];
+        if (v > best) { best = v; at = i; }
+    }
+    for (int o = 16; o > 0; o >>= 1)
+    {
+        float ov = __shfl_xor_sync(0xffffffffu, best, o);
+        int oi = __shfl_xor_sync(0xffffffffu, at, o);
+        if (ov > best || (ov == best && oi < at)) { best = ov; at = oi; }
+    }
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    if (lane == 0) { bv[warp] = best; bi[warp] = at; }
+    __syncthreads();
+    if (warp == 0)
+    {
+        int warps = blockDim.x >> 5;
+        best = lane < warps ? bv[lane] : -INFINITY;
+        at = lane < warps ? bi[lane] : 0x7fffffff;
+        for (int o = 16; o > 0; o >>= 1)
+        {
+            float ov = __shfl_xor_sync(0xffffffffu, best, o);
+            int oi = __shfl_xor_sync(0xffffffffu, at, o);
+            if (ov > best || (ov == best && oi < at)) { best = ov; at = oi; }
+        }
+        if (lane == 0)
+        {
+            if (at == 0x7fffffff) at = 0;
+            *out = at;
+            if (out2) *out2 = at;
+        }
+    }
+}
+
+AMQE_EXPORT int amqe_argmax(Engine* e, const float* x, int n, int* out, int* out2)
+{
+    launch(argmax_kernel, 1, 1024, 0, e->stream, x, n, out, out2);
+    return ok(cudaGetLastError());
+}
+
+/// 1: every decode GEMV sums each row in the order one-row decode does, so a
+/// row's values do not depend on how many rows run with it.
+AMQE_EXPORT int amqe_set_row_invariant(Engine* e, int on)
+{
+    e->rowInvariant = on ? 1 : 0;
+    return 0;
 }

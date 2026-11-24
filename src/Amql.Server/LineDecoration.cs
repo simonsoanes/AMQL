@@ -1,5 +1,7 @@
 using System.Text;
+using System.Text.Encodings.Web;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 
 namespace Amql.Server;
@@ -117,6 +119,98 @@ public sealed class LineDecoration
         }
         return value;
     }
+
+    /// <summary>
+    /// A tool result as the model is shown it: every string in it (a JSON result's string values,
+    /// else the text) that carries the decoration on most of its lines has it removed, so the model
+    /// reads a file as the file. A 0.8B model shown <c>L4:e3b0c4│</c> on a blank line read 18 lines of
+    /// a sound file as missing and rewrote them; shown the same file plain, it restated the task and
+    /// wrote the program. A JSON result is written back compactly with its non-ASCII text unescaped.
+    /// </summary>
+    public string Plain(string result, out bool changed)
+    {
+        changed = false;
+        string t = result.TrimStart();
+        if (!t.StartsWith('{') && !t.StartsWith('['))
+        {
+            return Strip(result, out changed);
+        }
+        JsonNode? root;
+        try
+        {
+            root = JsonNode.Parse(result);
+        }
+        catch (JsonException)
+        {
+            return Strip(result, out changed);
+        }
+        if (root is null)
+        {
+            return result;
+        }
+        bool any = false;
+        var stack = new Stack<JsonNode>();
+        stack.Push(root);
+        while (stack.Count > 0)
+        {
+            var node = stack.Pop();
+            if (node is JsonObject obj)
+            {
+                foreach (var (key, value) in obj.ToList())
+                {
+                    if (value is JsonValue v && v.GetValueKind() == JsonValueKind.String)
+                    {
+                        string s = v.GetValue<string>();
+                        if (s.Contains('\n'))
+                        {
+                            string plain = Strip(s, out bool did);
+                            if (did)
+                            {
+                                obj[key] = plain;
+                                any = true;
+                            }
+                        }
+                    }
+                    else if (value is not null)
+                    {
+                        stack.Push(value);
+                    }
+                }
+            }
+            else if (node is JsonArray arr)
+            {
+                for (int i = 0; i < arr.Count; i++)
+                {
+                    var value = arr[i];
+                    if (value is JsonValue v && v.GetValueKind() == JsonValueKind.String)
+                    {
+                        string s = v.GetValue<string>();
+                        if (s.Contains('\n'))
+                        {
+                            string plain = Strip(s, out bool did);
+                            if (did)
+                            {
+                                arr[i] = plain;
+                                any = true;
+                            }
+                        }
+                    }
+                    else if (value is not null)
+                    {
+                        stack.Push(value);
+                    }
+                }
+            }
+        }
+        if (!any)
+        {
+            return result;
+        }
+        changed = true;
+        return root.ToJsonString(Relaxed);
+    }
+
+    private static readonly JsonSerializerOptions Relaxed = new() { Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
 
     private string StripWith(Regex prefix, string[] lines, int length)
     {

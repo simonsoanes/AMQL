@@ -71,9 +71,12 @@ public static class ComputeBudget
     /// <c>AMQL_GPU_FORMAT</c> or <c>--gpu-format</c>. A weight stored as NVFP4
     /// always goes as NVFP4.</summary>
     public static GpuWeightFormat GpuWeightFormat { get; set; } =
-        Environment.GetEnvironmentVariable("AMQL_GPU_FORMAT")?.Trim().ToLowerInvariant() is "nvfp4" or "fp4"
-            ? GpuWeightFormat.Nvfp4
-            : GpuWeightFormat.Fp16;
+        Environment.GetEnvironmentVariable("AMQL_GPU_FORMAT")?.Trim().ToLowerInvariant() switch
+        {
+            "nvfp4" or "fp4" => GpuWeightFormat.Nvfp4,
+            "mxfp4" => GpuWeightFormat.Mxfp4,
+            _ => GpuWeightFormat.Fp16,
+        };
 
     /// <summary>Host memory the CUDA runtime, cuBLAS and the shim's staging
     /// buffers take once the GPU is in use; measured at 1.5 to 3 GiB.</summary>
@@ -220,4 +223,8 @@ public enum GpuWeightFormat
 {
     Fp16,
     Nvfp4,
+
+    /// <summary>OCP MXFP4: the GPU engine's projections at 4 bits with E8M0
+    /// scales per 32 (the lean path's device copies stay FP16).</summary>
+    Mxfp4,
 }

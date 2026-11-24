@@ -36,6 +36,23 @@ public class LineDecorationTests
     }
 
     [Fact]
+    public void ShowsAToolResultPlain()
+    {
+        string result = ReadResult(Code);
+        var d = LineDecoration.Learn([result])!;
+        string shown = d.Plain(result, out bool changed);
+        Assert.True(changed);
+        using var doc = JsonDocument.Parse(shown);
+        Assert.Equal(string.Join("\n", Code), doc.RootElement.GetProperty("content").GetString());
+        Assert.Equal("Program.cs", doc.RootElement.GetProperty("path").GetString());
+        Assert.DoesNotContain("\\u0022", shown);   // quotes in the code stay readable
+        // a result with nothing decorated is left exactly as it came
+        string other = """{"success":true,"output":"Build succeeded.\n0 Warning(s)\n0 Error(s)"}""";
+        Assert.Equal(other, d.Plain(other, out bool touched));
+        Assert.False(touched);
+    }
+
+    [Fact]
     public void StripsAPartialCopyAndADoubleOne()
     {
         var d = LineDecoration.Learn([ReadResult(Code)])!;
@@ -88,6 +105,30 @@ public class LineDecorationTests
     [InlineData("NOTE: 'handle' means poll or stop an existing background command.", "stop", false)]
     public void ToolResultSuggestions(string result, string name, bool suggests) =>
         Assert.Equal(suggests, TextGenerator.SuggestsParameter(result, name));
+
+    private const string Step2 = "Step 2: write a new version from scratch with create_file (overwrite true), no need to read_file the old one. "
+        + "Don't use edit_file. Then run_build, fix any errors, run it once with run_terminal.";
+
+    [Theory]
+    [InlineData("create_file", true)]
+    [InlineData("run_build", true)]
+    [InlineData("run_terminal", true)]
+    [InlineData("read_file", false)]   // "no need to"
+    [InlineData("edit_file", false)]   // "Don't use"
+    [InlineData("file", false)]        // part of a name, not a name
+    public void ToolsAMessageNames(string tool, bool named) =>
+        Assert.Equal(named, TextGenerator.NamesTool(Step2, tool));
+
+    [Fact]
+    public void NamedToolsFallDueInTheirOrder()
+    {
+        string[] tools = ["read_file", "run_terminal", "edit_file", "run_build", "create_file"];
+        Assert.Equal(["create_file"], TextGenerator.ToolsDue(Step2, tools, null));
+        Assert.Equal(["create_file", "run_build"], TextGenerator.ToolsDue(Step2, tools, new HashSet<string> { "create_file", "read_file" }));
+        Assert.Equal(["create_file", "run_build", "run_terminal"],
+            TextGenerator.ToolsDue(Step2, tools, new HashSet<string> { "create_file", "run_build", "run_terminal" }));
+        Assert.Empty(TextGenerator.ToolsDue("How big is my disk?", tools, null));
+    }
 
     [Fact]
     public void PlainResultsHaveNoDecoration()

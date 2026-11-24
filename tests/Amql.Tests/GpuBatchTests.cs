@@ -95,6 +95,77 @@ public class GpuBatchTests
         }
     }
 
+    /// <summary>A sequence rewound to its mark picks up exactly where it was
+    /// there: the rest of the prompt gives the same logits, and so do the steps
+    /// after it, though the sequence went past the mark in between. A prompt that
+    /// parts from the first after the mark is as if prefilled from the start in
+    /// the same two pieces, and two pieces agree with one to f32 rounding.</summary>
+    [Theory]
+    [InlineData("qwen3")]
+    [InlineData("qwen3_5-gdn")]
+    public void A_Rewound_Sequence_Picks_Up_At_Its_Mark(string family)
+    {
+        CudaShim.Reset();
+        if (!CudaShim.Enabled)
+        {
+            return;
+        }
+        using var dir = new TempDir();
+        string containerDir = Path.Combine(dir.Path, "c");
+        ModelToContainer.Encode(Path.Combine(Zoo, family), containerDir, family,
+            new ArchMapper.EncodeOptions { IncludeVision = false, IncludeMtp = false });
+        using var container = Vindex3Container.Open(containerDir);
+        using var store = container.CreateOperandStore();
+        var plan = Planner.Plan(container, "target", store);
+        var (ids, _) = ArchZooTests.Golden(family);
+        // Past a 512-row chunk and the chunked recurrence's 256-row threshold.
+        var prompt = Enumerable.Range(0, 700).Select(i => ids[i % ids.Length]).ToArray();
+        var other = Enumerable.Range(0, 90).Select(i => ids[(i * 7 + 3) % ids.Length]).ToArray();
+        const int mark = 600;
+
+        using var host = new DecodeSession(plan, store);
+        host.Prefill(new[] { ids[0] });
+        var engine = host.DeviceEngine()!;
+        engine.ExactPrefill = true;
+        float[][] Steps(GpuSequence seq, float[] from, int n)
+        {
+            var all = new List<float[]>();
+            for (int i = 0; i < n; i++)
+            {
+                from = engine.Step(new[] { seq }, new[] { Sampler.ArgMax(from) })[0];
+                all.Add(from);
+            }
+            return all.ToArray();
+        }
+
+        var seq = engine.NewSequence();
+        engine.Prefill(seq, prompt.AsSpan(0, mark));
+        engine.Mark(seq);
+        Assert.Equal(mark, seq.MarkedAt);
+        var first = engine.Prefill(seq, prompt.AsSpan(mark));
+        var firstSteps = Steps(seq, first, 6);
+
+        engine.Rewind(seq);
+        Assert.Equal(mark, seq.Position);
+        var again = engine.Prefill(seq, prompt.AsSpan(mark));
+        Assert.Equal(first, again);
+        var againSteps = Steps(seq, again, 6);
+        for (int i = 0; i < firstSteps.Length; i++)
+        {
+            Assert.Equal(firstSteps[i], againSteps[i]);
+        }
+
+        engine.Rewind(seq);
+        var parted = engine.Prefill(seq, other);
+        var fresh = engine.NewSequence();
+        engine.Prefill(fresh, prompt.AsSpan(0, mark));
+        Assert.Equal(parted, engine.Prefill(fresh, other));
+
+        engine.Reset(fresh);
+        Assert.Equal(-1, fresh.MarkedAt);
+        AssertClose(first, engine.Prefill(fresh, prompt), $"{family} two pieces against one");
+    }
+
     private static void AssertClose(float[] expected, float[] actual, string what)
     {
         Assert.Equal(expected.Length, actual.Length);

@@ -63,12 +63,18 @@ internal static partial class Program
             if (a == "--gpu-format")
             {
                 string? format = i + 1 < args.Length ? args[i + 1].ToLowerInvariant() : null;
-                if (format is not ("nvfp4" or "fp16"))
+                if (format is not ("nvfp4" or "mxfp4" or "fp16"))
                 {
-                    Console.Error.WriteLine("error: --gpu-format needs nvfp4 or fp16");
+                    Console.Error.WriteLine("error: --gpu-format needs nvfp4, mxfp4 or fp16");
                     return ExitUsage;
                 }
-                ComputeBudget.GpuWeightFormat = format == "nvfp4" ? GpuWeightFormat.Nvfp4 : GpuWeightFormat.Fp16;
+                ComputeBudget.GpuWeightFormat = format switch
+                {
+                    "nvfp4" => GpuWeightFormat.Nvfp4,
+                    "mxfp4" => GpuWeightFormat.Mxfp4,
+                    _ => GpuWeightFormat.Fp16,
+                };
+                GpuEngine.WeightFormat = ComputeBudget.GpuWeightFormat;
                 i++;
                 continue;
             }
@@ -154,6 +160,7 @@ internal static partial class Program
                 "from-gguf" => FromGguf(args[1..]),
                 "export-mtp" => ExportMtp(args[1..]),
                 "generate-mtp" => GenerateMtp(args[1..]),
+                "quantise" or "quantize" => Quantise(args[1..]),
                 "collect-mtp" => CollectMtp(args[1..]),
                 "fit-mtp" => FitMtp(args[1..]),
                 "layers" => Layers(args[1..]),
@@ -1853,6 +1860,26 @@ internal static partial class Program
     }
 
     // ── generate-mtp: bootstrap an MTP drafter for a model without one ──────
+
+    /// <summary>amql-cli quantise &lt;container&gt; --out &lt;dir&gt; [--format nvfp4|mxfp4]:
+    /// the container's projections compiled to 4 bits, once, for every runtime.</summary>
+    private static int Quantise(string[] args)
+    {
+        var containerDir = Arg(args, 0) ?? throw new CliException(
+            "quantise requires a container directory, e.g. 'amql-cli quantise <container-dir> --out <out> --format nvfp4'");
+        string outDir = OptionValue(args, "--out") ?? throw new CliException("quantise requires '--out <out>'");
+        var format = (OptionValue(args, "--format") ?? "nvfp4").ToLowerInvariant() switch
+        {
+            "nvfp4" => Amql.Merge.Fp4Format.Nvfp4,
+            "mxfp4" => Amql.Merge.Fp4Format.Mxfp4,
+            var other => throw new CliException($"unknown format '{other}': use nvfp4 or mxfp4"),
+        };
+        var report = Amql.Merge.QuantiseContainer.Transform(containerDir, outDir, format);
+        Console.WriteLine($"quantised:  {report.Quantised} projections to {report.Format}, {report.Kept} tensors kept");
+        Console.WriteLine($"payload:    {report.BytesBefore / 1e9:F2} GB -> {report.BytesAfter / 1e9:F2} GB (stack and drafter)");
+        Console.WriteLine($"wrote:      {report.OutDir}");
+        return 0;
+    }
 
     private static int GenerateMtp(string[] args)
     {

@@ -74,6 +74,20 @@ public sealed class WeightLoader
 
     public WeightWorkingSet WorkingSet => _workingSet;
 
+    /// <summary>Whether the store holds this tensor (a module the plan does
+    /// not run, such as an MTP drafter, may be absent).</summary>
+    public bool Contains(OperandRef operand)
+    {
+        try
+        {
+            return _store.ContainsTensor(operand.ObjectId, operand.TensorName);
+        }
+        catch (Amql.Vindex3.ContainerException)
+        {
+            return false;   // the graph has no such object
+        }
+    }
+
     /// <summary>True when at least one weight tensor has been uploaded to
     /// the device via the CUDA path — gates GPU-only ops like attention.</summary>
     public bool AnyDeviceWeight { get; private set; }
@@ -1230,6 +1244,45 @@ public sealed class WeightLoader
         var data = resolution.Values;
         ApplyPatch(operand, data);
         return (null, data);
+    }
+
+    /// <summary>The operand as stored when it is FP4 (an NVFP4 or MXFP4
+    /// container, or a quantised checkpoint), and nothing patches it; else null.</summary>
+    internal ScaledMatrix? StoredFp4(OperandRef operand)
+    {
+        var key = (operand.ObjectId, operand.TensorName);
+        if (_added.ContainsKey(key) || (_patch is not null && _patch.TryGet(operand.ObjectId, operand.TensorName, out _)))
+        {
+            return null;
+        }
+        try
+        {
+            if (!_store.IsScaled(operand.ObjectId, operand.TensorName))
+            {
+                return null;
+            }
+        }
+        catch (Amql.Vindex3.ContainerException)
+        {
+            return null;
+        }
+        return _store.ResolveScaled(operand) is { Element: Dtype.FP4 } m ? m : null;
+    }
+
+    /// <summary>The operand's values as stored, widened to f32 (patched, if a
+    /// patch covers it), never through a BF16-resident copy.</summary>
+    internal float[] StoredValues(OperandRef operand, int rows, int cols)
+    {
+        var resolution = _store.ResolveWidened(operand);
+        if (ElementCount(resolution.Shape) != (long)rows * cols)
+        {
+            throw new ContainerException(
+                $"operand '{operand.ObjectId}/{operand.TensorName}' resolves to shape " +
+                $"[{string.Join(",", resolution.Shape)}] — expected [{rows} x {cols}]");
+        }
+        var data = resolution.Values;
+        ApplyPatch(operand, data);
+        return data;
     }
 
     private bool HoldAsBf16(OperandRef operand)

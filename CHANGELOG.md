@@ -8,9 +8,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- **perf:** 4-bit weights (NVFP4 and MXFP4) on the GPU engine.
+  - `amql-cli quantise <container> --out <dir> --format nvfp4|mxfp4` compiles a container's stack and MTP drafter projections to FP4 with their block scales, once. On Qwen 3.5 4B they go from 7.38 GB to 2.08 / 1.96 GB.
+  - The managed path decodes those weights and the engine runs them as stored, so the two agree as at full precision. Entail adapters keep running their own programs at full precision.
+  - `AMQL_GPU_FORMAT=nvfp4|mxfp4` (`--gpu-format`) instead quantises at load, giving bit for bit the compiled container's logits.
+  - Decode GEMVs decode FP4 in registers with byte permutes (no conversion instructions), with 16-byte loads and more output rows a warp on short rows. Prompts decode exactly to BF16 for the tensor cores.
+  - On Qwen 3.5 4B (RTX 5090), a token's projections take 2.36 ms (NVFP4) or 2.46 ms (MXFP4) instead of 5.06 ms.
+  - Decode runs at 272 tok/s instead of 169, and 348 with two MTP drafts. Perplexity goes from 7.54 to 7.86 (NVFP4) or 8.24 (MXFP4) on this repo's docs and code, and the top token matches BF16 at 90% / 88% of positions.
+  - Speculative verify stays bit-identical to plain steps over 4-bit weights.
+- **perf:** speculative decoding with the model's own MTP drafter, exact.
+  - `GpuEngine.Draft` runs Qwen 3.5's MTP layer on the device, with its own KV cache, kept up to date through prefill and every kept row. Drafts are chosen among the first 32k head rows.
+  - `Verify` runs the chosen token and its drafts as rows of one pass. `Accept` keeps the rows up to the first miss and restores each Gated DeltaNet's state saved after that row.
+  - `RowInvariant` makes each verify row's logits bit for bit those of a one-token step.
+  - The server drafts 3 tokens, or copies from the context after an 8-token repeat. It takes each row through adapters, constraints and the sampler as a plain step would, so replies are unchanged, greedy or seeded.
+  - On Qwen 3.5 4B (RTX 5090), greedy code generation runs at 325 tok/s instead of 174. Served replies run 1.4–1.65× faster, including a sampled reply to a 23k-token agent request.
+  - `AMQL_MTP_DRAFTS`, `AMQL_SUFFIX_DRAFT`, `AMQL_MTP_VOCAB`, `AMQL_MTP=0` configure it.
+- **perf:** decode GEMVs tuned for every shape, not one model.
+  - At one or two activation rows, four warps share each output row (eight for very narrow matrices), instead of one or two for wide ones.
+  - A fused RMS norm is applied inside the dot loop: Σx² is summed alongside the products, and 1/rms is applied in the epilogue. Each block no longer stages a normalised copy in shared memory before streaming weights.
+  - On Qwen 3.5 4B (RTX 5090), the norm-fused projections and FFN down go from 1.39–1.48 TB/s to 1.64–1.66 TB/s, and a token's projections from 5.7 ms to 5.05 ms. The 0.8B's projections improve by 5–18%.
+  - Batched decode (three or more rows) keeps its previous launch rule. `AMQE_GEMV_SPLIT` overrides the rule.
+- **perf:** top-k sampling without a probability for every token: the k largest logits and the softmax's denominator in vectorised passes, then top-p and the draw over the survivors, drawing what the whole-vocabulary path draws (`Sampler.SampleWholeVocabulary`, tested seed for seed). 64 µs a draw on a 248k vocabulary instead of 1,099 µs. An Entail adapter's choice no longer walks the vocabulary with set lookups or sums its softmax in scalar doubles. On Qwen 3.5 4B, choosing a sampled token takes 120-330 µs of a ~7 ms step instead of ~1,150 µs.
+- **feat(server):** prompt prefixes reused between requests on the GPU engine. A finished sequence is kept with its prompt and its recurrent state saved at the prompt's second-last turn marker; a new prompt that agrees up to there rewinds it and prefills only the rest. On Qwen 3.5 4B with Hydra's 18k-token prompts, prefill went from 1.5-2.9 s to 125-212 ms per call after the first. `GpuEngine.Mark` / `Rewind` save and restore a sequence's state; `--no-prefix-reuse` turns it off; `AMQL_SERVER_TIMING=1` logs each admission's reuse and prefill time.
 - **feat(server):** function calling on `/v1/chat/completions` and `/v1/responses` for Qwen3.5-family templates. Tools, assistant calls and tool results (`tool_calls` / `tool` messages, `function_call` / `function_call_output` items) render exactly as transformers' `apply_chat_template` renders them. Replies come back as typed `tool_calls` or `function_call` items, streamed whole as each call closes; a call the token limit cut off is returned as content, never run. `tool_choice` (`none`, `auto`, `required`, a named function, enforced by writing the call's opening for the model) and `parallel_tool_calls` are supported.
 - **feat(server):** reasoning. Thinking is switched by `chat_template_kwargs.enable_thinking`, `reasoning_effort` / `reasoning.effort`, or `--think`, and comes back as `reasoning_content` (chat) or a `reasoning` output item (Responses), in streams too. Sent back on a later turn, it is rendered as the template renders it.
 - **feat(server):** several models, each with its own settings: `--config <models.json>` gives every model its path, adapters and defaults (`think`, `max_tokens`, `temperature`, `top_p`, `top_k`), and the same container can be served under several ids. `/v1/models` lists each chat model's context length, tools, thinking, adapters and defaults, and `GET /v1/models/{id}` returns one.
+- **feat(server):** three more for Qwen 3.5 0.8B in Hydra's agent:
+  - **Plain tool results** (`--keep-line-marks`): the model is shown tool results without their learned line decoration; it read `L4:e3b0c4│` on a blank line as a missing line and patched 18 lines of a sound file.
+  - **What a schema says in words:** a property described as only for some values of the object's required enum ("(replace_text only)") is offered only after that value, and of a "X or Y, never both" pair only one may be written.
+  - **Mentioned tools** (`--no-mention-rule`): the first call after the user's message names the first tool the message names, when the message names tools and not in a clause saying not to.
+  - **The user's turn** begins at the user's own message: notes a harness adds after it, or after a tool result, no longer hide the task.
+  - **Repeated calls** now also catch a result that comes back after another (a file and an "unchanged since your last read" note in turn), and the lead-in says "here is where things stand", not "here is what it showed", which led to a made-up file.
 - **feat(server):** rules for the ways Qwen 3.5 0.8B went wrong driving Hydra's agent, each with a switch to turn it off:
   - **Announced calls** (`--no-announce-rule`): a reply that ends on "…let me build it:" opens the call it promised instead of ending the turn. After a colon that only introduces a list ("Here's what was done:"), the reply goes on but no call is forced.
   - **Copied line decoration** (always on): the line marks a harness shows a file with (`L42:a3f9c1│`) are learned from the request's tool results and removed from a call's value that copied them, including partial and double copies.

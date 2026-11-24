@@ -82,6 +82,18 @@ takes its place at once. Up to 64 requests per model are accepted; past 8 they w
 - `--no-batch` turns it off. `--batch-bf16` runs batches of 4 or more on tensor cores (cuBLAS, activations
   rounded to BF16, as prompts already are): about 1.6x the throughput at 8, but a reply then depends slightly
   on what shares its batch.
+- **Speculative decoding.** A reply running alone on a model with an MTP drafter (Qwen 3.5) takes several
+  tokens a step. The drafter proposes 3 tokens, or the context does when the reply's last 8 tokens appeared in it
+  before. The model runs them as rows of one pass, and the reply takes each row exactly as a plain step would:
+  adapters, constraints and the sampler, in order, for as long as it chooses the next draft. The replies are
+  the same token for token, greedy or sampled with a seed; on Qwen 3.5 4B they come 1.4–1.65x faster.
+  `AMQL_MTP_DRAFTS=0` turns it off, `AMQL_SUFFIX_DRAFT=0` the context's drafts, and `AMQL_SERVER_TIMING=1` logs
+  drafts kept and where a step's time goes. See [GPU inference performance](gpu-performance.md#speculative-decoding).
+- **4-bit weights.** Point a model's `path` at a container compiled with `amql-cli quantise --format nvfp4` (or
+  `mxfp4`) and the GPU engine runs its projections at 4 bits. On Qwen 3.5 4B decode is ~1.6x faster, and perplexity
+  rises ~4% (NVFP4). Entail adapters are unaffected: they run their own programs over the tokens.
+  `AMQL_GPU_FORMAT=nvfp4|mxfp4` quantises an ordinary container at load instead, the same weights the compiled
+  container holds. See [GPU inference performance](gpu-performance.md#4-bit-weights-nvfp4-mxfp4).
 - `/v1/models` gives each chat model's `concurrency` (8 when it batches, else 1) and, when it does not batch,
   why (`batching`). `AMQL_SERVER_TIMING=1` logs where a batch step's time goes; `AMQL_GPU_ENGINE_TIMING=1` the
   engine's launch, wait and copy.
@@ -100,10 +112,45 @@ Mean latency at 8 clients drops from 1.7 s to 0.9 s (0.7 s with `--batch-bf16`),
 
 With Qwen's recommended sampling (temperature 0.6, top-p 0.95, top-k 20), exact: 315 tok/s for one client and 866
 at 8, against 290 at any count one at a time, after a rewrite of the top-p filter (it ranked and hashed the whole 248k vocabulary each token; it now ranks
-only the top-k survivors, with the same draws). What remains of sampling's cost is the softmax over the whole
-vocabulary. The engine alone (`amql-cli bench <container> --batch 8`) does 668 tok/s at 1 sequence and 2,256 at 8,
-3,577 with tensor-core batches. Prompt prefill on the engine runs at 30-50k tok/s, so reusing prompt prefixes
-between requests would save little and is not done.
+only the top-k survivors, with the same draws). The softmax over the whole vocabulary that remained has gone
+too: with top-k up to 256, the sampler finds the k largest logits and the softmax's denominator in vectorised
+passes (skipping blocks more than 30 below the largest, under float rounding of the sum) and gives a probability
+only to the survivors; top-p and the draw then run over those, in the same order and with the same full-vocabulary
+normalisation, so the draws match the whole-vocabulary path (`Sampler.SampleWholeVocabulary`, held to it seed for
+seed in `SamplerTopKTests`). On a 248k vocabulary a draw takes 64 µs instead of 1,099 µs. An Entail adapter's
+choice no longer walks the vocabulary with two set lookups per token, nor sums its softmax in scalar doubles:
+on Qwen 3.5 4B, choosing a sampled token went from ~1,150 µs to 120-330 µs of a ~7 ms step, and in an agent's
+tool calls from ~2,350 µs to 340-880 µs. The engine alone (`amql-cli bench <container> --batch 8`) does 668 tok/s at 1 sequence and 2,256 at 8,
+3,577 with tensor-core batches.
+
+**Prompt prefixes are reused.** An agent's calls share all but their last few hundred tokens: Hydra sends an
+18k-token system prompt and tool list, and each call adds a reply and a tool result. Qwen 3.5 4B prefills such a
+prompt in 1.5-2.9 s on an RTX 5090, which was half of every call. So the scheduler keeps finished sequences,
+each with its prompt and the recurrent state saved at that prompt's mark (`GpuEngine.Mark`). A new prompt that
+agrees with a kept one up to its mark rewinds that sequence there (`GpuEngine.Rewind`: the Gated DeltaNet
+state and conv history are copied back, and the KV entries before the mark were never overwritten) and
+prefills only the rest.
+
+- **The mark** is at the prompt's second-last `<|im_start|>`. The last opens the reply's turn. The message
+  before it is the newest, and an agent may move it: Hydra sends its notes as a user message after the
+  newest message, so in the next call that position holds the reply instead. Everything before the mark is
+  the same from one call to the next.
+- **What it saves:** replaying eight calls of a Hydra turn on the 4B, prefill went from 1.5-2.0 s to 125-212 ms
+  for every call after the first (17-20k tokens reused of 18-21k), and a 64-token reply from 2.2-2.8 s to 0.8 s.
+- **Two prefixes are kept** before an unrelated prompt takes the oldest, so an agent's side requests (Hydra's
+  JSON analysis calls) do not take the sequence its main calls pick up from. Each holds its KV cache: about
+  2 GiB at 32k positions on the 4B.
+- **Numerics:** a rewound sequence gives exactly the logits it gave at the mark, steps after it included
+  (tested on plain and Gated DeltaNet models). A prompt prefilled in two pieces rather than one agrees with
+  the one-piece prefill to f32 rounding in exact mode. In the default BF16 mode the split moves rounding,
+  as any change of chunk boundaries does, so greedy replies can part on a near-tie (three of eight in the
+  replay above, with similar wording).
+- `--no-prefix-reuse` prefills every prompt whole. `AMQL_SERVER_TIMING=1` logs each admission's prompt, reused
+  tokens and prefill time, and how far the prompt agrees with each kept sequence.
+
+**Device memory.** Keep the GPU's memory clear of other models. With three other models loaded beside the 4B
+(and LM Studio and a game on the same card, 28.5 of 32.6 GB in use), the same 18k-token prefill took 32.6 s
+instead of 2.9 s: its scratch buffers no longer fit, and the driver paged device memory to the host.
 
 ## Decisions
 
@@ -172,6 +219,32 @@ decoding as structured output, until `</tool_call>`:
 
 `--free-tool-calls` turns it off.
 
+**What a schema says in words.** Some rules a schema states only in its descriptions, and a small model breaks
+every one: Hydra's `edit_file` edits mark `find`, `find_lines`, `replace` and `replace_lines` "(replace_text
+only)", and three pairs "set one or the other, never both", and in one session Qwen 3.5 0.8B sent `op: replace` with
+`find`/`replace`, then `replace` beside `replace_lines`, and was refused each time. So in an object with a
+required string enum (the edit's `op`), a property whose description says it is only for some of the enum's
+values ("(replace_text only)", "insert_* only", "only for replace/delete") is offered only after the enum has one
+of them, and of two properties a description says to set "X or Y, never both", only one may be written.
+Descriptions without such words change nothing.
+
+**Mentioned tools.** Told "write a new version from scratch with create_file (overwrite true), no need to read the
+old one", the 0.8B read the file and patched it with `edit_file`, whose anchors it cannot write. So the first call
+after the user's message, when the message names tools (as whole words, not in a clause that says not to: "no
+need to", "don't use"), names the first of them, provided the model gives it 1e-4 of its probability. Later calls
+are the model's own: there it is working from results, and a redirect turned a reply that meant to read the file
+it had to fix into another build. Replayed, the step that had begun with `read_file` began with `create_file` and
+a whole program. `--no-mention-rule` turns it off with the parameter rule.
+
+**Tried and dropped: copying the task.** Given the code to write ("sum new FileInfo(f).Length over
+Directory.EnumerateFiles(folder, …)"), the 0.8B wrote `new FileInfo(folder)` and an invented `.FileList`. A prior
+that, where the reply ended with a stretch of the user's message, gave the stretch's next tokens a share of the
+probability (kNN-LM style, λ 0.5) did not pay. At a 16-character match it never acted, because the reply leaves
+the user's words before copying that much. At 10 characters with an absolute floor (0.1%) it pulled the user's
+prose into the code (`foreach (…) print the name and bytes / 1048576.0 formatted with …`). With a floor relative to
+the model's first choice it was safe but sampled programs built 2/8 times with it and 3/8 without. The mistake is
+in the model's plan, not in drifting from text it is copying, so the code was removed.
+
 **Mentioned parameters.** A small model plans in words and then writes the call by habit: asked to replace a file
 that exists, Qwen 3.5 0.8B said "I'll overwrite it", the tool answered "Pass overwrite: true", the user said so
 too, and still, measured, it chose `content` over `overwrite` at 0.995 to 0.005, and after `content` closed the
@@ -201,13 +274,30 @@ header lines copied above it. The shorter forms the model also writes (`L42:code
 of a copy (marked twice) are removed too. Values that merely contain a mark or two are left alone. The log says
 when it acts.
 
+The model is also shown the results without the decoration: a 0.8B model read `L4:e3b0c4│` on a blank line as a
+missing line, listed 18 lines of a sound file as missing and patched them one by one; shown the same file plain,
+it restated the six requirements of the task and wrote the program. A JSON result is written back compactly with
+its text unescaped; one with nothing decorated is sent as it came. The cost: anchors such as `L42:a3f9c1` are not
+in view, so a tool that edits by them is out of the model's reach (it had not used one successfully).
+`--keep-line-marks` shows the results as they came.
+
 **Repeated calls.** At temperature 0 a small model copies its own previous call from the conversation: it ran the
 program, got the output, and ran it again, and again. A call (tool and arguments, key order ignored) that has
-already been made at least twice, with the same result the last two times (numbers and hashes such as build ids
-and durations ignored), is not made a third time: the reply is generated again from what it said before the
-call, with calls closed (the call's markup cannot be written as text either), after a lead-in that says why ("That
-run_terminal call has already returned the same result twice, so instead of running it again, here is what it
-showed:"). The agent then reports the output. `--allow-repeated-calls` turns it off.
+already been made at least twice, whose latest result is one it returned before (numbers and hashes such as build
+ids and durations ignored; not only the time before, since a harness may answer a re-read with "unchanged since
+your last read", so the file and that note take turns, and the model read one file eight times), is not made
+again: the reply is generated again from what it said before the call, with calls closed (the call's markup
+cannot be written as text either), after a lead-in that says why ("That run_terminal call has already returned
+the same result twice, so instead of making it again, here is where things stand:"). After a run the agent then
+reports the output; after an edit, where the build stands. An earlier lead-in, "here is what it showed", led it
+to paste an old version of the file as if the edit had returned it. `--allow-repeated-calls` turns it off.
+
+**The user's turn.** The rules that read "the user's message" take the turn as beginning at the user's own
+message: user messages straight after it (a harness's retrieved notes and hints) belong to it, and a user message
+after a tool result (a harness's "[System] same action 3 times") is a note inside the turn, not a new one. When
+Hydra moved its notes into a message of their own after the user's, the task the user gave had vanished from
+"the newest user message", and the first call went back to reading the file. The mentioned-tool rule reads the
+user's own message only, since the notes name tools too ("tool:edit_file (graph proximity 0.45)").
 
 ### Continuing a reply
 

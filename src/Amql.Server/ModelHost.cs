@@ -367,6 +367,12 @@ public sealed record GenerationParams(
     /// where only a suggestion counts ("Pass overwrite: true"), not a field or a warning.</summary>
     public string? RecentResults { get; init; }
 
+    /// <summary>The user's own message that began the turn (not the notes after it), for the mentioned-tool rule.</summary>
+    public string? Task { get; init; }
+
+    /// <summary>The tools called since the user's latest message, for the mentioned-tool rule.</summary>
+    public IReadOnlySet<string>? CalledSince { get; init; }
+
     /// <summary>The reply's start the client wrote (<c>continue_final_message</c>): part of the
     /// reply for the rules that read it, though not repeated in the output.</summary>
     public string? Prefill { get; init; }
@@ -428,6 +434,45 @@ public sealed class TextGenerator : IDisposable
     public static bool SuggestsParameter(string results, string name) => Regex.IsMatch(results,
         $@"\b(?:pass|set|use|add|include|specify|with)\s+(?:the\s+)?[`'""]?{Regex.Escape(name)}[`'""]?\s*(?::|=|to\b)",
         RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    private static readonly Regex Negation = new(
+        @"\b(?:not|don't|do not|never|no need|no|without|avoid|instead of|rather than|stop)\b",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
+
+    /// <summary>Whether a message names a tool to use: the name as a whole word ("write it with
+    /// create_file"), outside a clause that says not to ("no need to read_file it", "don't use
+    /// edit_file").</summary>
+    public static bool NamesTool(string text, string name) => ToolMention(text, name) >= 0;
+
+    /// <summary>Where a message first names a tool to use (see <see cref="NamesTool"/>), or -1.</summary>
+    public static int ToolMention(string text, string name)
+    {
+        foreach (Match m in Regex.Matches(text, $@"(?<![\w-]){Regex.Escape(name)}(?![\w-])"))
+        {
+            int start = text.LastIndexOfAny(['.', '!', '?', '\n', ';', ',', '('], Math.Max(m.Index - 1, 0)) + 1;
+            if (!Negation.IsMatch(text[start..m.Index].Replace('’', '\'')))
+            {
+                return m.Index;
+            }
+        }
+        return -1;
+    }
+
+    /// <summary>
+    /// The tools a message names that a call may name now: those called already since it (a step
+    /// may be done again, a file written again after a failed build), and the first one not called
+    /// yet, since instructions name their tools in the order they are to be used.
+    /// </summary>
+    public static IReadOnlyList<string> ToolsDue(string text, IEnumerable<string> tools, IReadOnlySet<string>? called)
+    {
+        var named = tools.Select(t => (Tool: t, At: ToolMention(text, t))).Where(x => x.At >= 0).OrderBy(x => x.At).ToList();
+        var due = named.Where(x => called?.Contains(x.Tool) == true).Select(x => x.Tool).ToList();
+        if (named.FirstOrDefault(x => called?.Contains(x.Tool) != true) is { Tool: { } next })
+        {
+            due.Add(next);
+        }
+        return due;
+    }
 
     /// <summary>Whether the sentence that ends at a colon says the reply is about to act
     /// ("Now let me build it", not "Here's what was done").</summary>
@@ -1139,6 +1184,10 @@ internal sealed class GenerationRun
         {
             return null;
         }
+        if (MentionedToolPath(call) is { } toTool)
+        {
+            return toTool;
+        }
         string context = (_p.Recent ?? "") + "\n" + Reasoning();
         foreach (string name in call.OptionalLeft())
         {
@@ -1179,6 +1228,59 @@ internal sealed class GenerationRun
             }
         }
         return null;
+    }
+
+    /// <summary>
+    /// The mentioned-tool rule, the same idea for the tool a call names. Told "write a new version
+    /// with create_file, no need to read the old one", Qwen 3.5 0.8B read the file and patched it with
+    /// edit_file, whose anchors it cannot write. So where the first call after the user's newest
+    /// message names its tool and the message names some of the tools (not in a clause saying not
+    /// to), the call names the first of them, provided the model gives it at least
+    /// <see cref="MentionFloor"/>. A request whose message names no tool is untouched.
+    /// </summary>
+    private Func<string, bool>? MentionedToolPath(ToolCallConstraint call)
+    {
+        // Only the first call after the message: later, the model is working from results, and a
+        // redirect there turned a reply that meant to read the file it had to fix into a third build.
+        if (_p.Task is not { Length: > 0 } recent || _p.CalledSince is { Count: > 0 })
+        {
+            return null;
+        }
+        var paths = TextGenerator.ToolsDue(recent, call.ToolNames, _p.CalledSince)
+            .Select(call.PathToTool).OfType<string>().ToList();
+        if (paths.Count == 0)
+        {
+            return null;
+        }
+        bool OnPath(string t)
+        {
+            string rest = t.TrimStart(' ', '\n', '\r', '\t');
+            return rest.Length == 0 || paths.Any(p => p.StartsWith(rest, StringComparison.Ordinal) || rest.StartsWith(p, StringComparison.Ordinal));
+        }
+        return Share(OnPath) >= MentionFloor ? OnPath : null;
+    }
+
+    /// <summary>The share of the model's probability on the tokens (other than stops and
+    /// whitespace) whose text passes <paramref name="on"/>.</summary>
+    private double Share(Func<string, bool> on)
+    {
+        var row = Row();
+        float max = float.NegativeInfinity;
+        foreach (float v in row)
+        {
+            max = Math.Max(max, v);
+        }
+        double sum = 0, share = 0;
+        for (int id = 0; id < row.Length; id++)
+        {
+            double e = Math.Exp(row[id] - max);
+            sum += e;
+            if (e > 1e-12 && !_g.StopTokenIds.Contains(id) && _g.TokenText(id, row.Length) is { Length: > 0 } t && t.Trim().Length > 0 && on(t))
+            {
+                share += e;
+            }
+        }
+        return share / sum;
     }
 
     /// <summary>The logits this step chooses from: the model's, or with the packs blended in.</summary>
@@ -1300,6 +1402,33 @@ internal sealed class GenerationRun
     }
 }
 
+/// <summary>Where the batch scheduler saves a prompt's state for the next request.</summary>
+public static class PromptMark
+{
+    /// <summary>Where a prompt's state is saved: at its second-last turn marker.
+    /// The last opens the reply's own turn, and the message before it is the
+    /// newest, which an agent may not keep in the next call's history (Hydra
+    /// sends its notes as a user message after the newest one, and moves it on
+    /// every call). Everything before stays the same from one call to the next.</summary>
+    public static int At(int[] prompt, int? turnStart)
+    {
+        if (turnStart is { } start)
+        {
+            int last = Array.LastIndexOf(prompt, start);
+            int before = last > 0 ? Array.LastIndexOf(prompt, start, last - 1) : -1;
+            if (before > 0)
+            {
+                return before;
+            }
+            if (last > 0)
+            {
+                return last;
+            }
+        }
+        return prompt.Length - 1;
+    }
+}
+
 /// <summary>
 /// Continuous batching on the GPU engine. One thread owns the engine: it admits
 /// waiting requests (each gets a sequence of its own and is prefilled), then
@@ -1319,6 +1448,8 @@ internal sealed class BatchScheduler : IDisposable
         public IEntailAdapter[] Adapters = Array.Empty<IEntailAdapter>();
         public int Token;
         public int Row;     // its row in the last step
+        public int? Pending;   // a token already chosen (a verify's first miss), run next
+        public List<int>? Context;   // the prompt and every token run since, for suffix drafts
     }
 
     private readonly GpuEngine _engine;
@@ -1326,12 +1457,41 @@ internal sealed class BatchScheduler : IDisposable
     private readonly IReadOnlyList<IEntailAdapter> _adapters;
     private readonly Func<int[], int[]?>? _priorPrompt;
     private readonly System.Collections.Concurrent.BlockingCollection<Job> _waiting = new();
-    private readonly Stack<GpuSequence> _free = new();
+    // Finished sequences kept for the next requests, oldest first, each with the
+    // prompt it last ran: one whose prompt the next shares up to its mark is
+    // rewound there rather than prefilled again (an agent's calls share all but
+    // their last few hundred tokens).
+    private readonly List<GpuSequence> _free = new();
+    private readonly Dictionary<GpuSequence, int[]> _held = new();
+    private readonly int? _turnStart;
+    private GpuSequence? _priorSeq;
+
+    /// <summary>Set false (<c>--no-prefix-reuse</c>) to prefill every prompt whole.</summary>
+    internal static bool PrefixReuse = true;
+
+    // Each kept sequence holds its KV cache: ~2 GiB at 32k positions on Qwen 3.5 4B.
+    private const int KeptPrefixes = 2;
+    public long ReusedTokens, PrefilledTokens;
     private readonly Thread _thread;
 
     // AMQL_SERVER_TIMING=1: where a batch step's time goes, printed every 500 steps.
     private static readonly bool Timing = Environment.GetEnvironmentVariable("AMQL_SERVER_TIMING") is "1";
     private long _tChoose, _tDevice, _tFeed, _steps, _rows;
+
+    /// <summary>Drafts per step when one reply runs alone on a model with an
+    /// MTP drafter (<c>AMQL_MTP_DRAFTS</c>, default 3; 0 turns speculation off).</summary>
+    internal static int Drafts =
+        int.TryParse(Environment.GetEnvironmentVariable("AMQL_MTP_DRAFTS"), out int d) ? Math.Clamp(d, 0, GpuEngine.MaxDrafts) : 3;
+    /// <summary>Suffix drafts: when the last <c>AMQL_SUFFIX_DRAFT</c> tokens
+    /// (default 8; 0 turns it off) appeared earlier in the prompt or the reply,
+    /// what followed them there is drafted instead of asking the drafter. An
+    /// agent's replies repeat paths, names and code from its context. Shorter
+    /// matches fire on prose's common phrases, where a quarter of such drafts
+    /// held and the longer verify cost more than they saved.</summary>
+    internal static int SuffixMatch =
+        int.TryParse(Environment.GetEnvironmentVariable("AMQL_SUFFIX_DRAFT"), out int m) ? Math.Max(0, m) : 8;
+    private long _specCycles, _specDrafted, _specKept, _specTokens, _suffixCycles, _suffixDrafted, _suffixKept;
+    private long _tDraft, _tVerify, _tSpecFeed;
 
     public BatchScheduler(GpuEngine engine, TextGenerator g, IReadOnlyList<IEntailAdapter> adapters, Func<int[], int[]?>? priorPrompt)
     {
@@ -1339,6 +1499,7 @@ internal sealed class BatchScheduler : IDisposable
         _g = g;
         _adapters = adapters;
         _priorPrompt = priorPrompt;
+        _turnStart = g.Tokenizer.AddedTokenId("<|im_start|>");
         _thread = new Thread(Loop) { IsBackground = true, Name = "amql batch" };
         _thread.Start();
     }
@@ -1380,17 +1541,34 @@ internal sealed class BatchScheduler : IDisposable
                     Admit(waiting, active);
                 }
 
+                if (active.Count == 1 && Drafts > 0 && _engine.HasDrafter && _waiting.Count == 0)
+                {
+                    if (!Speculate(active[0]))
+                    {
+                        var done = active[0];
+                        active.Clear();
+                        Complete(done);
+                    }
+                    continue;
+                }
+
                 long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
                 // Each reply picks its next token on its own core: sampling reads the
                 // whole vocabulary, and the replies share nothing but the device.
                 var next = new int?[active.Count];
+                int? NextOf(Job job)
+                {
+                    var pending = job.Pending;
+                    job.Pending = null;
+                    return pending ?? job.Run.Next();
+                }
                 if (active.Count > 1)
                 {
-                    Parallel.For(0, active.Count, i => next[i] = active[i].Run.Next());
+                    Parallel.For(0, active.Count, i => next[i] = NextOf(active[i]));
                 }
                 else
                 {
-                    next[0] = active[0].Run.Next();
+                    next[0] = NextOf(active[0]);
                 }
                 for (int i = active.Count - 1; i >= 0; i--)
                 {
@@ -1423,6 +1601,7 @@ internal sealed class BatchScheduler : IDisposable
                 {
                     var job = active[i];
                     job.Row = i;
+                    job.Context?.Add(job.Token);
                     var verdict = EntailVerdict.Merge(job.Adapters.Select(a => a.Step(job.Token)).ToList());
                     // Read in place, before the next step overwrites it: no copy of the vocabulary per row.
                     job.Run.Fed(() => _engine.HostLogits(job.Row), verdict);
@@ -1476,44 +1655,207 @@ internal sealed class BatchScheduler : IDisposable
         }
     }
 
+    /// <summary>
+    /// One speculative step for a reply running alone: the drafter proposes
+    /// tokens to follow the one chosen, the model runs them all as rows of one
+    /// pass, and the reply takes each row as a plain step would (adapters, the
+    /// sampler and every constraint, in order) for as long as what it chooses
+    /// is the next draft. Its first other choice is the next step's token. The
+    /// reply is exactly what plain steps give, sampled or greedy: a draft only
+    /// saves a pass when the reply would have chosen it anyway. False when the
+    /// reply is over.
+    /// </summary>
+    private bool Speculate(Job job)
+    {
+        var pending = job.Pending;
+        job.Pending = null;
+        long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+        if ((pending ?? job.Run.Next()) is not { } token)
+        {
+            return false;
+        }
+        var seq = job.Seq!;
+        job.Context ??= new List<int>(job.Run.Prompt);
+        job.Context.Add(token);
+        var suffix = SuffixDraft.Find(job.Context, SuffixMatch, GpuEngine.MaxDrafts);
+        int[] rows = Device(() =>
+        {
+            var drafts = suffix ?? _engine.Draft(seq, token, Drafts);
+            var all = new int[drafts.Length + 1];
+            all[0] = token;
+            drafts.CopyTo(all, 1);
+            long t1 = System.Diagnostics.Stopwatch.GetTimestamp();
+            _tDraft += t1 - t0;
+            _engine.Verify(seq, all);
+            _tVerify += System.Diagnostics.Stopwatch.GetTimestamp() - t1;
+            return all;
+        });
+        long t2 = System.Diagnostics.Stopwatch.GetTimestamp();
+        int kept = 0;
+        bool going = true;
+        while (true)
+        {
+            int row = kept;
+            job.Row = row;
+            var verdict = EntailVerdict.Merge(job.Adapters.Select(a => a.Step(rows[row])).ToList());
+            job.Run.Fed(() => _engine.HostLogits(job.Row), verdict);
+            kept++;
+            if (job.Run.Next() is not { } choice)
+            {
+                going = false;
+                break;
+            }
+            if (kept == rows.Length || choice != rows[kept])
+            {
+                job.Pending = choice;
+                break;
+            }
+            job.Context.Add(choice);
+        }
+        Device(() =>
+        {
+            _engine.Accept(seq, kept);
+            return 0;
+        });
+        _tSpecFeed += System.Diagnostics.Stopwatch.GetTimestamp() - t2;
+        _specCycles++;
+        _specDrafted += rows.Length - 1;
+        _specKept += kept - 1;
+        _specTokens += kept;
+        if (suffix is not null)
+        {
+            _suffixCycles++;
+            _suffixDrafted += rows.Length - 1;
+            _suffixKept += kept - 1;
+        }
+        if (Timing && _specCycles % 200 == 0)
+        {
+            double ms(long t) => t * 1e3 / System.Diagnostics.Stopwatch.Frequency / _specCycles;
+            Console.Error.WriteLine($"speculative: {_specCycles} steps, {(double)_specTokens / _specCycles:F2} tokens/step, " +
+                $"{100.0 * _specKept / Math.Max(1, _specDrafted):F0}% of drafts kept; per step draft {ms(_tDraft):F2} ms, " +
+                $"verify {ms(_tVerify):F2} ms, choose {ms(_tSpecFeed):F2} ms; {_suffixCycles} from the context, " +
+                $"{100.0 * _suffixKept / Math.Max(1, _suffixDrafted):F0}% of theirs kept");
+            _specCycles = _specDrafted = _specKept = _specTokens = _suffixCycles = _suffixDrafted = _suffixKept = 0;
+            _tDraft = _tVerify = _tSpecFeed = 0;
+        }
+        return going;
+    }
+
     /// <summary>Gives a waiting reply a sequence and prefills its prompt (and,
     /// for an adapter that weighs tokens against the prior, the blank prompt first).</summary>
     private void Admit(Job job, List<Job> active)
     {
         try
         {
+            int[] prompt = job.Run.Prompt;
+            int mark = MarkFor(prompt);
+            int reused = 0;
             job.Seq = Device(() =>
             {
-                var seq = _free.Count > 0 ? _free.Pop() : _engine.NewSequence();
-                _engine.Reset(seq);
+                if (Timing)
+                {
+                    foreach (var kept in _free)
+                    {
+                        int common = _held.TryGetValue(kept, out var h) ? h.AsSpan().CommonPrefixLength(prompt) : -1;
+                        Console.Error.WriteLine($"reuse: kept sequence marked at {kept.MarkedAt}, agrees for {common} tokens");
+                    }
+                }
+                var seq = PrefixReuse ? Reusable(prompt) : null;
+                if (seq is not null)
+                {
+                    _free.Remove(seq);
+                    _engine.Rewind(seq);
+                    reused = seq.Position;
+                }
+                else
+                {
+                    // A prompt that shares nothing kept takes a sequence of its own while
+                    // fewer than KeptPrefixes are kept, so an agent's side requests do not
+                    // take the sequence its main calls pick up from.
+                    if (_free.Count >= KeptPrefixes || (_free.Count > 0 && !PrefixReuse))
+                    {
+                        seq = _free[0];
+                        _free.RemoveAt(0);
+                    }
+                    else
+                    {
+                        seq = _engine.NewSequence();
+                    }
+                    _engine.Reset(seq);
+                }
+                _held.Remove(seq);
                 return seq;
             });
             job.Adapters = _adapters.Select(a => a.Sibling()).ToArray();
-            int[] prompt = job.Run.Prompt;
             double[]? prior = null;
             if (job.Adapters.Any(a => a.Manifest.NeedsPrior) && _priorPrompt?.Invoke(prompt) is { } blank)
             {
+                // On a sequence of its own, so the reply's sequence keeps what it reused.
                 prior = Softmax(Device(() =>
                 {
-                    var l = _engine.Prefill(job.Seq, blank);
-                    _engine.Reset(job.Seq);
-                    return l;
+                    _priorSeq ??= _engine.NewSequence();
+                    _engine.Reset(_priorSeq);
+                    return _engine.Prefill(_priorSeq, blank);
                 }));
             }
-            var logits = Device(() => _engine.Prefill(job.Seq, prompt));
+            long a0 = System.Diagnostics.Stopwatch.GetTimestamp();
+            var seqNow = job.Seq;
+            var logits = Device(() =>
+            {
+                // Up to the mark, save the state there, then the rest of the prompt.
+                if (PrefixReuse && mark > reused)
+                {
+                    _engine.Prefill(seqNow, prompt.AsSpan(reused, mark - reused));
+                    _engine.Mark(seqNow);
+                }
+                return _engine.Prefill(seqNow, prompt.AsSpan(seqNow.Position));
+            });
+            _held[seqNow] = prompt;
+            ReusedTokens += reused;
+            PrefilledTokens += prompt.Length - reused;
+            long a1 = System.Diagnostics.Stopwatch.GetTimestamp();
             var verdict = EntailVerdict.Merge(job.Adapters.Select(a =>
             {
                 a.Reset();
                 return a.Prefill(prompt);
             }).ToList());
+            if (Timing)
+            {
+                double ms(long t) => t * 1e3 / System.Diagnostics.Stopwatch.Frequency;
+                Console.Error.WriteLine($"admit: {prompt.Length} prompt tokens, {reused} reused, prefill {ms(a1 - a0):F0} ms, adapters {ms(System.Diagnostics.Stopwatch.GetTimestamp() - a1):F0} ms");
+            }
             job.Run.Begin(() => logits, verdict, prior);
             active.Add(job);
         }
         catch (Exception e)
         {
+            if (job.Seq is { } failed)
+            {
+                _held.Remove(failed);
+            }
             Release(job);
             job.Done.TrySetException(e);
         }
+    }
+
+    private int MarkFor(int[] prompt) => PromptMark.At(prompt, _turnStart);
+
+    /// <summary>The kept sequence that the prompt can rewind into: its mark is
+    /// short of the prompt's end and the prompt agrees with what it held up to
+    /// there. The latest mark wins.</summary>
+    private GpuSequence? Reusable(int[] prompt)
+    {
+        GpuSequence? best = null;
+        foreach (var seq in _free)
+        {
+            int at = seq.MarkedAt;
+            if (at > 0 && at < prompt.Length && at > (best?.MarkedAt ?? 0) && _held.TryGetValue(seq, out var held)
+                && held.Length >= at && held.AsSpan(0, at).SequenceEqual(prompt.AsSpan(0, at)))
+            {
+                best = seq;
+            }
+        }
+        return best;
     }
 
     private void Complete(Job job)
@@ -1533,15 +1875,15 @@ internal sealed class BatchScheduler : IDisposable
         {
             job.Seq = null;
             // Keep a batch's worth of sequences for the next requests; free the rest.
-            if (_free.Count < GpuEngine.MaxBatch)
+            _free.Add(seq);
+            if (_free.Count > GpuEngine.MaxBatch)
             {
-                _free.Push(seq);
-            }
-            else
-            {
+                var oldest = _free[0];
+                _free.RemoveAt(0);
+                _held.Remove(oldest);
                 Device(() =>
                 {
-                    _engine.Release(seq);
+                    _engine.Release(oldest);
                     return 0;
                 });
             }

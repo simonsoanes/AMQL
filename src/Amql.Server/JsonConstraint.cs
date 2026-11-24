@@ -26,6 +26,16 @@ public sealed class JsonSchemaNode
 
     public int? MaxLength;
 
+    /// <summary>The index in <see cref="Properties"/> of the required string enum whose value decides
+    /// which other properties apply (an edit's <c>op</c>), or -1.</summary>
+    public int Discriminator = -1;
+
+    /// <summary>Per property: the discriminator values (compact JSON) it is only for, else null.</summary>
+    public List<HashSet<string>?>? OnlyFor;
+
+    /// <summary>Per property: a bit set of the properties it may not stand beside ("never both").</summary>
+    public List<long>? Excludes;
+
     /// <summary>Any JSON value at all.</summary>
     public static JsonSchemaNode Any() => new() { Obj = true, Arr = true, Str = true, Num = true, Bool = true, Null = true };
 
@@ -96,6 +106,7 @@ public sealed class JsonSchemaNode
             node.Properties = props.EnumerateObject()
                 .Select(p => (p.Name, Compile(p.Value, root, depth + 1), required.Contains(p.Name))).ToList();
             node.Obj = true;
+            Relate(node, props);
             typed = true;
         }
         if (s.TryGetProperty("items", out var items))
@@ -109,6 +120,84 @@ public sealed class JsonSchemaNode
             node.MaxLength = ml.GetInt32();
         }
         return typed ? node : Any();
+    }
+
+    // "(replace_text only)", "only for replace/delete", "insert_* only": a list of names before
+    // "only", or after "only for/on/with".
+    private static readonly System.Text.RegularExpressions.Regex OnlyBefore = new(
+        @"([A-Za-z_*][\w*]*(?:\s*(?:/|,|\bor\b|\band\b)\s*[A-Za-z_*][\w*]*)*)\s+only\b");
+    private static readonly System.Text.RegularExpressions.Regex OnlyAfter = new(
+        @"\bonly\s+(?:for|on|with|when)\s+(?:op\s+|ops\s+)?([A-Za-z_*][\w*]*(?:\s*(?:/|,|\bor\b|\band\b)\s*[A-Za-z_*][\w*]*)*)");
+    // "Set 'content_lines' or 'content', never both", "Set either 'find' or 'find_lines', never both".
+    private static readonly System.Text.RegularExpressions.Regex NeverBoth = new(
+        @"['`""]?(\w+)['`""]?\s+or\s+['`""]?(\w+)['`""]?,?\s+(?:but\s+)?never\s+both");
+
+    /// <summary>
+    /// What a schema says in words about how an object's properties go together, where its
+    /// keywords cannot: a property whose description says it is only for some values of the
+    /// required string enum (an edit's <c>op</c>) is offered only after the enum has one of them, and
+    /// of two properties a description says to set one of, "never both", only one may be written.
+    /// A small model otherwise fills an edit with fields from every op and the tool refuses it.
+    /// </summary>
+    private static void Relate(JsonSchemaNode node, JsonElement props)
+    {
+        var list = node.Properties!;
+        var descriptions = props.EnumerateObject()
+            .Select(p => p.Value.ValueKind == JsonValueKind.Object && p.Value.TryGetProperty("description", out var d)
+                && d.ValueKind == JsonValueKind.String ? d.GetString()! : "").ToList();
+        int disc = list.FindIndex(p => p.Required && p.Node.Enum is { Count: >= 2 } e && e.All(v => v.StartsWith('"')));
+        if (disc >= 0)
+        {
+            var values = list[disc].Node.Enum!.Select(v => JsonSerializer.Deserialize<string>(v)!).ToList();
+            var onlyFor = new List<HashSet<string>?>();
+            bool any = false;
+            for (int i = 0; i < list.Count; i++)
+            {
+                HashSet<string>? set = null;
+                if (i != disc)
+                {
+                    foreach (var m in OnlyBefore.Matches(descriptions[i]).Concat(OnlyAfter.Matches(descriptions[i])))
+                    {
+                        foreach (string name in System.Text.RegularExpressions.Regex.Split(m.Groups[1].Value, @"\s*(?:/|,|\bor\b|\band\b)\s*"))
+                        {
+                            foreach (string v in values.Where(v => name.EndsWith('*') ? v.StartsWith(name[..^1], StringComparison.Ordinal) : v == name))
+                            {
+                                (set ??= new HashSet<string>(StringComparer.Ordinal)).Add(JsonSerializer.Serialize(v));
+                            }
+                        }
+                    }
+                }
+                any |= set is not null;
+                onlyFor.Add(set);
+            }
+            if (any)
+            {
+                node.Discriminator = disc;
+                node.OnlyFor = onlyFor;
+            }
+        }
+        if (list.Count <= 64)
+        {
+            var excludes = new long[list.Count];
+            bool any = false;
+            foreach (string d in descriptions)
+            {
+                foreach (System.Text.RegularExpressions.Match m in NeverBoth.Matches(d))
+                {
+                    int a = list.FindIndex(p => p.Name == m.Groups[1].Value), b = list.FindIndex(p => p.Name == m.Groups[2].Value);
+                    if (a >= 0 && b >= 0 && a != b && !list[a].Required && !list[b].Required)
+                    {
+                        excludes[a] |= 1L << b;
+                        excludes[b] |= 1L << a;
+                        any = true;
+                    }
+                }
+            }
+            if (any)
+            {
+                node.Excludes = excludes.ToList();
+            }
+        }
     }
 
     private void Merge(JsonSchemaNode other)
@@ -252,18 +341,19 @@ public sealed class JsonConstraint : ITokenConstraint
 
     private enum ObjectPhase { Open, Comma, Colon, Value, After }
 
-    /// <summary>An object: <paramref name="next"/> is the first property still to come.</summary>
+    /// <summary>An object: <paramref name="next"/> is the first property still to come, <paramref name="used"/>
+    /// the properties written (a bit each), <paramref name="disc"/> the discriminator's value once written.</summary>
     private sealed class ObjectFrame(JsonSchemaNode node, ObjectPhase phase, int next, Frame after, int ws,
-        JsonSchemaNode? valueNode = null) : Frame
+        JsonSchemaNode? valueNode = null, long used = 0, string? disc = null) : Frame
     {
         private bool Free => node.Properties is null;
 
         // A required property still to come.
         private bool Owed => node.Properties is { } props && props.Skip(next).Any(p => p.Required);
 
-        private bool MoreToCome => Free || next < node.Properties!.Count;
+        private bool MoreToCome => Free || Candidates().Any();
 
-        private Frame Same(ObjectPhase p, int ws) => new ObjectFrame(node, p, next, after, ws, valueNode);
+        private Frame Same(ObjectPhase p, int ws) => new ObjectFrame(node, p, next, after, ws, valueNode, used, disc);
 
         public override Frame? Feed(char c)
         {
@@ -283,12 +373,22 @@ public sealed class JsonConstraint : ITokenConstraint
                     return MoreToCome ? Same(ObjectPhase.Comma, 0) : null;
                 case ObjectPhase.Colon when c == ':':
                     return Same(ObjectPhase.Value, 0);
+                case ObjectPhase.Value when !Free && next - 1 == node.Discriminator && valueNode!.Enum is { } values:
+                    // The discriminator's value is kept: it decides which properties follow.
+                    return new LiteralFrame(values, 0, DoneFrame.Instance,
+                        v => new ObjectFrame(node, ObjectPhase.After, next, after, 0, null, used, v)).Feed(c);
                 case ObjectPhase.Value:
-                    return StartValue(valueNode!, new ObjectFrame(node, ObjectPhase.After, next, after, 0), c);
+                    return StartValue(valueNode!, new ObjectFrame(node, ObjectPhase.After, next, after, 0, null, used, disc), c);
                 default:
                     return null;
             }
         }
+
+        // Whether property i may be written here: not one the schema's words rule out for the
+        // discriminator's value, and not the other half of a "never both" pair already written.
+        private bool Allowed(int i) =>
+            (node.OnlyFor?[i] is not { } only || disc is null || only.Contains(disc)) &&
+            (node.Excludes is not { } ex || (ex[i] & used) == 0);
 
         /// <summary>The properties a key typed so far may still name.</summary>
         public IEnumerable<(int Index, string Name)> Candidates()
@@ -300,7 +400,10 @@ public sealed class JsonConstraint : ITokenConstraint
             var props = node.Properties!;
             for (int i = next; i < props.Count; i++)
             {
-                yield return (i, props[i].Name);
+                if (Allowed(i))
+                {
+                    yield return (i, props[i].Name);
+                }
                 if (props[i].Required)
                 {
                     yield break;   // a required property cannot be skipped
@@ -320,7 +423,8 @@ public sealed class JsonConstraint : ITokenConstraint
             {
                 if (name == key)
                 {
-                    return new ObjectFrame(node, ObjectPhase.Colon, index + 1, after, 0, node.Properties![index].Node);
+                    long bit = index < 64 ? 1L << index : 0;
+                    return new ObjectFrame(node, ObjectPhase.Colon, index + 1, after, 0, node.Properties![index].Node, used | bit, disc);
                 }
             }
             return null;
@@ -405,15 +509,18 @@ public sealed class JsonConstraint : ITokenConstraint
         }
     }
 
-    /// <summary>One of a few fixed texts: an enum's values, true/false, null.</summary>
-    private sealed class LiteralFrame(List<string> texts, int at, Frame after) : Frame
+    /// <summary>One of a few fixed texts: an enum's values, true/false, null. With <paramref name="then"/>,
+    /// what follows depends on which text it was.</summary>
+    private sealed class LiteralFrame(List<string> texts, int at, Frame after, Func<string, Frame>? then = null) : Frame
     {
+        private Frame Next(string text) => then is null ? after : then(text);
+
         public override Frame? Feed(char c)
         {
             // A literal that is complete here ends, and c belongs to what follows it.
-            if (texts.Any(t => t.Length == at) && !texts.Any(t => t.Length > at && t[at] == c))
+            if (texts.FirstOrDefault(t => t.Length == at) is { } done && !texts.Any(t => t.Length > at && t[at] == c))
             {
-                return after.Feed(c);
+                return Next(done).Feed(c);
             }
             var still = texts.Where(t => t.Length > at && t[at] == c).ToList();
             if (still.Count == 0)
@@ -423,12 +530,12 @@ public sealed class JsonConstraint : ITokenConstraint
             // A quoted literal (a string enum) ends at its closing quote; nothing can extend it.
             if (still.Count == 1 && still[0].Length == at + 1 && still[0][0] == '"')
             {
-                return after;
+                return Next(still[0]);
             }
-            return new LiteralFrame(still, at + 1, after);
+            return new LiteralFrame(still, at + 1, after, then);
         }
 
-        public override bool CanEnd => texts.Any(t => t.Length == at) && after.CanEnd;
+        public override bool CanEnd => texts.FirstOrDefault(t => t.Length == at) is { } done && Next(done).CanEnd;
     }
 
     private enum NumberState { Start, Minus, Zero, Int, Dot, Frac, Exp, ExpSign, ExpDigits }

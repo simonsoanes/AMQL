@@ -7,7 +7,9 @@ namespace Amql.Server;
 
 /// <summary>
 /// Calls that have stopped telling the agent anything: the same call (tool and arguments) made at
-/// least twice already, with the same result each of the last two times. A small model at
+/// least twice already, whose latest result is one it has returned before (not only the time before:
+/// a harness may answer a re-read with "unchanged since your last read", so the full file and that
+/// note take turns, and the model read the same file eight times). A small model at
 /// temperature 0 copies its own previous call from the conversation and goes round and round
 /// ("run it again", the same output, "run it again"); a third identical call cannot return
 /// anything new. A reply that makes one is generated again with calls closed, so it answers from
@@ -39,7 +41,7 @@ public static class RepeatedCalls
         var stale = new HashSet<string>(StringComparer.Ordinal);
         foreach (var (key, list) in results)
         {
-            if (list.Count >= 2 && list[^1] == list[^2])
+            if (list.Count >= 2 && list.Take(list.Count - 1).Contains(list[^1]))
             {
                 stale.Add(key);
             }

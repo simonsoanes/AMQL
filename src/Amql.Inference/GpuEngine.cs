@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using Amql.Safetensors;
 using Amql.Vindex3;
 
 namespace Amql.Inference;
@@ -54,8 +55,50 @@ public sealed class GpuEngine : IDisposable
     private readonly IntPtr _tokens, _x, _hn, _proj, _q, _gate, _ctx, _conv, _gdn, _qk, _gb, _ffn, _branch, _branch2, _raw, _logits;
     private IntPtr _attnPart;
     private int _attnPartSplits;
-    private readonly int _maxHeads, _maxHeadDim;
+    private int _maxHeads, _maxHeadDim;
     private readonly IntPtr _hostToken, _hostLogits, _hostPrefillLogits;
+
+    // The MTP drafter (null without one): its layer, and scratch for its passes.
+    private readonly MtpDevice? _mtp;
+    private readonly IntPtr _hfin, _cat, _mtpH, _mtpLogits, _mtpTok, _drafts, _hostDrafts;
+
+    /// <summary>The most drafts one <see cref="Draft"/> proposes; a verify is
+    /// the chosen token and up to this many drafts, within the 8-row GEMV.</summary>
+    public const int MaxDrafts = 7;
+
+    /// <summary>Whether the model ships an MTP drafter the engine runs
+    /// (<c>AMQL_MTP=0</c> turns it off).</summary>
+    public bool HasDrafter => _mtp is not null;
+
+    /// <summary>True makes every decode projection sum each row in the order
+    /// one-row decode does, so a <see cref="Verify"/> row's logits equal a
+    /// <see cref="Step(int)"/>'s exactly. On by default with a drafter.</summary>
+    public bool RowInvariant
+    {
+        get => _rowInvariant;
+        set
+        {
+            _rowInvariant = value;
+            Check(Native.amqe_set_row_invariant(_engine, value ? 1 : 0), "row invariant");
+            _graphReady = false;
+        }
+    }
+
+    private bool _rowInvariant;
+
+    /// <summary>The head rows a draft chooses among: the first ones (a BPE
+    /// vocabulary runs roughly from common to rare), so a draft reads a slice
+    /// of the head instead of all of it. A rarer token is never drafted, which
+    /// costs a draft, not a token. <c>AMQL_MTP_VOCAB</c>; 32,768 by default: on
+    /// Qwen 3.5 4B as many drafts held as with all 248k rows, at a third of the
+    /// cost per draft.</summary>
+    public int DraftVocab
+    {
+        get => _draftVocab;
+        set => _draftVocab = Math.Clamp(value, 1, _vocab);
+    }
+
+    private int _draftVocab = int.TryParse(Environment.GetEnvironmentVariable("AMQL_MTP_VOCAB"), out int dv) && dv > 0 ? dv : 32768;
 
     /// <summary>The most sequences one <see cref="Step(IReadOnlyList{GpuSequence}, ReadOnlySpan{int})"/>
     /// advances together: the decode GEMV reads each weight once for up to 8 rows.</summary>
@@ -98,14 +141,75 @@ public sealed class GpuEngine : IDisposable
             _embed = Matrix(weights, embedOp.Table, embedOp.VocabSize, embedOp.HiddenSize);
             _hasEmbedScale = embedOp.Scale is not null;
             _embedScale = (float)(embedOp.Scale ?? 1.0);
-            _head = Matrix(weights, plan.Output.Projection, plan.Output.VocabSize, plan.Output.HiddenSize);
+            _head = Matrix(weights, plan.Output.Projection, plan.Output.VocabSize, plan.Output.HiddenSize, project: QuantiseHead);
             (_finalNormW, _finalNormB, _finalNormOff, _finalNormEps, _finalNormKind) = Norm(weights, plan.RequireFinalNorm("the GPU engine"));
 
             _layers = new LayerDevice[plan.Layers.Count];
-            int projWidth = _hidden, qWidth = 1, ctxWidth = 1, convWidth = 1, gdnWidth = 1, ffnWidth = 1, keyWidth = 1, vHeads = 1;
+            _projWidth = _hidden;
             for (int i = 0; i < plan.Layers.Count; i++)
             {
-                var lp = plan.Layers[i];
+                _layers[i] = UploadLayer(weights, plan.Layers[i]);
+            }
+            _mtp = Environment.GetEnvironmentVariable("AMQL_MTP") is "0" ? null : MtpDevice.TryUpload(this, weights, plan);
+            if (_mtp is not null)
+            {
+                _projWidth = Math.Max(_projWidth, _mtp.Layer.Qkv!.Rows);
+                _projWidth = Math.Max(_projWidth, _mtp.Layer.Up!.Rows);
+            }
+            int projWidth = _projWidth, qWidth = _qWidth, ctxWidth = _ctxWidth, convWidth = _convWidth, gdnWidth = _gdnWidth,
+                ffnWidth = _ffnWidth, keyWidth = _keyWidth, vHeads = _vHeads;
+
+            long rows = ChunkRows;
+            _tokens = Alloc(rows * 4);
+            _x = Alloc(rows * _hidden * 4);
+            _hn = Alloc(rows * _hidden * 4);
+            _proj = Alloc(rows * projWidth * 4);
+            _q = Alloc(rows * qWidth * 4);
+            _gate = Alloc(rows * qWidth * 4);
+            _ctx = Alloc(rows * ctxWidth * 4);
+            _conv = Alloc(rows * convWidth * 4);
+            _gdn = Alloc(rows * gdnWidth * 4);
+            _qk = Alloc(rows * 2 * keyWidth * 4);
+            _gb = Alloc(rows * 2 * vHeads * 4);
+            _ffn = Alloc(rows * ffnWidth * 4);
+            _branch = Alloc(rows * _hidden * 4);
+            _branch2 = Alloc(rows * _hidden * 4);
+            _raw = Alloc(rows * projWidth * 4);
+            _logits = Alloc((long)MaxBatch * _vocab * 4);
+            _batchTable = Alloc((long)_layers.Length * TableKinds * MaxBatch * 8);
+            Check(Native.amqe_host_alloc(out _hostToken, MaxBatch * 4), "host alloc");
+            Check(Native.amqe_host_alloc(out _hostLogits, (nuint)((long)MaxBatch * _vocab * 4)), "host alloc");
+            Check(Native.amqe_host_alloc(out _hostPrefillLogits, (nuint)((long)_vocab * 4)), "host alloc");
+            if (_mtp is not null)
+            {
+                _hfin = Alloc(rows * _hidden * 4);
+                _cat = Alloc(rows * 2 * _hidden * 4);
+                _mtpH = Alloc(_hidden * 4);
+                _mtpLogits = Alloc((long)_vocab * 4);
+                _mtpTok = Alloc((MaxDrafts + 1) * 4);
+                _drafts = Alloc(MaxDrafts * 4);
+                Check(Native.amqe_host_alloc(out _hostDrafts, MaxDrafts * 4), "host alloc");
+                RowInvariant = true;
+                DraftVocab = _draftVocab;
+            }
+            _main = NewSequence();
+        }
+        catch
+        {
+            Dispose();
+            throw;
+        }
+    }
+
+    // Scratch widths, the widest any uploaded layer needs.
+    private int _projWidth, _qWidth = 1, _ctxWidth = 1, _convWidth = 1, _gdnWidth = 1, _ffnWidth = 1, _keyWidth = 1, _vHeads = 1;
+
+    private LayerDevice UploadLayer(WeightLoader weights, LayerPlan lp)
+    {
+        int projWidth = _projWidth, qWidth = _qWidth, ctxWidth = _ctxWidth, convWidth = _convWidth, gdnWidth = _gdnWidth,
+            ffnWidth = _ffnWidth, keyWidth = _keyWidth, vHeads = _vHeads;
+        {
+            {
                 var ld = new LayerDevice { Plan = lp };
                 ld.PreAttn = lp.PreAttentionNorm is { } n1 ? Norm(weights, n1) : null;
                 ld.PostAttn = lp.PostAttentionNorm is { } n2 ? Norm(weights, n2) : null;
@@ -118,7 +222,7 @@ public sealed class GpuEngine : IDisposable
                         (attn.QProj, attn.QProjWidth), (attn.KProj, attn.KvDim), (attn.VProj, attn.KvDim));
                     ld.QkvBias = ConcatBias(weights,
                         (attn.QBias, attn.QProjWidth), (attn.KBias, attn.KvDim), (attn.VBias, attn.KvDim));
-                    ld.O = Matrix(weights, attn.OProj, _hidden, attn.QDim);
+                    ld.O = Matrix(weights, attn.OProj, _hidden, attn.QDim, project: true);
                     ld.OBias = OptionalVector(weights, attn.OBias, _hidden);
                     if (attn.QNorm is { } qn)
                     {
@@ -156,7 +260,7 @@ public sealed class GpuEngine : IDisposable
                     ld.ALog = Vector(weights, lin.ALog, lin.NumVHeads);
                     ld.DtBias = Vector(weights, lin.DtBias, lin.NumVHeads);
                     ld.GdnNormW = Vector(weights, lin.NormWeight, lin.HeadVDim);
-                    ld.Out = Matrix(weights, lin.OutProj, _hidden, lin.ValueDim);
+                    ld.Out = Matrix(weights, lin.OutProj, _hidden, lin.ValueDim, project: true);
                     ld.StateBytes = (long)lin.NumVHeads * lin.HeadKDim * lin.HeadVDim * 4;
                     ld.ConvHistoryBytes = (long)lin.ConvDim * (lin.ConvKernel - 1) * 4;
                     projWidth = Math.Max(projWidth, ld.In.Rows);
@@ -175,10 +279,10 @@ public sealed class GpuEngine : IDisposable
                     }
                     else
                     {
-                        ld.Up = Matrix(weights, dense.Up, dense.IntermediateSize, _hidden);
+                        ld.Up = Matrix(weights, dense.Up, dense.IntermediateSize, _hidden, project: true);
                         ld.UpBias = OptionalVector(weights, dense.UpBias, dense.IntermediateSize);
                     }
-                    ld.Down = Matrix(weights, dense.Down, _hidden, dense.IntermediateSize);
+                    ld.Down = Matrix(weights, dense.Down, _hidden, dense.IntermediateSize, project: true);
                     ld.DownBias = OptionalVector(weights, dense.DownBias, _hidden);
                     ld.Act = dense.Activation switch
                     {
@@ -190,36 +294,10 @@ public sealed class GpuEngine : IDisposable
                     projWidth = Math.Max(projWidth, ld.Up.Rows);
                     ffnWidth = Math.Max(ffnWidth, dense.IntermediateSize);
                 }
-                _layers[i] = ld;
+                (_projWidth, _qWidth, _ctxWidth, _convWidth, _gdnWidth, _ffnWidth, _keyWidth, _vHeads) =
+                    (projWidth, qWidth, ctxWidth, convWidth, gdnWidth, ffnWidth, keyWidth, vHeads);
+                return ld;
             }
-
-            long rows = ChunkRows;
-            _tokens = Alloc(rows * 4);
-            _x = Alloc(rows * _hidden * 4);
-            _hn = Alloc(rows * _hidden * 4);
-            _proj = Alloc(rows * projWidth * 4);
-            _q = Alloc(rows * qWidth * 4);
-            _gate = Alloc(rows * qWidth * 4);
-            _ctx = Alloc(rows * ctxWidth * 4);
-            _conv = Alloc(rows * convWidth * 4);
-            _gdn = Alloc(rows * gdnWidth * 4);
-            _qk = Alloc(rows * 2 * keyWidth * 4);
-            _gb = Alloc(rows * 2 * vHeads * 4);
-            _ffn = Alloc(rows * ffnWidth * 4);
-            _branch = Alloc(rows * _hidden * 4);
-            _branch2 = Alloc(rows * _hidden * 4);
-            _raw = Alloc(rows * projWidth * 4);
-            _logits = Alloc((long)MaxBatch * _vocab * 4);
-            _batchTable = Alloc((long)_layers.Length * TableKinds * MaxBatch * 8);
-            Check(Native.amqe_host_alloc(out _hostToken, MaxBatch * 4), "host alloc");
-            Check(Native.amqe_host_alloc(out _hostLogits, (nuint)((long)MaxBatch * _vocab * 4)), "host alloc");
-            Check(Native.amqe_host_alloc(out _hostPrefillLogits, (nuint)((long)_vocab * 4)), "host alloc");
-            _main = NewSequence();
-        }
-        catch
-        {
-            Dispose();
-            throw;
         }
     }
 
@@ -383,6 +461,11 @@ public sealed class GpuEngine : IDisposable
                 seq.Conv[i] = _layers[i].ConvHistoryBytes > 0 ? Alloc(_layers[i].ConvHistoryBytes) : IntPtr.Zero;
             }
         }
+        if (_mtp is not null)
+        {
+            seq.MtpPos = Alloc(16);
+            seq.MtpPending = Alloc(_hidden * 4);
+        }
         _sequences.Add(seq);
         EnsureKv(seq, 1024);
         Reset(seq);
@@ -401,7 +484,9 @@ public sealed class GpuEngine : IDisposable
         {
             _graphReady = false;
         }
-        foreach (var ptr in seq.K.Concat(seq.V).Concat(seq.State).Concat(seq.Conv).Append(seq.Pos))
+        foreach (var ptr in seq.K.Concat(seq.V).Concat(seq.State).Concat(seq.Conv).Concat(seq.MarkState ?? []).Concat(seq.MarkConv ?? [])
+                     .Concat(seq.SnapState ?? []).Concat(seq.SnapConv ?? [])
+                     .Concat([seq.Pos, seq.MtpK, seq.MtpV, seq.MtpPos, seq.MtpPending, seq.MarkMtpPending]))
         {
             if (ptr != IntPtr.Zero)
             {
@@ -429,6 +514,95 @@ public sealed class GpuEngine : IDisposable
         }
         Check(Native.amqe_sync(_engine), "reset");
         seq.Position = 0;
+        seq.MarkedAt = -1;
+        seq.MtpValid = _mtp is not null;
+        seq.VerifyRows = 0;
+    }
+
+    /// <summary>Saves the sequence's recurrent state at its present position,
+    /// so a later prompt that starts with the same tokens can <see cref="Rewind"/>
+    /// here instead of prefilling them again. The KV cache needs no copy: its
+    /// entries before the mark stay as they are until the sequence passes the
+    /// mark again.</summary>
+    public void Mark(GpuSequence seq)
+    {
+        Live(seq);
+        seq.MarkState ??= new IntPtr[_layers.Length];
+        seq.MarkConv ??= new IntPtr[_layers.Length];
+        for (int i = 0; i < _layers.Length; i++)
+        {
+            if (seq.State[i] == IntPtr.Zero)
+            {
+                continue;
+            }
+            if (seq.MarkState[i] == IntPtr.Zero)
+            {
+                seq.MarkState[i] = Alloc(_layers[i].StateBytes);
+            }
+            Check(Native.amqe_copy_async(_engine, seq.MarkState[i], seq.State[i], (nuint)_layers[i].StateBytes, 3), "mark");
+            if (seq.Conv[i] != IntPtr.Zero)
+            {
+                if (seq.MarkConv[i] == IntPtr.Zero)
+                {
+                    seq.MarkConv[i] = Alloc(_layers[i].ConvHistoryBytes);
+                }
+                Check(Native.amqe_copy_async(_engine, seq.MarkConv[i], seq.Conv[i], (nuint)_layers[i].ConvHistoryBytes, 3), "mark");
+            }
+        }
+        if (_mtp is not null)
+        {
+            // The drafter's cache holds every pair before the mark; the hidden
+            // state at the mark's last position waits for the token after it.
+            if (seq.MarkMtpPending == IntPtr.Zero)
+            {
+                seq.MarkMtpPending = Alloc(_hidden * 4);
+            }
+            Check(Native.amqe_copy_async(_engine, seq.MarkMtpPending, seq.MtpPending, (nuint)(_hidden * 4), 3), "mark");
+            seq.MarkMtpValid = seq.MtpValid;
+        }
+        Check(Native.amqe_sync(_engine), "mark");
+        seq.MarkedAt = seq.Position;
+    }
+
+    /// <summary>Takes the sequence back to its <see cref="Mark"/>: the recurrent
+    /// state saved there and its position, with the KV cache as it was.</summary>
+    public void Rewind(GpuSequence seq)
+    {
+        Live(seq);
+        if (seq.MarkedAt < 0 || seq.MarkState is null || seq.MarkConv is null)
+        {
+            throw new InvalidOperationException("the sequence has no mark");
+        }
+        for (int i = 0; i < _layers.Length; i++)
+        {
+            if (seq.State[i] == IntPtr.Zero)
+            {
+                continue;
+            }
+            Check(Native.amqe_copy_async(_engine, seq.State[i], seq.MarkState[i], (nuint)_layers[i].StateBytes, 3), "rewind");
+            if (seq.Conv[i] != IntPtr.Zero)
+            {
+                Check(Native.amqe_copy_async(_engine, seq.Conv[i], seq.MarkConv[i], (nuint)_layers[i].ConvHistoryBytes, 3), "rewind");
+            }
+        }
+        if (_mtp is not null && seq.MarkMtpPending != IntPtr.Zero)
+        {
+            Check(Native.amqe_copy_async(_engine, seq.MtpPending, seq.MarkMtpPending, (nuint)(_hidden * 4), 3), "rewind");
+            seq.MtpValid = seq.MarkMtpValid;
+        }
+        seq.VerifyRows = 0;
+        var pos = new[] { seq.MarkedAt, 0, 0, 0 };
+        var handle = GCHandle.Alloc(pos, GCHandleType.Pinned);
+        try
+        {
+            Check(Native.amqe_upload(_engine, seq.Pos, handle.AddrOfPinnedObject(), 16), "rewind");
+            Check(Native.amqe_sync(_engine), "rewind");
+        }
+        finally
+        {
+            handle.Free();
+        }
+        seq.Position = seq.MarkedAt;
     }
 
     private static void Live(GpuSequence seq)
@@ -487,11 +661,210 @@ public sealed class GpuEngine : IDisposable
             {
                 handle.Free();
             }
-            Forward(new[] { seq }, rows, head: start + rows == ids.Length);
+            bool drafting = _mtp is not null && seq.MtpValid;
+            Forward(new[] { seq }, rows, head: start + rows == ids.Length, hidden: drafting);
+            if (drafting)
+            {
+                MtpCatchUp(seq, seq.Position, rows);
+            }
             seq.Position += rows;
         }
         Check(Native.amqe_sync(_engine), "prefill");
+        seq.VerifyRows = 0;
         return ReadLogits(0, fromDevice: true);
+    }
+
+    // ── speculative decoding ────────────────────────────────────────────────
+
+    /// <summary>
+    /// The chosen next token and drafts after it, as rows at the sequence's
+    /// position in one pass: row i's logits (<see cref="HostLogits"/>(i)) are
+    /// the next token's after <paramref name="tokens"/>[0..i]. With
+    /// <see cref="RowInvariant"/> each row equals what a <see cref="Step(int)"/>
+    /// there gives, so drafts the model would have chosen are free tokens.
+    /// <see cref="Accept"/> then keeps the rows whose drafts held.
+    /// </summary>
+    public void Verify(GpuSequence seq, ReadOnlySpan<int> tokens)
+    {
+        Live(seq);
+        int n = tokens.Length;
+        if (n < 1 || n > MaxDrafts + 1)
+        {
+            throw new ArgumentException($"a verify takes 1 to {MaxDrafts + 1} rows");
+        }
+        if (EnsureKv(seq, seq.Position + n + MaxDrafts))
+        {
+            _graphReady = false;
+        }
+        EnsureSnapshots(seq, n - 1);
+        for (int i = 0; i < n; i++)
+        {
+            Marshal.WriteInt32(_hostToken, i * 4, tokens[i]);
+        }
+        bool drafting = _mtp is not null && seq.MtpValid;
+        Check(Native.amqe_copy_async(_engine, _tokens, _hostToken, (nuint)(n * 4), 1), "tokens");
+        Forward(new[] { seq }, n, head: true, allRows: true, hidden: drafting, snap: n > 1);
+        Check(Native.amqe_copy_async(_engine, _hostLogits, _logits, (nuint)((long)n * _vocab * 4), 2), "logits");
+        Check(Native.amqe_sync(_engine), "verify");
+        seq.VerifyFrom = seq.Position;
+        seq.VerifyRows = n;
+        seq.Position += n;
+        _lastRows = n;
+    }
+
+    /// <summary>Keeps the first <paramref name="rows"/> rows of the last
+    /// <see cref="Verify"/>: the sequence stands after them, its recurrent
+    /// state as it was there, and the drafter catches up on them.</summary>
+    public void Accept(GpuSequence seq, int rows)
+    {
+        Live(seq);
+        int n = seq.VerifyRows;
+        if (n == 0 || rows < 1 || rows > n)
+        {
+            throw new ArgumentException($"accept 1 to {n} rows of the last verify");
+        }
+        if (rows < n)
+        {
+            for (int i = 0; i < _layers.Length; i++)
+            {
+                if (seq.State[i] == IntPtr.Zero)
+                {
+                    continue;
+                }
+                long sb = _layers[i].StateBytes, cb = _layers[i].ConvHistoryBytes;
+                Check(Native.amqe_copy_async(_engine, seq.State[i], seq.SnapState![i] + (nint)((rows - 1) * sb), (nuint)sb, 3), "accept");
+                if (seq.Conv[i] != IntPtr.Zero)
+                {
+                    Check(Native.amqe_copy_async(_engine, seq.Conv[i], seq.SnapConv![i] + (nint)((rows - 1) * cb), (nuint)cb, 3), "accept");
+                }
+            }
+            Check(Native.amqe_set_int(_engine, seq.Pos, seq.VerifyFrom + rows), "accept");
+            seq.Position = seq.VerifyFrom + rows;
+        }
+        if (_mtp is not null && seq.MtpValid)
+        {
+            MtpCatchUp(seq, seq.VerifyFrom, rows);
+        }
+        seq.VerifyRows = 0;
+    }
+
+    /// <summary>
+    /// Up to <paramref name="count"/> draft tokens to follow
+    /// <paramref name="token"/> (the token chosen after the sequence's last
+    /// position), from the MTP drafter, greedily, each fed back for the next.
+    /// Empty without a drafter, or when the drafter has not kept up with the
+    /// sequence (a batch step passed it by). The sequence itself is unchanged.
+    /// </summary>
+    public int[] Draft(GpuSequence seq, int token, int count)
+    {
+        Live(seq);
+        count = Math.Min(count, MaxDrafts);
+        if (_mtp is null || !seq.MtpValid || seq.Position < 1 || count < 1)
+        {
+            return Array.Empty<int>();
+        }
+        if (EnsureKv(seq, seq.Position + count + MaxDrafts + 1))
+        {
+            _graphReady = false;
+        }
+        Check(Native.amqe_set_int(_engine, _mtpTok, token), "draft");
+        for (int i = 0; i < count; i++)
+        {
+            MtpPass(seq, 1, _mtpTok + i * 4, i == 0 ? seq.MtpPending : _mtpH, IntPtr.Zero, seq.Position - 1 + i,
+                draftTo: _drafts + i * 4, nextToken: _mtpTok + (i + 1) * 4);
+        }
+        Check(Native.amqe_copy_async(_engine, _hostDrafts, _drafts, (nuint)(count * 4), 2), "draft");
+        Check(Native.amqe_sync(_engine), "draft");
+        var drafts = new int[count];
+        Marshal.Copy(_hostDrafts, drafts, 0, count);
+        return drafts;
+    }
+
+    /// <summary>The drafter over the main rows just run at positions
+    /// <paramref name="from"/>.., whose tokens are in <c>_tokens</c> and whose
+    /// final-normed hidden states are in <c>_hfin</c>: pairs (hidden at p − 1,
+    /// token at p) fill its cache at p − 1, and the last row's hidden state
+    /// waits for the token chosen after it.</summary>
+    private void MtpCatchUp(GpuSequence seq, int from, int rows)
+    {
+        if (from == 0)
+        {
+            if (rows > 1)
+            {
+                MtpPass(seq, rows - 1, _tokens + 4, _hfin, _hfin + _hidden * 4, 0);
+            }
+        }
+        else
+        {
+            MtpPass(seq, rows, _tokens, seq.MtpPending, _hfin, from - 1);
+        }
+        Check(Native.amqe_copy_async(_engine, seq.MtpPending, _hfin + (nint)((long)(rows - 1) * _hidden * 4), (nuint)(_hidden * 4), 3), "mtp");
+    }
+
+    /// <summary>One drafter pass over <paramref name="rows"/> pairs at
+    /// positions <paramref name="pos"/>..: row r pairs the token at
+    /// <paramref name="tokens"/>[r] with a hidden state, <paramref name="hidden0"/>
+    /// for row 0 and <paramref name="hiddenRest"/>[r − 1] after. With
+    /// <paramref name="draftTo"/>, the last row goes on through the drafter's norm
+    /// and the head, and its argmax is written there and to <paramref name="nextToken"/>,
+    /// its normed hidden state to <c>_mtpH</c>.</summary>
+    private void MtpPass(GpuSequence seq, int rows, IntPtr tokens, IntPtr hidden0, IntPtr hiddenRest, int pos,
+        IntPtr draftTo = default, IntPtr nextToken = default)
+    {
+        var m = _mtp!;
+        int h = _hidden;
+        long ld = 2L * h;
+        Check(Native.amqe_embed(_engine, _embed.Ptr, _embed.Type, tokens, rows, h, _embedScale, _hasEmbedScale ? 1 : 0, _hn), "mtp embed");
+        Check(Native.amqe_norm(_engine, _hn, h, _cat, ld, rows, h, m.PreEmbed.W, m.PreEmbed.Off, m.PreEmbed.B, m.PreEmbed.Eps, m.PreEmbed.Kind), "mtp norm");
+        Check(Native.amqe_norm(_engine, hidden0, h, _cat + h * 4, ld, 1, h, m.PreHidden.W, m.PreHidden.Off, m.PreHidden.B, m.PreHidden.Eps, m.PreHidden.Kind), "mtp norm");
+        if (rows > 1)
+        {
+            Check(Native.amqe_norm(_engine, hiddenRest, h, _cat + (nint)(ld * 4) + h * 4, ld, rows - 1, h,
+                m.PreHidden.W, m.PreHidden.Off, m.PreHidden.B, m.PreHidden.Eps, m.PreHidden.Kind), "mtp norm");
+        }
+        Linear(m.Fc, _cat, (int)ld, rows, _x, h, IntPtr.Zero);
+        Check(Native.amqe_set_int(_engine, seq.MtpPos, pos), "mtp position");
+        Layer(m.Layer, -1, new[] { seq }, rows, new KvTarget(seq.MtpK, seq.MtpV, seq.MtpPos, pos), snap: false);
+        if (draftTo != IntPtr.Zero)
+        {
+            Check(Native.amqe_norm(_engine, _x + (nint)((long)(rows - 1) * h * 4), h, _mtpH, h, 1, h,
+                m.Norm.W, m.Norm.Off, m.Norm.B, m.Norm.Eps, m.Norm.Kind), "mtp norm");
+            Linear(_head, _mtpH, h, 1, _mtpLogits, _vocab, IntPtr.Zero, n: DraftVocab);
+            Check(Native.amqe_argmax(_engine, _mtpLogits, DraftVocab, draftTo, nextToken), "mtp argmax");
+        }
+    }
+
+    /// <summary>Room for a verify's recurrent state after each of
+    /// <paramref name="rows"/> rows.</summary>
+    private void EnsureSnapshots(GpuSequence seq, int rows)
+    {
+        if (rows <= seq.SnapRows)
+        {
+            return;
+        }
+        seq.SnapState ??= new IntPtr[_layers.Length];
+        seq.SnapConv ??= new IntPtr[_layers.Length];
+        for (int i = 0; i < _layers.Length; i++)
+        {
+            if (seq.State[i] == IntPtr.Zero)
+            {
+                continue;
+            }
+            if (seq.SnapState[i] != IntPtr.Zero)
+            {
+                Free(seq.SnapState[i]);
+            }
+            seq.SnapState[i] = Alloc(rows * _layers[i].StateBytes);
+            if (seq.Conv[i] != IntPtr.Zero)
+            {
+                if (seq.SnapConv[i] != IntPtr.Zero)
+                {
+                    Free(seq.SnapConv[i]);
+                }
+                seq.SnapConv[i] = Alloc(rows * _layers[i].ConvHistoryBytes);
+            }
+        }
+        seq.SnapRows = rows;
     }
 
     /// <summary>One token at the current position; returns its logits.</summary>
@@ -579,6 +952,9 @@ public sealed class GpuEngine : IDisposable
         foreach (var seq in batch)
         {
             seq.Position++;
+            // The drafter did not see this step: it drafts again after a reset or rewind.
+            seq.MtpValid = false;
+            seq.VerifyRows = 0;
         }
         _lastRows = b;
         if (Timing)
@@ -659,6 +1035,26 @@ public sealed class GpuEngine : IDisposable
             seq.K[i] = k;
             seq.V[i] = v;
         }
+        if (_mtp is not null)
+        {
+            long bytes = (long)capacity * _mtp.KvDim * 4;
+            var k = Alloc(bytes);
+            var v = Alloc(bytes);
+            if (seq.MtpK != IntPtr.Zero)
+            {
+                long used = (long)seq.Position * _mtp.KvDim * 4;
+                if (used > 0)
+                {
+                    Check(Native.amqe_copy_async(_engine, k, seq.MtpK, (nuint)used, 3), "kv grow");
+                    Check(Native.amqe_copy_async(_engine, v, seq.MtpV, (nuint)used, 3), "kv grow");
+                }
+                Check(Native.amqe_sync(_engine), "kv grow");
+                Free(seq.MtpK);
+                Free(seq.MtpV);
+            }
+            seq.MtpK = k;
+            seq.MtpV = v;
+        }
         seq.KvCapacity = capacity;
         // The decode attention's partial softmaxes: one slice per
         // amqe_attention_split_keys keys of capacity, for up to 8 query rows,
@@ -722,180 +1118,18 @@ public sealed class GpuEngine : IDisposable
     /// and the recurrence treats the rows alike; those two run per sequence.
     /// The head reads the last row of one sequence, or every row of a batch.
     /// </summary>
-    private void Forward(GpuSequence[] seqs, int rows, bool head)
+    private void Forward(GpuSequence[] seqs, int rows, bool head, bool allRows = false, bool hidden = false, bool snap = false)
     {
-        int hidden = _hidden;
         bool batch = seqs.Length > 1;
-        var one = seqs[0];
-        float residualScale = (float)_plan.ResidualScale;
-        Check(Native.amqe_embed(_engine, _embed.Ptr, _embed.Type, _tokens, rows, hidden, _embedScale, _hasEmbedScale ? 1 : 0, _x), "embed");
-
+        Check(Native.amqe_embed(_engine, _embed.Ptr, _embed.Type, _tokens, rows, _hidden, _embedScale, _hasEmbedScale ? 1 : 0, _x), "embed");
         for (int i = 0; i < _layers.Length; i++)
         {
-            var l = _layers[i];
-            var lp = l.Plan;
-            bool parallel = lp.ParallelResidual;
-
-            IntPtr hIn = _x;
-            (IntPtr, IntPtr, float, float, int)? inNorm = null;
-            if (l.PreAttn is { } pre)
-            {
-                if (!parallel && FusesNorm(rows))
-                {
-                    inNorm = pre;
-                }
-                else
-                {
-                    ApplyNorm(pre, _x, _hn, rows);
-                    hIn = _hn;
-                }
-            }
-
-            // The mixer's output joins the residual straight out of its last
-            // projection unless a post-norm or a parallel block needs it apart.
-            bool mixerDirect = l.PostAttn is null && !parallel;
-            IntPtr mixerOut = mixerDirect ? _x : _branch;
-            if (lp.Attention is { } attn)
-            {
-                int qkvWidth = l.Qkv!.Rows;
-                Linear(l.Qkv!, hIn, hidden, rows, _proj, qkvWidth, l.QkvBias, norm: inNorm);
-                if (l.QNormRow)
-                {
-                    Check(Native.amqe_norm(_engine, _proj, qkvWidth, _proj, qkvWidth, rows, attn.QDim,
-                        l.QNormW, l.QNormOff, IntPtr.Zero, l.QNormEps, 0), "q norm");
-                }
-                if (l.KNormRow)
-                {
-                    IntPtr k = _proj + attn.QProjWidth * 4;
-                    Check(Native.amqe_norm(_engine, k, qkvWidth, k, qkvWidth, rows, attn.KvDim,
-                        l.KNormW, l.KNormOff, IntPtr.Zero, l.KNormEps, 0), "k norm");
-                }
-                float softcap = attn.LogitSoftcapping ?? 0f;
-                int window = attn.Window is { } w ? (int)w : 0;
-                long qRow = (long)attn.NumQHeads * attn.HeadDim * 4;
-                if (batch)
-                {
-                    // Every sequence in one launch each: row r reads its own cache and position.
-                    Check(Native.amqe_attn_prep_batch(_engine, _proj, qkvWidth, rows, attn.NumQHeads, attn.NumKvHeads, attn.HeadDim,
-                        attn.OutputGate ? 1 : 0, _q, _gate, Table(i, 0), Table(i, 1), Table(i, 2),
-                        l.QNormRow ? IntPtr.Zero : l.QNormW, l.QNormOff, l.QNormEps,
-                        l.KNormRow ? IntPtr.Zero : l.KNormW, l.KNormOff, l.KNormEps,
-                        l.InvFreq, l.RopePairs, l.RopeScale, attn.RopeInterleaved ? 1 : 0, l.InvFreq != IntPtr.Zero ? 1 : 0), "attn prep");
-                    Check(Native.amqe_attention_batch(_engine, _q, Table(i, 0), Table(i, 1), attn.OutputGate ? _gate : IntPtr.Zero, _ctx,
-                        Table(i, 2), rows, attn.NumQHeads, attn.NumKvHeads, attn.HeadDim, (float)attn.ScoreScale, softcap, window,
-                        _attnPart, seqs.Max(Splits)), "attention");
-                }
-                for (int s = 0; s < (batch ? 0 : seqs.Length); s++)
-                {
-                    var seq = seqs[s];
-                    int n = batch ? 1 : rows;
-                    long at = batch ? s : 0;
-                    IntPtr q = _q + (nint)(at * qRow), gateRow = _gate + (nint)(at * qRow), ctx = _ctx + (nint)(at * qRow);
-                    Check(Native.amqe_attn_prep(_engine, _proj + (nint)(at * qkvWidth * 4), qkvWidth, n, attn.NumQHeads, attn.NumKvHeads,
-                        attn.HeadDim, attn.OutputGate ? 1 : 0, q, gateRow, seq.K[i], seq.V[i], seq.Pos,
-                        l.QNormRow ? IntPtr.Zero : l.QNormW, l.QNormOff, l.QNormEps,
-                        l.KNormRow ? IntPtr.Zero : l.KNormW, l.KNormOff, l.KNormEps,
-                        l.InvFreq, l.RopePairs, l.RopeScale, attn.RopeInterleaved ? 1 : 0, l.InvFreq != IntPtr.Zero ? 1 : 0), "attn prep");
-                    IntPtr gate = attn.OutputGate ? gateRow : IntPtr.Zero;
-                    // A prompt chunk goes through cuBLAS (its position is known on
-                    // the host: prompts are never captured); decode steps, and
-                    // chunks whose scores would pass the scratch budget, use the
-                    // attention kernels.
-                    int rc = n > 8 && RowsAttention
-                        ? Native.amqe_attention_rows(_engine, q, seq.K[i], seq.V[i], gate, ctx, seq.Position,
-                            n, attn.NumQHeads, attn.NumKvHeads, attn.HeadDim, (float)attn.ScoreScale, softcap, window)
-                        : -200;
-                    if (rc == -200)
-                    {
-                        rc = Native.amqe_attention(_engine, q, seq.K[i], seq.V[i], gate, ctx, seq.Pos,
-                            n, attn.NumQHeads, attn.NumKvHeads, attn.HeadDim, (float)attn.ScoreScale,
-                            softcap, window, _attnPart, Splits(seq));
-                    }
-                    Check(rc, "attention");
-                }
-                Linear(l.O!, _ctx, attn.QDim, rows, mixerOut, hidden, l.OBias,
-                    residual: mixerDirect ? _x : IntPtr.Zero, resScale: residualScale);
-            }
-            else
-            {
-                var lin = lp.LinearAttention!;
-                int inWidth = l.In!.Rows;
-                Linear(l.In!, hIn, hidden, rows, _proj, inWidth, IntPtr.Zero, norm: inNorm);
-                if (batch)
-                {
-                    Check(Native.amqe_gdn_batch(_engine, _proj, inWidth, rows, lin.KeyDim, lin.ValueDim,
-                        lin.NumKHeads, lin.NumVHeads, lin.HeadKDim, lin.HeadVDim, l.ConvW, lin.ConvKernel, Table(i, 4),
-                        l.ALog, l.DtBias, l.GdnNormW, (float)lin.NormEps, Table(i, 3), _conv, _qk, _gb, _gdn), "gated deltanet");
-                }
-                for (int s = 0; s < (batch ? 0 : seqs.Length); s++)
-                {
-                    long at = batch ? s : 0;
-                    Check(Native.amqe_gdn(_engine, _proj + (nint)(at * inWidth * 4), inWidth, batch ? 1 : rows, lin.KeyDim, lin.ValueDim,
-                        lin.NumKHeads, lin.NumVHeads, lin.HeadKDim, lin.HeadVDim, l.ConvW, lin.ConvKernel, seqs[s].Conv[i],
-                        l.ALog, l.DtBias, l.GdnNormW, (float)lin.NormEps, seqs[s].State[i], _conv, _qk, _gb,
-                        _gdn + (nint)(at * lin.ValueDim * 4)), "gated deltanet");
-                }
-                Linear(l.Out!, _gdn, lin.ValueDim, rows, mixerOut, hidden, IntPtr.Zero,
-                    residual: mixerDirect ? _x : IntPtr.Zero, resScale: residualScale);
-            }
-
-            if (!mixerDirect)
-            {
-                if (l.PostAttn is { } post)
-                {
-                    ApplyNorm(post, _branch, _branch, rows);
-                }
-                if (!parallel)
-                {
-                    Check(Native.amqe_add_scaled(_engine, _x, _branch, residualScale, (long)rows * hidden), "residual");
-                }
-            }
-
-            if (l.Up is null)
-            {
-                if (parallel)
-                {
-                    Check(Native.amqe_add_scaled(_engine, _x, _branch, residualScale, (long)rows * hidden), "residual");
-                }
-                continue;
-            }
-
-            IntPtr fIn = parallel ? hIn : _x;
-            (IntPtr, IntPtr, float, float, int)? ffnNorm = null;
-            if (!parallel && l.PreFfn is { } preFfn)
-            {
-                if (FusesNorm(rows))
-                {
-                    ffnNorm = preFfn;
-                }
-                else
-                {
-                    ApplyNorm(preFfn, _x, _hn, rows);
-                    fIn = _hn;
-                }
-            }
-            var dense = lp.Ffn!.Dense!;
-            int inter = dense.IntermediateSize;
-            Linear(l.Up, fIn, hidden, rows, _ffn, inter, l.UpBias, act: l.Act, glu: dense.IsGated, n: inter, norm: ffnNorm);
-            bool ffnDirect = l.PostFfn is null && !parallel;
-            Linear(l.Down!, _ffn, inter, rows, ffnDirect ? _x : _branch2, hidden, l.DownBias,
-                residual: ffnDirect ? _x : IntPtr.Zero, resScale: residualScale);
-            if (!ffnDirect)
-            {
-                if (l.PostFfn is { } postFfn)
-                {
-                    ApplyNorm(postFfn, _branch2, _branch2, rows);
-                }
-                if (parallel)
-                {
-                    Check(Native.amqe_add_scaled(_engine, _branch, _branch2, 1f, (long)rows * hidden), "residual");
-                    Check(Native.amqe_add_scaled(_engine, _x, _branch, residualScale, (long)rows * hidden), "residual");
-                }
-                else
-                {
-                    Check(Native.amqe_add_scaled(_engine, _x, _branch2, residualScale, (long)rows * hidden), "residual");
-                }
-            }
+            Layer(_layers[i], i, seqs, rows, null, snap);
+        }
+        if (hidden)
+        {
+            // Every row's final-normed hidden state, for the drafter.
+            ApplyNorm((_finalNormW, _finalNormB, _finalNormOff, _finalNormEps, _finalNormKind), _x, _hfin, rows);
         }
 
         if (head)
@@ -903,16 +1137,16 @@ public sealed class GpuEngine : IDisposable
             // One sequence: only its last row goes through the final norm and
             // the head. A batch: every row, each its own sequence's next token.
             var finalNorm = (_finalNormW, _finalNormB, _finalNormOff, _finalNormEps, _finalNormKind);
-            int headRows = batch ? rows : 1;
-            IntPtr first = batch ? _x : _x + (rows - 1) * hidden * 4;
-            if (FusesNorm(headRows))
+            int headRows = batch || allRows ? rows : 1;
+            IntPtr first = batch || allRows ? _x : _x + (rows - 1) * _hidden * 4;
+            if (FusesNorm(headRows, finalNorm))
             {
-                Linear(_head, first, hidden, headRows, _logits, _vocab, IntPtr.Zero, norm: finalNorm);
+                Linear(_head, first, _hidden, headRows, _logits, _vocab, IntPtr.Zero, norm: finalNorm);
             }
             else
             {
                 ApplyNorm(finalNorm, first, _hn, headRows);
-                Linear(_head, _hn, hidden, headRows, _logits, _vocab, IntPtr.Zero);
+                Linear(_head, _hn, _hidden, headRows, _logits, _vocab, IntPtr.Zero);
             }
             var output = _plan.Output!;
             if (output.Multiplier is not null || output.LogitSoftcapping is not null)
@@ -927,6 +1161,185 @@ public sealed class GpuEngine : IDisposable
         }
     }
 
+    /// <summary>The drafter's attention target: its own KV cache and position
+    /// in place of the sequence's layer <c>i</c>.</summary>
+    private readonly record struct KvTarget(IntPtr K, IntPtr V, IntPtr Pos, int HostPos);
+
+    /// <summary>One layer over the rows in <c>_x</c> (in place). With
+    /// <paramref name="kv"/> its attention reads and writes that cache instead
+    /// of the sequence's; with <paramref name="snap"/> each Gated DeltaNet keeps
+    /// its state after every row but the last (a single sequence's verify).</summary>
+    private void Layer(LayerDevice l, int i, GpuSequence[] seqs, int rows, KvTarget? kv, bool snap)
+    {
+        int hidden = _hidden;
+        bool batch = seqs.Length > 1;
+        float residualScale = (float)_plan.ResidualScale;
+        var lp = l.Plan;
+        bool parallel = lp.ParallelResidual;
+
+        IntPtr hIn = _x;
+        (IntPtr, IntPtr, float, float, int)? inNorm = null;
+        if (l.PreAttn is { } pre)
+        {
+            if (!parallel && FusesNorm(rows, pre))
+            {
+                inNorm = pre;
+            }
+            else
+            {
+                ApplyNorm(pre, _x, _hn, rows);
+                hIn = _hn;
+            }
+        }
+
+        // The mixer's output joins the residual straight out of its last
+        // projection unless a post-norm or a parallel block needs it apart.
+        bool mixerDirect = l.PostAttn is null && !parallel;
+        IntPtr mixerOut = mixerDirect ? _x : _branch;
+        if (lp.Attention is { } attn)
+        {
+            int qkvWidth = l.Qkv!.Rows;
+            Linear(l.Qkv!, hIn, hidden, rows, _proj, qkvWidth, l.QkvBias, norm: inNorm);
+            if (l.QNormRow)
+            {
+                Check(Native.amqe_norm(_engine, _proj, qkvWidth, _proj, qkvWidth, rows, attn.QDim,
+                    l.QNormW, l.QNormOff, IntPtr.Zero, l.QNormEps, 0), "q norm");
+            }
+            if (l.KNormRow)
+            {
+                IntPtr k = _proj + attn.QProjWidth * 4;
+                Check(Native.amqe_norm(_engine, k, qkvWidth, k, qkvWidth, rows, attn.KvDim,
+                    l.KNormW, l.KNormOff, IntPtr.Zero, l.KNormEps, 0), "k norm");
+            }
+            float softcap = attn.LogitSoftcapping ?? 0f;
+            int window = attn.Window is { } w ? (int)w : 0;
+            long qRow = (long)attn.NumQHeads * attn.HeadDim * 4;
+            if (batch)
+            {
+                // Every sequence in one launch each: row r reads its own cache and position.
+                Check(Native.amqe_attn_prep_batch(_engine, _proj, qkvWidth, rows, attn.NumQHeads, attn.NumKvHeads, attn.HeadDim,
+                    attn.OutputGate ? 1 : 0, _q, _gate, Table(i, 0), Table(i, 1), Table(i, 2),
+                    l.QNormRow ? IntPtr.Zero : l.QNormW, l.QNormOff, l.QNormEps,
+                    l.KNormRow ? IntPtr.Zero : l.KNormW, l.KNormOff, l.KNormEps,
+                    l.InvFreq, l.RopePairs, l.RopeScale, attn.RopeInterleaved ? 1 : 0, l.InvFreq != IntPtr.Zero ? 1 : 0), "attn prep");
+                Check(Native.amqe_attention_batch(_engine, _q, Table(i, 0), Table(i, 1), attn.OutputGate ? _gate : IntPtr.Zero, _ctx,
+                    Table(i, 2), rows, attn.NumQHeads, attn.NumKvHeads, attn.HeadDim, (float)attn.ScoreScale, softcap, window,
+                    _attnPart, seqs.Max(Splits)), "attention");
+            }
+            for (int s = 0; s < (batch ? 0 : seqs.Length); s++)
+            {
+                var seq = seqs[s];
+                int n = batch ? 1 : rows;
+                long at = batch ? s : 0;
+                IntPtr q = _q + (nint)(at * qRow), gateRow = _gate + (nint)(at * qRow), ctx = _ctx + (nint)(at * qRow);
+                Check(Native.amqe_attn_prep(_engine, _proj + (nint)(at * qkvWidth * 4), qkvWidth, n, attn.NumQHeads, attn.NumKvHeads,
+                    attn.HeadDim, attn.OutputGate ? 1 : 0, q, gateRow, kv?.K ?? seq.K[i], kv?.V ?? seq.V[i], kv?.Pos ?? seq.Pos,
+                    l.QNormRow ? IntPtr.Zero : l.QNormW, l.QNormOff, l.QNormEps,
+                    l.KNormRow ? IntPtr.Zero : l.KNormW, l.KNormOff, l.KNormEps,
+                    l.InvFreq, l.RopePairs, l.RopeScale, attn.RopeInterleaved ? 1 : 0, l.InvFreq != IntPtr.Zero ? 1 : 0), "attn prep");
+                IntPtr gate = attn.OutputGate ? gateRow : IntPtr.Zero;
+                // A prompt chunk goes through cuBLAS (its position is known on
+                // the host: prompts are never captured); decode steps, and
+                // chunks whose scores would pass the scratch budget, use the
+                // attention kernels.
+                int rc = n > 8 && RowsAttention
+                    ? Native.amqe_attention_rows(_engine, q, kv?.K ?? seq.K[i], kv?.V ?? seq.V[i], gate, ctx, kv?.HostPos ?? seq.Position,
+                        n, attn.NumQHeads, attn.NumKvHeads, attn.HeadDim, (float)attn.ScoreScale, softcap, window)
+                    : -200;
+                if (rc == -200)
+                {
+                    rc = Native.amqe_attention(_engine, q, kv?.K ?? seq.K[i], kv?.V ?? seq.V[i], gate, ctx, kv?.Pos ?? seq.Pos,
+                        n, attn.NumQHeads, attn.NumKvHeads, attn.HeadDim, (float)attn.ScoreScale,
+                        softcap, window, _attnPart, Splits(seq));
+                }
+                Check(rc, "attention");
+            }
+            Linear(l.O!, _ctx, attn.QDim, rows, mixerOut, hidden, l.OBias,
+                residual: mixerDirect ? _x : IntPtr.Zero, resScale: residualScale);
+        }
+        else
+        {
+            var lin = lp.LinearAttention!;
+            int inWidth = l.In!.Rows;
+            Linear(l.In!, hIn, hidden, rows, _proj, inWidth, IntPtr.Zero, norm: inNorm);
+            if (batch)
+            {
+                Check(Native.amqe_gdn_batch(_engine, _proj, inWidth, rows, lin.KeyDim, lin.ValueDim,
+                    lin.NumKHeads, lin.NumVHeads, lin.HeadKDim, lin.HeadVDim, l.ConvW, lin.ConvKernel, Table(i, 4),
+                    l.ALog, l.DtBias, l.GdnNormW, (float)lin.NormEps, Table(i, 3), _conv, _qk, _gb, _gdn), "gated deltanet");
+            }
+            for (int s = 0; s < (batch ? 0 : seqs.Length); s++)
+            {
+                long at = batch ? s : 0;
+                Check(Native.amqe_gdn(_engine, _proj + (nint)(at * inWidth * 4), inWidth, batch ? 1 : rows, lin.KeyDim, lin.ValueDim,
+                    lin.NumKHeads, lin.NumVHeads, lin.HeadKDim, lin.HeadVDim, l.ConvW, lin.ConvKernel, seqs[s].Conv[i],
+                    l.ALog, l.DtBias, l.GdnNormW, (float)lin.NormEps, seqs[s].State[i], _conv, _qk, _gb,
+                    _gdn + (nint)(at * lin.ValueDim * 4),
+                    snap ? seqs[s].SnapState![i] : IntPtr.Zero, snap ? seqs[s].SnapConv![i] : IntPtr.Zero), "gated deltanet");
+            }
+            Linear(l.Out!, _gdn, lin.ValueDim, rows, mixerOut, hidden, IntPtr.Zero,
+                residual: mixerDirect ? _x : IntPtr.Zero, resScale: residualScale);
+        }
+
+        if (!mixerDirect)
+        {
+            if (l.PostAttn is { } post)
+            {
+                ApplyNorm(post, _branch, _branch, rows);
+            }
+            if (!parallel)
+            {
+                Check(Native.amqe_add_scaled(_engine, _x, _branch, residualScale, (long)rows * hidden), "residual");
+            }
+        }
+
+        if (l.Up is null)
+        {
+            if (parallel)
+            {
+                Check(Native.amqe_add_scaled(_engine, _x, _branch, residualScale, (long)rows * hidden), "residual");
+            }
+            return;
+        }
+
+        IntPtr fIn = parallel ? hIn : _x;
+        (IntPtr, IntPtr, float, float, int)? ffnNorm = null;
+        if (!parallel && l.PreFfn is { } preFfn)
+        {
+            if (FusesNorm(rows, preFfn))
+            {
+                ffnNorm = preFfn;
+            }
+            else
+            {
+                ApplyNorm(preFfn, _x, _hn, rows);
+                fIn = _hn;
+            }
+        }
+        var dense = lp.Ffn!.Dense!;
+        int inter = dense.IntermediateSize;
+        Linear(l.Up, fIn, hidden, rows, _ffn, inter, l.UpBias, act: l.Act, glu: dense.IsGated, n: inter, norm: ffnNorm);
+        bool ffnDirect = l.PostFfn is null && !parallel;
+        Linear(l.Down!, _ffn, inter, rows, ffnDirect ? _x : _branch2, hidden, l.DownBias,
+            residual: ffnDirect ? _x : IntPtr.Zero, resScale: residualScale);
+        if (!ffnDirect)
+        {
+            if (l.PostFfn is { } postFfn)
+            {
+                ApplyNorm(postFfn, _branch2, _branch2, rows);
+            }
+            if (parallel)
+            {
+                Check(Native.amqe_add_scaled(_engine, _branch, _branch2, 1f, (long)rows * hidden), "residual");
+                Check(Native.amqe_add_scaled(_engine, _x, _branch, residualScale, (long)rows * hidden), "residual");
+            }
+            else
+            {
+                Check(Native.amqe_add_scaled(_engine, _x, _branch2, residualScale, (long)rows * hidden), "residual");
+            }
+        }
+    }
+
     /// <summary>y = epilogue(x · Wᵀ); with <paramref name="norm"/> the rows of
     /// x are normalised inside the projection (decode only: see
     /// <see cref="FusesNorm"/>).</summary>
@@ -938,12 +1351,14 @@ public sealed class GpuEngine : IDisposable
         var nm = norm ?? default;
         Check(Native.amqe_linear(_engine, w.Ptr, w.Type, outputs, w.Cols, x, ldx, rows, y, ldy,
             bias, residual, ldy, resScale, act, glu ? 1 : 0, _raw,
-            norm is null ? IntPtr.Zero : nm.W, nm.Off, nm.B, nm.Eps, nm.Kind), "linear");
+            norm is null ? IntPtr.Zero : nm.W, nm.Off, nm.B, nm.Eps, nm.Kind, w.Scales, w.RowScale), "linear");
     }
 
     /// <summary>Whether a norm can run inside the projection that reads it: a
-    /// few rows (the GEMV path), whose normalised copy fits in shared memory.</summary>
-    private bool FusesNorm(int rows) => rows < GemmFrom && (long)rows * _hidden * 4 <= 48 * 1024;
+    /// few rows (the GEMV path), where an RMS norm without a bias is applied in
+    /// the dot loop and any other norm's normalised copy must fit in shared memory.</summary>
+    private bool FusesNorm(int rows, (IntPtr W, IntPtr B, float Off, float Eps, int Kind) norm) =>
+        rows < GemmFrom && ((norm.Kind == 0 && norm.B == IntPtr.Zero) || (long)rows * _hidden * 4 <= 48 * 1024);
 
     // Rows from which a projection runs on cuBLAS rather than the GEMV (AMQE_GEMM_FROM, as the native side reads it).
     private static readonly int GemmFrom =
@@ -962,6 +1377,132 @@ public sealed class GpuEngine : IDisposable
         public required int Type { get; init; }
         public required int Rows { get; init; }
         public required int Cols { get; init; }
+
+        /// <summary>4-bit weights (types 2, 3): the block scales, and each
+        /// row's tensor scale (zero when every row's is 1).</summary>
+        public IntPtr Scales { get; init; }
+        public IntPtr RowScale { get; init; }
+    }
+
+    private const int NVFP4 = 2, MXFP4 = 3;
+
+    /// <summary>A 4-bit weight on its way to the device: packed elements,
+    /// block-scale bytes, and each row's tensor scale.</summary>
+    private sealed record Fp4Source(byte[] Packed, byte[] Scales, float[] RowScale, int Type);
+
+    /// <summary>The form the engine holds projections in. A container whose
+    /// projections are stored as NVFP4 or MXFP4 (see <c>amql-cli quantise</c>)
+    /// runs them as stored whatever this says; otherwise NVFP4 or MXFP4 here
+    /// quantises them at load (<c>AMQL_GPU_FORMAT=nvfp4|mxfp4</c>). The
+    /// embedding stays as stored, and so does the head unless
+    /// <c>AMQL_GPU_FORMAT_HEAD=1</c>.</summary>
+    public static GpuWeightFormat WeightFormat { get; set; } = ComputeBudget.GpuWeightFormat;
+
+    public static bool QuantiseHead { get; set; } = Environment.GetEnvironmentVariable("AMQL_GPU_FORMAT_HEAD") is "1";
+
+    /// <summary>Matrices the engine holds at 4 bits, and their device bytes.</summary>
+    public int Fp4Matrices { get; private set; }
+    public long Fp4Bytes { get; private set; }
+
+    private Fp4Source? Fp4Of(WeightLoader weights, OperandRef operand, int rows, int cols, bool project)
+    {
+        if (weights.StoredFp4(operand) is { } stored)
+        {
+            if (stored.Rows != rows || stored.Cols != cols)
+            {
+                throw new ContainerException($"'{operand.ObjectId}/{operand.TensorName}' is [{stored.Rows}, {stored.Cols}], expected [{rows}, {cols}]");
+            }
+            return FromScaled(stored, rows);
+        }
+        if (!project || WeightFormat == GpuWeightFormat.Fp16 || cols % 32 != 0)
+        {
+            return null;
+        }
+        // From the stored values, not a BF16-resident copy: the same 4 bits a
+        // compiled container holds.
+        var values = weights.StoredValues(operand, rows, cols);
+        if (WeightFormat == GpuWeightFormat.Mxfp4)
+        {
+            var mx = Mxfp4.Quantize(values, rows, cols);
+            return new Fp4Source(mx.Packed, mx.BlockScales, Enumerable.Repeat(1f, rows).ToArray(), MXFP4);
+        }
+        return FromScaled(Nvfp4.Quantize(values, rows, cols), rows);
+    }
+
+    /// <summary>A stored or freshly quantised FP4 matrix in the engine's
+    /// layout, or null when its blocks are neither NVFP4's nor MXFP4's.</summary>
+    private static Fp4Source? FromScaled(ScaledMatrix m, int rows)
+    {
+        if (m.Element != Dtype.FP4 || m.BlockRows != 1)
+        {
+            return null;
+        }
+        if (m.IsNvfp4)
+        {
+            var bytes = new byte[m.Scales.Length];
+            for (int i = 0; i < bytes.Length; i++)
+            {
+                bytes[i] = BitPattern.EncodeF8E4M3(m.Scales[i]);
+            }
+            return new Fp4Source(m.Elements, bytes, Enumerable.Repeat(m.Global, rows).ToArray(), NVFP4);
+        }
+        if (m.BlockCols == Mxfp4.BlockElements && m.ScaleCols * Mxfp4.BlockElements == m.Cols)
+        {
+            var bytes = new byte[m.Scales.Length];
+            for (int i = 0; i < bytes.Length; i++)
+            {
+                float s = m.Scales[i];
+                int bits = BitConverter.SingleToInt32Bits(s);
+                if (s <= 0 || (bits & 0x007FFFFF) != 0)
+                {
+                    return null;   // not a power of two: not E8M0
+                }
+                bytes[i] = (byte)((bits >> 23) & 0xFF);
+            }
+            return new Fp4Source(m.Elements, bytes, Enumerable.Repeat(m.Global, rows).ToArray(), MXFP4);
+        }
+        return null;
+    }
+
+    private static float[] Widen(ushort[] bits)
+    {
+        var f = new float[bits.Length];
+        for (int i = 0; i < f.Length; i++)
+        {
+            f[i] = BitConverter.Int32BitsToSingle(bits[i] << 16);
+        }
+        return f;
+    }
+
+    private DeviceMatrix UploadFp4(Fp4Source source, int rows, int cols)
+    {
+        var matrix = new DeviceMatrix
+        {
+            Ptr = UploadBytes(source.Packed),
+            Type = source.Type,
+            Rows = rows,
+            Cols = cols,
+            Scales = UploadBytes(source.Scales),
+            RowScale = source.RowScale.All(v => v == 1f) ? IntPtr.Zero : UploadFloats(source.RowScale),
+        };
+        Fp4Matrices++;
+        Fp4Bytes += source.Packed.LongLength + source.Scales.LongLength + (matrix.RowScale == IntPtr.Zero ? 0 : rows * 4L);
+        return matrix;
+    }
+
+    private IntPtr UploadBytes(byte[] data)
+    {
+        var ptr = Alloc(Math.Max(16, data.LongLength));
+        var handle = GCHandle.Alloc(data, GCHandleType.Pinned);
+        try
+        {
+            Check(Native.amqe_upload(_engine, ptr, handle.AddrOfPinnedObject(), (nuint)data.LongLength), "upload");
+        }
+        finally
+        {
+            handle.Free();
+        }
+        return ptr;
     }
 
     private sealed class LayerDevice
@@ -985,12 +1526,118 @@ public sealed class GpuEngine : IDisposable
         public int Act;
     }
 
-    private DeviceMatrix Matrix(WeightLoader weights, OperandRef operand, int rows, int cols)
+    /// <summary>
+    /// The model's own multi-token-prediction drafter (Qwen 3.5, Qwen3-Next):
+    /// one decoder layer shaped like the stack's full-attention layers, which
+    /// reads the final-normed hidden state at position t beside the embedding
+    /// of token t+1, <c>fc([norm_e(embed(t+1)) ; norm_h(h_t)])</c>, and through
+    /// its own final norm and the shared head predicts token t+2. It keeps a KV
+    /// cache of its own, one row per position.
+    /// </summary>
+    private sealed class MtpDevice
     {
-        var key = (operand.ObjectId, operand.TensorName);
+        public required LayerDevice Layer;
+        public required DeviceMatrix Fc;
+        public required (IntPtr W, IntPtr B, float Off, float Eps, int Kind) PreEmbed, PreHidden, Norm;
+        public required int KvDim;
+
+        private const string Stack = "mtp.stack";
+
+        public static MtpDevice? TryUpload(GpuEngine engine, WeightLoader weights, ComponentOpPlan plan)
+        {
+            var fc = new OperandRef(Stack, "fc.weight");
+            if (!weights.Contains(fc) || plan.FinalNorm is not { } finalNorm)
+            {
+                return null;
+            }
+            // The drafter's layer has the shape of the stack's full-attention layers.
+            int trunk = plan.Layers.FindLastIndex(l => l.Attention is not null && l.Ffn?.Dense is not null);
+            if (trunk < 0)
+            {
+                return null;
+            }
+            var src = plan.Layers[trunk];
+            string prefix = $"{trunk}.";
+            OperandRef Rebind(OperandRef r) => r.TensorName.StartsWith(prefix, StringComparison.Ordinal)
+                ? new OperandRef(Stack, "layers.0." + r.TensorName[prefix.Length..])
+                : throw new UnsupportedOperatorException($"MTP: cannot rebind {r.ObjectId}/{r.TensorName}");
+            OperandRef? RebindOpt(OperandRef? r) => r is null ? null : Rebind(r);
+            NormOp? N(NormOp? n) => n is null ? null : new NormOp
+            {
+                Weight = Rebind(n.Weight), Bias = RebindOpt(n.Bias), Kind = n.Kind, Eps = n.Eps,
+                WeightOffset = n.WeightOffset, Width = n.Width,
+            };
+            var a = src.Attention!;
+            var d = src.Ffn!.Dense!;
+            var layer = new LayerPlan
+            {
+                PreAttentionNorm = N(src.PreAttentionNorm),
+                PostAttentionNorm = N(src.PostAttentionNorm),
+                PreFfnNorm = N(src.PreFfnNorm),
+                PostFfnNorm = N(src.PostFfnNorm),
+                ParallelResidual = src.ParallelResidual,
+                Attention = new AttentionOp
+                {
+                    NumQHeads = a.NumQHeads, NumKvHeads = a.NumKvHeads, HeadDim = a.HeadDim,
+                    ScoreScale = a.ScoreScale, LogitSoftcapping = a.LogitSoftcapping, Window = a.Window,
+                    Causal = a.Causal, Position = a.Position, VFromK = a.VFromK, OutputGate = a.OutputGate,
+                    QkNormScope = a.QkNormScope, QkNormWeightOffset = a.QkNormWeightOffset,
+                    ParameterFreeQkNorm = a.ParameterFreeQkNorm, ParameterFreeQkNormEps = a.ParameterFreeQkNormEps,
+                    QNorm = N(a.QNorm), KNorm = N(a.KNorm),
+                    QProj = Rebind(a.QProj), KProj = Rebind(a.KProj), VProj = Rebind(a.VProj), OProj = Rebind(a.OProj),
+                    QBias = RebindOpt(a.QBias), KBias = RebindOpt(a.KBias), VBias = RebindOpt(a.VBias), OBias = RebindOpt(a.OBias),
+                    RopeInterleaved = a.RopeInterleaved,
+                },
+                Ffn = new LayerFfn
+                {
+                    Dense = new DenseFfnOp
+                    {
+                        Up = Rebind(d.Up), Down = Rebind(d.Down), Gate = RebindOpt(d.Gate),
+                        GateBias = RebindOpt(d.GateBias), UpBias = RebindOpt(d.UpBias), DownBias = RebindOpt(d.DownBias),
+                        Activation = d.Activation, IntermediateSize = d.IntermediateSize, HiddenSize = d.HiddenSize,
+                    },
+                },
+            };
+            if (a.HeadGate is not null || a.Indexer is not null || a.VFromK)
+            {
+                return null;
+            }
+            foreach (var name in new[] { "pre_fc_norm_embedding.weight", "pre_fc_norm_hidden.weight", "norm.weight", "layers.0.self_attn.q_proj.weight" })
+            {
+                if (!weights.Contains(new OperandRef(Stack, name)))
+                {
+                    return null;
+                }
+            }
+            NormOp Top(string name) => new()
+            {
+                Weight = new OperandRef(Stack, name), Kind = finalNorm.Kind, Eps = finalNorm.Eps,
+                WeightOffset = finalNorm.WeightOffset, Width = finalNorm.Width,
+            };
+            int hidden = plan.HiddenSize;
+            return new MtpDevice
+            {
+                Layer = engine.UploadLayer(weights, layer),
+                Fc = engine.Matrix(weights, fc, hidden, 2 * hidden, project: true),
+                PreEmbed = engine.Norm(weights, Top("pre_fc_norm_embedding.weight")),
+                PreHidden = engine.Norm(weights, Top("pre_fc_norm_hidden.weight")),
+                Norm = engine.Norm(weights, Top("norm.weight")),
+                KvDim = a.KvDim,
+            };
+        }
+    }
+
+    private DeviceMatrix Matrix(WeightLoader weights, OperandRef operand, int rows, int cols, bool project = false)
+    {
+        var fp4 = Fp4Of(weights, operand, rows, cols, project);
+        var key = (operand.ObjectId, operand.TensorName + (fp4 is null ? "" : "#fp4"));
         if (_matrixCache.TryGetValue(key, out var cached))
         {
             return cached;
+        }
+        if (fp4 is not null)
+        {
+            return _matrixCache[key] = UploadFp4(fp4, rows, cols);
         }
         var (bf16, f32) = weights.DeviceSource(operand, rows, cols);
         var matrix = bf16 is not null
@@ -1005,8 +1652,18 @@ public sealed class GpuEngine : IDisposable
     /// every part is BF16, otherwise all f32 (BF16 widens exactly).</summary>
     private DeviceMatrix Concat(WeightLoader weights, int cols, params (OperandRef Operand, int Rows)[] parts)
     {
-        var sources = parts.Select(p => weights.DeviceSource(p.Operand, p.Rows, cols)).ToArray();
         int rows = parts.Sum(p => p.Rows);
+        // 4-bit when every part is, in one format: elements and block scales
+        // stack by rows, and each row keeps its own part's tensor scale.
+        var fp4 = parts.Select(p => Fp4Of(weights, p.Operand, p.Rows, cols, project: true)).ToArray();
+        if (fp4.All(f => f is not null) && fp4.Select(f => f!.Type).Distinct().Count() == 1)
+        {
+            var packed = fp4.SelectMany(f => f!.Packed).ToArray();
+            var scales = fp4.SelectMany(f => f!.Scales).ToArray();
+            var rowScale = fp4.SelectMany(f => f!.RowScale).ToArray();
+            return UploadFp4(new Fp4Source(packed, scales, rowScale, fp4[0]!.Type), rows, cols);
+        }
+        var sources = parts.Select(p => weights.DeviceSource(p.Operand, p.Rows, cols)).ToArray();
         if (sources.All(s => s.Bf16 is not null))
         {
             var all = new ushort[(long)rows * cols];
@@ -1195,7 +1852,7 @@ public sealed class GpuEngine : IDisposable
         public static extern int amqe_linear(IntPtr e, IntPtr w, int wType, int n, int k,
             IntPtr x, int ldx, int rows, IntPtr y, int ldy,
             IntPtr bias, IntPtr residual, int ldr, float resScale, int act, int glu, IntPtr raw,
-            IntPtr normW, float normOff, IntPtr normBias, float normEps, int normKind);
+            IntPtr normW, float normOff, IntPtr normBias, float normEps, int normKind, IntPtr wScales, IntPtr rowScale);
 
         [DllImport(Lib)]
         public static extern int amqe_embed(IntPtr e, IntPtr table, int wType, IntPtr tokens, int rows, int hidden,
@@ -1223,7 +1880,11 @@ public sealed class GpuEngine : IDisposable
         public static extern int amqe_gdn(IntPtr e, IntPtr proj, int ldp, int rows, int keyDim, int valueDim,
             int nk, int nv, int kd, int vd, IntPtr convW, int kernel, IntPtr history,
             IntPtr aLog, IntPtr dtBias, IntPtr normW, float normEps,
-            IntPtr state, IntPtr conv, IntPtr qk, IntPtr gb, IntPtr output);
+            IntPtr state, IntPtr conv, IntPtr qk, IntPtr gb, IntPtr output, IntPtr stateSnap, IntPtr histSnap);
+
+        [DllImport(Lib)] public static extern int amqe_set_int(IntPtr e, IntPtr p, int v);
+        [DllImport(Lib)] public static extern int amqe_argmax(IntPtr e, IntPtr x, int n, IntPtr output, IntPtr output2);
+        [DllImport(Lib)] public static extern int amqe_set_row_invariant(IntPtr e, int on);
 
         [DllImport(Lib)]
         public static extern int amqe_logit_post(IntPtr e, IntPtr logits, long count, float mult, int hasMult, float cap);
@@ -1271,8 +1932,26 @@ public sealed class GpuSequence
 
     internal IntPtr Pos;
     internal readonly IntPtr[] K, V, State, Conv;
+    internal IntPtr[]? MarkState, MarkConv;
     internal int KvCapacity;
     internal bool Released;
+
+    // The MTP drafter's side: its KV cache and position, the final-normed hidden
+    // state of the last position (which pairs with the token chosen after it),
+    // and whether its cache has kept up with every position (a batch step does
+    // not update it).
+    internal IntPtr MtpK, MtpV, MtpPos, MtpPending, MarkMtpPending;
+    internal bool MtpValid, MarkMtpValid;
+
+    // A verify's recurrent state after each of its rows but the last, by layer,
+    // so keeping only its first rows restores the state there.
+    internal IntPtr[]? SnapState, SnapConv;
+    internal int SnapRows;
+    internal int VerifyFrom, VerifyRows;
+
+    /// <summary>The position <see cref="GpuEngine.Mark"/> last saved, or -1:
+    /// <see cref="GpuEngine.Rewind"/> takes the sequence back there.</summary>
+    public int MarkedAt { get; internal set; } = -1;
 
     /// <summary>Tokens the sequence has consumed.</summary>
     public int Position { get; internal set; }

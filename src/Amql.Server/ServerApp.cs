@@ -1125,6 +1125,10 @@ public static class ServerApp
     /// returned the same result twice.</summary>
     internal static bool RefuseStaleCalls = true;
 
+    /// <summary>Set false (<c>--keep-line-marks</c>) to show the model tool results with the line
+    /// decoration they came with (line numbers, hashes) instead of plain.</summary>
+    internal static bool PlainToolResults = true;
+
     /// <summary>Renders a request into a turn: thinking from
     /// <c>chat_template_kwargs.enable_thinking</c>, then the reasoning effort
     /// (<c>none</c>/<c>minimal</c> turn it off), then the server's default;
@@ -1176,6 +1180,35 @@ public static class ServerApp
             default:
                 throw new ApiException(400, $"unknown '{param}' type '{type}' (text, json_object, json_schema)", param: param);
         }
+    }
+
+    /// <summary>
+    /// Where the user's current turn begins: the first of the latest run of user messages that
+    /// follows a finished reply (or the start), or -1. A user message that comes after a tool result
+    /// is a note inside the turn (a harness's "[System] same action 3 times"), and the user messages
+    /// right after the user's own (a harness's retrieved notes and hints) belong to it, so neither
+    /// hides the task the user gave.
+    /// </summary>
+    public static int TurnStart(IReadOnlyList<ChatMessage> messages)
+    {
+        for (int i = messages.Count - 1; i >= 0; i--)
+        {
+            if (messages[i].Role != "user")
+            {
+                continue;
+            }
+            int before = i - 1;
+            while (before >= 0 && messages[before].Role == "user")
+            {
+                before--;
+            }
+            if (before < 0 || messages[before].Role != "tool")
+            {
+                return before + 1;
+            }
+            i = before + 1;   // a note after a tool result: keep looking further back
+        }
+        return -1;
     }
 
     private static ChatTurn Turn(ModelHost model, JsonElement body, ServerSettings settings, List<ChatMessage> messages,
@@ -1258,6 +1291,16 @@ public static class ServerApp
             messages = messages.Take(messages.Count - 1).ToList();
         }
 
+        // The line decoration of the tool results (line numbers, hashes), so a value that copies
+        // a file as it was shown is written as the file; and, unless --keep-line-marks, the model is
+        // shown the results without it.
+        var decoration = tools is { Count: > 0 } ? LineDecoration.Learn(messages.Where(m => m.Role == "tool").Select(m => m.Content)) : null;
+        var stale = tools is { Count: > 0 } && RefuseStaleCalls ? RepeatedCalls.Stale(messages) : null;
+        if (decoration is not null && PlainToolResults)
+        {
+            messages = messages.Select(m => m.Role == "tool" ? m with { Content = decoration.Plain(m.Content, out _) } : m).ToList();
+        }
+
         int[] prompt;
         try
         {
@@ -1271,7 +1314,7 @@ public static class ServerApp
         }
         // The current task, for the mentioned-parameter rule: the user's latest message and every
         // tool result since (a harness's hint such as "pass overwrite: true" may be a few calls back).
-        int lastUser = messages.FindLastIndex(m => m.Role == "user");
+        int lastUser = TurnStart(messages);
         var since = messages.Skip(Math.Max(lastUser, 0)).ToList();
         string recent = string.Join("\n", since.Where(m => m.Role is "user" or "tool").Select(m => m.Content));
         var p = Sampling(body, maxTokens, settings, model.Defaults) with
@@ -1279,12 +1322,10 @@ public static class ServerApp
             Forced = forced, Thinking = thinking, Json = format?.Schema, Tools = tools,
             Recent = string.Join("\n", since.Where(m => m.Role == "user").Select(m => m.Content)),
             RecentResults = string.Join("\n", since.Where(m => m.Role == "tool").Select(m => m.Content)),
+            Task = lastUser >= 0 ? messages[lastUser].Content : null,
+            CalledSince = since.SelectMany(m => m.ToolCalls ?? []).Select(c => c.Name).ToHashSet(StringComparer.Ordinal),
             NGram = Packs(body, model, settings, recent), Prefill = prefill,
         };
-        // The line decoration of the tool results (line numbers, hashes), so a value that copies
-        // a file as it was shown is written as the file.
-        var decoration = tools is { Count: > 0 } ? LineDecoration.Learn(messages.Where(m => m.Role == "tool").Select(m => m.Content)) : null;
-        var stale = tools is { Count: > 0 } && RefuseStaleCalls ? RepeatedCalls.Stale(messages) : null;
         return new ChatTurn(prompt, p, tools, parallel, decoration, stale);
     }
 
@@ -1370,7 +1411,7 @@ public static class ServerApp
         // Closing calls alone leaves a small model in the middle of writing one (it writes the markup
         // out as text); a lead-in that says why puts it on to the answer. It is part of the reply.
         string lead = (before.Length > 0 && !before.EndsWith("</think>") ? "\n\n" : "") +
-            $"That {refused} call has already returned the same result twice, so instead of running it again, here is what it showed:";
+            $"That {refused} call has already returned the same result twice, so instead of making it again, here is where things stand:";
         before += lead;
         foreach (var e in reply.Feed(lead))
         {

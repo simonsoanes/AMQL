@@ -144,6 +144,11 @@ public static class Sampler
             return ArgMaxOf(logits);
         }
 
+        if (config.TopK > 0 && config.TopK <= FastTopK && config.TopK < logits.Length)
+        {
+            return SampleTopK(logits, config, rng);
+        }
+
         var probs = SoftmaxAndFilter(logits, config, out _);
         if (probs is null)
         {
@@ -151,6 +156,205 @@ public static class Sampler
         }
 
         return MultinomialDraw(probs, rng);
+    }
+
+    /// <summary>The same draw over a probability for every token of the
+    /// vocabulary: what top-k sampling did before <see cref="SampleTopK"/>, kept
+    /// as its reference.</summary>
+    public static int SampleWholeVocabulary(ReadOnlySpan<float> logits, SamplingConfig config, Random rng)
+    {
+        if (config.Temperature <= 0f)
+        {
+            return ArgMaxOf(logits);
+        }
+        var probs = SoftmaxAndFilter(logits, config, out _);
+        return probs is null ? ArgMaxOf(logits) : MultinomialDraw(probs, rng);
+    }
+
+    /// <summary>The largest top-k <see cref="SampleTopK"/> takes; past it the
+    /// whole-vocabulary path runs.</summary>
+    private const int FastTopK = 256;
+
+    /// <summary>
+    /// Top-k (then top-p) sampling without a probability for every token: the
+    /// same filter and draw as <see cref="SoftmaxAndFilter"/> and
+    /// <see cref="MultinomialDraw"/>, but only the survivors get a probability.
+    /// The vocabulary is read three times, vectorised: for the k largest
+    /// logits, for the softmax's denominator, and for the survivors.
+    /// Probabilities are still normalised over the whole vocabulary, so top-p
+    /// cuts where it did. The denominator is summed in vector lanes rather than
+    /// in index order, so the probabilities differ from the other path's by
+    /// rounding.
+    /// </summary>
+    private static int SampleTopK(ReadOnlySpan<float> logits, SamplingConfig config, Random rng)
+    {
+        int n = logits.Length;
+        int k = config.TopK;
+        float invTemp = 1f / config.Temperature;
+        int width = System.Numerics.Vector<float>.Count;
+        bool vectors = System.Numerics.Vector.IsHardwareAccelerated;
+        ref float start = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(logits);
+
+        // The k largest logits, ascending, so top[0] is the k-th largest; most
+        // logits fail the first comparison, a vector at a time.
+        Span<float> top = stackalloc float[k];
+        top.Fill(float.NegativeInfinity);
+        int i = 0;
+        if (vectors)
+        {
+            for (; i <= n - width; i += width)
+            {
+                var block = System.Numerics.Vector.LoadUnsafe(ref start, (nuint)i);
+                if (!System.Numerics.Vector.GreaterThanAny(block, new System.Numerics.Vector<float>(top[0])))
+                {
+                    continue;
+                }
+                for (int j = i; j < i + width; j++)
+                {
+                    Keep(top, logits[j]);
+                }
+            }
+        }
+        for (; i < n; i++)
+        {
+            Keep(top, logits[i]);
+        }
+        float cutoff = top[0];
+        float maxScaled = top[k - 1] * invTemp;
+
+        // The softmax's denominator over the whole vocabulary. A block whose
+        // scaled logits are all more than 30 below the largest is skipped: all
+        // such terms together are under n·e^-30 (2.3e-8 of the sum for a 248k
+        // vocabulary), below the float rounding of the sum itself.
+        float sum = 0f;
+        i = 0;
+        if (vectors)
+        {
+            var scale = new System.Numerics.Vector<float>(invTemp);
+            var shift = new System.Numerics.Vector<float>(maxScaled);
+            var negligible = new System.Numerics.Vector<float>(maxScaled - 30f);
+            var acc = System.Numerics.Vector<float>.Zero;
+            for (; i <= n - width; i += width)
+            {
+                var scaled = System.Numerics.Vector.LoadUnsafe(ref start, (nuint)i) * scale;
+                if (System.Numerics.Vector.GreaterThanAny(scaled, negligible))
+                {
+                    acc += System.Numerics.Vector.Exp(scaled - shift);
+                }
+            }
+            sum = System.Numerics.Vector.Sum(acc);
+        }
+        for (; i < n; i++)
+        {
+            sum += MathF.Exp(logits[i] * invTemp - maxScaled);
+        }
+        if (sum <= 0f || float.IsNaN(sum) || float.IsInfinity(sum))
+        {
+            return ArgMaxOf(logits);
+        }
+        float invSum = 1f / sum;
+
+        // The survivors, in index order: every logit at or above the cutoff (ties
+        // at it all kept) whose probability is not zero.
+        var kept = new List<(int Index, float P)>(k + 8);
+        i = 0;
+        if (vectors)
+        {
+            var floor = new System.Numerics.Vector<float>(cutoff);
+            for (; i <= n - width; i += width)
+            {
+                var block = System.Numerics.Vector.LoadUnsafe(ref start, (nuint)i);
+                if (!System.Numerics.Vector.GreaterThanOrEqualAny(block, floor))
+                {
+                    continue;
+                }
+                for (int j = i; j < i + width; j++)
+                {
+                    Survivor(kept, logits[j], j, cutoff, invTemp, maxScaled, invSum);
+                }
+            }
+        }
+        for (; i < n; i++)
+        {
+            Survivor(kept, logits[i], i, cutoff, invTemp, maxScaled, invSum);
+        }
+        if (kept.Count == 0)
+        {
+            return ArgMaxOf(logits);
+        }
+
+        // Top-p: the shortest run, by descending probability (ties in index order),
+        // whose mass reaches top-p.
+        if (config.TopP is > 0f and < 1f)
+        {
+            var ranked = Enumerable.Range(0, kept.Count).ToArray();
+            Array.Sort(ranked, (a, b) => kept[a].P != kept[b].P ? kept[b].P.CompareTo(kept[a].P) : a.CompareTo(b));
+            float cumulative = 0f;
+            int keep = ranked.Length;
+            for (int r = 0; r < ranked.Length; r++)
+            {
+                cumulative += kept[ranked[r]].P;
+                if (cumulative >= config.TopP)
+                {
+                    keep = r + 1;
+                    break;
+                }
+            }
+            if (keep < ranked.Length)
+            {
+                var stays = new bool[kept.Count];
+                for (int r = 0; r < keep; r++)
+                {
+                    stays[ranked[r]] = true;
+                }
+                kept = kept.Where((_, at) => stays[at]).ToList();
+            }
+        }
+
+        double total = 0;
+        foreach (var (_, p) in kept)
+        {
+            total += p;
+        }
+        double draw = rng.NextDouble() * total;
+        double accumulated = 0;
+        foreach (var (index, p) in kept)
+        {
+            accumulated += p;
+            if (draw <= accumulated)
+            {
+                return index;
+            }
+        }
+        return kept[^1].Index;
+
+        static void Keep(Span<float> top, float v)
+        {
+            if (!(v > top[0]))
+            {
+                return;
+            }
+            int at = 0;
+            while (at + 1 < top.Length && top[at + 1] < v)
+            {
+                top[at] = top[at + 1];
+                at++;
+            }
+            top[at] = v;
+        }
+
+        static void Survivor(List<(int, float)> kept, float logit, int index, float cutoff, float invTemp, float maxScaled, float invSum)
+        {
+            if (!(logit >= cutoff) || float.IsNegativeInfinity(logit))
+            {
+                return;
+            }
+            float p = MathF.Exp(logit * invTemp - maxScaled) * invSum;
+            if (p > 0f)
+            {
+                kept.Add((index, p));
+            }
+        }
     }
 
     private static (int Token, LogprobsResult Logprobs) SampleWithStats(

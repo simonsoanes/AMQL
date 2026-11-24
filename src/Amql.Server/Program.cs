@@ -48,11 +48,13 @@ for (int i = 0; i < args.Length; i++)
         case "--max-tokens": maxTokens = int.Parse(Next()); break;
         case "--no-warm": warm = false; break;
         case "--no-batch": TextGenerator.BatchingEnabled = false; break;
+        case "--no-prefix-reuse": BatchScheduler.PrefixReuse = false; break;
         case "--no-loop-guard": TextGenerator.LoopGuardEnabled = false; break;
         case "--free-tool-calls": TextGenerator.ToolGrammarEnabled = false; break;
         case "--no-mention-rule": TextGenerator.MentionRuleEnabled = false; break;
         case "--no-announce-rule": GenerationRun.AnnounceRuleEnabled = false; break;
         case "--allow-repeated-calls": ServerApp.RefuseStaleCalls = false; break;
+        case "--keep-line-marks": ServerApp.PlainToolResults = false; break;
         case "--ngram-pack":
         {
             var pack = Amql.Inference.NGram.NGramPack.Load(Next());
@@ -88,7 +90,7 @@ for (int i = 0; i < args.Length; i++)
                 amql-server --model [id=]<container-dir> [--model …] [--urls http://127.0.0.1:8000]
                             [--api-key KEY] [--max-tokens N] [--no-warm]
                             [--adapter [id=]<dir>[,<dir>…]] [--think] [--temperature T] [--top-p P] [--top-k K]
-                            [--config <models.json>] [--no-batch] [--batch-bf16] [--no-loop-guard] [--free-tool-calls] [--no-mention-rule]
+                            [--config <models.json>] [--no-batch] [--no-prefix-reuse] [--batch-bf16] [--no-loop-guard] [--free-tool-calls] [--no-mention-rule]
 
                 Serves each container on the endpoints it can answer:
                   Von decision model          POST /v1/decisions, /v1/systemone, /api/v1/decisions (jevai envelope)
@@ -107,6 +109,8 @@ for (int i = 0; i < args.Length; i++)
                   --temperature, --top-p, --top-k   sampling defaults for requests that leave them out
                   --no-batch    one request at a time per model, even on the GPU engine (which otherwise
                                 batches up to 8 requests per step)
+                  --no-prefix-reuse  prefill every prompt whole (by default a prompt that starts like an
+                                earlier one, up to that one's last turn, picks up from the state saved there)
                   --free-tool-calls  do not hold calls to the request's tools (by default a call names a
                                 declared tool and its parameters, gives the required ones, and typed values parse)
                   --no-mention-rule  do not open an optional parameter the reply's thinking or the newest
@@ -118,6 +122,7 @@ for (int i = 0; i < args.Length; i++)
                                 how a chosen pack is blended (a request may set "ngram_lambda")
                   --allow-repeated-calls  let a reply make a call that has already returned the same result twice
                                 (by default it is generated again with calls closed, and answers)
+                  --keep-line-marks       show tool results with their line decoration (line numbers, hashes) instead of plain
                   --no-announce-rule  let a reply with tools end on a colon ("now let me build it:") with no
                                 call (by default the call opens there when the model gives it any chance)
                   --no-loop-guard  let a reply repeat itself to its token limit (by default a reply whose

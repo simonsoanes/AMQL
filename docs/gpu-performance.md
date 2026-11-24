@@ -134,13 +134,40 @@ launch, the logits copy and the argmax.
   - One warp streams 16-byte runs of a weight row against up to eight activation
     rows.
   - Each warp carries two rows when decoding, so the loads of both are in flight.
-  - Split-K across warps for narrow matrices: 1,024 outputs on 170 SMs would
-    otherwise be six warps per SM.
+  - Split-K across warps. For one or two activation rows (decode), four warps share
+    each output row, and eight when the matrix is so narrow (n = 1,024) that four
+    leave fewer than ~24 warps per SM. A sweep of 1/2/4/8 warps per row, 1/2/4
+    output rows per warp, and prefetch on or off, over every Qwen 3.5 0.8B and 4B
+    projection on an RTX 5090, found this within 2% of the best for each shape.
+    From three rows the FMAs per weight grow, and fewer warps per row win (about
+    32 warps per SM). `AMQE_GEMV_SPLIT=1|2|4|8` fixes it.
   - A grid-stride loop for the 248k-row head.
   - Epilogues fused in: bias, activation, the gate·up product, and the residual add,
     done in place.
-- **Norms fused into the projection that reads them.** Each block normalises its
-  activation rows into shared memory, which replaces a launch per norm.
+- **Norms fused into the projection that reads them.**
+  - An RMS norm without a bias is applied inside the dot loop. Each warp reads x and
+    the norm's weights from cache and sums x² over its own columns, alongside the
+    products. 1/rms is one number per row, applied in the epilogue. Nothing waits on
+    a block-wide pass before the weights start streaming.
+  - Staging the normalised rows in shared memory first, as every block used to,
+    cost 13% of these projections' bandwidth.
+  - Any other norm (LayerNorm, or one with a bias) is still staged that way.
+- **What the GEMV reaches** on Qwen 3.5 4B at one row, with the RTX 5090 otherwise
+  idle. It is measured over weight copies too big for L2, as one graph of
+  back-to-back projections.
+
+  | Projection | Before | Now |
+  |---|---|---|
+  | GDN in (norm fused) | 1,425 GB/s | 1,664 GB/s |
+  | Attention qkv (norm fused) | 1,481 GB/s | 1,658 GB/s |
+  | FFN gate·up (norm fused) | 1,397 GB/s | 1,661 GB/s |
+  | FFN down | 1,477 GB/s | 1,641 GB/s |
+  | Out projections | 1,650 GB/s | 1,670 GB/s |
+  | Head | 1,683 GB/s | 1,706 GB/s |
+
+  Across a token's projections that is 5.7 ms → 5.05 ms. With a game sharing the
+  card, the served model decoded at ~85 tok/s against ~68 tok/s on the old kernels,
+  measured old and new alternately under the same load.
 - **Programmatic dependent launch.** Every kernel lets the next one start early. A
   projection prefetches its first weight rows into L2 before waiting on the kernel
   before it (`griddepcontrol.wait`), so DRAM keeps streaming across kernel
@@ -187,7 +214,131 @@ launch, the logits copy and the argmax.
   - When decoding, the conv, the q/k L2 norm and decay/β are one kernel, and the
     recurrence and the gated RMSNorm are another.
 
+## Speculative decoding
+
+A model that ships an MTP drafter (Qwen 3.5's `mtp.*` tensors: one decoder layer, a
+projector and three norms) drafts tokens ahead, and the model checks them all in one
+pass. Decode reads every weight once per pass whether it has one row or eight, so
+each draft the model would have chosen anyway is a token for the price of a GEMV row.
+
+- **The drafter** runs on the device with a KV cache of its own. It reads the
+  final-normed hidden state at position t beside the embedding of token t+1,
+  `fc([norm(embed(t+1)) ; norm(h_t)])`, and through one layer, its norm and the
+  shared head predicts t+2. Each draft is fed back for the next. It catches up on
+  every prompt chunk and every kept verify row, so its cache holds every true pair.
+- **A draft reads 32k of the head's 248k rows** (`AMQL_MTP_VOCAB`; a BPE vocabulary
+  runs roughly from common to rare). As many drafts hold as with the whole head, at
+  ~0.37 ms a draft instead of ~1.05 ms.
+- **The verify** is the chosen token and the drafts as rows of one pass, each row's
+  logits kept. With `RowInvariant` (on with a drafter) the GEMV's split no longer
+  depends on the row count, a fused RMS norm runs in the dot loop at any row count,
+  and the Gated DeltaNet takes its one-launch path up to 8 rows, so each row's logits
+  are bit for bit what a one-token step gives. Attention already was.
+- **A miss** keeps the rows before it: each Gated DeltaNet layer saved its state and
+  conv history after every verify row, `Accept` restores the one at the last row
+  kept, and the position moves back. The KV cache needs nothing; later rows are
+  overwritten.
+- **Suffix drafts** (server): when the reply's last 8 tokens appeared earlier in the
+  context, what followed them there is drafted instead. These cost nothing to make
+  and suit an agent copying paths and code.
+
+Qwen 3.5 4B, RTX 5090, greedy code generation (300 tokens, `GpuEngine` alone):
+
+| Drafts per step | tok/s | Tokens per step | Draft | Verify |
+|---|---|---|---|---|
+| none | 174 | 1 | | 5.7 ms |
+| 2 | 303 | 2.56 | 0.78 ms | 6.85 ms |
+| 3 | 325 | 3.02 | 1.11 ms | 7.42 ms |
+| 4 | 330 | 3.38 | 1.43 ms | 7.95 ms |
+
+Served (3 drafts, thinking on, idle GPU), the replies are identical to those without
+speculation, greedy and seeded sampling alike. A 400-token essay runs 1.38–1.41×
+faster and a 600-token sampled reply to a real 23k-token Hydra request 1.65×. Prose
+under sampling keeps about half the drafts.
+
+`AMQL_MTP_DRAFTS` (default 3, 0 off), `AMQL_SUFFIX_DRAFT` (default 8, 0 off),
+`AMQL_MTP=0` (no drafter, and no row invariance). Speculation runs while one reply
+runs alone. A batch step passes the drafter by, and that sequence drafts again only
+after a reset or a rewind.
+
+## 4-bit weights (NVFP4, MXFP4)
+
+Decode reads every weight once a token, so it runs as fast as the weights are
+small. The engine runs projections stored at 4 bits as they are stored.
+
+- **Compile once.** `amql-cli quantise <container> --out <dir> --format nvfp4|mxfp4`
+  writes every projection of the decoder stack and the MTP drafter as FP4 E2M1
+  elements with their block scales. That is q/k/v/o, the Gated DeltaNet's
+  in- and out-projections, the FFN and the drafter's fc. NVFP4 has an E4M3 scale
+  per 16 and an F32 tensor scale; MXFP4 has an E8M0 scale per 32. The embedding,
+  the head, norms and convolutions stay as they were. On Qwen 3.5 4B the stack
+  and drafter go from 7.38 GB to 2.08 GB (NVFP4) or 1.96 GB (MXFP4), in about 80 s.
+- **Every runtime then multiplies by the same weights.** The operand store
+  decodes them for the managed path, and the GPU engine reads them as stored. The
+  two agree to f32 rounding, as at full precision (tested on both formats). An
+  Entail adapter runs its own program over the token stream at full precision,
+  whatever the model's weights are. A drafter's acceptance measured on the 4-bit
+  model holds wherever it runs.
+- **Or quantise at load.** `AMQL_GPU_FORMAT=nvfp4|mxfp4` (`--gpu-format` in
+  `amql-cli`) quantises an ordinary container's projections as the engine uploads
+  them. It uses the same quantiser on the same set, so the engine's logits are bit
+  for bit those of the compiled container. The managed path still reads the
+  originals. `AMQL_GPU_FORMAT_HEAD=1` quantises the head as well (the engine only).
+- **Decode** decodes FP4 in registers. A lane loads 16 bytes (32 elements) a step,
+  and a byte permute turns four elements at a time into f32s: E2M1's magnitudes
+  are f32s whose low two bytes are zero. There are no conversion instructions,
+  which run at a fraction of the integer rate. The block scale multiplies each
+  8-element partial sum, and the tensor scale multiplies each output row's sum.
+  Stacked weights (q/k/v) keep each part's own tensor scale per row.
+- **Short rows are costly.** A 4-bit row of 2,560 columns is only 1,280 bytes, so
+  a row's fixed cost (the warps' reduction, the epilogue) weighs four times as
+  much. A warp takes four output rows, and rows under 4,096 wide take one warp
+  each (four from 4,096).
+- **Code size matters at several rows.** Past one activation row, the 4-bit step
+  loop is not unrolled. Unrolling it thrashed the instruction cache: two rows cost
+  twice one.
+- **Prompts** decode the weight to BF16 (exact: element × block scale has at most
+  6 significant bits) for the BF16 tensor-core GEMM, and apply the tensor scale in
+  the epilogue. With `ExactPrefill` they decode to f32 for the SGEMM instead.
+- **Verify rows stay bit-identical to steps** over 4-bit weights: the split rule
+  is fixed per shape, never tuned by timing, so a reply is the same from run to run.
+
+Qwen 3.5 4B decode GEMVs on an RTX 5090, per token (all of them, head included):
+
+| Weights | 1 row | 4 rows |
+|---|---|---|
+| BF16 | 5.06 ms (1,661 GB/s) | 5.40 ms |
+| NVFP4 | 2.36 ms (1,002 GB/s) | 4.76 ms |
+| MXFP4 | 2.46 ms (906 GB/s) | 4.67 ms |
+
+Qwen 3.5 4B end to end: compiled containers (the head stays BF16), greedy code
+generation (`GpuEngine` alone, idle GPU). Quality is teacher-forced on 4,095
+tokens of this repo's docs and C#:
+
+| Weights | Decode | With 2 MTP drafts | Perplexity | Top-1 as BF16 |
+|---|---|---|---|---|
+| BF16 | 169 tok/s | 316 tok/s | 7.54 | — |
+| NVFP4 | 272 tok/s | 348 tok/s | 7.86 (+4.3%) | 90.4% |
+| MXFP4 | 267 tok/s | 345 tok/s | 8.24 (+9.4%) | 88.0% |
+
+Speculation gains less at 4 bits, because each verify row costs about 1 ms against
+0.2 ms at BF16. Two drafts do best.
+
+The 4-bit kernels move fewer bytes per second than BF16: the decode is work BF16
+does not do. A 4-bit row also finishes in a quarter of the time, so its fixed
+costs show.
+
 ## What would go further
+
+- **Faster 4-bit GEMVs.** They reach 0.9–1.0 TB/s against 1.66 for BF16, and
+  each extra activation row costs ~0.6 ms a token, where BF16 hides it under
+  memory. The kernel is bound by issue and latency, not bandwidth. Candidates are
+  fewer registers per warp (more warps to hide latency), the RMS norm applied once
+  per row outside the dot loop, and packed half2 products.
+
+- **A cheaper verify.** A row costs ~0.55 ms: four rows run at 7.4 ms against 5.7 ms
+  for one. Part of that is the decode split rule at 3+ rows, and part is a verify
+  launched kernel by kernel rather than from a captured graph.
 
 - **Smaller weights.** Decode is bound by the bytes streamed per token. 8-bit or FP4
   weights read in the GEMV would roughly halve or quarter them, at the cost of

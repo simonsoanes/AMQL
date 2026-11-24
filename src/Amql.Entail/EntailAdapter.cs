@@ -254,16 +254,8 @@ public sealed class EntailVerdict
         HashSet<int>? below = null;
         if (_prefers.Count > 0)
         {
-            float max = float.NegativeInfinity;
-            foreach (float v in logits)
-            {
-                max = Math.Max(max, v);
-            }
-            double sum = 0;
-            foreach (float v in logits)
-            {
-                sum += Math.Exp(v - max);
-            }
+            float max = logits[FirstMax(logits)];
+            double sum = SumExp(logits, max);
             foreach (var (token, threshold, timesPrior, strict) in _prefers)
             {
                 if (timesPrior && prior is null)
@@ -284,16 +276,35 @@ public sealed class EntailVerdict
                 }
             }
         }
-        int free = 0, held = -1;
-        for (int i = 0; i < logits.Length; i++)
+        // The partner's own choice, and the best the rules leave (the first of equals).
+        // Only the tokens the rules name are visited, not the whole vocabulary.
+        int n = logits.Length;
+        int free = FirstMax(logits), held;
+        bool Kept(int t) => t >= 0 && t < n && Permits(t) && below?.Contains(t) != true;
+        if (Allowed is not null)
         {
-            if (logits[i] > logits[free])
+            held = -1;
+            foreach (int t in Allowed)
             {
-                free = i;
+                if (Kept(t) && (held < 0 || logits[t] > logits[held] || (logits[t] == logits[held] && t < held)))
+                {
+                    held = t;
+                }
             }
-            if (Permits(i) && below?.Contains(i) != true && (held < 0 || logits[i] > logits[held]))
+        }
+        else if (Kept(free))
+        {
+            held = free;
+        }
+        else
+        {
+            held = -1;
+            for (int i = 0; i < n; i++)
             {
-                held = i;
+                if (Kept(i) && (held < 0 || logits[i] > logits[held]))
+                {
+                    held = i;
+                }
             }
         }
         // Rules that leave nothing can't be kept, so the partner goes free.
@@ -306,20 +317,117 @@ public sealed class EntailVerdict
         {
             return (held, held == free ? EntailTokenSource.Partner : EntailTokenSource.Narrowed);
         }
-        var masked = logits.ToArray();
+        float[] masked;
         bool narrowed = false;
-        if (Allowed is not null || Banned.Count > 0 || below is not null)
+        if (Allowed is not null)
         {
-            for (int i = 0; i < masked.Length; i++)
+            masked = new float[n];
+            Array.Fill(masked, float.NegativeInfinity);
+            int kept = 0;
+            foreach (int t in Allowed)
             {
-                if (!Permits(i) || below?.Contains(i) == true)
+                if (Kept(t))
                 {
-                    masked[i] = float.NegativeInfinity;
+                    masked[t] = logits[t];
+                    kept++;
+                }
+            }
+            narrowed = kept < n;
+        }
+        else
+        {
+            masked = logits.ToArray();
+            foreach (int t in Banned.Concat(below ?? Enumerable.Empty<int>()))
+            {
+                if (t >= 0 && t < n)
+                {
+                    masked[t] = float.NegativeInfinity;
                     narrowed = true;
                 }
             }
         }
         return (sample(masked), narrowed ? EntailTokenSource.Narrowed : EntailTokenSource.Partner);
+    }
+
+    /// <summary>The index of the largest logit, the first of equals, as a scalar
+    /// <c>logits[i] &gt; logits[best]</c> scan from 0 finds it; vectorised.</summary>
+    private static int FirstMax(ReadOnlySpan<float> logits)
+    {
+        int n = logits.Length, width = System.Numerics.Vector<float>.Count;
+        if (!System.Numerics.Vector.IsHardwareAccelerated || n < 4 * width || float.IsNaN(logits[0]))
+        {
+            int best = 0;
+            for (int i = 1; i < n; i++)
+            {
+                if (logits[i] > logits[best])
+                {
+                    best = i;
+                }
+            }
+            return best;
+        }
+        ref float start = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(logits);
+        var negInf = new System.Numerics.Vector<float>(float.NegativeInfinity);
+        var top = negInf;
+        int at = 0;
+        for (; at <= n - width; at += width)
+        {
+            var v = System.Numerics.Vector.LoadUnsafe(ref start, (nuint)at);
+            // NaN never wins the scalar scan.
+            top = System.Numerics.Vector.Max(top, System.Numerics.Vector.ConditionalSelect(System.Numerics.Vector.Equals(v, v), v, negInf));
+        }
+        float max = float.NegativeInfinity;
+        for (int j = 0; j < width; j++)
+        {
+            max = Math.Max(max, top[j]);
+        }
+        for (; at < n; at++)
+        {
+            if (logits[at] > max)
+            {
+                max = logits[at];
+            }
+        }
+        for (int i = 0; i < n; i++)
+        {
+            if (logits[i] == max)
+            {
+                return i;
+            }
+        }
+        return 0;
+    }
+
+    /// <summary>Σ e^(logit − max) over the vocabulary, in double as the threshold
+    /// test needs. Terms more than 60 below the largest are left out: together
+    /// they are under n·e^-60 of the sum.</summary>
+    private static double SumExp(ReadOnlySpan<float> logits, float max)
+    {
+        int n = logits.Length, width = System.Numerics.Vector<float>.Count;
+        double sum = 0;
+        int i = 0;
+        if (System.Numerics.Vector.IsHardwareAccelerated && !float.IsInfinity(max) && !float.IsNaN(max))
+        {
+            ref float start = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(logits);
+            var negligible = new System.Numerics.Vector<float>(max - 60f);
+            for (; i <= n - width; i += width)
+            {
+                var v = System.Numerics.Vector.LoadUnsafe(ref start, (nuint)i);
+                if (!System.Numerics.Vector.GreaterThanAny(v, negligible))
+                {
+                    continue;
+                }
+                for (int j = i; j < i + width; j++)
+                {
+                    sum += Math.Exp(logits[j] - max);
+                }
+            }
+        }
+        for (; i < n; i++)
+        {
+            sum += Math.Exp(logits[i] - max);
+        }
+        return sum;
     }
 
     /// <summary>This verdict with one more token ruled out.</summary>
