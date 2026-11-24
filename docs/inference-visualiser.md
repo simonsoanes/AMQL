@@ -200,10 +200,6 @@ an aggregate-only mode keeps just the per-node reductions for very long runs.
 
 ## 11. Known limitations of what shipped
 
-- **The rendering has not been judged by a human for the lens, attention or live
-  panels.** The window has been confirmed to open and load a real trace, and the
-  stream tail has been proven against a file being actively appended to, but
-  nobody has clicked `▶ Run…` or looked at the two new panels.
 - **Prefill is not traced.** The recorder attaches after prefill, so the map shows
   decode steps only. For a long prompt that is the cheaper half of the run. The
   lens and attention hooks are inside `RunLayerInternal` and `StepForward`, so
