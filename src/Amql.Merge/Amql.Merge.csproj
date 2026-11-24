@@ -14,4 +14,9 @@
     <RootNamespace>Amql.Merge</RootNamespace>
   </PropertyGroup>
 
+  <ItemGroup>
+    <!-- GPTQ's calibration when none is given: this repository's docs and C#. -->
+    <EmbeddedResource Include="Calibration\default.txt" LogicalName="Amql.Merge.Calibration.default.txt" />
+  </ItemGroup>
+
 </Project>

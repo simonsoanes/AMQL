@@ -4,11 +4,9 @@ using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using Amql.Gui.Model;
+using Amql.Gui.Services;
 
 namespace Amql.Gui.Run;
-
-/// <summary>How to invoke amql-cli, resolved from <see cref="CliSettings"/>.</summary>
-public sealed record CliInvocation(string FileName, IReadOnlyList<string> PrefixArguments);
 
 /// <summary>
 /// Launches amql-cli as a child process and streams its output. Transforms and
@@ -30,46 +28,6 @@ public sealed class CliRunner
     private static readonly Regex PercentRegex = new(@"(?<![\w.])(\d{1,3}(?:[.,]\d+)?)\s*%", RegexOptions.Compiled);
     private static readonly Regex FractionRegex = new(@"\b(\d+)\s*/\s*(\d+)\b", RegexOptions.Compiled);
 
-    /// <summary>Resolves the CLI invocation, or throws with an actionable message.</summary>
-    public static CliInvocation Resolve(CliSettings settings)
-    {
-        if (!string.IsNullOrWhiteSpace(settings.CliExePath))
-        {
-            var exe = settings.CliExePath.Trim();
-            if (!File.Exists(exe))
-            {
-                throw new FileNotFoundException($"CLI executable not found: '{exe}'", exe);
-            }
-            return new CliInvocation(exe, Array.Empty<string>());
-        }
-
-        if (!string.IsNullOrWhiteSpace(settings.RepoPath))
-        {
-            var repo = settings.RepoPath.Trim();
-            var cliProject = Path.Combine(repo, "src", "Amql.Cli", "Amql.Cli.csproj");
-            if (!File.Exists(cliProject))
-            {
-                throw new FileNotFoundException(
-                    $"no src/Amql.Cli/Amql.Cli.csproj under repo path '{repo}' — set the CLI exe path or fix the repo path", cliProject);
-            }
-            return new CliInvocation("dotnet", new[] { "run", "--no-launch-profile", "--project", cliProject, "--" });
-        }
-
-        // No explicit exe and no repo path: try autodetect before giving up on
-        // PATH. This is what makes the shared bin/<Configuration>/ output
-        // useful — a CLI built beside the GUI is found with no configuration,
-        // which matters for windows that are not opened from a project (the
-        // inference visualiser launched via `amql-gui --trace`, say) and so
-        // have default settings.
-        if (CliAutoDetect.FindExe() is { } detected)
-        {
-            return new CliInvocation(detected, Array.Empty<string>());
-        }
-
-        // Last resort: amql-cli on PATH.
-        return new CliInvocation("amql-cli", Array.Empty<string>());
-    }
-
     /// <summary>
     /// Runs one command, invoking <paramref name="onLine"/> for every output
     /// line (on a thread-pool thread — marshal to the UI thread yourself) and
@@ -82,19 +40,20 @@ public sealed class CliRunner
         Action<string> onLine,
         Action<double>? onProgress,
         CancellationToken cancellationToken,
-        bool machineProgress = true)
+        bool machineProgress = true,
+        IReadOnlyDictionary<string, string>? environment = null)
     {
-        var invocation = Resolve(settings);
+        var invocation = ToolLocator.Require(ToolLocator.Cli);
 
         var argv = new List<string>(invocation.PrefixArguments);
-        if (settings.Device == "cpu") argv.Add("--cpu");
-        else if (settings.Device == "gpu") argv.Add("--gpu");
+        argv.AddRange(settings.GlobalArguments());
         // Ask for the machine-readable protocol: the CLI emits newline-delimited
         // ##amql-progress / ##amql-result JSON on stdout, which the parser below
         // binds to exactly. ParseProgress remains as a fallback for the
         // human-readable output the protocol does not cover.
         if (machineProgress) argv.Add("--progress");
-        argv.Add(command);
+        // Subcommands ("entail bench", "ngram build") are separate words on the command line.
+        argv.AddRange(command.Split(' ', StringSplitOptions.RemoveEmptyEntries));
         argv.AddRange(args);
 
         var psi = new ProcessStartInfo
@@ -104,15 +63,17 @@ public sealed class CliRunner
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             CreateNoWindow = true,
-            WorkingDirectory = !string.IsNullOrWhiteSpace(settings.RepoPath)
-                ? settings.RepoPath.Trim()
-                : Directory.GetCurrentDirectory(),
+            WorkingDirectory = invocation.WorkingDirectory,
             StandardOutputEncoding = Encoding.UTF8,
             StandardErrorEncoding = Encoding.UTF8,
         };
         foreach (var a in argv)
         {
             psi.ArgumentList.Add(a);
+        }
+        foreach (var (name, value) in environment ?? new Dictionary<string, string>())
+        {
+            psi.Environment[name] = value;
         }
         if (!string.IsNullOrWhiteSpace(settings.WeightsEnv))
         {
@@ -152,7 +113,7 @@ public sealed class CliRunner
         catch (Exception e)
         {
             throw new InvalidOperationException(
-                $"cannot start '{invocation.FileName}' — check the CLI settings in the project (exe path or repo path). {e.Message}", e);
+                $"cannot start '{invocation.FileName}': {e.Message}", e);
         }
         process.BeginOutputReadLine();
         process.BeginErrorReadLine();

@@ -103,12 +103,14 @@ public static class ServerApp
         app.Use(async (ctx, next) =>
         {
             var clock = System.Diagnostics.Stopwatch.StartNew();
+            var trace = ServerStats.Begin(ctx.Request.Method, ctx.Request.Path.Value ?? "");
             try
             {
                 await next(ctx);
             }
             finally
             {
+                ServerStats.End(trace, ctx.Response.StatusCode);
                 Log($"{ctx.Connection.RemoteIpAddress} {ctx.Request.Method} {ctx.Request.Path}{ctx.Request.QueryString} -> {ctx.Response.StatusCode} ({clock.ElapsedMilliseconds} ms)");
             }
         });
@@ -118,7 +120,8 @@ public static class ServerApp
             try
             {
                 if (settings.ApiKey is { } key &&
-                    (ctx.Request.Path.StartsWithSegments("/v1") || ctx.Request.Path.StartsWithSegments("/api")))
+                    (ctx.Request.Path.StartsWithSegments("/v1") || ctx.Request.Path.StartsWithSegments("/api") ||
+                     ctx.Request.Path.StartsWithSegments("/amql")))
                 {
                     string auth = ctx.Request.Headers.Authorization.ToString();
                     if (!System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(
@@ -152,6 +155,9 @@ public static class ServerApp
             ["status"] = "ok",
             ["models"] = new JsonArray(models.Select(m => (JsonNode?)m.Id).ToArray()),
         }, Json));
+
+        // What the server is doing, for a monitor: in-flight and recent requests, per-model totals.
+        app.MapGet("/amql/status", () => Results.Json(ServerStats.Snapshot(models), Json));
 
         app.MapGet("/v1/models", () => Results.Json(new JsonObject
         {
@@ -249,6 +255,16 @@ public static class ServerApp
     {
         var capable = models.Where(m => m.Capabilities.HasFlag(need)).ToList();
         string? name = body.TryGetProperty("model", out var m) && m.ValueKind == JsonValueKind.String ? m.GetString() : null;
+        var chosen = Choose(models, capable, name, need, lenientName);
+        if (ServerStats.Current is { } trace)
+        {
+            trace.Model = chosen.Id;
+        }
+        return chosen;
+    }
+
+    private static ModelHost Choose(IReadOnlyList<ModelHost> models, List<ModelHost> capable, string? name, Capability need, bool lenientName)
+    {
         if (name is not null && models.FirstOrDefault(x => x.Id == name) is { } named)
         {
             return named.Capabilities.HasFlag(need)
@@ -385,6 +401,10 @@ public static class ServerApp
             data.Add(new JsonObject { ["object"] = "embedding", ["index"] = i, ["embedding"] = embedding });
         }
         int tokens = inputs.Sum(x => x.Length);
+        if (ServerStats.Current is { } trace)
+        {
+            trace.PromptTokens += tokens;
+        }
         return Results.Json(new JsonObject
         {
             ["object"] = "list",
@@ -1484,7 +1504,14 @@ public static class ServerApp
         GenerationResult result;
         try
         {
-            result = model.Generator!.Generate(turn.Prompt, turn.Params, d => Read(reply.Feed(d)), enough.Token, logprobsTopK);
+            var trace = ServerStats.Current;
+            trace?.GenerateStarted();
+            result = model.Generator!.Generate(turn.Prompt, turn.Params, d =>
+            {
+                trace?.Delta();
+                Read(reply.Feed(d));
+            }, enough.Token, logprobsTopK);
+            trace?.GenerateFinished(result.PromptTokens, result.CompletionTokens, result.FinishReason);
         }
         catch (ArgumentException e)
         {

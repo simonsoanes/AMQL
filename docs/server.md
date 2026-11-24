@@ -9,8 +9,11 @@ dotnet build -c Release src/Amql.Server
 ./bin/Release/amql-server --model von=<von-container> --model chat=<qwen-container> --model emb=<embedding-container> \
                           --urls http://127.0.0.1:8000 [--api-key KEY] [--max-tokens N] [--no-warm] \
                           [--adapter [id=]<dir>[,<dir>…]] [--think] [--temperature T] [--top-p P] [--top-k K] \
-                          [--config <models.json>] [--no-batch] [--batch-bf16]
+                          [--config <models.json>] [--max-ram GB] [--gpu-memory GB] [--cpu] [--no-batch] [--batch-bf16]
 ```
+
+[AMQL Studio](amql-studio.md) starts and stops the server with the models you choose and shows what it is
+doing; everything below applies whichever way it is started.
 
 | Container | Endpoints |
 |---|---|
@@ -18,6 +21,7 @@ dotnet build -c Release src/Amql.Server
 | Embedding container (`convert-to-embedding`, an `embedding` surface) | `POST /v1/embeddings` |
 | Generative decoder with a chat template this build renders | `POST /v1/chat/completions`, `POST /v1/responses` — streaming (SSE) or not; tools and reasoning for Qwen3.5-family templates |
 | Every model | `GET /v1/models`, `GET /v1/models/{id}` (with `capabilities`, and for chat models `context_length`, `tools`, `thinking`, `adapters` and `defaults`), `GET /health` |
+| The server itself | `GET /amql/status`: what it is doing (see [Status](#status)) |
 
 A sequence classifier or a bare encoder loads but is offered no endpoint (the log notes `amql-cli classify`).
 
@@ -38,6 +42,7 @@ is refused at startup:
 }
 ```
 
+`"kv_dir"` gives a model its own folder for paged-out prompt state (see [Concurrency](#concurrency)).
 A model's own settings (`think`, `max_tokens`, `temperature`, `top_p`, `top_k`) come first, then the server's flags,
 then the built-in defaults; a request's own fields override all of them. A model that thinks by default gets
 4096 tokens unless something says otherwise. The same container may be served under several ids, here with and
@@ -56,10 +61,47 @@ defaults it applies, and `GET /v1/models/{id}` returns one (404 `model_not_found
   path takes turns across all models, because its kernels stage through process-wide device buffers and two
   sessions on the GPU at once would overwrite each other's activations. Generation runs off the request thread,
   streams through a channel, and stops at the next token when the client disconnects.
-- `--api-key` (or `AMQL_API_KEY`) requires `Authorization: Bearer <key>` on `/v1/*` and `/api/*`; `/health` is
-  open. Without a key the server logs that it is unauthenticated — bind it to loopback.
+- `--api-key` (or `AMQL_API_KEY`) requires `Authorization: Bearer <key>` on `/v1/*`, `/api/*` and `/amql/*`;
+  `/health` is open. Without a key the server logs that it is unauthenticated — bind it to loopback.
 - Weights are warmed at startup (one short forward pass per model) so the first request does not pay for
   widening them; `--no-warm` skips that.
+
+## Memory and device
+
+- `--max-ram GB` is the RAM the process aims to stay under. It selects the lean working set, as
+  `amql-cli --max-ram` does, unless `AMQL_WEIGHTS` chose a mode: weights stream through a cache sized to fit.
+  That is slower, but it serves models larger than memory.
+- `--gpu-memory GB` caps the GPU memory the weights may take. The rest stay on the host, and 0 keeps every
+  weight there. Without it the loader takes the device's free memory, less a margin.
+- `--cpu` serves on the CPU even when a GPU is available.
+- The GPU engine's KV cache is FP16 by default (`--kv-format fp16`): half f32's memory (32 KiB a token on
+  Qwen 3.5 4B), a little faster decode at long contexts, and on the 4B no measurable difference from f32
+  (perplexity 10.325 against 10.326, the same top token at all 8,192 positions). Paged-out files are half the size
+  too. `--kv-format f32` (or `AMQL_KV_FORMAT=f32`) keeps the values as computed.
+- `--kv-format nvfp4` stores the GPU engine's KV cache as NVFP4: ~7x less memory a token on Qwen 3.5 4B
+  (592 bytes a position instead of 4,096), faster decode at long contexts, and paged-out files 7x smaller.
+  Replies differ slightly from f32 KV's (perplexity +0.4%, KL 0.008 on the 4B). See [The KV cache](kv-cache.md).
+  With it, each conversation's system prompt, tools and first user message stay out of the 4-bit rounding
+  (`--kv-exact-prefix auto`, the default; `N` tokens, or `0` for none), so the instructions every later token
+  reads keep their precision. They are kept at FP16 by default: half f32's memory, and on the 4B no measurable
+  difference from f32 (KL under 0.00005, the same top token at all 8,192 positions). `--kv-exact-format f32`
+  keeps them at f32, bit for bit an f32 cache's.
+
+## Status
+
+`GET /amql/status` reports what the server is doing, for a monitor to poll. AMQL Studio's Monitor reads it once
+a second. It returns:
+
+- `process`: pid, working set, private bytes, managed heap, CPU seconds, and whether the GPU is in use.
+- `totals`: requests and failures since start, and requests and completion tokens over the last minute.
+- `models`: for each model, its capabilities, the requests in flight, requests, errors, prompt and completion
+  tokens, mean decode tokens/s, last use, context length, adapters and load notes.
+- `active` and `recent` (the newest 50 of 200 kept): each request's path, model, status, prompt and
+  completion tokens (streamed so far for an active one), seconds, `ttft_seconds` (time to first token, from
+  when generation starts), `decode_tps` (tokens after the first over the time after it) and finish reason.
+
+Health checks, `/v1/models` and status polls are left out of the counts and lists. The endpoint needs the API
+key when one is set.
 
 ## Concurrency
 
@@ -137,9 +179,12 @@ prefills only the rest.
   the same from one call to the next.
 - **What it saves:** replaying eight calls of a Hydra turn on the 4B, prefill went from 1.5-2.0 s to 125-212 ms
   for every call after the first (17-20k tokens reused of 18-21k), and a 64-token reply from 2.2-2.8 s to 0.8 s.
-- **Two prefixes are kept** before an unrelated prompt takes the oldest, so an agent's side requests (Hydra's
-  JSON analysis calls) do not take the sequence its main calls pick up from. Each holds its KV cache: about
-  2 GiB at 32k positions on the 4B.
+- **Kept by time and memory, not by count.** Every finished sequence is kept, so any number of conversations
+  pick up where they left off, until it has sat unused for `--kv-idle` seconds (default 300) or the kept
+  sequences pass `--kv-gpu-budget` GiB of GPU memory (default 4), least recently used first. Then its memory is
+  released. Each holds its KV cache at its capacity: about 2.3 GiB at 32k positions on the 4B (KV is f32, 64 KiB
+  a token, plus the drafter's 8 KiB), 150 MiB for a 1.7k-token prompt on the 0.8B. `--kv-idle 0` keeps them
+  until the budget needs the room.
 - **Numerics:** a rewound sequence gives exactly the logits it gave at the mark, steps after it included
   (tested on plain and Gated DeltaNet models). A prompt prefilled in two pieces rather than one agrees with
   the one-piece prefill to f32 rounding in exact mode. In the default BF16 mode the split moves rounding,
@@ -147,6 +192,36 @@ prefills only the rest.
   replay above, with similar wording).
 - `--no-prefix-reuse` prefills every prompt whole. `AMQL_SERVER_TIMING=1` logs each admission's prompt, reused
   tokens and prefill time, and how far the prompt agrees with each kept sequence.
+
+**Paging prompt state to disk** (off by default). With `--kv-disk`, a kept sequence that leaves GPU memory
+(idle, over the budget, or at shutdown) is written to disk first, and a later prompt that starts the same way
+loads it back instead of prefilling. It works for any model the GPU engine batches: what is written is exactly
+what `GpuEngine.Rewind` needs (`GpuEngine.SaveMark`): the prompt's tokens up to its mark, every attention layer's
+KV rows before the mark, the recurrent state and conv history saved there, and the MTP drafter's cache and
+pending state. Rows after the mark are left out. `GpuEngine.RestoreMark` builds a new sequence from it that
+carries on bit for bit as the one saved, drafter included (`KvPagingTests`).
+
+- **Each model has its own folder:** `kv-cache` in its container by default (the NVFP4/MXFP4 copy has its own),
+  `--kv-dir DIR` for `DIR/<model id>`, or `"kv_dir"` per model in `--config` (which turns the disk tier on for
+  that model). Every file records the model's fingerprint, a hash of its engine geometry, prefill precision and
+  container files, and one that does not match is deleted when found, so a rebuilt container never loads stale
+  state. Files left from an earlier run are loaded at start when they are still in date.
+- **Limits:** `--kv-disk-budget GB` per model (default 1), oldest deleted first; a state larger than the budget is
+  not written (a 1.7k-token prompt on the 0.8B is 65 MiB, on the 4B 64 KiB a token, so 1 GiB holds ~15k tokens).
+  `--kv-expire S` deletes a state that long after its last use (default 1800; 0 never). Prompts saved before
+  fewer than 512 tokens are not written: they prefill faster than they load.
+- **Off the batch:** the write runs in the background, and the read runs on the request's thread before it joins
+  the batch, so other replies keep stepping. A state is taken (its file deleted) when it is loaded; it is written
+  again with its newer mark when that sequence leaves GPU memory. A state still being written can be taken from
+  memory.
+- **Measured** on the 0.8B, a 1,707-token conversation idle for 5 s: paged out to a 65 MiB file, loaded back
+  with 43 tokens left to prefill (99 ms for the whole 40-token reply against 39 ms from GPU memory), and the
+  reply the same as the one picked up from GPU memory. Larger models and longer prompts gain the most: the 4B
+  prefills an 18k-token prompt in 1.5-2.9 s, against ~1.2 GB to read back.
+- **Privacy:** the files hold the conversation in a recoverable form. Keep the folder on a disk only the server's
+  account can read; deleting a file on an SSD does not erase its blocks.
+
+The log (stderr) names each page-out, restore, expiry and release.
 
 **Device memory.** Keep the GPU's memory clear of other models. With three other models loaded beside the 4B
 (and LM Studio and a game on the same card, 28.5 of 32.6 GB in use), the same 18k-token prefill took 32.6 s

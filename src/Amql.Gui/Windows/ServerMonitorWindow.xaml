@@ -1,0 +1,161 @@
+<Window x:Class="Amql.Gui.Windows.ServerMonitorWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="clr-namespace:Amql.Gui.Windows"
+        Title="Server Monitor — AMQL Studio" Height="860" Width="1180" MinWidth="720" MinHeight="480"
+        WindowStartupLocation="CenterScreen">
+    <ScrollViewer x:Name="PageScroll" VerticalScrollBarVisibility="Auto">
+        <StackPanel Margin="22,18,22,18">
+            <!-- Header -->
+            <DockPanel Margin="0,0,0,12">
+                <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
+                    <CheckBox x:Name="PauseCheck" Content="Pause" Margin="0,0,12,0"/>
+                    <CheckBox x:Name="TopmostCheck" Content="Keep on top" Checked="OnTopmost" Unchecked="OnTopmost"/>
+                </StackPanel>
+                <Ellipse x:Name="StateDot" Width="12" Height="12" Margin="0,0,10,0" Fill="{StaticResource IdleBrush}"/>
+                <StackPanel>
+                    <TextBlock x:Name="StateText" Text="Not running" FontSize="20" FontWeight="SemiBold"/>
+                    <TextBlock x:Name="SubText" Style="{StaticResource Caption}"/>
+                </StackPanel>
+            </DockPanel>
+
+            <!-- Headline numbers -->
+            <WrapPanel>
+                <Border Style="{StaticResource Tile}">
+                    <StackPanel>
+                        <TextBlock Text="Generating now" Style="{StaticResource TileLabel}"/>
+                        <TextBlock x:Name="ActiveValue" Text="–" Style="{StaticResource TileValue}"/>
+                        <TextBlock x:Name="ActiveSub" Style="{StaticResource Caption}"/>
+                    </StackPanel>
+                </Border>
+                <Border Style="{StaticResource Tile}">
+                    <StackPanel>
+                        <TextBlock Text="Output speed" Style="{StaticResource TileLabel}"/>
+                        <TextBlock x:Name="SpeedValue" Text="–" Style="{StaticResource TileValue}"/>
+                        <TextBlock x:Name="SpeedSub" Style="{StaticResource Caption}"/>
+                    </StackPanel>
+                </Border>
+                <Border Style="{StaticResource Tile}">
+                    <StackPanel>
+                        <TextBlock Text="Requests" Style="{StaticResource TileLabel}"/>
+                        <TextBlock x:Name="RequestsValue" Text="–" Style="{StaticResource TileValue}"/>
+                        <TextBlock x:Name="RequestsSub" Style="{StaticResource Caption}"/>
+                    </StackPanel>
+                </Border>
+                <Border Style="{StaticResource Tile}">
+                    <StackPanel>
+                        <TextBlock Text="Server memory" Style="{StaticResource TileLabel}"/>
+                        <TextBlock x:Name="MemoryValue" Text="–" Style="{StaticResource TileValue}"/>
+                        <TextBlock x:Name="MemorySub" Style="{StaticResource Caption}"/>
+                    </StackPanel>
+                </Border>
+                <Border Style="{StaticResource Tile}">
+                    <StackPanel>
+                        <TextBlock Text="GPU" Style="{StaticResource TileLabel}"/>
+                        <TextBlock x:Name="GpuValue" Text="–" Style="{StaticResource TileValue}"/>
+                        <TextBlock x:Name="GpuSub" Style="{StaticResource Caption}"/>
+                    </StackPanel>
+                </Border>
+            </WrapPanel>
+
+            <!-- Trends: one measure per chart -->
+            <UniformGrid Columns="2" Margin="0,0,0,2">
+                <Border Style="{StaticResource Card}" Margin="0,0,10,12">
+                    <StackPanel>
+                        <TextBlock Text="Tokens per second, last 5 minutes" FontWeight="SemiBold" Margin="0,0,0,6"/>
+                        <local:Sparkline x:Name="SpeedChart" Height="110"/>
+                    </StackPanel>
+                </Border>
+                <Border Style="{StaticResource Card}" Margin="0,0,0,12">
+                    <StackPanel>
+                        <TextBlock x:Name="SecondChartTitle" Text="GPU utilisation (%), last 5 minutes" FontWeight="SemiBold" Margin="0,0,0,6"/>
+                        <local:Sparkline x:Name="LoadChart" Height="110"/>
+                    </StackPanel>
+                </Border>
+            </UniformGrid>
+
+            <!-- Models -->
+            <Border Style="{StaticResource Card}">
+                <StackPanel>
+                    <TextBlock Text="Models" Style="{StaticResource SectionTitle}"/>
+                    <DataGrid x:Name="ModelsGrid" AutoGenerateColumns="False" IsReadOnly="True" HeadersVisibility="Column"
+                              GridLinesVisibility="None" CanUserAddRows="False" BorderThickness="0" Background="Transparent"
+                              SelectionMode="Single" MaxHeight="260">
+                        <DataGrid.Columns>
+                            <DataGridTemplateColumn Header="" Width="28">
+                                <DataGridTemplateColumn.CellTemplate>
+                                    <DataTemplate>
+                                        <Ellipse Width="9" Height="9" Fill="{Binding StateBrush}" ToolTip="{Binding State}"/>
+                                    </DataTemplate>
+                                </DataGridTemplateColumn.CellTemplate>
+                            </DataGridTemplateColumn>
+                            <DataGridTextColumn Header="Model" Binding="{Binding Id}" Width="2*" FontWeight="SemiBold"/>
+                            <DataGridTextColumn Header="Serves" Binding="{Binding Serves}" Width="2*"/>
+                            <DataGridTextColumn Header="State" Binding="{Binding State}" Width="*"/>
+                            <DataGridTextColumn Header="Requests" Binding="{Binding Requests}" Width="*"/>
+                            <DataGridTextColumn Header="Tokens out" Binding="{Binding TokensOut}" Width="*"/>
+                            <DataGridTextColumn Header="Avg decode" Binding="{Binding Decode}" Width="*"/>
+                            <DataGridTextColumn Header="Last used" Binding="{Binding LastUsed}" Width="*"/>
+                        </DataGrid.Columns>
+                    </DataGrid>
+                </StackPanel>
+            </Border>
+
+            <!-- In flight -->
+            <Border Style="{StaticResource Card}">
+                <StackPanel>
+                    <TextBlock Text="In progress" Style="{StaticResource SectionTitle}"/>
+                    <TextBlock x:Name="NoActiveText" Text="Nothing is running." Style="{StaticResource Caption}"/>
+                    <ItemsControl x:Name="ActiveList">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate>
+                                <Grid Margin="0,4">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="180"/>
+                                        <ColumnDefinition Width="200"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Text="{Binding Model}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/>
+                                    <TextBlock Grid.Column="1" Text="{Binding Endpoint}" Style="{StaticResource Caption}" VerticalAlignment="Center"/>
+                                    <StackPanel Grid.Column="2" Orientation="Horizontal">
+                                        <ProgressBar IsIndeterminate="True" Width="80" Height="4" Margin="0,0,12,0" VerticalAlignment="Center"/>
+                                        <TextBlock Text="{Binding Progress}"/>
+                                    </StackPanel>
+                                </Grid>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                </StackPanel>
+            </Border>
+
+            <!-- Recent -->
+            <Border Style="{StaticResource Card}">
+                <StackPanel>
+                    <TextBlock Text="Recent requests" Style="{StaticResource SectionTitle}"/>
+                    <DataGrid x:Name="RecentGrid" AutoGenerateColumns="False" IsReadOnly="True" HeadersVisibility="Column"
+                              GridLinesVisibility="None" CanUserAddRows="False" BorderThickness="0" Background="Transparent"
+                              MaxHeight="360">
+                        <DataGrid.Columns>
+                            <DataGridTemplateColumn Header="" Width="28">
+                                <DataGridTemplateColumn.CellTemplate>
+                                    <DataTemplate>
+                                        <Ellipse Width="9" Height="9" Fill="{Binding StatusBrush}" ToolTip="{Binding StatusText}"/>
+                                    </DataTemplate>
+                                </DataGridTemplateColumn.CellTemplate>
+                            </DataGridTemplateColumn>
+                            <DataGridTextColumn Header="Time" Binding="{Binding Time}" Width="80"/>
+                            <DataGridTextColumn Header="Model" Binding="{Binding Model}" Width="2*"/>
+                            <DataGridTextColumn Header="Endpoint" Binding="{Binding Endpoint}" Width="2*"/>
+                            <DataGridTextColumn Header="Status" Binding="{Binding StatusText}" Width="*"/>
+                            <DataGridTextColumn Header="In" Binding="{Binding PromptTokens}" Width="*"/>
+                            <DataGridTextColumn Header="Out" Binding="{Binding CompletionTokens}" Width="*"/>
+                            <DataGridTextColumn Header="First token" Binding="{Binding Ttft}" Width="*"/>
+                            <DataGridTextColumn Header="Decode" Binding="{Binding Decode}" Width="*"/>
+                            <DataGridTextColumn Header="Total" Binding="{Binding Duration}" Width="*"/>
+                        </DataGrid.Columns>
+                    </DataGrid>
+                </StackPanel>
+            </Border>
+        </StackPanel>
+    </ScrollViewer>
+</Window>

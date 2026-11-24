@@ -23,6 +23,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
+#include <vector>
 
 // Cross-platform ABI: Windows needs __declspec(dllexport); Linux/macOS use
 // visibility("default") with -fvisibility=hidden (or default visibility).
@@ -2456,6 +2458,273 @@ static int device_product(int format, const void* w, float global,
     return 0;
 }
 
+// ── Grouped expert GEMV: every routed expert's product in one launch ─────
+//
+// A routed layer in decode gives each picked expert a row or two. Run one
+// expert at a time and a token costs six launches an expert a layer
+// (gather, gate, up, SiLU, down, scatter): ~2,900 for 10 experts over 48
+// layers, most of them too small to fill the GPU. As in grouped GEMM for
+// dropless MoE (one kernel over every expert's actual rows, no padding to a
+// capacity), a task here is one NVFP4 product over up to 8 rows, and one
+// launch runs them all: blockIdx.y picks the task, the warps of blockIdx.x
+// its output rows. Each warp's arithmetic is nvfp4_gemv's, term for term,
+// so the result is bit for bit the one-expert-at-a-time path's.
+
+struct Fp4Task
+{
+    const unsigned char* packed;
+    const unsigned char* scales;
+    const float* a;      // rows of the input, k apart
+    float* c;            // rows of the output, n apart
+    float global;
+    int rows;            // 1..8
+    int n;
+    int k;
+};
+
+__global__ void nvfp4_grouped_gemv(const Fp4Task* __restrict__ tasks)
+{
+    const Fp4Task t = tasks[blockIdx.y];
+    int row = (int)((blockIdx.x * (long)blockDim.x + threadIdx.x) >> 5);
+    int lane = threadIdx.x & 31;
+    if (row >= t.n)
+    {
+        return;
+    }
+    int k = t.k;
+    int blocks = k / 16;
+    int tilesInner = fp4_scale_tiles_inner(k);
+    const unsigned char* rowPack = t.packed + (size_t)row * (k / 2);
+    float acc[8];
+#pragma unroll
+    for (int i = 0; i < 8; i++)
+    {
+        acc[i] = 0.f;
+    }
+    for (int b = lane; b < blocks; b += 32)
+    {
+        float scale = e4m3_decoded(t.scales[fp4_scale_index(row, b, tilesInner)]);
+        uint2 bytes = *reinterpret_cast<const uint2*>(rowPack + (size_t)b * 8);
+        float w[16];
+#pragma unroll
+        for (int j = 0; j < 16; j += 2)
+        {
+            unsigned int word = (j >> 3) == 0 ? bytes.x : bytes.y;
+            float2 pair = e2m1x2_decoded((unsigned char)((word >> (((j >> 1) & 3) * 8)) & 0xFF));
+            w[j] = pair.x * scale;
+            w[j + 1] = pair.y * scale;
+        }
+#pragma unroll
+        for (int i = 0; i < 8; i++)
+        {
+            if (i < t.rows)
+            {
+                const float4* x = reinterpret_cast<const float4*>(t.a + (size_t)i * k + (size_t)b * 16);
+                float4 x0 = x[0], x1 = x[1], x2 = x[2], x3 = x[3];
+                acc[i] += w[0] * x0.x + w[1] * x0.y + w[2] * x0.z + w[3] * x0.w
+                        + w[4] * x1.x + w[5] * x1.y + w[6] * x1.z + w[7] * x1.w
+                        + w[8] * x2.x + w[9] * x2.y + w[10] * x2.z + w[11] * x2.w
+                        + w[12] * x3.x + w[13] * x3.y + w[14] * x3.z + w[15] * x3.w;
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 8; i++)
+    {
+        if (i < t.rows)
+        {
+            float v = acc[i];
+            for (int offset = 16; offset > 0; offset >>= 1)
+            {
+                v += __shfl_down_sync(0xffffffff, v, offset);
+            }
+            if (lane == 0)
+            {
+                t.c[(size_t)i * t.n + row] = v * t.global;
+            }
+        }
+    }
+}
+
+// out[r] = sum of rowWeight[s] * y[s] over row r's slots, in job order:
+// the same additions, in the same order, as scatter_add_rows job by job.
+__global__ void combine_slots(const float* __restrict__ y, const int* __restrict__ rowSlotStart,
+    const int* __restrict__ rowSlots, const float* __restrict__ slotWeights, int m, int width,
+    float* __restrict__ out)
+{
+    long index = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= (long)m * width)
+    {
+        return;
+    }
+    int r = (int)(index / width);
+    int col = (int)(index % width);
+    float acc = 0.f;
+    for (int i = rowSlotStart[r]; i < rowSlotStart[r + 1]; i++)
+    {
+        int slot = rowSlots[i];
+        acc += slotWeights[slot] * y[(size_t)slot * width + col];
+    }
+    out[index] = acc;
+}
+
+static void* gGroupTasks[2] = {nullptr, nullptr};  static size_t gGroupTasksBytes[2] = {0, 0};
+static void* gGroupSlots = nullptr;  static size_t gGroupSlotsBytes = 0;
+static std::vector<Fp4Task> gGroupHostTasks[2];
+static std::vector<int> gGroupHostSlots;
+
+// AMQL_GROUPED_FFN=0 (or amql_cuda_set_grouped_ffn(0)) runs routed experts
+// one at a time, as before.
+static int gGroupedFfn = -1;
+static long long gGroupedFfnCalls = 0;
+
+static bool grouped_ffn_enabled()
+{
+    if (gGroupedFfn < 0)
+    {
+        const char* v = getenv("AMQL_GROUPED_FFN");
+        gGroupedFfn = !(v != nullptr && (strcmp(v, "0") == 0 || strcmp(v, "off") == 0 || strcmp(v, "false") == 0));
+    }
+    return gGroupedFfn == 1;
+}
+
+AMQL_EXPORT void amql_cuda_set_grouped_ffn(int on)
+{
+    gGroupedFfn = on ? 1 : 0;
+}
+
+AMQL_EXPORT int amql_cuda_get_grouped_ffn()
+{
+    return grouped_ffn_enabled() ? 1 : 0;
+}
+
+/// Routed layers run as grouped launches since the library loaded.
+AMQL_EXPORT long long amql_cuda_grouped_ffn_calls()
+{
+    return gGroupedFfnCalls;
+}
+
+// One launch of every task in tasks, n rows at most. The descriptors go up
+// from pageable memory, which the copy has taken before it returns; each of
+// a layer's two launches has its own buffer so neither overwrites the other's.
+static int run_fp4_tasks(int which, const std::vector<Fp4Task>& tasks, int maxN, cudaStream_t stream)
+{
+    if (tasks.empty())
+    {
+        return 0;
+    }
+    size_t bytes = tasks.size() * sizeof(Fp4Task);
+    if (scratch_reserve(&gGroupTasks[which], &gGroupTasksBytes[which], bytes) != 0 ||
+        cudaMemcpyAsync(gGroupTasks[which], tasks.data(), bytes, cudaMemcpyHostToDevice, stream) != cudaSuccess)
+    {
+        return -1;
+    }
+    const int threads = 256;
+    dim3 grid((unsigned)(((long)maxN * 32 + threads - 1) / threads), (unsigned)tasks.size());
+    nvfp4_grouped_gemv<<<grid, threads, 0, stream>>>((const Fp4Task*)gGroupTasks[which]);
+    return cudaGetLastError() == cudaSuccess ? 0 : -2;
+}
+
+// The routed layer's jobs as grouped launches, when every product is NVFP4
+// with at most kGemvRows rows (decode and small batches); 1 when not this
+// path's, 0 when done (out on the device in gFfnOut), negative on error.
+static int grouped_nvfp4_ffn(int m, int k, int width, int jobs, const int* rowStart,
+    const int* inter, const void* const* weights, const int* formats, const float* globals,
+    int totalRows, int maxInter, cudaStream_t stream)
+{
+    if (!grouped_ffn_enabled() || jobs < 2 || k % 16 != 0)
+    {
+        return 1;
+    }
+    for (int j = 0; j < jobs; j++)
+    {
+        int count = rowStart[j + 1] - rowStart[j];
+        if (formats[3 * j] != 1 || formats[3 * j + 1] != 1 || formats[3 * j + 2] != 1 ||
+            count > kGemvRows || inter[j] % 16 != 0)
+        {
+            return 1;
+        }
+    }
+    if (scratch_reserve(&gFfnG, &gFfnGBytes, (size_t)totalRows * maxInter * 4) != 0 ||
+        scratch_reserve(&gFfnU, &gFfnUBytes, (size_t)totalRows * maxInter * 4) != 0 ||
+        scratch_reserve(&gFfnY, &gFfnYBytes, (size_t)totalRows * width * 4) != 0 ||
+        scratch_reserve(&gFfnRows, &gFfnRowsBytes, (size_t)totalRows * k * 4) != 0)
+    {
+        return -3;
+    }
+    // Every job's rows, gathered at once: slot s is rows[s].
+    long gathered = (long)totalRows * k;
+    gather_rows<<<(int)((gathered + 255) / 256), 256, 0, stream>>>(
+        (const float*)gFfnX, (const int*)gFfnIdx, totalRows, k, (float*)gFfnRows);
+
+    // Gate and up, every job, one launch: slot s's hidden units at s * maxInter.
+    float* g = (float*)gFfnG;
+    float* u = (float*)gFfnU;
+    const float* xr = (const float*)gFfnRows;
+    auto& tasks = gGroupHostTasks[0];
+    tasks.clear();
+    for (int j = 0; j < jobs; j++)
+    {
+        int first = rowStart[j], count = rowStart[j + 1] - first, n = inter[j];
+        for (int done = 0; done < count; done += 8)
+        {
+            int rows = std::min(8, count - done);
+            for (int p = 0; p < 2; p++)
+            {
+                const unsigned char* packed = (const unsigned char*)weights[3 * j + p];
+                Fp4Task t;
+                t.packed = packed;
+                t.scales = packed + nvfp4_scale_offset(n, k);
+                t.a = xr + (size_t)(first + done) * k;
+                // A job's hidden rows are n apart, as the one-job path lays them out.
+                t.c = (p == 0 ? g : u) + (size_t)first * maxInter + (size_t)done * n;
+                t.global = globals[3 * j + p];
+                t.rows = rows;
+                t.n = n;
+                t.k = k;
+                tasks.push_back(t);
+            }
+        }
+    }
+    int code;
+    if ((code = run_fp4_tasks(0, tasks, maxInter, stream)) != 0)
+    {
+        return -10 + code;
+    }
+    // SiLU(gate) * up over every job's hidden units at once.
+    long hidden = (long)totalRows * maxInter;
+    silu_times<<<(int)((hidden + 255) / 256), 256, 0, stream>>>(g, u, hidden);
+
+    // Down, every job, one launch: slot s's output at s * width.
+    float* y = (float*)gFfnY;
+    auto& downs = gGroupHostTasks[1];
+    downs.clear();
+    for (int j = 0; j < jobs; j++)
+    {
+        int first = rowStart[j], count = rowStart[j + 1] - first, n = inter[j];
+        const unsigned char* packed = (const unsigned char*)weights[3 * j + 2];
+        for (int done = 0; done < count; done += 8)
+        {
+            Fp4Task t;
+            t.packed = packed;
+            t.scales = packed + nvfp4_scale_offset(width, n);
+            t.a = g + (size_t)first * maxInter + (size_t)done * n;
+            t.c = y + (size_t)(first + done) * width;
+            t.global = globals[3 * j + 2];
+            t.rows = std::min(8, count - done);
+            t.n = width;
+            t.k = n;
+            downs.push_back(t);
+        }
+    }
+    if ((code = run_fp4_tasks(1, downs, width, stream)) != 0)
+    {
+        return -20 + code;
+    }
+    gGroupedFfnCalls++;
+    return 0;
+}
+
 /// Runs gated SiLU FFN jobs over rows of x, all on the device, and writes
 /// the weighted sum of their outputs to out ([m, width], overwritten).
 /// Job j covers rows[rowStart[j] .. rowStart[j + 1]) with rowWeights, and
@@ -2503,6 +2772,49 @@ AMQL_EXPORT int amql_cuda_ffn(
     }
     const int* idx = (const int*)gFfnIdx;
     const float* wts = (const float*)gFfnW;
+    int grouped = grouped_nvfp4_ffn(m, k, width, jobs, rowStart, inter, weights, formats, globals,
+        totalRows, maxInter, stream);
+    if (grouped < 0)
+    {
+        return -300 + grouped;
+    }
+    if (grouped == 0)
+    {
+        // Each row's slots in job order, so the sum adds as the per-job scatter does.
+        auto& slots = gGroupHostSlots;
+        slots.assign((size_t)m + 1 + totalRows, 0);
+        int* start = slots.data();
+        int* list = start + m + 1;
+        for (int s = 0; s < totalRows; s++)
+        {
+            start[rows[s] + 1]++;
+        }
+        for (int r = 0; r < m; r++)
+        {
+            start[r + 1] += start[r];
+        }
+        std::vector<int> fill(start, start + m);
+        for (int s = 0; s < totalRows; s++)
+        {
+            list[fill[rows[s]]++] = s;   // slots run in job order
+        }
+        size_t bytes = slots.size() * 4;
+        if (scratch_reserve(&gGroupSlots, &gGroupSlotsBytes, bytes) != 0 ||
+            cudaMemcpyAsync(gGroupSlots, slots.data(), bytes, cudaMemcpyHostToDevice, stream) != cudaSuccess)
+        {
+            return -8;
+        }
+        long outCount = (long)m * width;
+        combine_slots<<<(int)((outCount + 255) / 256), 256, 0, stream>>>(
+            (const float*)gFfnY, (const int*)gGroupSlots, (const int*)gGroupSlots + m + 1, wts, m, width,
+            (float*)gFfnOut);
+        if (cudaGetLastError() != cudaSuccess ||
+            cudaMemcpyAsync(out, gFfnOut, (size_t)m * width * 4, cudaMemcpyDeviceToHost, stream) != cudaSuccess)
+        {
+            return -9;
+        }
+        return cudaStreamSynchronize(stream) == cudaSuccess ? 0 : -7;
+    }
     for (int j = 0; j < jobs; j++)
     {
         int first = rowStart[j];
@@ -2579,6 +2891,48 @@ AMQL_EXPORT int amql_cuda_multi(
     if (cudaMemcpyAsync(gFfnX, a, (size_t)m * k * 4, cudaMemcpyHostToDevice, stream) != cudaSuccess)
     {
         return -4;
+    }
+    // All NVFP4 with few rows (decode): every product in one grouped launch.
+    bool grouped = grouped_ffn_enabled() && count > 1 && m <= kGemvRows && k % 16 == 0;
+    for (int i = 0; grouped && i < count; i++)
+    {
+        grouped = formats[i] == 1;
+    }
+    if (grouped)
+    {
+        auto& tasks = gGroupHostTasks[0];
+        tasks.clear();
+        size_t at = 0;
+        int maxN = 0;
+        for (int i = 0; i < count; i++)
+        {
+            const unsigned char* packed = (const unsigned char*)weights[i];
+            for (int done = 0; done < m; done += 8)
+            {
+                Fp4Task t;
+                t.packed = packed;
+                t.scales = packed + nvfp4_scale_offset(ns[i], k);
+                t.a = (const float*)gFfnX + (size_t)done * k;
+                t.c = (float*)gMultiOut + at + (size_t)done * ns[i];
+                t.global = globals[i];
+                t.rows = std::min(8, m - done);
+                t.n = ns[i];
+                t.k = k;
+                tasks.push_back(t);
+            }
+            at += (size_t)m * ns[i];
+            maxN = std::max(maxN, ns[i]);
+        }
+        if (run_fp4_tasks(0, tasks, maxN, stream) != 0)
+        {
+            return -7;
+        }
+        gGroupedFfnCalls++;
+        if (cudaMemcpyAsync(out, gMultiOut, total * 4, cudaMemcpyDeviceToHost, stream) != cudaSuccess)
+        {
+            return -5;
+        }
+        return cudaStreamSynchronize(stream) == cudaSuccess ? 0 : -6;
     }
     size_t offset = 0;
     for (int i = 0; i < count; i++)

@@ -1,88 +1,76 @@
 # AMQL Studio (Amql.Gui)
 
-A project-based WPF front-end for `amql-cli`. Every command and option of the
-CLI is exposed as a form; projects are stored in a single `.amqlproj` file that
-holds all parameters **and** the status/progress/output of every run.
+The WPF desktop app: it starts and watches `amql-server`, offers a chat playground and an API tester, puts
+every `amql-cli` command behind a form, and hosts the container explorer and inference visualiser. The user
+guide, with screenshots, is [docs/amql-studio.md](../../docs/amql-studio.md). This file covers how the app is
+built.
 
-## Design principle: the CLI is the default path
-
-Commands run by driving `amql-cli` as a child process (`Process` +
-`ArgumentList`, stdout/stderr streamed), so:
-
-- feature parity with the command line is structural — same binary, same flags;
-- concurrent work on the AMQL core cannot break the GUI (or vice versa);
-- the global `--cpu` / `--gpu` flags and the `AMQL_WEIGHTS` env var are
-  surfaced as project settings.
-
-The GUI does link three AMQL libraries directly, where shelling out would be
-the wrong tool: `Amql.Vindex3` and `Amql.Safetensors` so the Container Explorer
-can read tensors without spawning a process per click, and `Amql.Inference` for
-the inference visualiser's trace model (`RunTrace`, `TraceMetrics`). Note that
-`Amql.Inference` brings the CUDA shim into the GUI process with it.
-
-Three ways to reach the CLI (in priority order):
-
-1. **CLI exe path** — a built `amql-cli.exe` (fastest startup);
-2. **Repo path** — runs `dotnet run --no-launch-profile --project <repo>/src/Amql.Cli --`;
-3. neither set — `amql-cli` on `PATH`.
-
-## The `.amqlproj` format
-
-JSON, versioned (`formatVersion`, currently 1), additive — unknown properties
-are ignored on load. Sections:
-
-| Section      | Contents |
-|--------------|----------|
-| `cli`        | exe path, repo path, device (`auto`/`cpu`/`gpu`), `AMQL_WEIGHTS` value |
-| `defaults`   | project-wide container dir, tokenizer dir, patch file, component — stamped into forms via *Apply Project Defaults* (never overrides typed values) |
-| `commands`   | per-command last-entered parameter values, keyed by command then parameter |
-| `runs`       | the run history: id, command, argv, start/finish UTC, **status** (`Running`/`Succeeded`/`Failed`/`Cancelled`/`Interrupted`), exit code, output line count, last parsed **progress percent**, a bounded output tail (400 lines), and the error message |
-| `lastCommand`| command selected when saved |
-
-Saves are atomic (temp file + replace). The project is autosaved after every
-run, so status and progress survive a crash or a mid-run save. Runs persisted
-while `Running` are re-opened as `Interrupted`.
-
-## Commands covered
-
-All 22 CLI commands, grouped into 8 categories: ingest & verify
-(`encode`, `verify`, `synth-model`, `layers`), text & tokenizer
-(`tokens`, `decode`), pathways & probing (`route`, `path`, `generate`,
-`inspect-token`), patching & LoRA (`change-tensor`, `save-lora`), export &
-conversion (`export`, `to-gguf`), MTP drafter (`export-mtp`, `generate-mtp`,
-`collect-mtp`, `fit-mtp`), model transformation (`import`, `moe-ify`,
-`prune`), and fine-tuning (`fine-tune`).
-
-The declarative catalogue lives in `Commands/CommandCatalog.cs` — one record per
-command with its parameters (positional / option / switch, editor kind,
-defaults, choices). `BuildArguments` produces the argv, and the same catalogue
-drives both the dynamic form and the live command-line preview.
-
-## Progress
-
-The GUI asks the CLI for its machine-readable progress protocol (`--progress`,
-or `AMQL_PROGRESS=1`): newline-delimited `##amql-progress` / `##amql-result`
-JSON lines on stdout (`src/Amql.Cli/CliProgress.cs`). Progress lines feed the
-bar exactly and are kept out of the output pane; result lines are echoed as a
-compact `[result] key=value, …` summary.
-
-`CliRunner.ParseProgress` (heuristic `NN%` / `N/M` scraping) remains as the
-fallback for output the protocol does not cover and for CLI builds that predate
-`--progress`.
-
-## Exit codes
-
-The CLI documents its exit codes (`amql-cli help`): 0 = success, 1 = a
-legitimate negative result (e.g. `path` found no chain within budget, `verify`
-integrity failed), 2 = usage/runtime error. The GUI records exit 0 as
-`Succeeded`, exit 1 as `Negative` (an answer, not a fault — the bar completes),
-and anything else as `Failed` (`CliExitCodes`).
-
-## Run it
-
-```
+```powershell
 dotnet run --project src/Amql.Gui
 ```
 
-Keyboard: `F5` runs the selected command, `Ctrl+S` saves the project. The
-Cancel button kills the CLI process tree.
+## Layout
+
+| Folder | What is there |
+|---|---|
+| `MainWindow` | The shell: a navigation rail with the server's state always in view, and a page host. Pages are built on first visit and kept. |
+| `Pages/` | `HomePage` (getting started), `ServerPage` (models, memory, start/stop, advanced), `PlaygroundPage` (streamed chat, raw API requests), `ToolsPage` (the command forms, run history and project), `ExplorerPage` (wraps `Explorer/ContainerExplorer`). |
+| `Windows/` | `ServerMonitorWindow` (the live dashboard) and `Sparkline` (its single-series trend chart). |
+| `Services/` | `ToolLocator` (finds amql-cli and amql-server), `AppSettings` (per-machine settings), `ModelLibrary` (finds containers and reads their kind), `ServerController` (starts and stops the server and follows its start-up), `ServerClient` (health, `/amql/status`, streamed chat), `SystemInfo` (RAM, and the GPU through nvidia-smi), `WheelScrolling`. |
+| `Commands/CommandCatalog.cs` | One record per CLI command and parameter. It drives both the forms and the argv builder. |
+| `Run/CliRunner.cs` | Runs one CLI command as a child process and reads its `--progress` protocol. |
+| `Explorer/`, `Visualiser/` | The container explorer and the inference visualiser. |
+
+The app uses WPF's Fluent theme (`Application.ThemeMode="System"`), so it follows Windows' light or dark
+setting. Page colours come from the theme's brushes, and no standard control is restyled implicitly. The
+explorer's tensor grid and the visualiser were drawn for a light background, so they keep
+`ThemeMode="Light"`.
+
+## Finding the executables
+
+There is no setting for where `amql-cli` or `amql-server` live. `ToolLocator` looks at every candidate and
+uses the most recently built one that is complete. The candidates are: beside the app, the folder above it,
+the repository's `bin`, `bin/Release`, `bin/Debug`, `bin-dev` and publish folders, and `PATH`.
+
+A candidate is complete when its own dll and every project library in its `.deps.json` sit beside it, so a
+partial build output is skipped. With nothing built but the repository present, the tool runs with
+`dotnet run --project src/<Project>`. Discovery is cached and is redone before every server start and from the
+Tools page's ⋯ menu.
+
+## The server
+
+`ServerController` turns a `ServerProfile` into an amql-server command line. The enabled models, with their
+per-model options, go into a `--config` file in the settings folder. Memory, device, request defaults and the
+optional behaviours become flags. The server's output is read only to follow start-up, using its
+`loading {id} from …`, `  {id}: …` and `listening on …` lines, and is kept in a 600-line buffer for the Advanced
+view.
+
+Once the server runs, what it is doing comes from `GET /amql/status` (`src/Amql.Server/ServerStats.cs`):
+in-flight and recent requests with tokens, time to first token and decode speed, plus per-model totals and
+process memory. Stopping kills the process tree. When the app starts, a healthy server already on the
+configured port is adopted as *External*: it can be watched and used, but not stopped.
+
+## Command forms
+
+`CommandCatalog` lists every command the CLI dispatches, subcommands included. A name with a space, such as
+`entail bench`, becomes separate argv words. Parameters marked `Required` are shown first, and the rest go
+under "Advanced options". The CLI's global flags (`--cpu`/`--gpu`, `--max-ram`, `--gpu-memory`,
+`--gpu-format`, `--fp4-prefill`, `--verbose`) come from the project's `CliSettings`, along with
+`AMQL_WEIGHTS`. Keep the catalogue in step with `src/Amql.Cli/Program.cs` when commands change.
+
+## Projects
+
+A project (`.amqlproj`, JSON, `formatVersion` 1, additive) holds the CLI run settings, project defaults, each
+command's last form values and the run history (status, exit code, progress, an output tail).
+
+A default project in `%LOCALAPPDATA%\AMQL Studio` is opened when no other has been. Projects save
+automatically after each run, on switching and on exit. Runs that were active when the app exited reopen as
+`Interrupted`. Older project files still load: their `cli.cliExePath` and `cli.repoPath` are ignored.
+
+The CLI's exit codes are recorded as `Succeeded` (0), `Negative` (1: an answer, such as `path` finding nothing)
+or `Failed`.
+
+## Keyboard
+
+F5 runs the selected command on the Tools page. In the playground, Enter sends and Shift+Enter starts a new
+line.

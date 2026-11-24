@@ -76,7 +76,8 @@ AMQL/
 ## CLI Reference
 
 ```
-amql-cli encode <model-dir> --out <container-dir>
+amql-cli encode <model-dir | https://huggingface.co/owner/name | owner/name> --out <container-dir> [--revision R]
+amql-cli download <https://huggingface.co/owner/name | owner/name> [--out <dir>]
 amql-cli verify <container-dir>
 amql-cli generate <container> --prompt "text" --tokenizer <dir> [--steps N (default: until an end token)] [--patch <file>]
                      [--trace] [--trace-tensors] [--weights f32|bf16|mxfp4]
@@ -309,27 +310,39 @@ completion-only.
 ops). Includes full RoPE (dynamic cos/sin tables), RMSNorm from primitives, SiLU, and
 scaled dot-product attention with mask. Compatible with ONNX Runtime 1.21+.
 
-### GUI & Explorer
+### AMQL Studio (GUI)
 
-`amql-gui` provides a WPF desktop interface: command catalog with parameter editing, run
-history, and a **Container Explorer** tab. The explorer drills into the VIndex3 structure
-(components → layers → objects → edges) with right-click context menus for viewing tensor
-values in a spreadsheet grid, browsing the tokenizer vocabulary, and inspecting
-hidden-state edge connections.
+`amql-gui` is the desktop app for running models locally. Tick the containers to serve, whether chat,
+embedding, classifier or decision models, set how much RAM and GPU memory they may use with two sliders, and
+press **Start**. The app starts `amql-server` with them behind one OpenAI-compatible endpoint, and shows its
+state on every page. It finds `amql-cli` and `amql-server` by itself, so there is nothing to configure first.
+Advanced settings stay out of the way until needed. See [AMQL Studio](docs/amql-studio.md).
 
-![AMQL Studio command runner](screenshots/AMQL%20Studio.png)
+![AMQL Studio — the server page](screenshots/AMQL%20Studio%20-%20Server.png)
 
-*The Commands tab: every CLI command as a parameter form, grouped into eight categories,
-with a live argv preview above the Run button, streamed output below, and a run history
-saved into the project on the right.*
+*The Server page: the containers found on disk, each with its kind read from its system graph, two chat
+models chosen and the server running on port 8000.*
+
+![Server Monitor](screenshots/Server%20Monitor.png)
+
+*The Monitor is a live view of the server, not a log: four requests generating across two models, output
+speed and GPU use over the last five minutes, per-model totals, and the recent requests with time to first
+token and decode speed.*
+
+**Import from Hugging Face** encodes a checkpoint from a folder on disk or straight from the Hub: paste a
+model's URL (or `owner/name`), and it is downloaded (resumable, SHA-256 checked) and encoded into a container
+ready to serve.
+
+The **Playground** streams a chat with any loaded model, showing speed and token counts under each reply. It
+can also send raw requests to any endpoint. **Tools** puts every `amql-cli` command (61, subcommands included)
+behind a searchable form, with required fields first, the rest under Advanced, memory sliders for the CLI's
+`--max-ram` / `--gpu-memory`, and a run history.
 
 ![Container Explorer](screenshots/Model%20Explorer.png)
 
-*The Explorer tab on a Qwen3.5-0.8B container: index facts, then the primary-text
-component's per-layer attention policy — `linear_attention` and `softmax` alternating on a
-4-layer interval, each expandable to its span, position encoding and head geometry — above
-the object graph (embedding, decoder stack, final norm, output head, vision tower, MTP
-drafter).*
+*The Explorer on a Qwen3.5-0.8B container: index facts, then the primary-text component's per-layer attention
+policy (`linear_attention` and `softmax` alternating on a 4-layer interval) above the object graph (embedding,
+decoder stack, final norm, output head, vision tower, MTP drafter). Tensors open in a value grid.*
 
 ### Server
 
@@ -422,6 +435,7 @@ multi-million-element matrix is too small to measure downstream. See
 - [Classifier Models](docs/classifier-models-jev.md) — Jev/NLI classification design
 - [Embedding Models](docs/embedding-models-nomic-embed-text.md) — nomic-bert encoder
 - [Decision Models](docs/decision-models-von.md) — Von (ModernBERT option-marker) import/export
+- [AMQL Studio](docs/amql-studio.md) — the desktop app: serving models, the monitor, playground and tools
 - [Inference Visualiser](docs/inference-visualiser.md) — operator trace format and the map UI
 - [Entail](docs/entail.md) — compiling statements into weights: design and results
 - [The Entail Language](docs/entail-language.md) — language reference

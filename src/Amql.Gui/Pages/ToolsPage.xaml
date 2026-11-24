@@ -1,0 +1,187 @@
+<UserControl x:Class="Amql.Gui.Pages.ToolsPage"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <Grid>
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="250" MinWidth="180"/>
+            <ColumnDefinition Width="5"/>
+            <ColumnDefinition Width="3*" MinWidth="420"/>
+            <ColumnDefinition Width="5"/>
+            <ColumnDefinition Width="260" MinWidth="160"/>
+        </Grid.ColumnDefinitions>
+
+        <!-- Command list -->
+        <DockPanel Grid.Column="0" Margin="12,16,4,12">
+            <TextBlock DockPanel.Dock="Top" Text="Tools" Style="{StaticResource SectionTitle}"/>
+            <TextBox DockPanel.Dock="Top" x:Name="SearchBox" TextChanged="OnSearchChanged" Margin="0,0,0,8"
+                     ToolTip="Filter commands by name or description"/>
+            <TreeView x:Name="CommandTree" SelectedItemChanged="OnCommandSelected" BorderThickness="0"
+                      Background="Transparent"/>
+        </DockPanel>
+        <GridSplitter Grid.Column="1" HorizontalAlignment="Stretch" Background="Transparent"/>
+
+        <!-- Form + output -->
+        <Grid Grid.Column="2" Margin="4,16,4,12">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="3*" MinHeight="140"/>
+                <RowDefinition Height="5"/>
+                <RowDefinition Height="2*" MinHeight="80"/>
+            </Grid.RowDefinitions>
+
+            <StackPanel Grid.Row="0" Margin="0,0,0,8">
+                <Grid>
+                    <TextBlock x:Name="CommandTitle" Text="Choose a tool" Style="{StaticResource PageTitle}" FontSize="22"/>
+                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Top">
+                        <TextBlock x:Name="ProjectText" Style="{StaticResource Caption}" VerticalAlignment="Center" Margin="0,0,8,0"
+                                   ToolTip="Form values and run history are saved in this project"/>
+                        <Button x:Name="ProjectButton" Click="OnProjectMenu" ToolTip="Project: new, open, save as, defaults">
+                            <TextBlock Style="{StaticResource Icon}" Text="&#xE712;"/>
+                            <Button.ContextMenu>
+                                <ContextMenu>
+                                    <MenuItem Header="_New project…" Click="OnNewProject"/>
+                                    <MenuItem Header="_Open project…" Click="OnOpenProject"/>
+                                    <MenuItem Header="Save project _as…" Click="OnSaveProjectAs"/>
+                                    <Separator/>
+                                    <MenuItem Header="Project _defaults…" Click="OnProjectDefaults"/>
+                                    <MenuItem Header="Fill the form from project defaults" Click="OnApplyDefaults"/>
+                                    <Separator/>
+                                    <MenuItem Header="Find amql-cli again" Click="OnRedetectCli"/>
+                                </ContextMenu>
+                            </Button.ContextMenu>
+                        </Button>
+                    </StackPanel>
+                </Grid>
+                <TextBlock x:Name="CommandSummary" Style="{StaticResource PageSubtitle}" Margin="0,0,0,10"/>
+                <StackPanel Orientation="Horizontal">
+                    <Button x:Name="RunButton" Click="OnRun" Style="{DynamicResource AccentButtonStyle}" Padding="18,6"
+                            ToolTip="Run (F5)">
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Style="{StaticResource Icon}" Text="&#xE768;" Margin="0,0,8,0"/>
+                            <TextBlock Text="Run"/>
+                        </StackPanel>
+                    </Button>
+                    <Button x:Name="CancelButton" Click="OnCancelRun" IsEnabled="False" Margin="8,0,0,0" Content="Cancel"/>
+                    <ProgressBar x:Name="RunProgress" Width="200" Height="6" Margin="16,0,8,0" Minimum="0" Maximum="100"
+                                 VerticalAlignment="Center"/>
+                    <TextBlock x:Name="RunStateText" VerticalAlignment="Center" Text="" Style="{StaticResource Caption}"/>
+                </StackPanel>
+            </StackPanel>
+
+            <ScrollViewer Grid.Row="1" x:Name="FormScroll" VerticalScrollBarVisibility="Auto" Padding="0,0,12,0">
+                <StackPanel>
+                    <StackPanel x:Name="ParamPanel"/>
+                    <Expander x:Name="AdvancedExpander" Header="Advanced options" Margin="0,8,0,0" Visibility="Collapsed"
+                              HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
+                        <StackPanel x:Name="AdvancedPanel" Margin="0,8,0,0"/>
+                    </Expander>
+                    <Expander Header="Run settings (device, memory, GPU format)" Margin="0,8,0,0"
+                              HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
+                        <Grid Margin="0,8,0,0">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="180"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                            </Grid.RowDefinitions>
+                            <TextBlock Grid.Row="0" Text="Device" Style="{StaticResource FieldLabel}"/>
+                            <ComboBox Grid.Row="0" Grid.Column="1" x:Name="DeviceBox" SelectionChanged="OnGlobalChanged" Margin="0,2">
+                                <ComboBoxItem Content="Automatic" Tag="auto"/>
+                                <ComboBoxItem Content="GPU (fail if none)" Tag="gpu"/>
+                                <ComboBoxItem Content="CPU only" Tag="cpu"/>
+                            </ComboBox>
+                            <CheckBox Grid.Row="1" Grid.Column="1" x:Name="RamLimitCheck" Content="Limit memory use"
+                                      Checked="OnGlobalChanged" Unchecked="OnGlobalChanged" Margin="0,6,0,0"/>
+                            <DockPanel Grid.Row="2" Grid.Column="1" Margin="0,2">
+                                <TextBlock DockPanel.Dock="Right" x:Name="RamLimitText" Width="70" TextAlignment="Right" VerticalAlignment="Center"/>
+                                <Slider x:Name="RamSlider" Minimum="2" Maximum="64" TickFrequency="1" IsSnapToTickEnabled="True"
+                                        ValueChanged="OnGlobalChanged" IsEnabled="{Binding IsChecked, ElementName=RamLimitCheck}"/>
+                            </DockPanel>
+                            <CheckBox Grid.Row="3" Grid.Column="1" x:Name="GpuLimitCheck" Content="Limit GPU memory"
+                                      Checked="OnGlobalChanged" Unchecked="OnGlobalChanged" Margin="0,6,0,0"/>
+                            <DockPanel Grid.Row="4" Grid.Column="1" Margin="0,2">
+                                <TextBlock DockPanel.Dock="Right" x:Name="GpuLimitText" Width="70" TextAlignment="Right" VerticalAlignment="Center"/>
+                                <Slider x:Name="GpuSlider" Minimum="0" Maximum="24" TickFrequency="0.5" IsSnapToTickEnabled="True"
+                                        ValueChanged="OnGlobalChanged" IsEnabled="{Binding IsChecked, ElementName=GpuLimitCheck}"/>
+                            </DockPanel>
+                            <TextBlock Grid.Row="5" Text="GPU weight format" Style="{StaticResource FieldLabel}"/>
+                            <ComboBox Grid.Row="5" Grid.Column="1" x:Name="GpuFormatBox" SelectionChanged="OnGlobalChanged" Margin="0,2">
+                                <ComboBoxItem Content="As stored" Tag=""/>
+                                <ComboBoxItem Content="FP16" Tag="fp16"/>
+                                <ComboBoxItem Content="NVFP4 (4-bit)" Tag="nvfp4"/>
+                                <ComboBoxItem Content="MXFP4 (4-bit)" Tag="mxfp4"/>
+                            </ComboBox>
+                            <StackPanel Grid.Row="6" Grid.Column="1" Margin="0,4,0,0">
+                                <StackPanel Orientation="Horizontal">
+                                    <TextBlock Text="FP4 prefill" Style="{StaticResource FieldLabel}"/>
+                                    <ComboBox x:Name="Fp4PrefillBox" SelectionChanged="OnGlobalChanged" MinWidth="120">
+                                        <ComboBoxItem Content="Default" Tag=""/>
+                                        <ComboBoxItem Content="On" Tag="on"/>
+                                        <ComboBoxItem Content="Off" Tag="off"/>
+                                    </ComboBox>
+                                    <CheckBox x:Name="VerboseCheck" Content="Verbose output" Margin="16,0,0,0"
+                                              Checked="OnGlobalChanged" Unchecked="OnGlobalChanged"/>
+                                </StackPanel>
+                                <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
+                                    <TextBlock Text="AMQL_WEIGHTS" Style="{StaticResource FieldLabel}"/>
+                                    <ComboBox x:Name="WeightsBox" SelectionChanged="OnGlobalChanged" MinWidth="120">
+                                        <ComboBoxItem Content="(default)" Tag=""/>
+                                        <ComboBoxItem Content="bf16" Tag="bf16"/>
+                                        <ComboBoxItem Content="mxfp4" Tag="mxfp4"/>
+                                        <ComboBoxItem Content="disk" Tag="disk"/>
+                                        <ComboBoxItem Content="lean" Tag="lean"/>
+                                    </ComboBox>
+                                </StackPanel>
+                            </StackPanel>
+                        </Grid>
+                    </Expander>
+                    <TextBlock Text="Command line" Style="{StaticResource Caption}" Margin="0,14,0,2"/>
+                    <TextBox x:Name="CommandLinePreview" IsReadOnly="True" TextWrapping="Wrap" FontFamily="{StaticResource MonoFont}"
+                             FontSize="11.5" ToolTip="The exact command that Run starts (select to copy)"/>
+                </StackPanel>
+            </ScrollViewer>
+
+            <GridSplitter Grid.Row="2" HorizontalAlignment="Stretch" Background="Transparent"/>
+
+            <DockPanel Grid.Row="3">
+                <Grid DockPanel.Dock="Top" Margin="0,4,0,4">
+                    <TextBlock Text="Output" FontWeight="SemiBold"/>
+                    <Button HorizontalAlignment="Right" Content="Clear" Padding="10,2" Click="OnClearOutput"/>
+                </Grid>
+                <TextBox x:Name="OutputBox" Style="{StaticResource OutputBox}"/>
+            </DockPanel>
+        </Grid>
+
+        <GridSplitter Grid.Column="3" HorizontalAlignment="Stretch" Background="Transparent"/>
+
+        <!-- Run history -->
+        <DockPanel Grid.Column="4" Margin="4,16,12,12">
+            <Grid DockPanel.Dock="Top" Margin="0,0,0,8">
+                <TextBlock Text="Recent runs" Style="{StaticResource SectionTitle}" Margin="0"/>
+                <Button Content="Clear" HorizontalAlignment="Right" Padding="10,2" Click="OnClearHistory"/>
+            </Grid>
+            <ListBox x:Name="HistoryList" SelectionChanged="OnHistorySelected" HorizontalContentAlignment="Stretch"
+                     ScrollViewer.HorizontalScrollBarVisibility="Disabled" BorderThickness="0" Background="Transparent">
+                <ListBox.ItemTemplate>
+                    <DataTemplate>
+                        <StackPanel Margin="0,2">
+                            <TextBlock Text="{Binding Command}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/>
+                            <TextBlock Style="{StaticResource Caption}" TextTrimming="CharacterEllipsis">
+                                <Run Text="{Binding Status, Mode=OneWay}"/>
+                                <Run Text=" · "/>
+                                <Run Text="{Binding StartedLocal, Mode=OneWay}"/>
+                            </TextBlock>
+                        </StackPanel>
+                    </DataTemplate>
+                </ListBox.ItemTemplate>
+            </ListBox>
+        </DockPanel>
+    </Grid>
+</UserControl>

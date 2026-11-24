@@ -1,0 +1,78 @@
+<UserControl x:Class="Amql.Gui.Pages.HomePage"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <ScrollViewer x:Name="PageScroll" VerticalScrollBarVisibility="Auto">
+        <StackPanel Margin="28,22,28,24" MaxWidth="1040">
+            <TextBlock Text="Welcome" Style="{StaticResource PageTitle}"/>
+            <TextBlock Style="{StaticResource PageSubtitle}"
+                       Text="Run models locally behind an OpenAI-compatible server, chat with them, and use every AMQL tool from one place."/>
+
+            <!-- The three steps to a running model -->
+            <TextBlock Text="Get going" Style="{StaticResource SectionTitle}"/>
+            <UniformGrid Columns="3" Margin="0,0,0,8">
+                <Border Style="{StaticResource Card}" Margin="0,0,12,12">
+                    <DockPanel>
+                        <Button DockPanel.Dock="Bottom" Content="Choose models" Click="OnChooseModels" HorizontalAlignment="Left" Margin="0,12,0,0"/>
+                        <StackPanel>
+                            <TextBlock Text="1  Pick models" FontSize="16" FontWeight="SemiBold"/>
+                            <TextBlock x:Name="ModelsText" Style="{StaticResource Caption}" Margin="0,6,0,0" Text="Looking for models…"/>
+                        </StackPanel>
+                    </DockPanel>
+                </Border>
+                <Border Style="{StaticResource Card}" Margin="0,0,12,12">
+                    <DockPanel>
+                        <Button DockPanel.Dock="Bottom" x:Name="StartButton" Click="OnStart" Style="{DynamicResource AccentButtonStyle}"
+                                HorizontalAlignment="Left" Margin="0,12,0,0" Content="Start server"/>
+                        <StackPanel>
+                            <TextBlock Text="2  Start the server" FontSize="16" FontWeight="SemiBold"/>
+                            <TextBlock x:Name="ServerText" Style="{StaticResource Caption}" Margin="0,6,0,0"/>
+                        </StackPanel>
+                    </DockPanel>
+                </Border>
+                <Border Style="{StaticResource Card}" Margin="0,0,0,12">
+                    <DockPanel>
+                        <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" Margin="0,12,0,0">
+                            <Button Content="Open playground" Click="OnChat"/>
+                            <Button Content="Monitor" Click="OnMonitor" Margin="8,0,0,0"/>
+                        </StackPanel>
+                        <StackPanel>
+                            <TextBlock Text="3  Use it" FontSize="16" FontWeight="SemiBold"/>
+                            <TextBlock x:Name="UseText" Style="{StaticResource Caption}" Margin="0,6,0,0"
+                                       Text="Chat in the playground, or point any OpenAI client at the server."/>
+                        </StackPanel>
+                    </DockPanel>
+                </Border>
+            </UniformGrid>
+
+            <!-- Common jobs -->
+            <TextBlock Text="Common jobs" Style="{StaticResource SectionTitle}"/>
+            <WrapPanel x:Name="Shortcuts" Margin="0,0,0,12"/>
+
+            <!-- What this machine has -->
+            <TextBlock Text="This computer" Style="{StaticResource SectionTitle}"/>
+            <Border Style="{StaticResource Card}">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="140"/>
+                        <ColumnDefinition Width="*"/>
+                    </Grid.ColumnDefinitions>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
+                    <TextBlock Text="GPU" Style="{StaticResource FieldLabel}"/>
+                    <TextBlock Grid.Column="1" x:Name="GpuText" VerticalAlignment="Center" Text="Checking…"/>
+                    <TextBlock Grid.Row="1" Text="Memory" Style="{StaticResource FieldLabel}"/>
+                    <TextBlock Grid.Row="1" Grid.Column="1" x:Name="RamText" VerticalAlignment="Center"/>
+                    <TextBlock Grid.Row="2" Text="amql-cli" Style="{StaticResource FieldLabel}"/>
+                    <TextBlock Grid.Row="2" Grid.Column="1" x:Name="CliText" VerticalAlignment="Center" TextWrapping="Wrap"/>
+                    <TextBlock Grid.Row="3" Text="amql-server" Style="{StaticResource FieldLabel}"/>
+                    <TextBlock Grid.Row="3" Grid.Column="1" x:Name="ServerToolText" VerticalAlignment="Center" TextWrapping="Wrap"/>
+                </Grid>
+            </Border>
+            <TextBlock Style="{StaticResource Caption}" Text="AMQL Studio finds amql-cli and amql-server by itself: beside the app, in the repository's build folders, or on PATH — the newest build wins."/>
+        </StackPanel>
+    </ScrollViewer>
+</UserControl>

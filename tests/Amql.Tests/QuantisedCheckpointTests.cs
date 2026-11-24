@@ -292,6 +292,68 @@ public sealed class Nvfp4DeviceTests
     }
 
     [Theory]
+    [InlineData(1)]  // decode: a row an expert
+    [InlineData(3)]
+    [InlineData(24)] // experts with more than 8 rows take several tasks
+    public void Grouped_Experts_Match_One_Expert_At_A_Time_Bit_For_Bit(int rows)
+    {
+        if (!GpuAvailable())
+        {
+            return;
+        }
+        const int hidden = 256, inter = 96, experts = 16, topK = 4;
+        var rng = new Random(rows);
+        float[] Values(int count, float scale) =>
+            Enumerable.Range(0, count).Select(_ => (float)(rng.NextDouble() * 2 - 1) * scale).ToArray();
+        var gates = Enumerable.Range(0, experts).Select(_ => Nvfp4.Quantize(Values(inter * hidden, 0.1f), inter, hidden)).ToArray();
+        var ups = Enumerable.Range(0, experts).Select(_ => Nvfp4.Quantize(Values(inter * hidden, 0.1f), inter, hidden)).ToArray();
+        var downs = Enumerable.Range(0, experts).Select(_ => Nvfp4.Quantize(Values(hidden * inter, 0.1f), hidden, inter)).ToArray();
+        var router = new Tensor2D(Values(experts * hidden, 0.2f), experts, hidden);
+        var x = new Tensor2D(Values(rows * hidden, 1f), rows, hidden);
+
+        var uploads = new List<(IntPtr Pointer, int Rows, int Cols)>();
+        Tensor2D Fp4(ScaledMatrix w)
+        {
+            var p = CudaShim.UploadNvfp4(w);
+            uploads.Add((p, w.Rows, w.Cols));
+            return Tensor2D.OnDeviceNvfp4(w.Rows, w.Cols, p, w.Global, () => Tensor2D.FromScaled(w));
+        }
+        var held = Enumerable.Range(0, experts).Select(e => (Fp4(gates[e]), Fp4(ups[e]), Fp4(downs[e]))).ToArray();
+        bool was = CudaShim.GroupedFfn;
+        try
+        {
+            Tensor2D Run() => FfnKernel.Routed(x, router, experts, hidden, e => held[e],
+                topK, ExpertRoutingPolicy.NormalisedOverSelected, Activation.Silu);
+            CudaShim.GroupedFfn = false;
+            long before = CudaShim.GroupedFfnCalls;
+            var single = Run();
+            Assert.Equal(before, CudaShim.GroupedFfnCalls);
+            CudaShim.GroupedFfn = true;
+            var grouped = Run();
+            Assert.Equal(before + 1, CudaShim.GroupedFfnCalls);
+            Assert.Equal(single.Data, grouped.Data);
+
+            var host = FfnKernel.Routed(x, router, experts, hidden,
+                e => (Tensor2D.FromScaled(gates[e]), Tensor2D.FromScaled(ups[e]), Tensor2D.FromScaled(downs[e])),
+                topK, ExpertRoutingPolicy.NormalisedOverSelected, Activation.Silu);
+            double scale = host.Data.Max(v => Math.Abs(v));
+            for (int i = 0; i < host.Data.Length; i++)
+            {
+                Assert.True(Math.Abs(grouped.Data[i] - host.Data[i]) <= 1e-2 * scale,
+                    $"[{i / hidden}, {i % hidden}]: grouped {grouped.Data[i]} vs host {host.Data[i]}");
+            }
+        }
+        finally
+        {
+            CudaShim.GroupedFfn = was;
+            foreach (var (pointer, r, c) in uploads)
+            {
+                CudaShim.FreeNvfp4(pointer, r, c);
+            }
+        }
+    }
+
+    [Theory]
     [InlineData(1)]
     [InlineData(40)]
     public void Shared_Input_Products_Share_One_Upload(int m)
@@ -342,6 +404,49 @@ public sealed class Nvfp4DeviceTests
             CudaShim.SetFp4Prefill(true);
             CudaShim.FreeNvfp4(p4, 300, k);
             CudaShim.FreeMxfp8(p8, 128, k);
+        }
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(11)]
+    public void Shared_Input_Nvfp4_Products_Group_Into_One_Launch_Bit_For_Bit(int m)
+    {
+        if (!GpuAvailable())
+        {
+            return;
+        }
+        const int k = 256;
+        var rng = new Random(m);
+        float[] Values(int count, float scale) =>
+            Enumerable.Range(0, count).Select(_ => (float)(rng.NextDouble() * 2 - 1) * scale).ToArray();
+        // q, k and v as attention has them: different widths, one input.
+        int[] widths = [256, 64, 96];
+        var packs = widths.Select(n => Nvfp4.Quantize(Values(n * k, 0.05f), n, k)).ToArray();
+        var pointers = packs.Select(CudaShim.UploadNvfp4).ToArray();
+        var x = new Tensor2D(Values(m * k, 1f), m, k);
+        bool was = CudaShim.GroupedFfn;
+        try
+        {
+            var weights = packs.Select((w, i) => Tensor2D.OnDeviceNvfp4(w.Rows, k, pointers[i], w.Global, () => Tensor2D.FromScaled(w))).ToArray();
+            CudaShim.GroupedFfn = false;
+            var single = TensorOps.MatMulTransposedBMany(x, weights);
+            CudaShim.GroupedFfn = true;
+            long before = CudaShim.GroupedFfnCalls;
+            var grouped = TensorOps.MatMulTransposedBMany(x, weights);
+            Assert.Equal(before + 1, CudaShim.GroupedFfnCalls);
+            for (int i = 0; i < widths.Length; i++)
+            {
+                Assert.Equal(single[i].Data, grouped[i].Data);
+            }
+        }
+        finally
+        {
+            CudaShim.GroupedFfn = was;
+            for (int i = 0; i < packs.Length; i++)
+            {
+                CudaShim.FreeNvfp4(pointers[i], packs[i].Rows, k);
+            }
         }
     }
 

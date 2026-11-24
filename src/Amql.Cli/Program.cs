@@ -78,6 +78,18 @@ internal static partial class Program
                 i++;
                 continue;
             }
+            if (a == "--kv-format")
+            {
+                string? format = i + 1 < args.Length ? args[i + 1].ToLowerInvariant() : null;
+                if (format is not ("nvfp4" or "fp16" or "f32"))
+                {
+                    Console.Error.WriteLine("error: --kv-format needs f32, fp16 or nvfp4");
+                    return ExitUsage;
+                }
+                GpuEngine.RequestedKvFormat = format;
+                i++;
+                continue;
+            }
             if (a is "--max-ram" or "--gpu-memory")
             {
                 if (i + 1 >= args.Length ||
@@ -133,9 +145,24 @@ internal static partial class Program
         {
             CudaShim.SetFp4Prefill(prefillOnTensorCores);
         }
+        // The notice goes to a person at a console, on stderr: piped output (JSON, TSV, the
+        // --progress protocol) stays exactly what the command writes.
+        if (!progress && !Console.IsErrorRedirected)
+        {
+            Console.Error.WriteLine($"amql-cli — {CopyrightNotice} — {ProjectUrl}");
+        }
 
         args = filtered.ToArray();
         CliProgress.Configure(args[0], progress, verbose);
+        // Running a container at 4 bits means its GPTQ copy (built beside it once),
+        // not each weight rounded to nearest as it loads.
+        if (ComputeBudget.GpuWeightFormat is GpuWeightFormat.Nvfp4 or GpuWeightFormat.Mxfp4 &&
+            args[0] is "generate" or "bench" && args.Length > 1 && File.Exists(Path.Combine(args[1], "index.json")))
+        {
+            args[1] = Amql.Merge.Fp4Cache.Resolve(args[1],
+                ComputeBudget.GpuWeightFormat == GpuWeightFormat.Nvfp4 ? Amql.Merge.Fp4Format.Nvfp4 : Amql.Merge.Fp4Format.Mxfp4,
+                line => Console.Error.WriteLine($"gpu-format: {line}"));
+        }
 
         int result;
         try
@@ -143,6 +170,7 @@ internal static partial class Program
             result = args[0] switch
             {
                 "encode" => Encode(args[1..]),
+                "download" => Download(args[1..]),
                 "verify" => Verify(args[1..]),
                 "synth-model" => SynthModel(args[1..]),
                 "tokens" => Tokens(args[1..]),
@@ -174,6 +202,7 @@ internal static partial class Program
                 "bake-predicate" => BakePredicate(args[1..]),
                 "lora-train" => LoraTrain(args[1..]),
                 "tool-trace" => ToolTrace(args[1..]),
+                "kv-probe" => KvProbe(args[1..]),
                 "entail" => EntailCommand(args[1..]),
                 "ngram" => NGramCommand(args[1..]),
                 "classify" => Classify(args[1..]),
@@ -236,16 +265,29 @@ internal static partial class Program
 
     private static int Encode(string[] args)
     {
-        var modelDir = Arg(args, 0) ?? throw new CliException("encode requires a model directory");
+        var source = Arg(args, 0) ?? throw new CliException("encode requires a model directory or a Hugging Face URL / repo id");
         string? outDir = OptionValue(args, "--out");
         if (outDir is null)
         {
             throw new CliException("encode requires '--out <container-dir>'");
         }
 
+        // A Hugging Face URL or owner/name is downloaded first, then encoded like a local checkpoint.
+        string modelDir = source;
+        string? modelId = null;
+        if (!Directory.Exists(source) && Amql.Hf.HfDownloader.TryParse(source, OptionValue(args, "--revision")) is { } hub)
+        {
+            modelDir = DownloadFromHub(hub, args);
+            modelId = hub.Name;
+        }
+        else if (!Directory.Exists(source))
+        {
+            throw new CliException($"'{source}' is neither a local checkpoint directory nor a Hugging Face URL or owner/name");
+        }
+
         Console.WriteLine($"encoding '{modelDir}' → '{outDir}'");
         CliProgress.Phase("encode");
-        var report = ModelToContainer.Encode(modelDir, outDir);
+        var report = ModelToContainer.Encode(modelDir, outDir, modelId);
         CliProgress.Complete($"{report.Tensors} tensors, {report.PayloadBytes} bytes");
 
         Console.WriteLine();
@@ -264,6 +306,62 @@ internal static partial class Program
         }
         Console.WriteLine("done. run 'amql-cli verify <container-dir>' for integrity + runtime readiness.");
         return 0;
+    }
+
+    // ── download ───────────────────────────────────────────────────────────
+
+    private static int Download(string[] args)
+    {
+        var source = FirstPositional(args, "--out", "--revision") ?? throw new CliException("download requires a Hugging Face URL or owner/name");
+        var hub = Amql.Hf.HfDownloader.TryParse(source, OptionValue(args, "--revision"))
+                  ?? throw new CliException($"'{source}' is not a Hugging Face model URL or owner/name");
+        string dir = DownloadFromHub(hub, args, OptionValue(args, "--out"));
+        Console.WriteLine($"done. encode it with: amql-cli encode \"{dir}\" --out <container-dir>");
+        CliProgress.Result(new { directory = dir, repo = hub.Repo, revision = hub.Revision });
+        return 0;
+    }
+
+    /// <summary>Downloads a Hub model (to --download-dir, the given folder, or the cache) with progress, and returns the folder.</summary>
+    private static string DownloadFromHub(Amql.Hf.HfModelRef hub, string[] args, string? directory = null)
+    {
+        directory ??= OptionValue(args, "--download-dir");
+        Console.WriteLine($"downloading {hub} from {hub.PageUrl}");
+        CliProgress.Phase("download");
+        string? lastFile = null;
+        int lastTenth = -1;
+        try
+        {
+            var result = Amql.Hf.HfDownloader.DownloadAsync(hub, directory, token: null, allFiles: HasOption(args, "--all-files"),
+                log: line => Console.WriteLine($"  {line}"),
+                progress: p =>
+                {
+                    CliProgress.Advance(p.Done, p.Total, p.File);
+                    // A line per tenth of each large file keeps a console readable.
+                    int tenth = p.FileTotal > 0 ? (int)(10 * p.FileDone / p.FileTotal) : 10;
+                    if (p.File != lastFile)
+                    {
+                        lastFile = p.File;
+                        lastTenth = -1;
+                    }
+                    if (p.FileTotal >= 64L << 20 && tenth != lastTenth)
+                    {
+                        lastTenth = tenth;
+                        Console.WriteLine($"  [{p.FileIndex}/{p.FileCount}] {p.File}: {Amql.Hf.HfDownloader.FormatBytes(p.FileDone)} of " +
+                                          $"{Amql.Hf.HfDownloader.FormatBytes(p.FileTotal)}" +
+                                          (p.BytesPerSecond > 0 ? $" ({Amql.Hf.HfDownloader.FormatBytes((long)p.BytesPerSecond)}/s)" : ""));
+                    }
+                }).GetAwaiter().GetResult();
+            Console.WriteLine($"downloaded:   {result.Directory}");
+            return result.Directory;
+        }
+        catch (Amql.Hf.HfDownloadException e)
+        {
+            throw new CliException(e.Message);
+        }
+        catch (HttpRequestException e)
+        {
+            throw new CliException($"could not reach the Hugging Face Hub: {e.Message}");
+        }
     }
 
     // ── verify ─────────────────────────────────────────────────────────────
@@ -1879,17 +1977,13 @@ internal static partial class Program
             var other => throw new CliException($"unknown format '{other}': use nvfp4 or mxfp4"),
         };
         string? calibration = OptionValue(args, "--calibration");
-        var rounding = (OptionValue(args, "--rounding") ?? (calibration is null ? "nearest" : "gptq")).ToLowerInvariant() switch
+        var rounding = (OptionValue(args, "--rounding") ?? "gptq").ToLowerInvariant() switch
         {
             "nearest" => Amql.Merge.Fp4Rounding.Nearest,
             "search" => Amql.Merge.Fp4Rounding.ScaleSearch,
             "gptq" => Amql.Merge.Fp4Rounding.Gptq,
             var other => throw new CliException($"unknown rounding '{other}': use nearest, search or gptq"),
         };
-        if (rounding == Amql.Merge.Fp4Rounding.Gptq && calibration is null)
-        {
-            throw new CliException("gptq rounding needs '--calibration <file-or-folder>' (text the model reads)");
-        }
         var options = new Amql.Merge.QuantiseOptions(format)
         {
             Rounding = rounding,
@@ -1918,7 +2012,8 @@ internal static partial class Program
                 "'amql-cli quantise compare <reference> <candidate> --text <file>'");
         }
         string text = ReadText(OptionValue(args, "--text") ?? throw new CliException("quantise compare requires '--text <file-or-folder>'"));
-        Amql.Merge.QuantCompare.Run(dirs[0], dirs.Skip(1).ToList(), text, IntOption(args, "--tokens", 4096), Console.WriteLine);
+        Amql.Merge.QuantCompare.Run(dirs[0], dirs.Skip(1).ToList(), text, IntOption(args, "--tokens", 4096), Console.WriteLine,
+            IntOption(args, "--score-from", 0));
         return 0;
     }
 
@@ -2806,25 +2901,35 @@ internal static partial class Program
 
     // ── plumbing ───────────────────────────────────────────────────────────
 
+    internal const string CopyrightNotice = "Copyright © 2026 Simon Soanes";
+    internal const string ProjectUrl = "https://github.com/simonsoanes/AMQL";
+
     private static void PrintVersion()
     {
         Console.WriteLine("amql-cli v0.x");
-        Console.WriteLine("Copyright © 2026 Simon Soanes");
+        Console.WriteLine(CopyrightNotice);
+        Console.WriteLine(ProjectUrl);
     }
 
     private static void PrintHelp()
     {
+        Console.WriteLine($"amql-cli — {CopyrightNotice} — {ProjectUrl}");
+        Console.WriteLine();
         Console.WriteLine("""
             amql-cli — load an HF checkpoint into a canonical VINDEX3 container,
             then run and inspect inference against it
 
             USAGE:
-              amql-cli [--cpu | --gpu] [--max-ram GB] [--gpu-memory GB] [--gpu-format nvfp4|fp16] [--fp4-prefill on|off] [--progress] [--verbose] <command> [args]
+              amql-cli [--cpu | --gpu] [--max-ram GB] [--gpu-memory GB] [--gpu-format nvfp4|fp16] [--kv-format fp16|f32|nvfp4] [--fp4-prefill on|off] [--progress] [--verbose] <command> [args]
               amql-cli --version | -V
 
             Commands:
-              amql-cli encode <model-dir> --out <container-dir>   map + materialise
+              amql-cli encode <model-dir | hf-url | owner/name> --out <container-dir>   map + materialise
                               [--dtype Q4_0|Q8_0|FP4|BF16|FP32]   single-encoding slim import
+                              [--revision main] [--download-dir <dir>] [--all-files]
+                              a Hugging Face URL or owner/name is downloaded first (HF_TOKEN for gated models)
+              amql-cli download <hf-url | owner/name> [--out <dir>] [--revision main] [--all-files]
+                              fetch a checkpoint from the Hugging Face Hub (resumable, SHA-256 checked)
               amql-cli strip <container-dir> --keep <encoding> [--out <slim-dir>]   slim copy
               amql-cli verify <container-dir>                     integrity + readiness
               amql-cli classify <classifier-container>
@@ -3146,9 +3251,14 @@ internal static partial class Program
             holds them at their stored size. NVFP4 and MXFP8 weights go
             to the GPU as stored (0.56 and 1.03 bytes an element), routed
             experts included, which then share the device in least-recently-used
-            order. --gpu-format nvfp4 (AMQL_GPU_FORMAT) also quantises
-            other weights to NVFP4 on their way to the GPU (lossy);
-            the default, fp16, keeps them exact.
+            order. --gpu-format nvfp4|mxfp4 (AMQL_GPU_FORMAT) runs
+            generate and bench (and amql-server) on the container's
+            GPTQ-rounded copy, built beside it ({dir}-nvfp4-gptq) the
+            first time and reused; other weights, and containers GPTQ
+            cannot calibrate, are quantised to nearest on their way to the
+            GPU (lossy). The default, fp16, keeps them exact.
+            quantise rounds with GPTQ by default, calibrated on a
+            built-in text unless --calibration names your own.
             Prefill products with NVFP4 weights run on the FP4 tensor
             cores, quantising the activations to NVFP4 as well (W4A4,
             what NVFP4 checkpoints are trained for); decode keeps FP32

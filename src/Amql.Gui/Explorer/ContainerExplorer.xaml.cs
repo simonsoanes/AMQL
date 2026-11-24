@@ -307,6 +307,13 @@ public partial class ContainerExplorer : UserControl
         PathText.Text = dlg.FolderName;
     }
 
+    /// <summary>Opens a container without asking (from the Server page's model list, say).</summary>
+    public void Open(string containerPath)
+    {
+        _model.Load(containerPath);
+        PathText.Text = containerPath;
+    }
+
     private void OnCloseContainer(object sender, RoutedEventArgs e)
     {
         _model.Unload();

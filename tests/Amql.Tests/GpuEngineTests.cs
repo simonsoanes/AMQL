@@ -12,9 +12,15 @@ namespace Amql.Tests;
 /// families it refuses must say why. Skips without a CUDA device.
 /// </summary>
 [Collection("gpu")]
-public class GpuEngineTests
+public class GpuEngineTests : IDisposable
 {
     private static string Zoo => Path.Combine(AppContext.BaseDirectory, "fixtures", "arch-zoo");
+
+    // These hold the kernels to the managed f32 path, so the KV cache stays f32
+    // (the default FP16 cache is held to f32 in KvFormatTests).
+    private readonly string _kvFormat = GpuEngine.RequestedKvFormat;
+    public GpuEngineTests() => GpuEngine.RequestedKvFormat = "f32";
+    public void Dispose() => GpuEngine.RequestedKvFormat = _kvFormat;
 
     /// <summary>Families whose plans need an operator the engine leaves to the
     /// managed path (routed experts, length-dependent rope, Qwen4's gated

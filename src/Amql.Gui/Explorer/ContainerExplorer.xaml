@@ -8,7 +8,7 @@
              d:DesignHeight="450" d:DesignWidth="300">
     <DockPanel>
         <!-- Header -->
-        <Border DockPanel.Dock="Top" Padding="6" Background="#FFF0F2F5" BorderBrush="#FFD0D7E2" BorderThickness="0,0,0,1">
+        <Border DockPanel.Dock="Top" Padding="6" Background="{DynamicResource LayerFillColorDefaultBrush}" BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}" BorderThickness="0,0,0,1">
             <StackPanel>
                 <StackPanel Orientation="Horizontal">
                     <Button x:Name="OpenButton" Content="📂 Open Container…" Click="OnOpenContainer"

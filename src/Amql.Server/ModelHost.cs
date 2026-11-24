@@ -109,12 +109,38 @@ public sealed class ModelHost : IDisposable
 
     /// <param name="adapters">Entail adapter directories to run beside a
     /// generative model; each must have been built for this model's tokenizer.</param>
-    public static ModelHost Load(string id, string path, IReadOnlyList<string>? adapters = null, ModelDefaults? defaults = null)
+    /// <param name="kvDir">This model's own folder for paged-out prompt state
+    /// (its <c>kv_dir</c> in <c>--config</c>); see <see cref="KvPaging.For"/>.</param>
+    public static ModelHost Load(string id, string path, IReadOnlyList<string>? adapters = null, ModelDefaults? defaults = null, string? kvDir = null)
     {
         var host = LoadEngines(id, path, adapters);
+        void Log(string line) => Console.Error.WriteLine($"{DateTime.Now:HH:mm:ss.fff} {id}: {line}");
         var library = host.Generator is { } g
-            ? new NGramLibrary(path, TokenizerFingerprint(g.Tokenizer), line => Console.Error.WriteLine($"{DateTime.Now:HH:mm:ss.fff} {id}: {line}"))
+            ? new NGramLibrary(path, TokenizerFingerprint(g.Tokenizer), Log)
             : null;
+        if (host.Generator?.Batch is { } batch)
+        {
+            var paging = KvPaging.For(id, path, kvDir);
+            var store = paging.DiskDir is { } dir
+                ? new KvPageStore(dir, KvPageStore.Fingerprint(path, batch.MarkGeometry), paging.DiskBudgetBytes, paging.ExpireSeconds, Log)
+                : null;
+            batch.Configure(paging, store, Log);
+            if (host.Notes is List<string> kvNotes && (batch.KvFormat.Format != "f32" || batch.KvFormat.Refusal is not null))
+            {
+                kvNotes.Add(batch.KvFormat.Refusal is { } why ? $"KV cache stays f32: {why}"
+                    : $"KV cache stored as {batch.KvFormat.Format}" + (batch.KvFormat.Format != "nvfp4" ? "" : paging.ExactPrefix switch
+                    {
+                        < 0 => $", each conversation's system prompt and first user message at {(paging.ExactF16 ? "FP16" : "f32")}",
+                        0 => "",
+                        var n => $", each conversation's first {n} tokens at {(paging.ExactF16 ? "FP16" : "f32")}",
+                    }));
+            }
+            if (store is not null && host.Notes is List<string> notes)
+            {
+                notes.Add($"prompt state pages out to {store.Folder} after {paging.IdleSeconds:F0} s idle " +
+                               $"(up to {paging.DiskBudgetBytes / (1024.0 * 1024 * 1024):F1} GiB, deleted after {paging.ExpireSeconds:F0} s)");
+            }
+        }
         return new ModelHost(host, defaults ?? new ModelDefaults(),
             (adapters ?? Array.Empty<string>()).Select(d => System.IO.Path.GetFileName(System.IO.Path.GetFullPath(d).TrimEnd('/', '\\'))).ToList())
         {
@@ -562,6 +588,9 @@ public sealed class TextGenerator : IDisposable
 
     /// <summary>Requests that can generate at once: the batch size on the GPU engine, else 1.</summary>
     public int Concurrency => _batch is null ? 1 : GpuEngine.MaxBatch;
+
+    /// <summary>The batch scheduler, when requests are batched on the GPU engine.</summary>
+    internal BatchScheduler? Batch => _batch;
 
     /// <summary>Why requests are not batched, when they are not.</summary>
     public string? BatchRefusal { get; }
@@ -1427,6 +1456,31 @@ public static class PromptMark
         }
         return prompt.Length - 1;
     }
+
+    /// <summary>How many first positions to keep exact: <paramref name="mode"/>
+    /// tokens when positive, none at 0, and at -1 (auto) everything through the
+    /// first user message, up to the turn after it: the system prompt, the tools
+    /// and the first instruction. None when the prompt has no user turn.</summary>
+    public static int Exact(int[] prompt, int mode, int? turnStart, int? userRole)
+    {
+        if (mode >= 0)
+        {
+            return Math.Min(mode, prompt.Length);
+        }
+        if (turnStart is not { } start || userRole is not { } user)
+        {
+            return 0;
+        }
+        for (int i = 0; i + 1 < prompt.Length; i++)
+        {
+            if (prompt[i] == start && prompt[i + 1] == user)
+            {
+                int next = Array.IndexOf(prompt, start, i + 2);
+                return next < 0 ? prompt.Length : next;
+            }
+        }
+        return 0;
+    }
 }
 
 /// <summary>
@@ -1450,6 +1504,7 @@ internal sealed class BatchScheduler : IDisposable
         public int Row;     // its row in the last step
         public int? Pending;   // a token already chosen (a verify's first miss), run next
         public List<int>? Context;   // the prompt and every token run since, for suffix drafts
+        public (int Mark, ChunkedBuffer State)? Paged;   // a state taken from disk for its prompt
     }
 
     private readonly GpuEngine _engine;
@@ -1457,21 +1512,45 @@ internal sealed class BatchScheduler : IDisposable
     private readonly IReadOnlyList<IEntailAdapter> _adapters;
     private readonly Func<int[], int[]?>? _priorPrompt;
     private readonly System.Collections.Concurrent.BlockingCollection<Job> _waiting = new();
-    // Finished sequences kept for the next requests, oldest first, each with the
-    // prompt it last ran: one whose prompt the next shares up to its mark is
-    // rewound there rather than prefilled again (an agent's calls share all but
-    // their last few hundred tokens).
+    // Finished sequences kept for the next requests, least recently used first,
+    // each with the prompt it last ran and when: one whose prompt the next
+    // shares up to its mark is rewound there rather than prefilled again (an
+    // agent's calls share all but their last few hundred tokens). They leave
+    // GPU memory when unused for the idle time or past the GPU budget, oldest
+    // first, paged to disk when the model has a disk tier. Only the batch
+    // thread touches these (and Dispose, once it has stopped).
     private readonly List<GpuSequence> _free = new();
     private readonly Dictionary<GpuSequence, int[]> _held = new();
-    private readonly int? _turnStart;
+    private readonly Dictionary<GpuSequence, DateTime> _usedAt = new();
+    private readonly int? _turnStart, _userRole;
     private GpuSequence? _priorSeq;
+    private KvPaging _paging = KvPaging.Defaults;
+    private KvPageStore? _store;
+    private Action<string>? _log;
+    private long _lastHousekeep;
 
     /// <summary>Set false (<c>--no-prefix-reuse</c>) to prefill every prompt whole.</summary>
     internal static bool PrefixReuse = true;
 
-    // Each kept sequence holds its KV cache: ~2 GiB at 32k positions on Qwen 3.5 4B.
-    private const int KeptPrefixes = 2;
-    public long ReusedTokens, PrefilledTokens;
+    public long ReusedTokens, PrefilledTokens, RestoredTokens, Released;
+
+    /// <summary>The disk tier, when the model has one.</summary>
+    public KvPageStore? Store => _store;
+
+    /// <summary>The engine's geometry for a saved state (see <see cref="GpuEngine.MarkGeometry"/>).</summary>
+    public string MarkGeometry => _engine.MarkGeometry;
+
+    /// <summary>The KV cache's format, and why NVFP4 was refused when asked for.</summary>
+    public (string Format, string? Refusal) KvFormat => (_engine.KvFormat, _engine.KvFormatRefusal);
+
+    /// <summary>How long kept state stays, how much GPU memory it may hold,
+    /// and the disk tier. Set before the first request.</summary>
+    public void Configure(KvPaging paging, KvPageStore? store, Action<string>? log)
+    {
+        _paging = paging;
+        _store = store;
+        _log = log;
+    }
     private readonly Thread _thread;
 
     // AMQL_SERVER_TIMING=1: where a batch step's time goes, printed every 500 steps.
@@ -1500,6 +1579,7 @@ internal sealed class BatchScheduler : IDisposable
         _adapters = adapters;
         _priorPrompt = priorPrompt;
         _turnStart = g.Tokenizer.AddedTokenId("<|im_start|>");
+        _userRole = g.Tokenizer.EncodeToIds("user").ToArray() is [var user] ? user : null;
         _thread = new Thread(Loop) { IsBackground = true, Name = "amql batch" };
         _thread.Start();
     }
@@ -1508,6 +1588,11 @@ internal sealed class BatchScheduler : IDisposable
     public GenerationResult Run(GenerationRun run)
     {
         var job = new Job(run);
+        // Read from disk here, on the request's thread, so the batch keeps stepping meanwhile.
+        if (PrefixReuse && _store is { } store)
+        {
+            job.Paged = store.Take(run.Prompt);
+        }
         _waiting.Add(job);
         return job.Done.Task.GetAwaiter().GetResult();
     }
@@ -1532,9 +1617,15 @@ internal sealed class BatchScheduler : IDisposable
         {
             try
             {
-                if (active.Count == 0 && _waiting.TryTake(out var first, Timeout.Infinite))
+                Housekeep();
+                // Idle with state kept: wake now and then to release what has sat too long.
+                if (active.Count == 0 && _waiting.TryTake(out var first, _free.Count > 0 ? 1000 : Timeout.Infinite))
                 {
                     Admit(first, active);
+                }
+                if (active.Count == 0)
+                {
+                    continue;
                 }
                 while (active.Count < GpuEngine.MaxBatch && _waiting.TryTake(out var waiting))
                 {
@@ -1642,6 +1733,10 @@ internal sealed class BatchScheduler : IDisposable
                 foreach (var job in active)
                 {
                     job.Run.Abort("error");
+                    if (job.Seq is { } failed)
+                    {
+                        _held.Remove(failed);   // its state is not to be trusted
+                    }
                     Release(job);
                     job.Done.TrySetException(e);
                 }
@@ -1750,6 +1845,9 @@ internal sealed class BatchScheduler : IDisposable
             int[] prompt = job.Run.Prompt;
             int mark = MarkFor(prompt);
             int reused = 0;
+            bool fromDisk = false;
+            var paged = job.Paged;
+            job.Paged = null;
             job.Seq = Device(() =>
             {
                 if (Timing)
@@ -1761,31 +1859,47 @@ internal sealed class BatchScheduler : IDisposable
                     }
                 }
                 var seq = PrefixReuse ? Reusable(prompt) : null;
-                if (seq is not null)
+                if (paged is { } p && (seq is null || p.Mark > seq.MarkedAt))
+                {
+                    try
+                    {
+                        var restored = _engine.RestoreMark(p.State);
+                        if (restored.MarkedAt != p.Mark)
+                        {
+                            _engine.Release(restored);
+                            throw new InvalidDataException($"the state was saved at {restored.MarkedAt}, not {p.Mark}");
+                        }
+                        seq = restored;
+                        reused = seq.Position;
+                        fromDisk = true;
+                        paged = null;
+                    }
+                    catch (Exception e) when (e is InvalidDataException or EndOfStreamException or InvalidOperationException)
+                    {
+                        _log?.Invoke($"kv: could not restore a paged-out state ({e.Message}); prefilling");
+                        paged = null;
+                    }
+                }
+                if (!fromDisk && seq is not null)
                 {
                     _free.Remove(seq);
+                    _usedAt.Remove(seq);
                     _engine.Rewind(seq);
                     reused = seq.Position;
                 }
-                else
+                else if (!fromDisk)
                 {
-                    // A prompt that shares nothing kept takes a sequence of its own while
-                    // fewer than KeptPrefixes are kept, so an agent's side requests do not
-                    // take the sequence its main calls pick up from.
-                    if (_free.Count >= KeptPrefixes || (_free.Count > 0 && !PrefixReuse))
-                    {
-                        seq = _free[0];
-                        _free.RemoveAt(0);
-                    }
-                    else
-                    {
-                        seq = _engine.NewSequence();
-                    }
-                    _engine.Reset(seq);
+                    seq = _engine.NewSequence();
+                    _engine.SetExactRows(seq, ExactFor(prompt), _paging.ExactF16);
                 }
-                _held.Remove(seq);
-                return seq;
+                _held.Remove(seq!);
+                return seq!;
             });
+            if (paged is { } unused && _store is { } store)
+            {
+                // A kept sequence went further: the state read from disk goes back.
+                store.Put(prompt[..unused.Mark], unused.State.View(), DateTime.UtcNow);
+            }
             job.Adapters = _adapters.Select(a => a.Sibling()).ToArray();
             double[]? prior = null;
             if (job.Adapters.Any(a => a.Manifest.NeedsPrior) && _priorPrompt?.Invoke(prompt) is { } blank)
@@ -1813,6 +1927,11 @@ internal sealed class BatchScheduler : IDisposable
             _held[seqNow] = prompt;
             ReusedTokens += reused;
             PrefilledTokens += prompt.Length - reused;
+            if (fromDisk)
+            {
+                RestoredTokens += reused;
+                _log?.Invoke($"kv: restored {reused} tokens from disk, prefilled {prompt.Length - reused}");
+            }
             long a1 = System.Diagnostics.Stopwatch.GetTimestamp();
             var verdict = EntailVerdict.Merge(job.Adapters.Select(a =>
             {
@@ -1839,6 +1958,9 @@ internal sealed class BatchScheduler : IDisposable
     }
 
     private int MarkFor(int[] prompt) => PromptMark.At(prompt, _turnStart);
+
+    /// <summary>How many of a new conversation's first positions stay f32 in an NVFP4 cache.</summary>
+    private int ExactFor(int[] prompt) => PromptMark.Exact(prompt, _paging.ExactPrefix, _turnStart, _userRole);
 
     /// <summary>The kept sequence that the prompt can rewind into: its mark is
     /// short of the prompt's end and the prompt agrees with what it held up to
@@ -1874,20 +1996,92 @@ internal sealed class BatchScheduler : IDisposable
         if (job.Seq is { } seq)
         {
             job.Seq = null;
-            // Keep a batch's worth of sequences for the next requests; free the rest.
-            _free.Add(seq);
-            if (_free.Count > GpuEngine.MaxBatch)
+            if (PrefixReuse && _held.ContainsKey(seq) && seq.MarkedAt > 0)
             {
-                var oldest = _free[0];
-                _free.RemoveAt(0);
-                _held.Remove(oldest);
+                // Kept for the next requests while it fits the GPU budget.
+                _free.Add(seq);
+                _usedAt[seq] = DateTime.UtcNow;
+                TrimToBudget();
+            }
+            else
+            {
+                _held.Remove(seq);
                 Device(() =>
                 {
-                    _engine.Release(oldest);
+                    _engine.Release(seq);
                     return 0;
                 });
             }
         }
+    }
+
+    /// <summary>Releases kept sequences unused for the idle time. At most once a second.</summary>
+    private void Housekeep()
+    {
+        long now = Environment.TickCount64;
+        if (now - _lastHousekeep < 1000 || _paging.IdleSeconds <= 0)
+        {
+            return;
+        }
+        _lastHousekeep = now;
+        var cutoff = DateTime.UtcNow - TimeSpan.FromSeconds(_paging.IdleSeconds);
+        foreach (var seq in _free.Where(s => _usedAt[s] < cutoff).ToList())
+        {
+            Evict(seq, "idle");
+        }
+    }
+
+    /// <summary>Releases the least recently used kept sequences until the rest fit the GPU budget.</summary>
+    private void TrimToBudget()
+    {
+        long total = _free.Sum(_engine.DeviceBytes);
+        while (_free.Count > 0 && total > _paging.GpuBudgetBytes)
+        {
+            var oldest = _free[0];
+            total -= _engine.DeviceBytes(oldest);
+            Evict(oldest, "over the GPU budget");
+        }
+    }
+
+    /// <summary>Takes a kept sequence out of GPU memory: to disk first when
+    /// the model has a disk tier and the state is worth loading back.</summary>
+    private void Evict(GpuSequence seq, string why)
+    {
+        _free.Remove(seq);
+        var usedAt = _usedAt.Remove(seq, out var t) ? t : DateTime.UtcNow;
+        _held.Remove(seq, out var held);
+        long bytes = _engine.DeviceBytes(seq);
+        string where = "released";
+        try
+        {
+            if (_store is { } store && held is not null && seq.MarkedAt >= _paging.MinPageTokens && held.Length >= seq.MarkedAt)
+            {
+                var state = new ChunkedBuffer();
+                Device(() =>
+                {
+                    _engine.SaveMark(seq, state);
+                    return 0;
+                });
+                if (store.Put(held[..seq.MarkedAt], state, usedAt))
+                {
+                    where = "paged out";
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            _log?.Invoke($"kv: could not page out a sequence: {e.Message}");
+        }
+        finally
+        {
+            Device(() =>
+            {
+                _engine.Release(seq);
+                return 0;
+            });
+            Released++;
+        }
+        _log?.Invoke($"kv: {where} a sequence ({why}; {seq.MarkedAt} tokens, {bytes / (1024.0 * 1024):F0} MiB of GPU memory); {_free.Count} kept");
     }
 
     private static double[] Softmax(float[] logits)
@@ -1909,7 +2103,15 @@ internal sealed class BatchScheduler : IDisposable
     public void Dispose()
     {
         _waiting.CompleteAdding();
-        _thread.Join(TimeSpan.FromSeconds(10));
+        if (_thread.Join(TimeSpan.FromSeconds(10)))
+        {
+            // The batch thread has stopped: what is kept goes to disk, for after a restart.
+            foreach (var seq in _free.ToList())
+            {
+                Evict(seq, "shutting down");
+            }
+        }
+        _store?.Dispose();
     }
 }
 

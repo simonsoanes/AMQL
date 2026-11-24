@@ -17,9 +17,18 @@ namespace Amql.Tests;
 /// container tests need none).
 /// </summary>
 [Collection("gpu")]
-public class Fp4EngineTests
+public class Fp4EngineTests : IDisposable
 {
     private static string Zoo => Path.Combine(AppContext.BaseDirectory, "fixtures", "arch-zoo");
+
+    // These hold 4-bit weights to the managed path, so the KV cache stays f32
+    // (the default FP16 cache is held to f32 in KvFormatTests).
+    private readonly string _kvFormat = GpuEngine.RequestedKvFormat;
+    public Fp4EngineTests() => GpuEngine.RequestedKvFormat = "f32";
+    public void Dispose() => GpuEngine.RequestedKvFormat = _kvFormat;
+
+    /// <summary>Rounding to nearest: what quantising as a weight loads does, value for value.</summary>
+    private static QuantiseOptions Nearest(Fp4Format format) => new(format) { Rounding = Fp4Rounding.Nearest };
 
     private static string Encode(TempDir dir, string family)
     {
@@ -37,7 +46,7 @@ public class Fp4EngineTests
         using var dir = new TempDir();
         string source = Encode(dir, "qwen3_5-gdn");
         string quantised = Path.Combine(dir.Path, "q");
-        var report = QuantiseContainer.Transform(source, quantised, format);
+        var report = QuantiseContainer.Transform(source, quantised, Nearest(format));
         Assert.True(report.Quantised > 0);
         Assert.True(report.BytesAfter < report.BytesBefore);
 
@@ -79,7 +88,7 @@ public class Fp4EngineTests
         }
         using var dir = new TempDir();
         string quantised = Path.Combine(dir.Path, "q");
-        QuantiseContainer.Transform(Encode(dir, family), quantised, format);
+        QuantiseContainer.Transform(Encode(dir, family), quantised, Nearest(format));
         using var container = Vindex3Container.Open(quantised);
         using var store = container.CreateOperandStore();
         var plan = Planner.Plan(container, "target", store);
@@ -121,7 +130,7 @@ public class Fp4EngineTests
         using var dir = new TempDir();
         string source = Encode(dir, family);
         string quantised = Path.Combine(dir.Path, "q");
-        QuantiseContainer.Transform(source, quantised, format);
+        QuantiseContainer.Transform(source, quantised, Nearest(format));
         var (ids, _) = ArchZooTests.Golden(family);
         var prompt = Enumerable.Range(0, 40).Select(i => ids[i % ids.Length]).ToArray();
 
@@ -168,7 +177,7 @@ public class Fp4EngineTests
         const string family = "qwen3_5-gdn";
         using var dir = new TempDir();
         string quantised = Path.Combine(dir.Path, "q");
-        QuantiseContainer.Transform(Encode(dir, family), quantised, Fp4Format.Nvfp4);
+        QuantiseContainer.Transform(Encode(dir, family), quantised, Nearest(Fp4Format.Nvfp4));
         using var container = Vindex3Container.Open(quantised);
         using var store = container.CreateOperandStore();
         var plan = Planner.Plan(container, "target", store);
@@ -333,6 +342,34 @@ public class Fp4EngineTests
         var b = cpu.Prefill(prompt).FirstRow().ToArray();
         Assert.True(gpu.DeviceEngine()!.Fp4Matrices > 0);
         AssertClose(b, a, $"gptq {format}", 1e-3);
+    }
+
+    [Fact]
+    public void Running_At_Four_Bits_Picks_The_Gptq_Copy_Beside_The_Container()
+    {
+        CudaShim.Reset();
+        if (!CudaShim.Enabled)
+        {
+            return;
+        }
+        const string family = "qwen3_5-gdn";
+        using var dir = new TempDir();
+        string source = Path.GetFullPath(Encode(dir, family)).TrimEnd('/', '\\');
+        string copy = source + "-nvfp4-gptq";
+        var (ids, _) = ArchZooTests.Golden(family);
+        QuantiseContainer.Transform(source, copy, new QuantiseOptions(Fp4Format.Nvfp4)
+        {
+            CalibrationIds = Enumerable.Range(0, 128).Select(i => ids[(i * 7) % ids.Length]).ToArray(),
+            SequenceTokens = 64,
+        });
+        Assert.Contains("\"rounding\":\"gptq\"", File.ReadAllText(Path.Combine(copy, "index.json")));
+
+        // The copy is newer than its source, so it is reused, not rebuilt.
+        var written = File.GetLastWriteTimeUtc(Path.Combine(copy, "index.json"));
+        Assert.Equal(copy, Fp4Cache.Resolve(source, Fp4Format.Nvfp4));
+        Assert.Equal(written, File.GetLastWriteTimeUtc(Path.Combine(copy, "index.json")));
+        // A container already at 4 bits is run as it is.
+        Assert.Equal(copy, Fp4Cache.Resolve(copy, Fp4Format.Nvfp4));
     }
 
     private static void AssertClose(float[] expected, float[] actual, string what, double tolerance)

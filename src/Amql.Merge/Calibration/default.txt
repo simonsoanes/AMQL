@@ -1,0 +1,2842 @@
+# Pre-trained MTP drafter for AMQL — an engineered, calculation-first design
+
+**Goal:** turn a dense container that ships no MTP (e.g. `Qwen3.5-0.8B`) into one that
+carries a *pre-trained* MTP drafter — where "pre-trained" means the drafter's free
+parameters are **calculated**, not optimised by stochastic gradient descent: one forward
+pass over a corpus collects the model's own continuation map, and a closed-form ridge
+least-squares solve replaces training. No autograd, no SGD, no random seeds in the
+learning path.
+
+The known baseline it must beat: the bootstrapped `generate-mtp` drafter (trunk = a copy
+of the last full-attention layer, projector `fc` = the mean-combination boot) measured at
+**0.3% zero-shot draft acceptance** on `Qwen3.5-0.8B`. Every phase in this design gates on
+the same deterministic acceptance measurement.
+
+## Principles
+
+1. **Calculation over training.** The drafter's free block is fit by a ridge-regularised
+   least-squares projection (order-independent, closed-form). "Trial and error" is limited
+   to choosing a small set of *scalar* hyper-parameters (ridge, clusters, features) — each
+   chosen by a principled default and confirmed by the measurement gate, never by search.
+2. **Determinism.** Corpus → pairs → weights → acceptance is a pure function of (container,
+   corpus, scalars). Same inputs, byte-identical weights; validated by a determinism test.
+3. **Reuse.** The build reuses existing, tested machinery: the ridge solver
+   (`Amql.Merge.LeastSquares.Fit/ResidualL2` from the anchored-alignment merge), the
+   balanced k-means + materialised linear router (`MoeIfy.ClusterUnits`, the moe-ify
+   router construction), the runtime acceptance gate (`GenerateMtp.MeasureDraftAcceptance`),
+   and the module materialisation / export-companion path (`GenerateMtp.Transform`,
+   `ModelExporter.ExportMtp`).
+4. **Measurement-gated.** No phase is "complete" without its acceptance / residual number,
+   computed through the runtime path on a **held-out** split.
+
+## The drafter composition being optimised
+
+The pre-trained drafter keeps the deterministic skeleton and replaces only its free block:
+
+```
+x_t = concat( pre_fc_norm_hidden(h_t), pre_fc_norm_embedding(e_{t+1}) )   ∈ R^{2h}   (frozen)
+p_t = FREE_BLOCK(x_t)                                                       ∈ R^h      (the fitted part)
+y_t = trunk(p_t)                                                            ∈ R^h      (Rms → causal GQA + fused σ-gate → silu FFN → residual; FROZEN, copied from the last full-attention layer)
+logits_t = head( mtp_norm(y_t) )                                            ∈ R^vocab  (FROZEN, the shared head)
+draft_t = argmax logits_t                                                  → token t+2
+```
+
+`generate-mtp` already assembles this skeleton and materialises it. The design below
+defines how `FREE_BLOCK` is calculated so the composition maximises acceptance.
+
+## The data contract (one forward pass, deterministic)
+
+The frozen model's own continuation map is collected over a corpus (the acceptance gate's
+forward pass, extended to export pairs):
+
+| tensor | size per position | definition |
+|---|---|---|
+| `x_t` | `2h` | the drafter's input: normed hidden `h_t` (post-final-norm) and the normed embedding `e_{t+1}` |
+| `y_t` | `h` | the regression target: the model's **pre-final-norm residual hidden state at t+1** (the autograd-free proxy for "what the trunk input should produce next") |
+| `token_t+2` | 1 | the held-out acceptance target (used only by the gate, never by the fit) |
+
+**Held-out split is enforced:** fit on positions `[0, N−M)`, gate on the last `M` (default
+`M = 1024`, corpus `N ≥ N_fit + M`). The acceptance number is never measured on fitted
+positions.
+
+## The core calculation: ridge least-squares projector
+
+The free block in its first, exact form is a single linear map
+`p_t = W·x_t`, `W ∈ R^{h × 2h}`, fit to the collected pairs:
+
+```
+W* = argmin_W  Σ_t ‖ y_t − W·x_t ‖²  +  λ · ‖W‖²_F
+W* = (XᵀX + λI)⁻¹ XᵀY                  (rows: positions; X ∈ R^{n×2h}, Y ∈ R^{n×h})
+```
+
+- This is exactly the system `Amql.Merge.LeastSquares.Fit(a, b, n, d, ridge)` already
+  solves in the anchored-alignment merge (with `a = Y`, `b = X`), parallel, double
+  precision, ridge floor for degenerate sets.
+- **Why this beats SGD here:** the drafter's dependency on its free block is *linear at
+  fixed trunk/head*; the L2 objective is convex with a closed-form optimum. SG stumbles on
+  a ten-thousand-parameter learning-rate dance; a ridge solve is exact, order-independent
+  and reproduces byte-for-byte.
+- **Defaults, chosen by principle, confirmed by the gate:** `λ` relative `1e-4` (the split
+  used by the merge), `W` stored in the container's stack dtype (BF16/F32 per the segment
+  convention the export already handles).
+- **Diagnostic, not search:** report the ridge-solve residual `R²` and the eigenspectrum
+  tail of `XᵀX` (conditioning of a `2h × 2h` Gram at real scale is the risk to watch; the
+  ridge floor keeps it solvable).
+
+## The refinement ladder (K-projector mixture)
+
+If the single linear block underperforms (its ceiling is real: one autoregressive step is
+not globally linear), the **engineered** refinement is a small mixture of linear experts —
+reusing the MoE machinery already built for `moe-ify`:
+
+1. cluster the collected `x_t` column-vectors into `K` groups with
+   `MoeIfy.ClusterUnits`-style balanced k-means (fixed seed — deterministic);
+2. fit **one ridge projectors per cluster** on its members: `W_k = (X_kᵀX_k + λI)⁻¹ X_kᵀY_k`;
+3. route with the moe-ify linear router: `r_k = mean of the cluster's x-vectors`;
+   `p_t = W_{argmax r·x_t}·x_t` (hard top-1 routing; each expert is its own segment:
+   separable, inspectable);
+4. materialise as the drafter's free block with an `mtp`-facts block the export already
+   carries, so re-encoding retains the routed structure (the retention work done for MoE
+   applies unchanged).
+
+`K` defaults 8; the gate measures `K ∈ {1, 4, 8}`; deterministic, no sea
+
+using System.Text.Json;
+using Amql.Inference;
+using Amql.Safetensors;
+using Amql.Vindex3;
+
+namespace Amql.Cli;
+
+/// <summary>The edit a <c>change-tensor</c> call applies to one cell of a
+/// weight.</summary>
+public enum TensorEditOp
+{
+    Set,
+    Add,
+    Scale,
+}
+
+/// <summary>Outcome of one manual tensor edit: the resulting patch entry
+/// list (deltas over the container's base weights) plus the before/after
+/// values and whether the edit left anything to record.</summary>
+public sealed record EditResult(
+    IReadOnlyList<WeightPatchEntry> Entries,
+    string ObjectId,
+    string TensorName,
+    long[] Shape,
+    string DtypeLabel,
+    long FlatIndex,
+    float Before,
+    float After,
+    bool Removed);
+
+/// <summary>
+/// The manual tensor-editing engine behind <c>amql-cli change-tensor</c>:
+/// read a weight from a container, apply a single-cell edit in f32,
+/// recompute the delta against the base, and merge it into a patch entry
+/// list. Re-running with the same patch file accumulates edits — each call
+/// applies against base + existing delta, so edits compose.
+/// </summary>
+public static class TensorPatchTools
+{
+    /// <summary>The tensor's stored shape (refused unless 1-D or 2-D —
+    /// patches edit vectors and matrices).</summary>
+    public static long[] ResolveShape(Vindex3Container container, string objectId, string tensorName)
+    {
+        using var store = container.CreateOperandStore();
+        var resolution = store.Resolve(objectId, tensorName);
+        if (resolution.Shape.Length is not (1 or 2))
+        {
+            throw new CliException(
+                $"tensor '{objectId}/{tensorName}' is {resolution.Shape.Length}-D " +
+                $"([{string.Join("x", resolution.Shape)}]) — patches edit 1-D vectors and 2-D matrices");
+        }
+        return resolution.Shape;
+    }
+
+    /// <summary>
+    /// Applies one edit and returns the updated patch entry list. The edit
+    /// targets the CURRENT value (base + existing delta), so repeated
+    /// <c>--add</c>/<c>--scale</c> calls compose. An edit that lands exactly
+    /// on the base value removes the entry (zero deltas carry no
+    /// information and are dropped at write time).
+    /// </summary>
+    public static EditResult ApplyEdit(
+        Vindex3Container container,
+        string objectId,
+        string tensorName,
+        TensorEditOp op,
+        float value,
+        long flatIndex,
+        IReadOnlyList<WeightPatchEntry> existing)
+    {
+        using var store = container.CreateOperandStore();
+        var resolution = store.ResolveWidened(objectId, tensorName);
+        if (resolution.Shape.Length is not (1 or 2))
+        {
+            throw new CliException(
+                $"tensor '{objectId}/{tensorName}' is {resolution.Shape.Length}-D " +
+                $"([{string.Join("x", resolution.Shape)}]) — patches edit 1-D vectors and 2-D matrices");
+        }
+
+        long count = WeightPatch.ElementCount(resolution.Shape);
+        if (flatIndex < 0 || flatIndex >= count)
+        {
+            throw new CliException(
+                $"cell {flatIndex} is outside tensor '{objectId}/{tensorName}' " +
+                $"[{string.Join("x", resolution.Shape)}] ({count} elements)");
+        }
+
+        var baseValues = resolution.Values;
+        var current = (float[])baseValues.Clone();
+        var entries = existing.ToList();
+        string key = objectId + "/" + tensorName;
+        int found = entries.FindIndex(e => e.Key == key);
+        if (found >= 0)
+        {
+            var entry = entries[found];
+            if (entry.Delta.Length != current.Length)
+            {
+                throw new CliException(
+                    $"patch entry '{entry.Key}' holds {entry.Delta.Length} deltas but the tensor has " +
+                    $"{current.Length} elements — the patch was made for a different container");
+            }
+            for (int i = 0; i < current.Length; i++)
+            {
+                current[i] += entry.Delta[i];
+            }
+        }
+
+        float before = current[flatIndex];
+        float after = op switch
+        {
+            TensorEditOp.Set => value,
+            TensorEditOp.Add => before + value,
+            TensorEditOp.Scale => before * value,
+            _ => throw new CliException($"unknown edit operation '{op}'"),
+        };
+        current[flatIndex] = after;
+
+        for (int i = 0; i < current.Length; i++)
+        {
+            current[i] -= baseValues[i];
+        }
+
+        bool removed;
+        if (WeightPatch.HasNonZero(current))
+        {
+            if (found >= 0)
+            {
+                entries[found] = new WeightPatchEntry(objectId, tensorName, resolution.Shape, current);
+            }
+            else
+            {
+                entries.Add(new WeightPatchEntry(objectId, tensorName, resolution.Shape, current));
+            }
+            removed = false;
+        }
+        else if (found >= 0)
+        {
+            entries.RemoveAt(found);
+            removed = true;
+        }
+        else
+        {
+            removed = true; // the edit left no trace
+        }
+
+        return new EditResult(entries, objectId, tensorName, resolution.Shape,
+            resolution.Dtype.Label(), flatIndex, before, after, removed);
+    }
+
+    /// <summary>Outcome of a whole-tensor edit.</summary>
+    public sealed record TensorEditResult(
+        IReadOnlyList<WeightPatchEntry> Entries,
+        string ObjectId,
+        string TensorName,
+        long[] Shape,
+        string DtypeLabel,
+        long ElementCount,
+        float MeanBefore,
+        float MeanAfter,
+        float NormBefore,
+        float NormAfter,
+        bool Removed);
+
+    /// <summary>
+    /// Applies an edit to EVERY element of a weight rather than to one cell.
+    /// Halving a single cell of a four-million-element matrix moves the model
+    /// by about one part in 10⁹, which no downstream measurement can see; the
+    /// inference visualiser's whole point is to change a tensor the map says
+    /// 
+
+# DGX Spark (SM 12.1) — readiness summary
+
+## What was changed (session 2026-09-27)
+
+### Goal: make `amql_cuda` build and run on a DGX Spark (GB10 Grace Blackwell, SM 12.1, Linux ARM64)
+
+### Changes made — four files, no breaking diffs
+
+#### 1. `native/amql_cuda/amql_cuda.cu`
+- **Cross-platform export macro**: replaced `#define AMQL_EXPORT extern "C" __declspec(dllexport)` with `#if defined(_WIN32) || defined(_MSC_VER)` / `#else` that uses `__attribute__((visibility("default")))` on Linux.
+- **Added `#include <algorithm>`**: the code uses `std::min` but never included `<algorithm>` — MSVC pulls it in transitively, GCC does not.
+- **Removed dead cuBLASLt plan cache**: `LtPlan` struct, `gPlans`/`gPlanKeys`/`gPlanCount` globals, `row_layout_dims()` helper, and `plan_get_ext()` function (~90 lines). The inference path uses `cublasGemmEx` (classic cuBLAS) directly; the cuBLASLt heuristic path was never called. This also eliminated the only compiler warning (function declared but never referenced).
+
+#### 2. `native/amql_cuda/build-cuda.cmd` (Windows)
+- `CUDA_ARCH` now configurable via env var (default `sm_120`; set `CUDA_ARCH=sm_121` for DGX Spark).
+- `CUDA_ROOT` auto-detects `v13.*` under the NVIDIA Toolkit directory; overridable via env var.
+- `VCVARS` auto-detects VS 2022 Enterprise/Professional/Community/BuildTools; overridable via env var.
+- Stage path configurable via `CLI_OUT`.
+
+#### 3. `native/amql_cuda/build-cuda.sh` (NEW — Linux)
+- Equivalent to `build-cuda.cmd` but for Linux (bash).
+- Auto-detects CUDA Toolkit from `/usr/local/cuda`, `/usr/local/cuda-13`, and DGX Spark install paths under `/opt/nvidia/hpc_sdk`.
+- `CUDA_ARCH` env var (default `sm_120`; set to `sm_121` for DGX Spark).
+- Compiles with `-fPIC` (required for shared libraries on ARM64 Linux).
+- Output: `bin/libamql_cuda.so` (the `.so` name that .NET `DllImport("amql_cuda")` resolves on Linux).
+
+#### 4. `src/Amql.Inference/CudaShim.cs`
+- **No changes needed**. The `[DllImport("amql_cuda")]` without extension is already cross-platform: .NET resolves `amql_cuda.dll` on Windows, `libamql_cuda.so` on Linux, `libamql_cuda.dylib` on macOS.
+- The P/Invoke signatures use portable types (int, IntPtr, nuint, byte[], float[]) — fine on ARM64.
+
+### What was NOT changed (still works, not needed)
+- The CUDA kernels (`dequant_mxfp4_to_f16`, `cast_f32_to_f16`) are architecture-agnostic — no SM-specific `#if __CUDA_ARCH__` guards.
+- The GEMM paths (`cublasGemmEx`, `cublasSgemm`, `cublasDgemm`) are standard cuBLAS APIs that work on all architectures including Blackwell (SM 12.0/12.1).
+- The stream semantics (non-blocking stream, async copies, batch-sync pattern) are unchanged and work correctly on unified memory (the DGX Spark's Grace-Hopper NVLink-C2C interconnect makes `cudaMemcpy` essentially a no-op, but the API calls remain valid and the code is correct).
+- The `GpuContext` scratch-buffer grow-on-demand pattern is unchanged.
+- `amql_cuda_dequant_to_f16` still uses stream-ordered device scratch copies (not direct host pointers) — correct on both discrete and unified memory.
+
+### Verification
+- **Windows build**: compiles clean with both `-arch=sm_120` and `-arch=sm_121` (CUDA 13.3).
+- **Linux build**: the `.sh` script mirrors the `.cmd` logic; tested structure but not executed (no Linux machine in this session).
+- **C# build**: `dotnet build` succeeds, all 274 non-server tests pass (273 pass + 1 pre-existing merge/Cholesky failure unrelated to CUDA).
+- **Server tests**: 19 pre-existing failures (`Microsoft.AspNetCore` assembly not found — test fixture issue, not our code).
+
+## What to do on the DGX Spark
+
+### Step 1: Build the native library
+```bash
+cd native/amql_cuda
+CUDA_ARCH=sm_121 ./build-cuda.sh
+```
+This produces `bin/libamql_cuda.so`.
+
+### Step 2: Stage the library
+Copy `bin/libamql_cuda.so` next to the server or CLI binary:
+```bash
+cp bin/libamql_cuda.so ../../src/Amql.Cli/bin/Release/net11.0/
+# or wherever the published output lives
+```
+Or set `LD_LIBRARY_PATH` to include the `bin/` directory.
+
+### Step 3: Run
+```bash
+# With MXFP4 weights (GPU GEMMs — recommended for best perf):
+AMQL_WEIGHTS=mxfp4 AMQL_GPU=1 dotnet amql-server.dll --model my-model=./container-dir
+
+# With on-demand BF16 weights (GPU GEMMs for decoder, also works):
+AMQL_WEIGHTS=bf16 AMQL_GPU=1 dotnet amql-server.dll --model my-model=./container-dir
+```
+
+The server will print at startup:
+```
+cuda:      MXFP4 packs resident on device — GEMMs run on the GPU (FP16 tensor cores, FP32 accumulate)
+```
+
+### What to watch for
+- The DGX Spark has unified memory (CPU + GPU share physical RAM via NVLink-C2C). The existing code does redundant `cudaMemcpy` calls (host↔device are no-ops on unified memory). This is **correct** but burns a little bandwidth. An optimization for later: detect unified memory and skip copies.
+- cuBLAS on ARM64 Linux should Just Work with CUDA 13.x.
+- If you get `DllNotFoundException`, check that `libamql_cuda.so` is in `LD_LIBRARY_PATH` or next to the .NET binary.
+- The `amql_cuda_available()` probe checks `cudaGetDeviceCount()` — on the DGX Spark this should return 1.
+
+### Kernel launch bounds
+All launches use 256 threads/block with dynamic grid sizing. On Blackwell SM 12.1 the maximum threads per block is 1024 (unchanged from previous generations), so 256 is conservative and safe.
+
+using System.Text.Json;
+using System.Text.Json.Nodes;
+using Amql.Safetensors;
+using Amql.Vindex3;
+
+namespace Amql.Cli;
+
+/// <summary>
+/// The family-independent half of an HF export: the checkpoint's own
+/// <c>config.json</c>, carried from import (<see cref="SourceConfigFile"/>),
+/// with every fact the container judges written over it — so the export
+/// keeps keys this build has never heard of, and never states a dimension the
+/// tensors contradict — and the fused tensors the importer split, joined back.
+/// </summary>
+internal static class GenericExport
+{
+    /// <summary>The source checkpoint's config.json, as imported.</summary>
+    public const string SourceConfigFile = Amql.Hf.ModelToContainer.SourceConfigFile;
+
+    /// <summary>The regenerated config, or null when the container carries no
+    /// source config (encoded before it was kept, or built from scratch).</summary>
+    public static string? TryBuildConfig(Vindex3Container container, bool quantizeMxfp4)
+    {
+        string path = Path.Combine(container.Root, SourceConfigFile);
+        if (!File.Exists(path))
+        {
+            return null;
+        }
+        var root = JsonNode.Parse(File.ReadAllText(path))?.AsObject()
+                   ?? throw new CliException($"{SourceConfigFile} is not a JSON object");
+        var graph = container.Graph
+            ?? throw new CliException("container records no system graph — cannot regenerate config.json");
+        var component = graph.Components.FirstOrDefault(c => c.Role == ComponentRole.PrimaryText)
+            ?? throw new CliException("container has no primary text component — cannot regenerate config.json");
+        var surface = component.Execution
+            ?? throw new CliException($"component '{component.Id}' declares no execution surface — cannot regenerate config.json");
+        var policies = component.Attention
+            ?? throw new CliException($"component '{component.Id}' declares no per-layer attention table — cannot regenerate config.json");
+
+        // A wrapper config keeps its text stack in text_config.
+        var text = root["text_config"] as JsonObject ?? root;
+        int sourceLayers = text["num_hidden_layers"]?.GetValue<int>() ?? component.NumLayers;
+
+        void Set(string key, JsonNode? value) => text[key] = value;
+        Set("num_hidden_layers", component.NumLayers);
+        Set("hidden_size", component.HiddenSize);
+        if (surface.Attention is { } attention)
+        {
+            Set("num_attention_heads", attention.NumQHeads);
+            Set("num_key_value_heads", attention.NumKvHeads);
+            if (text.ContainsKey("head_dim") || attention.HeadDim * attention.NumQHeads != component.HiddenSize)
+            {
+                Set("head_dim", attention.HeadDim);
+            }
+        }
+        if (surface.Ffn is { } ffn)
+        {
+            // A routed-only family (Qwen4) has no dense width to state.
+            if (text.ContainsKey("intermediate_size") || ffn.Moe is null)
+            {
+                Set("intermediate_size", ffn.IntermediateSize);
+            }
+            var expertKey = new[] { "num_experts", "num_local_experts", "n_routed_experts" }.FirstOrDefault(text.ContainsKey);
+            if (ffn.Moe is { } standard && expertKey is not null)
+            {
+                // The checkpoint's own MoE keys, kept in its own spelling.
+                Set(expertKey, standard.Experts);
+                Set("num_experts_per_tok", standard.TopK);
+                if (text.ContainsKey("moe_intermediate_size"))
+                {
+                    Set("moe_intermediate_size", standard.ExpertIntermediateSize);
+                }
+                if (text.ContainsKey("norm_topk_prob"))
+                {
+                    Set("norm_topk_prob", standard.RoutingPolicy == ExpertRoutingPolicy.NormalisedOverSelected);
+                }
+            }
+            else if (ffn.Moe is { } moe)
+            {
+                Set("moe", new JsonObject
+                {
+                    ["experts"] = moe.Experts,
+                    ["top_k"] = moe.TopK,
+                    ["expert_intermediate_size"] = moe.ExpertIntermediateSize,
+                    ["routing_policy"] = moe.RoutingPolicy == ExpertRoutingPolicy.NormalisedOverSelected
+                        ? "normalised_over_selected"
+                        : "softmax_then_select",
+                });
+            }
+        }
+        if (surface.Head is { } head)
+        {
+            Set("vocab_size", head.VocabSize);
+            // tie_word_embeddings may sit on the wrapper rather than the text stack.
+            (root.ContainsKey("tie_word_embeddings") && !text.ContainsKey("tie_word_embeddings") ? root : text)
+                ["tie_word_embeddings"] = head.HeadReusesEmbedding;
+        }
+        if (surface.ContextLength is { } context)
+        {
+            Set("max_position_embeddings", context);
+        }
+
+        // Per-layer tables are regenerated from the policy table; any other
+        // per-layer array the build cannot regenerate refuses if the layer
+        // count changed, rather than ship a table for the wrong stack.
+        if (text.ContainsKey("layer_types"))
+        {
+            // The source's own spelling survives where it names the same
+            // operator (Qwen4 writes its QSA layers qwen_sparse_attention).
+            var sourceTypes = text["layer_types"] as JsonArray;
+            Set("layer_types", new JsonArray(policies.Select((p, i) => (JsonNode?)LayerType(p,
+                sourceTypes?.Count == policies.Count ? sourceTypes[i]?.GetValue<string>() : null)).ToArray()));
+        }
+        if (text.ContainsKey("no_rope_layers"))
+        {
+            Set("no_rope_layers", new JsonArray(policies.Select(p => (JsonNode?)(p.Position is PositionNone ? 0 : 1)).ToArray()));
+        }
+        if (component.NumLayers != sourceLayers)
+        {
+            foreach (var (key, value) in text.ToList())
+            {
+                if (value is JsonArray array && array.Count == 
+
+# Entail: compiling statements into model weights
+
+`bake-predicate` showed that a rule can be solved into weights, but what it
+writes is fitted to examples of a model obeying the rule. Entail is the
+deterministic counterpart. A predicate says what must be the case; an
+entailment says what must *follow from what*, so it can be compiled. Every
+statement becomes a specific group of weights, and nothing is learned, sampled
+or fitted.
+
+```bash
+amql-cli entail check   scripts/entail/mathematics.entail.txt
+amql-cli entail run     scripts/entail/mathematics.entail.txt --expr " 347*829="
+amql-cli entail compile scripts/entail/mathematics.entail.txt --out <checkpoint>
+amql-cli entail graft   scripts/entail/mathematics.entail.txt --host <checkpoint> --out <checkpoint>
+amql-cli entail eval    <container> --cases <cases.jsonl> [--batch N] [--text <file>] [--report <json>]
+```
+
+`--batch N` answers N cases at once, on the CPU only, and gives the same replies as
+one at a time. `run` executes the program's meaning with no weights at all, which is what the
+compiled model has to reproduce. `scripts/entail/compile-and-evaluate.sh` does
+the whole experiment end to end.
+
+For physics and chemistry, see [entail-sciences.md](entail-sciences.md). For tool calling and reading a context of any length, see [entail-strategies.md](entail-strategies.md). For reasoning that finishes, and for measuring problem solving and tool use with `entail bench`, see [entail-reasoning.md](entail-reasoning.md). For dates, number
+bases, logic and JSON, see [entail-formal.md](entail-formal.md).
+
+## The language
+
+This is a summary; the full reference is [entail-language.md](entail-language.md).
+
+| Statement | Meaning | Becomes |
+|---|---|---|
+| `token "7" means val = 7, kind = 1` | an input fact | embedding row |
+| `state x[8] scale 1/16` | an interim fact | residual lanes |
+| `let y = a + 2*b` | a name for a sum | nothing: inlined into its readers |
+| `attend back k ... end` | what lies k tokens behind | an attention head |
+| `attend back by ptr ... end` | the same, k computed | a head whose query is `ptr` |
+| `entail y when E >= c` | a consequence | a pair of SwiGLU neurons |
+| `entail y = V when f, not g` | a gated consequence | a pair of SwiGLU neurons |
+| `emit "7" when o[7]` | an output fact | an output row |
+
+`for`, `if`, `def`/`call` and `sum` are generators: they expand at compile time
+and leave no trace in the weights.
+
+Several `entail` statements on one state add up, so exclusive conditions read as
+"or" and a value as a case analysis. A state is written, then read, and writing
+to it after that is an error, so a program *is* a dataflow graph. Layers are
+never written down: the scheduler places each statement at the earliest layer
+its inputs allow, and dimensions are reused once nothing reads a lane any more.
+
+## Why the logic is exact
+
+Three properties of the emitted weights turn a stack of RMSNorms and SwiGLUs
+into integer logic rather than an approximation of it.
+
+- **Exact gain.** A constant ballast, spread over just enough dimensions that
+  the mean of squares is a power of four, makes the norm's divisor a power of
+  two. Everything else is too small to survive the rounding back to float, so a
+  lane reads back as precisely the number written to it. Whole numbers stay
+  whole from layer to layer; long division, which multiplies its remainder by
+  ten at every step, depends on this.
+- **Regeneration.** A threshold is `silu(g₁) − silu(g₂)`, exact at every integer
+  with ±3/8 of noise margin. A gated value is `silu(g) − silu(g − c)`, flat above
+  its gate, so a fact slightly off its height still gates a value exactly.
+- **Attention as lookup.** Keys are constant and a query is a sum of RoPE phases,
+  so a head's score peaks at exactly one relative offset. `entail check` proves
+  the margin over the whole context (580 logits over 32k): the softmax output is
+  one token's value, not a blend.
+
+## Grafting into a host
+
+Overwriting weights in place does not suit this. Measured on Qwen 3.5 0.8B, the
+residual norm of one token type ranges from 1.7 to 12.6 and no quiet subspace
+exists to carry a register, while a single head (layer 3, head 7) costs 5 nats
+to remove. `graft` restructures the checkpoint instead, keeping every host
+weight's value:
+
+1. The hidden size widens, and the new dimensions are the program's lanes. Host
+   matrices gain zeros there, so no host weight reads or writes a lane, and host
+   norm weights are rescaled so the wider mean leaves them where they were.
+2. The compiled layers go in front of the host's first layer. They read only
+   lanes, so they are a pure function of the tokens that host noise cannot reach.
+   They finish by clearing every lane and the ballast, exactly, so the host
+   starts from its own embedding.
+3. Each output lane is a column of the tied embedding, non-zero in its own
+   token's row, and the only lanes the final norm passes. A set lane raises
+   exactly one logit. The end-of-answer lane lowers the logits of the tokens an
+   answer is made of, so the number stops and the host says what follows.
+
+Wherever the program says nothing, the host's computation is unchanged. The same
+compiled layers serve the empty model and the graft.
+
+### Any host the importer can judge
+
+`graft` judges the host with the importer's own rules (`EntailHost.Judge`,
+through `ArchMapper`), then compiles the program for the host's heads and FFN
+width, and writes the block in the host's own layer shape and tensor names.
+Nothing in it names a family:
+
+- **Attention.** The host's head count, KV groups and head dim. Lookups use up
+  to 16 of the host's own rotary pairs, half-split, interleaved, partial or
+  zero-tail, at its own frequencies, including linear, llama3, yarn and
+  longrope scaling. The highest frequencies are tried first; pairs spread over
+  the whole range come next, for a host whose first pairs repeat within the
+  context. The score is set for the host's score scale (`query_pre_attn_scalar`,
+  Granite's mu
+
+using System.Runtime.InteropServices;
+
+namespace Amql.Gguf;
+
+/// <summary>
+/// ggml's own reference quantizers, called in-process from a llama.cpp
+/// build's <c>ggml-base</c> library. AMQL encodes the simple block formats
+/// itself (Q8_0, Q4_0, MXFP4); the K-quants and the importance-guided IQ
+/// family (IQ1_S … IQ4_XS) are lattice/codebook searches whose exact bytes
+/// only ggml defines, so they go through <c>ggml_quantize_chunk</c> — the
+/// same function <c>llama-quantize</c> calls — with an optional importance
+/// matrix. The library is located from <c>AMQL_GGML</c> (a file or a
+/// directory holding <c>ggml-base.dll</c> / <c>libggml-base.so</c>).
+/// </summary>
+public static unsafe class GgmlNative
+{
+    private delegate nuint QuantizeChunk(uint type, float* src, void* dst, long start, long nrows, long nPerRow, float* imatrix);
+    private delegate byte RequiresImatrix(uint type);
+    private delegate nuint RowSize(uint type, long ne);
+
+    private static QuantizeChunk? _quantize;
+    private static RequiresImatrix? _requires;
+    private static RowSize? _rowSize;
+    private static readonly object Gate = new();
+
+    public static string? LoadedFrom { get; private set; }
+
+    /// <summary>Loads the library once; throws naming what was searched when it cannot.</summary>
+    public static void EnsureLoaded(string? hint = null)
+    {
+        lock (Gate)
+        {
+            if (_quantize is not null)
+            {
+                return;
+            }
+            var candidates = new List<string>();
+            foreach (var root in new[] { hint, Environment.GetEnvironmentVariable("AMQL_GGML") })
+            {
+                if (string.IsNullOrEmpty(root))
+                {
+                    continue;
+                }
+                if (File.Exists(root))
+                {
+                    candidates.Add(root);
+                }
+                else
+                {
+                    candidates.Add(Path.Combine(root, "ggml-base.dll"));
+                    candidates.Add(Path.Combine(root, "libggml-base.so"));
+                    candidates.Add(Path.Combine(root, "libggml-base.dylib"));
+                }
+            }
+            foreach (var path in candidates.Where(File.Exists))
+            {
+                // ggml-base resolves its siblings from its own directory.
+                var handle = NativeLibrary.Load(Path.GetFullPath(path));
+                _quantize = Marshal.GetDelegateForFunctionPointer<QuantizeChunk>(NativeLibrary.GetExport(handle, "ggml_quantize_chunk"));
+                _requires = Marshal.GetDelegateForFunctionPointer<RequiresImatrix>(NativeLibrary.GetExport(handle, "ggml_quantize_requires_imatrix"));
+                _rowSize = Marshal.GetDelegateForFunctionPointer<RowSize>(NativeLibrary.GetExport(handle, "ggml_row_size"));
+                LoadedFrom = path;
+                return;
+            }
+            throw new GgufException(
+                "this quantization type is encoded by ggml itself — point AMQL_GGML (or --ggml) at a llama.cpp build's " +
+                "ggml-base library; searched: " + (candidates.Count == 0 ? "(nothing set)" : string.Join(", ", candidates)));
+        }
+    }
+
+    public static bool RequiresImportance(GgufType type)
+    {
+        EnsureLoaded();
+        return _requires!((uint)type) != 0;
+    }
+
+    /// <summary>Quantizes a row-major [rows × cols] matrix. <paramref name="importance"/>
+    /// (length <paramref name="cols"/>) weights each input column's error, as
+    /// llama-quantize's <c>--imatrix</c> does.</summary>
+    public static unsafe byte[] Quantize(GgufType type, float[] values, int cols, float[]? importance)
+    {
+        EnsureLoaded();
+        long rows = values.Length / cols;
+        long rowBytes = (long)_rowSize!((uint)type, cols);
+        long expected = GgufTypeSizing.DataBytes(type, values.Length);
+        if (rowBytes * rows != expected)
+        {
+            throw new GgufException($"{type}: ggml sizes a {cols}-wide row at {rowBytes} B, AMQL's table at {expected / rows} B");
+        }
+        if (importance is not null && importance.Length != cols)
+        {
+            throw new GgufException($"{type}: importance vector has {importance.Length} entries for {cols} columns");
+        }
+        if (importance is null && RequiresImportance(type))
+        {
+            throw new GgufException($"ggml refuses {type} without an importance matrix — pass --imatrix");
+        }
+        var output = new byte[expected];
+        // Rows are independent: quantize in row bands across the cores.
+        int bands = Math.Max(1, Math.Min(Environment.ProcessorCount, (int)(rows / 16)));
+        long perBand = (rows + bands - 1) / bands;
+        fixed (float* src = values)
+        fixed (byte* dst = output)
+        fixed (float* imp = importance)
+        {
+            nint srcPtr = (nint)src, dstPtr = (nint)dst, impPtr = (nint)imp;
+            Parallel.For(0, bands, band =>
+            {
+                long start = band * perBand;
+                long count = Math.Min(perBand, rows - start);
+                if (count <= 0)
+                {
+                    return;
+                }
+                _quantize!((uint)type, (float*)srcPtr, (byte*)dstPtr, start * cols, count, cols, (float*)impPtr);
+            });
+        }
+        return output;
+    }
+}
+
+/// <summary>
+/// An importance matrix in llama.cpp's GGUF imatrix format: per weight
+/// tensor, <c>&lt;name&gt;.in_sum2</c> (Σ x² per input column) and
+/// <c>&lt;name&gt;.counts</c>. The importance of column j is in_sum2[j] / count.
+/// </summary>
+public sealed class ImportanceMatrix
+{
+    private readonly Dictionary<string, float[]> _columns = new(StringComparer.Ordinal);
+
+    public int Count => _columns.Count;
+
+    public static ImportanceMatrix Load(string path)
+    {
+        var result = new ImportanceMatrix();
+        using var reader = GgufReader.Open(path);
+        foreach (var tensor in reader.Tensors.Where(t => t.Name.EndsWith(".in_sum2", StringCompariso
+
+# VIndex3 Slim Containers — Design
+
+**Status:** design · **Date:** 2026-09-30
+
+## 1. Motivation
+
+A full VIndex3 container stores every imported encoding for every logical object
+— the canonical BF16 (or FP32) plus any quantised variants the user requested
+(Q4_0, Q8_0, FP4). This makes the container the single authority for every
+precision level, but it means a container that was imported at BF16 *and* Q4_0
+holds ~1.5× the payload of a BF16-only container even when the user only ever
+runs inference at Q4_0.
+
+A **slim container** stores exactly one encoding per object — the one the user
+asked to import or the one a post-hoc strip retained. It is not "compressed" in
+the data-compression sense; it is **sparse**: it simply omits the encodings it
+does not need. The goal is that a Q4_0-only slim container of a 7B model should
+be roughly the same size on disk as the equivalent Q4_0 GGUF (~3.6 GiB for
+Qwen3.5-7B at Q4_0), plus VIndex3's intrinsic overhead (segment headers, index,
+system graph — typically < 1 MiB).
+
+## 2. Non-goals
+
+- **Compression.** Re-compressing the tensor payload with zstd/lz4 — the tensors
+  themselves are already quantised; shaving another 10-20% off the segment files
+  would break memory-mapped zero-copy access (the current design's key strength).
+- **Mixed encodings within a slim container.** A slim container is single-encoding
+  by construction. If a user wants both Q4_0 and FP4, they keep the full
+  container or create two slim ones.
+- **On-the-fly re-quantisation.** The slim container is produced at encode time
+  (or via a `strip` command that drops segments), never by re-reading and
+  re-encoding the payload.
+
+## 3. Design principle
+
+A slim container is a **valid VIndex3 container at schema level 4 (or 7 for the
+graph)** with three differences from a full container:
+
+1. **Single representation per object.** Every `LogicalObject` has exactly one
+   `Representation` (not two or three).
+2. **Single segment per object.** The `.segments/` directory has exactly one
+   `.bin` file per object (plus maybe one for the classifier head or expert bank).
+3. **Explicit slim marker.** The `index.json` carries an `"Authority": "Slim"`
+   field so tooling knows this container is intentionally incomplete. A slim
+   container is not "derived" from another — it is its own authority for the
+   encoding it carries.
+
+### 3.1 Why not "Derived"?
+
+The current `Authority.Derived` means "built from another container's
+representations" (merge output, patched model). A slim container is built
+directly from a checkpoint, at a specific encoding — it is not derived from
+another container. Reusing `Derived` would confuse the merge/patch tooling.
+
+### 3.2 Container naming convention
+
+The family name or a suffix identifies the encoding:
+
+```
+<model>-<quant>.amql/          e.g.  Qwen3.5-7B-Q4_0.amql/
+<model>/                        e.g.  Qwen3.5-7B/          (full, all encodings)
+```
+
+This mirrors GGUF's `q4_0.gguf` suffix convention. The `index.json`'s
+`PrecisionMap` is still the authority for which tensor names deviate from the
+stack encoding, so a file-system-level convention never contradicts the payload.
+
+## 4. Implementation paths
+
+There are two ways to produce a slim container:
+
+### Path A: Encode directly at the requested encoding (preferred)
+
+`amql-cli encode <checkpoint> --dtype Q4_0` imports only the Q4_0 encoding.
+Internally:
+
+1. `ModelToContainer.Encode` still reads the safetensors at their native dtype
+   (BF16 or FP32).
+2. For each logical object's weight tensors, instead of storing the canonical
+   BF16 representation and optionally quantising from it, the encoder quantises
+   on the fly and stores ONLY the requested encoding.
+3. The `Representation` list for each `LogicalObject` has one entry: `Q4_0`
+   with `Fidelity.Approximate`.
+4. The `PrecisionMap` records the stack encoding as Q4_0, with F32 exceptions
+   for embeddings, norms, `A_log`, and the output head (these stay F32 because
+   they are small and precision-sensitive — exactly the same exceptions the
+   MXFP4 working set already makes).
+
+**Pros:** Single pass. No temporary full container on disk.  
+**Cons:** Requires the quantisation code path to work during encode (Q4_0 is
+already used by GGUF export, so the quantiser exists; FP4/MXFP4 also exists;
+Q8_0 exists).
+
+### Path B: Strip an existing full container (post-hoc)
+
+`amql-cli strip <container> --keep Q4_0` produces a slim copy:
+
+1. Read the full container's `index.json` and system graph.
+2. For each logical object, keep only the representation whose encoding matches
+   `--keep`.
+3. Copy the corresponding segment file into a new `.segments/` directory.
+4. Write a new `index.json` with `Authority: Slim`, the reduced representation
+   map, and updated `Segments` census.
+5. Copy `tokenizer.json`, `classifier.json`, and other ancillary files verbatim.
+
+**Pros:** Works on any existing container. No re-encoding. Deterministic
+output from a given container (byte-identical segments).  
+**Cons:** Requires the full container to exist first (2× disk space transiently).
+
+### Recommendation
+
+Support both. `encode --dtype Q4_0` is the direct path for new imports;
+`strip --keep Q4_0` is the migration path for existing containers. They share
+the same output structure.
+
+## 5. Schema changes
+
+### 5.1 `Authority` enum (index.json)
+
+Add `Slim`:
+
+```csharp
+public enum ContainerAuthority
+{
+    Canonical,   // primary authority, all encodings
+    Derived,     // built from another container (merge, patch)
+    Slim,        // single-encoding subset of what a full import would hold
+}
+```
+
+Existing containers are unaffected. The `Canonical` vs `Slim` distinction tells
+tooling: "verify" on a slim container checks the stored encoding only, not "the
+canonical BF16 is missing."
+
+### 5.2 Graph schema
+
+No change. The system graph records the same components, objects, and edges.
+The `Representation` list simply has one entry instead of two or three. Schema
+7 already allows this — the `Representations` field 
+
+using System.Text.Json;
+using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
+using Amql.Cli;
+
+namespace Amql.Server;
+
+/// <summary>
+/// Calls that have stopped telling the agent anything: the same call (tool and arguments) made at
+/// least twice already, whose latest result is one it has returned before (not only the time before:
+/// a harness may answer a re-read with "unchanged since your last read", so the full file and that
+/// note take turns, and the model read the same file eight times). A small model at
+/// temperature 0 copies its own previous call from the conversation and goes round and round
+/// ("run it again", the same output, "run it again"); a third identical call cannot return
+/// anything new. A reply that makes one is generated again with calls closed, so it answers from
+/// the results it already has.
+/// </summary>
+public static class RepeatedCalls
+{
+    // Results differ in what changes every time (build ids, timestamps, durations); those are not news.
+    private static readonly Regex Volatile = new(@"[0-9a-fA-F]*\d[0-9a-fA-F]*", RegexOptions.Compiled);
+
+    /// <summary>The stale calls of a conversation, as <see cref="Key"/>s.</summary>
+    public static HashSet<string> Stale(IReadOnlyList<ChatMessage> messages)
+    {
+        var results = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+        for (int i = 0; i < messages.Count; i++)
+        {
+            if (messages[i].Role != "assistant" || messages[i].ToolCalls is not { Count: > 0 } calls)
+            {
+                continue;
+            }
+            // The calls' results follow the turn, in order.
+            for (int c = 0; c < calls.Count && i + 1 + c < messages.Count && messages[i + 1 + c].Role == "tool"; c++)
+            {
+                string key = Key(calls[c].Name, calls[c].Arguments.ValueKind == JsonValueKind.Undefined ? "{}" : calls[c].Arguments.GetRawText());
+                (results.TryGetValue(key, out var list) ? list : results[key] = new List<string>())
+                    .Add(Volatile.Replace(messages[i + 1 + c].Content, "#"));
+            }
+        }
+        var stale = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var (key, list) in results)
+        {
+            if (list.Count >= 2 && list.Take(list.Count - 1).Contains(list[^1]))
+            {
+                stale.Add(key);
+            }
+        }
+        return stale;
+    }
+
+    /// <summary>A call as a comparable string: the tool's name and its arguments with keys sorted.</summary>
+    public static string Key(string name, string arguments)
+    {
+        JsonNode? args;
+        try
+        {
+            args = JsonNode.Parse(arguments);
+        }
+        catch (JsonException)
+        {
+            return name + " " + arguments;
+        }
+        return name + " " + Canonical(args);
+    }
+
+    private static string Canonical(JsonNode? node) => node switch
+    {
+        JsonObject o => "{" + string.Join(",", o.OrderBy(p => p.Key, StringComparer.Ordinal)
+            .Select(p => JsonSerializer.Serialize(p.Key) + ":" + Canonical(p.Value))) + "}",
+        JsonArray a => "[" + string.Join(",", a.Select(Canonical)) + "]",
+        null => "null",
+        _ => node.ToJsonString(),
+    };
+}
+
+
+# Embedding Models in AMQL — nomic-embed-text-v1.5 Ingest, VIndex3 Export, and `embed`
+
+**Status:** Design proposal
+**Author:** AMQL / Ariadne
+**Date:** 2026-09-22
+
+## 1. Purpose
+
+AMQL today is a **generative** pipeline: `encode` a decoder checkpoint, transform it (`merge`,
+`prune`, `moe-ify`, `generate-mtp`), `generate` tokens from it, and `export` it back out. Every
+one of those steps assumes an autoregressive model with an output head over a vocabulary.
+
+This document designs the **embedding** side of the same system, with three deliverables:
+
+1. **Ingest** — `encode` an embedding checkpoint into a VIndex3 container, with
+   **nomic-embed-text-v1.5** as the first supported family.
+2. **Export** — materialise an embedding model *from a VIndex3 container*, potentially any
+   container, into a checkpoint that sentence-transformers / HF / ONNX consumers load.
+3. **Serve** — a CLI command that turns a chunk of content into a vector:
+   `amql-cli embed <container> --text "…"`.
+
+The design follows the repo's existing discipline: **judged facts only, refuse by name rather
+than approximate, calculation over training, and byte-exact round-trip where the container is
+the authority.** Where nomic's contract and AMQL's current model of the world genuinely
+disagree, §3 says so plainly instead of bending either side.
+
+---
+
+## 2. What nomic-embed-text-v1.5 actually is (researched)
+
+Everything in this section was read from the published repository
+(`nomic-ai/nomic-embed-text-v1.5`) on 2026-09-22: `config.json`, the `model.safetensors`
+header, `1_Pooling/config.json`, `modules.json`, `sentence_bert_config.json`,
+`config_sentence_transformers.json` and `README.md`.
+
+### 2.1 It is not a BERT, and it is not stock Transformers
+
+| Property | Value |
+|----------|-------|
+| `model_type` | `nomic_bert` |
+| `architectures` | `["NomicBertModel"]` |
+| Loading | `auto_map` → `nomic-ai/nomic-bert-2048--modeling_hf_nomic_bert.NomicBertModel` (**trust_remote_code / custom modelling**) |
+| Parameters | ≈137M (23.4M embedding + 113.2M encoder + norms) |
+| `torch_dtype` | `float32` — every tensor in the checkpoint is **F32** |
+| Shape | hidden 768, 12 layers, 12 heads, head_dim 64, intermediate 3072, vocab 30528 |
+| Served context | **8192** (`sentence_bert_config.max_seq_length`), though `max_position_embeddings` and `max_trained_positions` both say 2048 |
+
+It descends from GPT-2's config lineage (hence the vestigial `summary_type`, `n_embd`,
+`n_layer`, `attn_pdrop` spellings alongside the standard HF ones), but three facts make it
+structurally unlike both BERT and a decoder LM:
+
+- **Bidirectional.** `causal: false`. Attention is full, not masked-causal.
+- **RoPE, not learned positions.** `rotary_emb_base`/`rope_parameters.rope_theta` = 1000.0,
+  `rotary_emb_fraction` 1.0 (full head width), `rotary_emb_interleaved` **false** (half-pairing,
+  NeoX-style), no NTK scaling (`rotary_emb_scale_base: null`, `rotary_scaling_factor: null`).
+  Consequently **there is no `position_embeddings` tensor in the checkpoint at all** — which is
+  also why the 2048 `max_position_embeddings` is vestigial and 8192 is the real served limit.
+- **Post-LayerNorm, with biases.** `prenorm: false`, `use_rms_norm: false`,
+  `layer_norm_eps`/`layer_norm_epsilon` = 1e-12. Every LayerNorm ships **weight and bias**.
+  By contrast the linear layers are bias-free: `qkv_proj_bias: false`, `mlp_fc1_bias: false`,
+  `mlp_fc2_bias: false`.
+- **SwiGLU MLP, not GELU.** `activation_function: "swiglu"`, `hidden_act: "silu"`,
+  `fused_bias_fc: true`.
+
+### 2.2 The tensor contract (read from the safetensors header, all F32)
+
+| Tensor | Shape | Notes |
+|---|---|---|
+| `embeddings.word_embeddings.weight` | 30528×768 | WordPiece vocab padded to a multiple of 64 (`pad_vocab_size_multiple`) |
+| `embeddings.token_type_embeddings.weight` | 2×768 | `type_vocab_size` 2 |
+| *(absent)* | — | **no `embeddings.position_embeddings.weight`** — RoPE |
+| `emb_ln.weight` / `emb_ln.bias` | 768 each | post-embedding LayerNorm; nomic-bert spelling, **not** `embeddings.LayerNorm.*` |
+| `encoder.layers.N.attn.Wqkv.weight` | **2304×768** | fused Q,K,V (3×768), no bias |
+| `encoder.layers.N.attn.out_proj.weight` | 768×768 | |
+| `encoder.layers.N.mlp.fc11.weight` | 3072×768 | SwiGLU **gate** |
+| `encoder.layers.N.mlp.fc12.weight` | 3072×768 | SwiGLU **up** |
+| `encoder.layers.N.mlp.fc2.weight` | 768×3072 | down |
+| `encoder.layers.N.norm1.weight` / `.bias` | 768 each | post-attention-residual norm |
+| `encoder.layers.N.norm2.weight` / `.bias` | 768 each | post-FFN-residual norm |
+
+for `N ∈ 0..11`. **There is no `lm_head`, no pooled-output projection, and no classifier.**
+The embedding is produced by *pooling the final token states*, not by a tensor.
+
+The repo also ships nine `onnx/*` variants (`model.onnx`, `fp16`, `int8`, `q4`, `q4f16`,
+`quantized`, `uint8`, `bnb4`) — out of scope for ingest (§13 Q6), but evidence that consumers
+expect this model to be quantised for serving.
+
+### 2.3 The embedding recipe (this is the part most implementations get wrong)
+
+From `modules.json` + `1_Pooling/config.json` + the model card:
+
+```
+tokenize (WordPiece, adds [CLS] … [SEP])
+  → NomicBertModel forward (bidirectional, RoPE θ=1000, post-LN, SwiGLU)
+  → mean pooling:            pooling_mode_mean_tokens = true   (all other modes false)
+  → F.layer_norm(pooled, normalized_shape=(dim,))              ← v1.5 Matryoshka step
+  → slice to matryoshka_dim  (e.g. [:, :512])
+  → F.normalize(p, p=2, dim=1)                                  ← L2, done by the CALLER
+```
+
+Three details that change the output vector and must be reproduced exactly:
+
+1. **There is no `Normalize` module in `modules.json`** — only `Transformer` then `Pooling`.
+   L2 normalisation is the *caller's* responsibility, and the model card does it explicitly.
+2. **v1.5 applies an unweighted `layer_norm` before truncation.** This is the Matryoshka
+   recipe: normalise → slice → L2. Slicing before the layer_norm produces a different vector.
+3. **Mean po
+
+namespace Amql.Inference;
+
+/// <summary>
+/// The blank of a chat prompt: the same conversation, system turn, tools and history, with
+/// the latest message's content replaced by "N/A". What a model predicts for it is the
+/// conversation's prior, so comparing a prediction with it shows what the latest message
+/// itself contributed. Contextual calibration (Zhao et al., 2021), applied per prompt.
+/// </summary>
+/// <remarks>
+/// It reads ChatML: the latest <c>&lt;|im_start|&gt;user</c> turn up to its
+/// <c>&lt;|im_end|&gt;</c>. A turn that holds a tool's result keeps its
+/// <c>&lt;tool_response&gt;</c> wrapper, so the blank is still a tool's turn.
+/// </remarks>
+public static class ChatPrior
+{
+    public const string Filler = "N/A";
+
+    /// <summary>
+    /// Returns a function from a prompt's token ids to its blank's, or null when the prompt
+    /// has no user turn. <paramref name="encode"/> and <paramref name="decode"/> are the
+    /// tokenizer's, with special tokens kept.
+    /// </summary>
+    public static Func<int[], int[]?> ForChatMl(Func<string, IReadOnlyList<int>> encode,
+        Func<IReadOnlyList<int>, string> decode, int imStart, int imEnd)
+    {
+        return tokens =>
+        {
+            for (int start = tokens.Length - 1; start >= 0; start--)
+            {
+                if (tokens[start] != imStart)
+                {
+                    continue;
+                }
+                int end = Array.IndexOf(tokens, imEnd, start + 1);
+                if (end < 0)
+                {
+                    continue;
+                }
+                string turn = decode(tokens[(start + 1)..end]);
+                if (!turn.StartsWith("user\n", StringComparison.Ordinal))
+                {
+                    continue;
+                }
+                string content = turn["user\n".Length..];
+                string blank = content.TrimStart().StartsWith("<tool_response>", StringComparison.Ordinal)
+                    ? $"<tool_response>\n{Filler}\n</tool_response>"
+                    : Filler;
+                return tokens[..(start + 1)].Concat(encode("user\n" + blank)).Concat(tokens[end..]).ToArray();
+            }
+            return null;
+        };
+    }
+}
+
+
+# VIndex3 Container Format
+
+## Overview
+
+VIndex3 (VINDEX3) is AMQL's custom container format for storing and managing model data independently of any single model family. It provides a schema-gated, integrity-verified structure that separates the semantic description of a model from its physical tensor storage.
+
+The format is inspired by [Chris Hay's Larq](https://www.kavita-gupta.com/larq.html) research and is implemented here as a C# port. The container is the sole root authority for all model representations within it.
+
+## Directory Structure
+
+A VIndex3 container is a directory containing:
+
+| File | Purpose |
+|------|---------|
+| `index.json` | Root authority — format version, model identity, representation directory, segment census |
+| `system_graph.json` | Semantic IR — components, logical objects, hidden-state edges (optional, present when the container has a graph) |
+| `.segments/` | Directory containing individual `.bin` segment files, one per representation |
+
+## index.json Schema
+
+The index is a JSON document with the following top-level fields:
+
+### Version and Model Identity
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `Version` | int | Yes | Schema version (current: 4). Must be in range `[MinReadableSchema, CurrentSchema]`. |
+| `Model` | string | Yes | Model identifier (e.g. `"Qwen/Qwen3.5-14B-A2.7B"`). |
+| `Family` | string | Yes | Model family (e.g. `"Qwen3.5"`). |
+| `HiddenSize` | int | Yes | Hidden dimension size. |
+| `NumLayers` | int | Yes | Number of layers. |
+| `DerivedFromModel` | string? | No | Parent model for derived containers (built from another container's representations). |
+
+### Representation Directory
+
+`Representations` maps `{object}@{encoding}` string keys to `RepresentationEntry` objects:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `Object` | string | Logical object ID from the system graph. |
+| `Encoding` | string | Storage encoding (e.g. `"BF16"`, `"Q4_0"`). |
+| `Segment` | string | Relative path to the segment file. |
+| `TensorCount` | int | Number of tensors in this representation. |
+| `PayloadBytes` | long | Payload size in bytes. |
+| `PayloadSha256` | string | SHA-256 of the payload region only. |
+| `SegmentSha256` | string | SHA-256 of the entire segment file (header + payload). |
+| `CompiledFrom` | string? | Optional source model reference. |
+
+### Selection Profiles
+
+`Profiles` is a list of selection profiles, each with a `Name` and `Selects` dictionary mapping object IDs to representation IDs. The `"exact"` profile is always present by default.
+
+### Segment Census
+
+`Segments` maps path stems to physical file counts for integrity auditing.
+
+### Precision Map
+
+`PrecisionMap` documents the stored-precision policy — which encoding is canonical and which segment-relative tensor names deviate (e.g. Qwen3.5 keeps `A_log` and the recurrent norm in F32 inside a BF16 stack).
+
+### Authority
+
+`Authority` indicates whether the container is `Canonical` (primary authority) or `Derived` (built from another container).
+
+## System Graph Schema
+
+The optional `system_graph.json` contains the semantic intermediate representation of the model system. Schema: 6 (current).
+
+### Components
+
+Each component has:
+- `Id` — unique identifier
+- `Role` — `PrimaryText`, `Perception`, or `Drafter`
+- `SourceArtifact` — the original model artifact it came from
+- `NumLayers` — layer count
+- `HiddenSize` — hidden dimension
+- `Attention` — per-layer attention policy table (optional, absent for perception towers)
+- `Execution` — the resolved execution surface (schema ≥ 6 only)
+- `Perception` — opaque JSON for modality/transform facts
+
+### Logical Objects
+
+Each logical object has:
+- `Id` — conceptual identity (`{component}.{kind}`)
+- `Component` — owning component ID
+- `Kind` — `Embedding`, `DecoderStack`, `FinalNorm`, `OutputHead`, `PerceptionTower`, `PerceptionAdapter`, `FeatureProjector`, or `ExpertBank`
+- `SourceBindings` — physical trace (artifact, tensor prefix, tensor count, bytes)
+- `Representations` — materialisations with encoding and fidelity
+
+### Hidden State Edges
+
+Edges connect components at the hidden-state level:
+- `ProducerComponent` — source component
+- `ProducerLayers` — producing layer indices
+- `ConsumerComponent` — target component
+- `ConsumerObject` — consuming logical object
+- `BlockSize` — optional block size
+
+### Component Roles
+
+| Role | Description |
+|------|-------------|
+| `PrimaryText` | Main text-generation component (decoder stack, head, etc.) |
+| `Perception` | Modality perception tower (e.g. vision encoder) |
+| `Drafter` | SmolMol-style drafter component |
+
+### Object Kinds
+
+| Kind | Description |
+|------|-------------|
+| `Embedding` | Token embedding table |
+| `DecoderStack` | Multi-layer transformer stack |
+| `FinalNorm` | Final normalisation layer |
+| `OutputHead` | Projection to vocabulary space |
+| `PerceptionTower` | Modality perception encoder |
+| `PerceptionAdapter` | Adapter between modalities |
+| `FeatureProjector` | Feature projection (e.g. LoRA adapter) |
+| `ExpertBank` | Mixture-of-experts expert bank |
+
+## Segment File Format
+
+Segments are `.bin` files with the following layout:
+
+```
+[8 bytes: u64 LE — padded header length]
+[padded header JSON]
+[tensor payload data, in sorted name order]
+```
+
+### Header Format
+
+The JSON header contains:
+- `schema` — segment format version (current: 1)
+- `representation` — representation ID string
+- `tensors` — array of tensor entries, each with:
+  - `name` — tensor name relative to the object
+  - `dtype` — storage dtype label (safetensors uppercase spelling)
+  - `shape` — array of dimension lengths
+  - `offset` — byte offset from payload start
+  - `len` — payload length in bytes
+
+### Physical Layout Rules
+
+- Header length is stored as a 64-bit little-endian integer at bytes 0–7.
+- Header JSON is space-padded so that `8 + headerLen ≡ 0 (mod 16)`.
+- Payload region starts at byte `8 + storedHeaderLength` (always 16-byte aligned).
+- Tensors are 
+
+namespace Amql.Inference;
+
+/// <summary>Raised when an operation the container declares has no managed
+/// implementation in this build. Fail-closed: the primitive is named, never
+/// approximated — mirroring the reference's exhaustive match refusing to
+/// serve an unjudged operator.</summary>
+public sealed class UnsupportedOperatorException : NotSupportedException
+{
+    public UnsupportedOperatorException(string message) : base(message) { }
+}
+
+# The Entail language
+
+Reference for the language compiled by `amql-cli entail`. For why it exists, how
+the weights stay exact and what it achieved on a real model, see
+[entail.md](entail.md). The full worked program is
+[`scripts/entail/mathematics.entail.txt`](../scripts/entail/mathematics.entail.txt).
+
+An Entail program says what each token means, what follows from that, and what
+token must come next. It has no runtime of its own: `compile` turns it into a
+model, and from then on it is just weights.
+
+## A first program
+
+This program answers `7?` with `8`: the digit after the one before the `?`,
+wrapping 9 round to 0.
+
+```
+program next_digit
+
+# Input facts: what each token is.
+state val, known, asked
+for d in 0 to 9
+    token "{d}" means val = d, known = 1
+end
+token "?" means asked = 1
+
+# Sight: the token one place back.
+state before, there
+attend back 1
+    before <- val
+    there  <- known
+end
+
+# Consequences.
+state ask, wrap, answer
+entail ask when asked, there
+entail wrap when before >= 9, ask
+entail answer = before + 1 - 10*wrap when ask
+
+# Output facts: the token that must come next.
+state o[10]
+for d in 0 to 9
+    entail o[d] when answer == d, ask
+    emit "{d}" when o[d]
+end
+```
+
+Save it as `next-digit.entail.txt`, then:
+
+```bash
+amql-cli entail check next-digit.entail.txt
+```
+
+```bash
+amql-cli entail run next-digit.entail.txt --expr " 9?"
+```
+
+`check` reports the size of the compiled model and `run` prints ` 9?0`. Note the
+leading space: see [The start of the text](#the-start-of-the-text).
+
+## Lexical rules
+
+- A statement is one line. A line may break after a comma in a `state`, `token`
+  or `when` list.
+- `#` starts a comment that runs to the end of the line.
+- Indentation means nothing; blocks close with `end`.
+- Names are letters, digits and `_`, starting with a letter or `_`.
+- Numbers are decimal, with an optional fraction: `9`, `0.5`.
+- Strings are in double quotes. `\n` is a newline, `\t` a tab, `\r` a carriage return,
+  `\q` a double quote, `\{` a literal brace and `\e` a backslash, for when one comes
+  before a letter. There are no other escape sequences: `"\"` is one backslash.
+- `{x}` inside a name or string is replaced by the value of the loop variable or
+  `def` parameter `x`: `token "{d}"`, `state {p}_carry[n]`. Constants cannot be
+  used this way.
+
+Reserved words: `program const state scale let token means for in to if else end
+def call attend back by entail when not emit only forbid vote sum min floor`.
+`carry` starts a carry statement only when a name follows it, so a state may still be
+called `carry`. Likewise `prefer` and `decide` start an output only when a quoted token
+follows them.
+
+## Expressions
+
+An expression is a *linear form*: a constant plus lanes multiplied by constants.
+
+| Form | Meaning |
+|---|---|
+| `a + b`, `a - b`, `-a` | sum, difference, negation |
+| `3 * a`, `a * 3` | scaling; one side must be constant |
+| `a / 2` | scaling; the divisor must be constant |
+| `2 ^ k` | power, of constants only |
+| `(sum i in 0 to n-1 : 10^i * d[i])` | sum over a range; the brackets are required |
+| `min(a, b)`, `floor(a)` | of constants only |
+| `x`, `x[i]`, `x[i][j]` | a constant, loop variable, `let` or state |
+
+A product of two states is refused, because it is not linear. Gate one by the
+other instead, with `when`. Index expressions must be constant.
+
+## Declarations
+
+```
+program NAME
+```
+Names the program. Optional.
+
+```
+const NAME = EXPR
+```
+A compile-time number. Constants are global, and assigning one again replaces it.
+
+```
+state NAME, NAME[DIM], NAME[DIM][DIM] scale EXPR, ...
+```
+Declares interim facts. A state with dimensions is an array, indexed from 0. Each
+element is one residual lane, allocated the first time it is used. Dimensions are
+reused once a lane is dead, so a large program can compile to a narrow model.
+
+`scale` is the raw value stored per unit of meaning. Use a power of two, and use
+one for any state that holds large numbers: `state rem[9] scale 1/8192` holds a
+remainder near 100,000 as a raw value near 12, keeping it clear of the norm's
+exactness budget (see [Limits](#limits-a-program-must-respect)).
+
+```
+let NAME = EXPR
+let NAME[I] = EXPR
+```
+A name for a linear form. It costs no weights: its value is substituted wherever
+it is used. Its right-hand side is evaluated at this point, and `let`s are global.
+
+```
+token "TEXT", "TEXT" means LANE = VALUE, LANE = VALUE
+```
+What an input token is: the lanes its embedding row sets. Values are constants.
+Tokens missing from a model's vocabulary are skipped and listed in the build
+report, so one program can list spellings for several tokenizers.
+
+## Generators
+
+These run at compile time and leave nothing in the weights.
+
+```
+for VAR in FROM to TO
+    ...
+end
+```
+Both bounds are inclusive. If `FROM` is above `TO` the body does not run.
+
+```
+if LEFT OP RIGHT
+    ...
+else
+    ...
+end
+```
+A compile-time choice between constants. `OP` is one of `< > <= >= == !=`, and
+`else` is optional. This is not a runtime branch: a condition on a state belongs
+in `when`.
+
+```
+def NAME(P, Q)
+    ...
+end
+
+call NAME(ARG, ARG)
+```
+A macro. A bare name that is not a number binds as a name, so a `def` can be told
+which states to use; anything else binds as a number. Use `{p}` to build names from
+a parameter:
+
+```
+def chain(p, n)
+    state {p}_c[n + 1]
+    ...
+end
+call chain(add, ADD)        # declares and defines add_c
+```
+
+## Attention
+
+```
+attend back K
+    DEST <- EXPR
+    DEST <- EXPR
+end
+```
+One attention head. Each destination receives the value its expression has at the
+token `K` places back, where `K` is a constant. The body may use `for` and `if`.
+
+```
+attend back by POINTER
+    DEST <- EXPR
+end
+```
+The same, with a computed distance. `POINTER` is a one-index state: if `POINTER[c]`
+is set, the head looks `c` tokens back. At most one element may be set. If none is,
+the head reads a blend of the context, so gate whatever consumes its result.
+
+## Consequences
+
+Each `entail` adds to its target. Several statements on 
+
+using Amql.Hf;
+using Amql.Inference;
+using Amql.Vindex3;
+
+namespace Amql.Merge;
+
+/// <summary>Outcome of one fine-tune run: what was adjusted and the patch
+/// that carries the deltas.</summary>
+public sealed record FineTuneReport(
+    string PatchPath,
+    string ComponentId,
+    string HeadObjectId,
+    string HeadTensorName,
+    int VocabSize,
+    int HiddenSize,
+    int Pairs,
+    int Steps,
+    bool HeadReusesEmbedding,
+    double LearningRate,
+    int Epochs,
+    IReadOnlyList<string> Notes);
+
+/// <summary>
+/// Supervised fine-tuning via teacher-forced output-head adaptation:
+/// given (prompt, completion) text pairs, runs the model forward and
+/// accumulates per-token head deltas that push the output toward the
+/// desired completions. The result is a standard AMQL weight-patch file
+/// — no gradient infrastructure, no autograd, deterministic given the
+/// same inputs. The container itself is never rewritten.
+/// </summary>
+public static class ModelFinetuner
+{
+    /// <summary>
+    /// Runs fine-tuning over a TSV data file (one <c>prompt\tcompletion</c>
+    /// per line) and writes the accumulated head deltas to
+    /// <c>outPatchPath</c>.
+    /// </summary>
+    public static FineTuneReport FineTune(
+        Vindex3Container container,
+        string componentId,
+        string dataPath,
+        string outPatchPath,
+        HfTokenizer tokenizer,
+        double lr = 1e-4,
+        int epochs = 1,
+        WeightPatch? basePatch = null)
+    {
+        if (lr <= 0)
+            throw new MergeException("learning rate must be positive");
+        if (epochs <= 0)
+            throw new MergeException("epochs must be positive");
+
+        var lines = File.ReadAllLines(dataPath);
+        var pairs = ParsePairs(lines, dataPath);
+        if (pairs.Count == 0)
+            throw new MergeException($"'{dataPath}' contains no valid training pairs");
+
+        using var store = container.CreateOperandStore();
+        var plan = Planner.Plan(container, componentId, store);
+        if (plan.Output is null)
+            throw new MergeException(
+                $"component '{componentId}' carries no output head — fine-tuning needs one");
+
+        int vocabSize = plan.Output.VocabSize;
+        int hiddenSize = plan.Output.HiddenSize;
+        string headObjectId = plan.Output.Projection.ObjectId;
+        string headTensorName = plan.Output.Projection.TensorName;
+        bool headReusesEmbedding = plan.Output.ReusesEmbedding;
+
+        // ── pre-encode every pair ─────────────────────────────────────
+        // Tokenize once so we don't re-tokenize per epoch.
+        var encoded = new List<(int[] PromptIds, int[] CompletionIds)>(pairs.Count);
+        foreach (var (prompt, completion) in pairs)
+        {
+            var pIds = tokenizer.EncodeToIds(prompt).ToArray();
+            var cIds = tokenizer.EncodeToIds(completion).ToArray();
+            if (pIds.Length > 0 && cIds.Length > 0)
+                encoded.Add((pIds, cIds));
+        }
+        if (encoded.Count == 0)
+            throw new MergeException($"'{dataPath}' contains no tokenizable training pairs");
+
+        // ── accumulator ────────────────────────────────────────────────
+        var accum = new double[vocabSize * hiddenSize];
+        int totalSteps = 0;
+        var notes = new List<string>();
+
+        // ── one runtime for the whole session (keeps weight cache warm) ─
+        var rt = new GenericRuntime(plan, store, basePatch);
+        var finalNormW = store.ResolveWidened(plan.RequireFinalNorm("fine-tuning").Weight).Values;
+
+        for (int epoch = 0; epoch < epochs; epoch++)
+        {
+            foreach (var (promptIds, completionIds) in encoded)
+            {
+                // Reset KV cache — keep weights loaded.
+                rt.ResetKvCache();
+
+                // ── prefill the prompt ──────────────────────────────
+                var hidden = rt.Embed(promptIds);
+                var positions = Enumerable.Range(0, promptIds.Length).ToArray();
+                for (int layer = 0; layer < plan.Layers.Count; layer++)
+                    hidden = rt.RunLayerInternal(hidden, layer, positions, positions, appendKv: true);
+                int pos = promptIds.Length;
+
+                // ── teacher-force each completion token ─────────────
+                foreach (var targetId in completionIds)
+                {
+                    if (targetId < 0 || targetId >= vocabSize)
+                    {
+                        notes.Add($"token {targetId} outside vocabulary — skipped");
+                        break;
+                    }
+
+                    var hNorm = hidden.Clone();
+                    Norms.ApplyInPlace(hNorm, plan.RequireFinalNorm("fine-tuning").Kind, plan.RequireFinalNorm("fine-tuning").Eps,
+                        finalNormW, plan.RequireFinalNorm("fine-tuning").WeightOffset);
+
+                    var row = hNorm.Row(hNorm.Rows - 1);
+                    int baseOffset = targetId * hiddenSize;
+                    for (int d = 0; d < hiddenSize; d++)
+                        accum[baseOffset + d] += lr * row[d];
+                    totalSteps++;
+
+                    // Step forward with the target token.
+                    hidden = rt.Embed(new[] { targetId });
+                    var qpos = new[] { pos };
+                    var kvpos = Enumerable.Range(0, pos + 1).ToArray();
+                    for (int layer = 0; layer < plan.Layers.Count; layer++)
+                        hidden = rt.RunLayerInternal(hidden, layer, qpos, kvpos, appendKv: true);
+                    pos++;
+                }
+            }
+        }
+
+        if (totalSteps == 0)
+        {
+            throw new MergeException(
+                "no training steps were taken — check that the data file contains " +
+                "valid prompt/completion pairs whose tokens are in vocabulary");
+        }
+
+        // Build the patch entry: one dense F32 delta array for the head
+        // tensor, shaped [vocabSize, hiddenSize].
+        var delta = new float[vocabSize 
+
+# Architecture Overview
+
+## Design Philosophy
+
+AMQL is a **model-agnostic** framework. Its inference engine is built around a **generic operation program** — a sequence of abstract tensor operations that are independent of any specific model family. The same engine can run Qwen3.5, SmolMol, Gemma, Mistral, and any architecture that can be expressed as a composition of supported operations.
+
+The key insight: model-specific code is pushed to the encoder/planner layer. The inference runtime sees only operations (`EmbeddingOp`, `AttentionOp`, `DenseFfnOp`, `RoutedFfnOp`, etc.) with operand references and resolved parameters.
+
+## Layered Architecture
+
+```
+┌───────────────────────────────────────────────────────────────────────┐
+│  CLI (amql-cli)                                                        │
+│  ┌─────────────┐ ┌──────────┐ ┌───────────┐ ┌───────────────────┐   │
+│  │ encode      │ │ verify   │ │ infer     │ │ inspect / export  │   │
+│  └─────────────┘ └──────────┘ └───────────┘ └───────────────────┘   │
+└───────────────────────────────────────────────────────────────────────┘
+│  ┌──────────────────────────────────────────────────────────────────┐ │
+│  │  VINDEX3 Container                                               │ │
+│  │  ┌───────────┐  ┌────────────────┐  ┌────────────────────────┐   │ │
+│  │  │ index.json│  │ system_graph   │  │ .segments/*.bin        │   │ │
+│  │  │ + profiles│  │ (semantic IR)  │  │ (payload + hashed)     │   │ │
+│  │  └───────────┘  └────────────────┘  └────────────────────────┘   │ │
+│  └──────────────────────────────────────────────────────────────────┘ │
+│  ┌──────────────────────────────────────────────────────────────────┐ │
+│  │  Encoder / Planner Layer                                          │ │
+│  │  ┌──────────┐  ┌──────────┐  ┌──────────────────┐              │ │
+│  │  │ Hf       │  │ Merge    │  │ Inference/Plan   │              │ │
+│  │  │ (convert)│  │ (patch)  │  │ (graph → ops)    │              │ │
+│  │  └──────────┘  └──────────┘  └──────────────────┘              │ │
+│  └──────────────────────────────────────────────────────────────────┘ │
+│  ┌──────────────────────────────────────────────────────────────────┐ │
+│  │  Core Libraries                                                   │ │
+│  │  ┌──────────────┐ ┌─────────────┐ ┌────────────────────────┐    │ │
+│  │  │ Vindex3      │ │ Inference   │ │ Safetensors            │    │ │
+│  │  │ (container)  │ │ (IR + plan) │ │ (tensor readers)       │    │ │
+│  │  └──────────────┘ └─────────────┘ └────────────────────────┘    │ │
+│  └──────────────────────────────────────────────────────────────────┘ │
+└───────────────────────────────────────────────────────────────────────┘
+```
+
+## Component Responsibilities
+
+### Amql.Safetensors
+
+Low-level safetensors file readers. Provides `NamedTensorData` records and dtype definitions (`FP32`, `BF16`, `Q4_0`, `FP4`, etc.). Used by both the Vindex3 encoder and the Hf converter.
+
+### Amql.Vindex3
+
+The container format layer. Three core subsystems:
+
+1. **Segment writer** (`SegmentWriter`) — single-pass streaming write with dual SHA-256 computation. Handles tensors beyond the 2 GiB single-buffer ceiling by chunking.
+2. **Segment reader** (`SegmentFile`) — memory-mapped read with lazy tensor access. Parses JSON header once, reads payload on demand via `ReadBytes()` and `ReadBytes(name, offset, count)`.
+3. **Execution surface** (`ExecutionSurface`) — runtime parameters that the planner resolves at build time. Encodes norm types, attention geometry, FFN configuration, MoE routing, and optional operators (linear attention, KDA, MLA, Mamba2).
+
+### Amql.Hf
+
+Hugging Face model converter. Reads from the Hugging Face Hub, converts model weights into VIndex3 container format. Handles the full pipeline from HF tensor naming conventions to the abstract logical object model used by system graphs.
+
+### Amql.Merge
+
+Model patching and merge operations. Supports:
+
+- **Patching** — apply delta tensors to an existing model (e.g. LoRA adapters)
+- **Merging** — combine multiple models using different interpolation strategies
+- Uses `Amql.Inference`'s graph resolution to ensure semantic consistency across merged components
+
+### Amql.Inference
+
+The inference engine. Two main phases:
+
+1. **Planning** (`Plan.cs`) — converts a VIndex3 container's system graph into a sequence of generic operations (`ComponentOpPlan`). The planner resolves hidden-state edges between components, assigns segment-relative tensor references, and constructs `LayerPlan` structures that encode the full forward pass.
+
+2. **Execution** — executes the operation program using the resolved operand references and surface parameters. The runtime is model-family agnostic.
+
+## Data Flow
+
+### Encoding (Model → Container)
+
+```
+HF Model → Hf converter → Logical objects → Vindex3 encoder → Segments
+     ↓                                    ↓
+  Raw tensors                    System graph (semantic IR)
+     ↓                                    ↓
+  safetensors                   index.json (authority)
+```
+
+### Inference (Container → Output)
+
+```
+Container read → Graph parse → Planner → ComponentOpPlan → Execution
+     ↓             ↓           ↓           ↓              ↓
+  index.json  Components   Attention   Softmax,       Embedding,
+  graph.json  Objects      Edge map   FFN ops, norms  Norm ops
+  segments/   Edges        Norm       Linear attn     Output head
+                          surface     MLA, KDA,       (or tied)
+                          spec        Mamba2, etc.
+```
+
+## Execution Surface
+
+The `ExecutionSurface` type is the contract between planner and executor. It captures everything needed to run a component without any model-family knowledge:
+
+- **Attention geometry** — query/KV heads, head dimension, scope (per-head vs. full-projection)
+- **Norm configuration** — RMS/Layer norm, placement (pre/post), final norm, weight offset convention
+- **FFN type** — dense (Gated/DotGated/Glu), MoE (router, experts, top-k, rou
+
+using System.Security.Cryptography;
+using System.Text.Json;
+
+namespace Amql.Vindex3;
+
+/// <summary>One integrity check result for one representation.</summary>
+public sealed record IntegrityCheck(
+    string Representation,
+    bool Ok,
+    string? Detail);
+
+/// <summary>The full result of re-verifying a container's byte
+/// equivalence (G4-style): every representation's payload hash and whole
+/// segment hash are recomputed from disk and compared against the index.</summary>
+public sealed record IntegrityReport(bool Ok, List<IntegrityCheck> Checks);
+
+/// <summary>
+/// An opened VINDEX3 container: <c>index.json</c> (root authority) plus,
+/// when recorded, <c>system_graph.json</c> (semantic IR). Opening is
+/// schema-gated and fails closed — an unreadable schema, a dangling
+/// reference or a missing file is a typed error, never a guess.
+///
+/// The container is a stateless view (index + graph + root path): payload
+/// segments are owned by <see cref="OperandStore"/> instances, each
+/// mapping its own files so disposal of one store never affects another.
+/// </summary>
+public sealed class Vindex3Container : IDisposable
+{
+    public Vindex3Container(string root, Vindex3Index index, SystemGraph? graph)
+    {
+        Root = root;
+        Index = index;
+        Graph = graph;
+    }
+
+    public string Root { get; }
+    public Vindex3Index Index { get; }
+    public SystemGraph? Graph { get; }
+
+    public static Vindex3Container Open(string root)
+    {
+        var indexPath = Path.Combine(root, "index.json");
+        if (!File.Exists(indexPath))
+        {
+            throw new ContainerException($"container '{root}' has no index.json");
+        }
+
+        Vindex3Index index;
+        try
+        {
+            index = JsonSerializer.Deserialize<Vindex3Index>(File.ReadAllBytes(indexPath), ViJson.Options)
+                    ?? throw new ContainerException($"container '{root}': index.json is empty");
+        }
+        catch (JsonException e)
+        {
+            throw new ContainerException($"container '{root}': malformed index.json: {e.Message}", e);
+        }
+
+        if (index.Version is < Vindex3Index.MinReadableSchema or > Vindex3Index.CurrentSchema)
+        {
+            throw new ContainerException(
+                $"container '{root}': index schema {index.Version} is not readable " +
+                $"(expected {Vindex3Index.MinReadableSchema}..{Vindex3Index.CurrentSchema})");
+        }
+
+        SystemGraph? graph = null;
+        if (index.SystemGraph is { } graphPath)
+        {
+            var graphFile = Path.Combine(root, graphPath);
+            if (!File.Exists(graphFile))
+            {
+                throw new ContainerException(
+                    $"container '{root}': index references system graph '{graphPath}' but the file is missing");
+            }
+            try
+            {
+                graph = JsonSerializer.Deserialize<SystemGraph>(File.ReadAllBytes(graphFile), ViJson.Options)
+                        ?? throw new ContainerException($"container '{root}': {graphPath} is empty");
+            }
+            catch (JsonException e)
+            {
+                throw new ContainerException($"container '{root}': malformed {graphPath}: {e.Message}", e);
+            }
+
+            if (graph.Schema < 6 || graph.Schema > SystemGraph.CurrentSchema)
+            {
+                throw new ContainerException(
+                    $"container '{root}': system graph schema {graph.Schema} is not supported " +
+                    $"(expected 6..{SystemGraph.CurrentSchema})");
+            }
+        }
+
+        var container = new Vindex3Container(root, index, graph);
+        container.ValidateStructure();
+        return container;
+    }
+
+    /// <summary>Coherence validation: every recorded reference resolves —
+    /// index representations name known objects (when a graph exists),
+    /// graph components/objects/edges resolve to each other, and every
+    /// representation entry's segment file exists on disk.</summary>
+    private void ValidateStructure()
+    {
+        if (Graph is null)
+        {
+            return; // no graph recorded: representation refs cannot be checked
+        }
+
+        var objectIds = new HashSet<string>(Graph.Objects.Select(o => o.Id), StringComparer.Ordinal);
+        var componentIds = new HashSet<string>(Graph.Components.Select(c => c.Id), StringComparer.Ordinal);
+
+        foreach (var (representationId, entry) in Index.Representations)
+        {
+            if (!objectIds.Contains(entry.Object))
+            {
+                throw new ContainerException(
+                    $"representation '{representationId}' names object '{entry.Object}' which the system graph does not contain");
+            }
+            var segmentFile = Path.Combine(Root, entry.Segment);
+            if (!File.Exists(segmentFile))
+            {
+                throw new ContainerException(
+                    $"representation '{representationId}' points at '{entry.Segment}' but the file is missing");
+            }
+        }
+
+        foreach (var obj in Graph.Objects)
+        {
+            if (!componentIds.Contains(obj.Component))
+            {
+                throw new ContainerException(
+                    $"object '{obj.Id}' names component '{obj.Component}' which does not exist");
+            }
+        }
+
+        foreach (var edge in Graph.Edges)
+        {
+            if (!componentIds.Contains(edge.ProducerComponent))
+            {
+                throw new ContainerException(
+                    $"edge producer '{edge.ProducerComponent}' does not exist");
+            }
+            if (!componentIds.Contains(edge.ConsumerComponent))
+            {
+                throw new ContainerException(
+                    $"edge consumer '{edge.ConsumerComponent}' does not exist");
+            }
+            if (!objectIds.Contains(edge.ConsumerObject))
+            {
+                throw new ContainerException(
+                    $"edge consumer object '{edge.ConsumerObject}' does not exis
+
+# Strategies: tool calling and long context on Qwen 3.5 0.8B
+
+Knowledge can be given to a small model on demand, in its context. This experiment asks
+whether strategies can be handled the same way: written down as programs rather than
+trained in. It covers two strategies:
+
+- **Reading a context of any length**, with every part of it actually read.
+- **Calling tools**: given request A, the model calls tool B with arguments C.
+
+The method is the one Entail already uses for mathematics: train the behaviour, look at
+what training changed, and write the result as a program. That needed three new pieces:
+a LoRA trainer in AMQL, a translator from a LoRA to Entail, and a tracer for the tool
+decisions. Everything below was run on Qwen 3.5 0.8B on the CPU, in float32.
+
+## Results in brief
+
+| Question | Finding |
+|---|---|
+| Where does the 0.8B model fail at tools? | The first token: calling now or talking first. Talking first sometimes ends in the call and sometimes in a refusal. Once it opens `<tool_call>` it picks the right tool and copies the right arguments, even for a renamed tool. It also lets the tool that best matches the request outvote a policy. |
+| What drives that decision? | The template's instruction lines and the request's wording. Removing the relevant tool from the list barely changes it. The `<IMPORTANT>` block, which says to answer normally when no function applies, pushes against calling. |
+| What does one training example teach? | A bias, not a rule. The LoRA learned to suppress the openers "To" and "I" on the reply's first token whatever the request, so the model then calls a tool for everything. |
+| Is the tool the one nearest the request's intent? | Yes, but in layers 7 to 15, not in the embedding: there the request is nearest the chosen tool's description in 9 or 10 cases of 10, against 6 of 10 for static embeddings. Middle layers attend to that description, a layer-19 head copies its name, and argument values are copied from the request. |
+| Can a program read an unbounded context? | Yes, as a fold. With the new `carry` statement, an Entail program read 2 MB and 8 MB texts in 2,640 bytes of state and found the one record that decided the answer. |
+| A generic fix? | Split the work: the model supplies meaning (which tool is near, where a value lies), and a program supplies the strategy (when to call, what takes precedence, what to carry). A first call gate with a hand-written lexicon cost as much as it gained. |
+| A generic fix for missed calls? | Yes. The model's first-token probability of `<tool_call>` already says when a call is due. It is only below prose's. A 10-neuron program, `decide "<tool_call>" at 2 times prior`, calls when the latest message at least doubles that probability over the same conversation with the message blanked. With two template lines removed, the clean set goes from 23 to 36 calls of 36 with no new false call. On 120 real policy conversations, calls rise from 64 to 94 and right tools from 46 to 70. No word lists are involved. |
+| What fails next? | Choosing the tool: a tool listed late loses to one listed early. Restating the tools near the reply fixes that, but it blurs the call decision. |
+
+## What was built
+
+| Piece | Command | What it does |
+|---|---|---|
+| LoRA trainer | `amql-cli lora-train` | Trains LoRA factors on FFN down-projections without an autograd engine, and monitors itself as it goes. |
+| LoRA to Entail | `amql-cli entail from-lora` | Writes each rank component of a LoRA as an Entail state, with where it fires, what it says and what in the context it depends on. |
+| Tool tracer | `amql-cli tool-trace` | For the model's own reply, traces the call, tool and argument decisions: attention over the prompt's parts, and request-to-tool similarity. |
+| Recurrent registers | `carry DEST from SOURCE` | A lane that starts each token holding another lane's value from the token before. A fold over the text. |
+| Streaming | `entail run --file` | Runs a program over a file of any size in fixed memory. |
+| Host-weighed outputs | `prefer`, `decide` | Say a token when the host's own model gives it enough probability, absolutely or relative to its prior for the same conversation with the latest message blanked. |
+| The call program | `call-when-likely.entail.txt` | The tool-call decision as a 10-neuron fold plus one `decide`. |
+| Decision probes | `entail eval --watch --prefix --logprobs` | First-token probabilities, forced openings and per-token probabilities. |
+| Cases | `scripts/entail/toolcall/` | The synthetic and real cases, anchors, scorers, prompt variants, trace summary and the call programs. |
+
+### Training without autograd
+
+The forward pass is AMQL's own runtime. The backward pass runs exactly through the output
+head and the final RMSNorm, which gives the loss gradient on the last residual. For a LoRA
+on the **last** layer's down-projection that is the whole chain, so its gradient is exact.
+A finite-difference check confirms it, and runs at the first step of every training run:
+
+| Check, layer 23 | Predicted | Measured | Ratio |
+|---|---|---|---|
+| random direction | -0.008114 | -0.008113 | 1.0002 |
+| along the gradient | 0.82811 | 0.82800 | 1.0001 |
+
+For an earlier layer the gradient follows the direct residual path only, ignoring how the
+layers above react to the change. The same check measures how far that is off, rather than
+assuming. The loss the trainer reports and acts on always comes from the exact forward pass.
+
+Other features of the trainer:
+
+- **Cached prefix.** Layers below the first LoRA layer never change, so they run once per
+  example, and each step runs only the layers above. A step on the last layer takes about
+  1 s for one 680-token example.
+- **Spike guard.** A step that raises the loss by more than half is undone and the learning
+  rate halved.
+- **Early stop.** Training stops once the loss is below target and every training example
+  decodes exactly, which an evaluation confirms.
+- **Anchors.** Unlabelled prompts 
+
+using System.Diagnostics;
+using System.Text;
+using Amql.Hf;
+using Amql.Inference;
+using Amql.Vindex3;
+
+namespace Amql.Cli;
+
+// ── generate, masked diffusion models ─────────────────────────────────────
+
+internal static partial class Program
+{
+    /// <summary>Whether the container's text component is a masked diffusion
+    /// LM, which <c>generate</c> must hand to the diffusion sampler: stepping
+    /// it one token at a time would run a bidirectional stack as if causal.</summary>
+    private static bool IsDiffusionContainer(string containerDir, string component)
+    {
+        using var container = Vindex3Container.Open(containerDir);
+        return container.Graph?.Components.FirstOrDefault(c => c.Id == component)?.Execution?.Diffusion is not null;
+    }
+
+    /// <summary>
+    /// <c>generate</c> for a masked diffusion container. <c>--gen</c> masked
+    /// positions follow the prompt and are unmasked over <c>--steps</c> full
+    /// passes, <c>--block</c> positions at a time, left to right.
+    /// </summary>
+    private static int GenerateDiffusion(string containerDir, string[] args, string component)
+    {
+        string? prompt = OptionValue(args, "--prompt");
+        string tokenizerDir = ResolveTokenizerDir(containerDir, args);
+        var tokenizer = Tokenizer(tokenizerDir);
+        int[] tokens;
+        if (prompt is not null)
+        {
+            if (HasOption(args, "--chat"))
+            {
+                string template = ChatTemplate.Load(tokenizerDir) ?? throw new CliException(
+                    "--chat requires a chat template, but none was found in chat_template.jinja or tokenizer_config.json");
+                prompt = ChatTemplate.Apply(template, prompt, OptionValue(args, "--system"));
+                // The A2D checkpoints are tuned with thinking off: the template's
+                // enable_thinking=false branch pre-fills an empty think block.
+                if (template.Contains("enable_thinking") && !HasOption(args, "--think"))
+                {
+                    prompt += "<think>\n\n</think>\n\n";
+                }
+                Console.WriteLine("chat:      prompt formatted via chat template" +
+                                  (HasOption(args, "--think") ? "" : " (thinking off)"));
+            }
+            tokens = tokenizer.EncodeToIds(prompt).ToArray();
+        }
+        else
+        {
+            tokens = ParseIntList(OptionValue(args, "--tokens"), fallback: Array.Empty<int>());
+        }
+        if (tokens.Length == 0)
+        {
+            throw new CliException("diffusion generation needs a prompt (--prompt or --tokens)");
+        }
+
+        var stopTokens = ResolveStopTokens(tokenizerDir, tokenizer);
+        int gen = IntOption(args, "--gen", 128);
+        string remasking = OptionValue(args, "--remasking") ?? "low_confidence";
+        var options = new DiffusionOptions
+        {
+            GenLength = gen,
+            Steps = IntOption(args, "--steps", gen),
+            BlockLength = IntOption(args, "--block", Math.Min(32, gen)),
+            Temperature = FloatOption(args, "--temperature", 0f),
+            Seed = IntOption(args, "--seed", 42),
+            Remasking = remasking switch
+            {
+                "low_confidence" => Remasking.LowConfidence,
+                "random" => Remasking.Random,
+                _ => throw new CliException($"unknown --remasking '{remasking}' — use low_confidence or random"),
+            },
+            StopTokens = HasOption(args, "--no-early-stop") ? null : stopTokens,
+        };
+        bool showSteps = HasOption(args, "--show-steps");
+        WeightWorkingSet? workingSet = (OptionValue(args, "--weights") ?? "") switch
+        {
+            "f32" or "fp32" => WeightWorkingSet.ResidentF32,
+            "bf16" => WeightWorkingSet.OnDemandBf16,
+            "mxfp4" or "fp4" => WeightWorkingSet.Mxfp4,
+            "disk" => WeightWorkingSet.Disk,
+            "" => null,
+            var other => throw new CliException($"unknown weight mode '{other}' — use f32, bf16, mxfp4 or disk"),
+        };
+
+        using var container = Vindex3Container.Open(containerDir);
+        using var store = container.CreateOperandStore();
+        var plan = Planner.Plan(container, component, store);
+        var runtime = new GenericRuntime(plan, store, LoadPatch(args, container), workingSet);
+        var sampler = new MaskedDiffusionSampler(runtime);
+
+        Console.WriteLine($"diffusion: masked (MDLM), mask token {sampler.MaskTokenId}, " +
+                          $"{options.GenLength} positions, {options.Steps} steps, block {options.BlockLength}, " +
+                          $"remasking {remasking}, temperature {options.Temperature}");
+        Console.WriteLine($"prompt:    {tokens.Length} tokens");
+        Console.WriteLine($"weights:   {workingSet ?? WeightWorkingSetExtensions.FromEnv()}" +
+                          (CudaShim.Enabled ? " (CUDA available)" : " (CPU)"));
+
+        string Canvas(IReadOnlyList<int> sequence)
+        {
+            var sb = new StringBuilder();
+            for (int i = tokens.Length; i < sequence.Count; i++)
+            {
+                sb.Append(sequence[i] == sampler.MaskTokenId ? "_" : tokenizer.Decode(new[] { sequence[i] }));
+            }
+            return sb.ToString().Replace("\n", "⏎");
+        }
+
+        var clock = Stopwatch.StartNew();
+        var result = sampler.Generate(tokens, options, showSteps
+            ? step => Console.WriteLine($"  [b{step.Block} s{step.Step}] {Canvas(step.Sequence)}")
+            : null);
+        clock.Stop();
+
+        // The answer ends at the first stop token; what follows it is padding
+        // the sampler filled because every position must be committed.
+        int end = Array.FindIndex(result.Generated, stopTokens.Contains);
+        var answer = end < 0 ? result.Generated : result.Generated[..end];
+        var text = tokenizer.DecodeText(answer.Where(t => t != sampler.MaskTokenId).ToArray());
+
+        Console.WriteLine();
+        Console.WriteLine(tex
+
+# Dates, number bases, logic and JSON in Entail
+
+These four subjects are rule systems with nothing to learn: the calendar, positional
+notation, truth tables and a grammar. Each rule fixes the answer once a request is written
+in the subject's notation. This page records what the programs do, how they scored, and
+where they stop.
+
+| Program | Reads | Writes |
+|---|---|---|
+| [`dates.entail.txt`](../scripts/entail/dates.entail.txt) | `2024-03-15 was a` | `Friday` |
+| | `Days from 2024-01-01 to 2024-03-15 =` | `74 days` |
+| | `30 days after 15 March 2024 is` | `2024-04-14` |
+| [`bases.entail.txt`](../scripts/entail/bases.entail.txt) | `255 in binary is` | `11111111` |
+| | `0xff in decimal is` | `255` |
+| | `16777215 in base 14 is` | `232a207` |
+| [`logic.entail.txt`](../scripts/entail/logic.entail.txt) | `p or not p is` | `a tautology` |
+| | `((p -> q) and q) -> p is` | `contingent` |
+| | `Truth table of p or r:` | `01011111` |
+| [`json.entail.txt`](../scripts/entail/json.entail.txt) | `JSON: {"a": [1, 2]}` then `Valid:` | ` yes` |
+| | a JSON text being written | only tokens that keep it valid |
+
+## The idea in each
+
+**Dates are one law.** A year has 365 days, plus one every 4 years, less one every 100,
+plus one every 400. Weekdays, differences and date sums all follow from thresholds on those
+counts, and nothing is listed year by year. A date that doesn't exist entails nothing.
+
+**A number is the same in any base.** Each digit of the source adds a fixed amount to each
+column of the target, so a conversion is a linear sum followed by carrying. Every number
+passes through 8 hexadecimal columns, and one carry chain serves all the target bases, with
+the base as an input. No large number is ever held, so 32 bits fit easily.
+
+**Logic tries every case.** There are three letters, so eight assignments. Tokens become
+events, and a small evaluator runs once per assignment. All eight true is a tautology, none
+is a contradiction, and anything else is contingent. Precedence is not, then and, then or
+and xor, then `->` and `<->`.
+
+**JSON is a grammar, used in two ways.** A verdict reads a whole text and says whether it is
+valid. A guard reads a text as it is written, and rules out every token that would break it.
+That is constrained decoding held in the weights, with no sampler outside the model. It
+needed the new `only` and `forbid` statements in
+[the language](entail-language.md#output), which narrow what the host may say without
+choosing for it.
+
+Three of the programs are generated, because a tokenizer doesn't respect the notation. Qwen
+cuts `0xDEADBEEF` as `0|xDE|ADB|EE|F`, merges `((p`, and writes `":[` as one token, which
+means different things inside and outside a string. So `make_bases.py`, `make_logic.py` and
+`make_json.py` list each token with what it contributes. `make_json.py` runs one small
+scanner over the whole vocabulary, from inside and outside a string, and that scanner
+decides both the verdict and the guard's token sets, so the two can't disagree.
+
+## Results
+
+Qwen 3.5 0.8B, on the CPU. Each prompt opens with a short drill so that the base model
+answers. Answers were worked out separately in Python.
+
+| Test | Cases | Base | Graft |
+|---|---|---|---|
+| Weekdays | 90 | 12 | 90 |
+| Days between dates | 60 | 1 | 60 |
+| Adding and taking days | 60 | 5 | 60 |
+| Leap years | 16 | 13 | 16 |
+| Month lengths | 24 | 23 | 24 |
+| To binary, hex and octal | 90 | 7 | 90 |
+| From hex, binary and octal | 120 | 28 | 120 |
+| Hex, octal and binary to each other | 30 | 4 | 30 |
+| To and from bases 2 to 16 | 75 | 2 | 75 |
+| Expressions with true and false | 80 | 20 | 80 |
+| Tautology, contradiction or contingent | 90 | 11 | 89 |
+| Named laws | 12 | 12 | 12 |
+| Named fallacies | 6 | 0 | 6 |
+| Truth tables | 30 | 2 | 30 |
+| JSON verdicts, valid texts | 150 | 63 | 150 |
+| JSON verdicts, altered texts | 220 | 154 | 220 |
+
+The graft broke no answer the base model had right. The one logic miss is an expression of
+29 events, over the limit of 28: the program stayed silent and the host answered wrongly.
+On 23 requests outside the programs' range, all stayed silent.
+
+The base model gets all 12 laws and none of the 6 fallacies, so its 12 says little. The
+altered JSON texts are mostly invalid, which flatters a model that tends to say `no`.
+
+**The guard.** Each of 60 unfinished texts, 2 to 8 brackets deep, was given to the host to
+continue for 48 tokens.
+
+| | Base | Graft |
+|---|---|---|
+| Still valid | 38 | 60 |
+| Reached the end of the document | 1 | 4 |
+
+The guard keeps a text valid, but it can't make the host finish: most replies were still
+going, validly, when the 48 tokens ran out.
+
+| Program | Layers (host 24) | Loss on prose (base 3.55195) |
+|---|---|---|
+| Dates | 63 | 3.55207 |
+| Bases | 77 | 3.55222 |
+| Logic | 79 | 3.55256 |
+| JSON | 85 | 3.55213 |
+
+Further sets with new seeds were scored through `entail run` with Qwen's tokenizer, without
+weights: dates 747 of 747, bases 945 of 945, JSON 1,126 of 1,126, and logic 649 of 658, all
+9 misses being silence on an expression over the length limit. The JSON set predates the
+blank-space rule, and the verdicts were rechecked after it, through the weights.
+
+## What this doesn't do
+
+**No chat answer got better.** Over 10 plain-English questions per program, the graft and
+base scored the same: dates 3, bases 2, logic 7, and JSON 8 replies that parse. Dates and
+JSON gave identical replies. Five replies changed for bases and logic, with no change in
+score. In chat Qwen works through a method, such as Zeller's congruence or repeated
+division, and never writes the phrase a program waits for. As with the sciences, reaching
+chat needs a host that writes the notation, or a program that reads the question itself.
+
+**JSON helps structured output, not Qwen's tool calls.** Qwen's native tool format is XML
+(`<tool_call><function=…>`), which the guard doesn't know. It fits a reply or arguments asked
+for as JSON. In chat the model already wrote valid JSON: the 2 failures of 10 were c
+
+using System.Text.Json;
+using Amql.Safetensors;
+using Amql.Vindex3;
+
+namespace Amql.Hf;
+
+/// <summary>
+/// G1 resolution → G2 graph → G3 materialisation instruction, all in one
+/// pass: the reference's invent/representability/plan pipeline, .NET-shaped.
+/// The graph is built from <em>judged facts only</em> — an unseen
+/// layer_type or activation refuses the checkpoint, it never defaults.
+/// Unknown surface facts (partial MRoPE, output gates, the linear-attention
+/// operator) are <em>carried verbatim in the graph</em>, exactly as the
+/// runtime's fail-closed contract demands: recorded, never approximated.
+/// </summary>
+public static partial class ArchMapper
+{
+    public sealed record EncodeOptions
+    {
+        public bool IncludeVision { get; init; } = true;
+        public bool IncludeMtp { get; init; } = true;
+    }
+
+    public static ContainerSpec MapToContainerSpec(string modelId, TextArchitectureFacts facts, HfInventory inventory, EncodeOptions options,
+        ClassificationFacts? classification = null)
+    {
+        // ModernBERT keeps its layers at the checkpoint root ("layers.N"),
+        // which the text-prefix probe below would reject.
+        if (facts.ModelType == ModernBert.ModelType)
+        {
+            return MapModernBert(modelId, facts, inventory);
+        }
+
+        bool isNomicBert = facts.ModelType == "nomic_bert";
+        string prefix = DetectTextPrefix(inventory);
+        if (facts.LayerTypes.Count != facts.NumLayers)
+        {
+            throw new ModelConfigException(
+                $"layer_types declares {facts.LayerTypes.Count} layers but num_hidden_layers is {facts.NumLayers}");
+        }
+        // Activation is validated uniformally inside MapActivation.
+
+        if (isNomicBert)
+        {
+            return MapNomicBert(modelId, facts, inventory, options, classification, prefix);
+        }
+
+        // ── the stack's tensors and the role each plays ──────────────────
+        // Bound first: which norms, biases, gates and fusions exist is read
+        // from the tensors themselves, and every later judgement leans on it.
+        var conventions = FamilyConventions.For(facts.ModelType);
+        var (stackTensors, fused) = BindLayers(inventory, prefix, facts);
+        LayerRoleMap roles;
+        try
+        {
+            roles = TensorRoles.Judge(stackTensors.Select(t => t.Name), fused);
+        }
+        catch (ContainerException e)
+        {
+            throw new ModelConfigException(e.Message, e);
+        }
+        bool parallel = TensorRoles.IsParallelBlock(roles);
+        // Qwen4: the gated residual, QSA and the n-gram embedding, judged
+        // against the bound tensors before anything leans on the norm roles.
+        Qwen4Facts? qwen4 = IsQwen4Exp(facts) ? JudgeQwen4(facts, inventory, prefix, stackTensors) : null;
+        // Routed experts: the count and top-k come from the config, the
+        // expert width from the expert tensors themselves.
+        MoeFacts? moeFacts = facts.Moe;
+        if (roles.Experts is { } experts)
+        {
+            if (moeFacts is null)
+            {
+                throw new ModelConfigException(
+                    $"layers carry routed experts ('{experts.Prefix}N.') but the config states no expert count and top-k");
+            }
+            if (roles.Name(TensorRoles.Router, "bias") is { } routerBias)
+            {
+                throw new ModelConfigException($"router bias '{routerBias}' is not served — this build routes by the router's weights alone");
+            }
+            var upTensor = stackTensors.FirstOrDefault(t => t.Name.EndsWith("." + experts.Name(0, experts.Up), StringComparison.Ordinal))
+                ?? throw new ModelConfigException($"no '{experts.Name(0, experts.Up)}' tensor in any layer");
+            moeFacts = moeFacts with { ExpertIntermediateSize = (int)upTensor.Shape[0] };
+        }
+        else
+        {
+            // Expert keys over a stack without expert tensors (an export that
+            // writes num_experts: 0, or a dense sibling's config): dense.
+            moeFacts = null;
+        }
+        // Tied unless a head tensor exists, when the config does not say.
+        bool tied = facts.TieDeclared ? facts.TieWordEmbeddings : !HasOutputHead(inventory, prefix);
+        bool gatedFfn = roles.Name(TensorRoles.Gate) is not null || moeFacts is not null;
+
+        // ── per-layer policy table ────────────────────────────────────────
+        // Position policy: plain or partial rope (and per-layer-type rope
+        // blocks) are served; every other rope fact (MRoPE sections, scaled
+        // families) is carried verbatim as unresolved and refused by the
+        // planner naming the kind.
+        DiffusionSurface? diffusion = JudgeDiffusion(facts);
+        PositionPolicy position = JudgePosition(facts, conventions);
+        bool anySliding = false;
+        var policies = new List<AttentionLayerPolicy>(facts.NumLayers);
+        for (int l = 0; l < facts.NumLayers; l++)
+        {
+            string layerType = facts.LayerTypes[l];
+            bool linear = layerType == "linear_attention";
+            // A sliding window without a per-layer table applies to every
+            // layer (Mistral, Phi-3, Starcoder2) unless the config switches it
+            // off (Qwen2/3 carry a size with use_sliding_window: false).
+            bool sliding = layerType == "sliding_attention" ||
+                           (layerType == "full_attention" && !facts.LayerTypesDeclared &&
+                            facts.SlidingWindow is not null && facts.UseSlidingWindow != false);
+            if (sliding && facts.SlidingWindow is null)
+            {
+                throw new ModelConfigException($"layer {l}: 'sliding_attention' declared but the config carries no sliding_window");
+            }
+            anySliding |= sliding;
+            HeadGeometry geometry = linear && facts.LinearAttention is { } lin
+                ? new HeadGeometry { HeadDim = lin.KeyHeadDim, NumKvHeads = lin.KeyHeads }
+     
+
+# Statistical Outputs — Logprobs, Entropy & Perplexity
+
+**Status:** design · **Date:** 2026-10-03
+
+## 1. Motivation
+
+A user running inference wants to know how uncertain the model is about its
+output — per-token log-probabilities, the entropy of the next-token distribution,
+and aggregate sequence-level metrics. This is standard in the OpenAI API
+(`logprobs`, `top_logprobs`) and essential for:
+
+- **Calibration checks** — is the model's stated confidence well-calibrated?
+- **Hallucination detection** — high-entropy steps often precede fabrications.
+- **Contrastive evaluation** — running the same prompt against two models and
+  comparing where each was uncertain.
+- **Prompt engineering** — identifying which tokens in a prompt drive the model
+  into low-confidence territory.
+
+AMQL already computes the full softmax distribution internally (the Sampler picks
+from it), already computes top-K candidates for display (`--logits K`), and
+already computes Shannon entropy for trace recording — but none of it is
+surfaced to the user as a first-class output.
+
+## 2. What already exists
+
+| Capability | Where | Surfaced? |
+|---|---|---|
+| Softmax over full vocab | `Sampler.ApplyTemperatureAndSample` | No — discarded after token selection |
+| Top-K candidates (logit + prob) | `InferenceCommands.CandidatesFor` | CLI only (`--logits K`) |
+| Shannon entropy (nats) | `InferenceCommands.SoftmaxEntropy` | Trace only (`--trace-json`) |
+| Top-1 margin | `InferenceCommands` (inline) | Trace only |
+| Negative log-likelihood | — | Not computed |
+| Perplexity | `Amql.Merge/MoeIfy.cs` | MoE quality gate only |
+| OpenAI `logprobs` parameter | `ServerApp.RefuseUnsupported` | Explicitly refused |
+| `logprobs` in response | `ServerApp` | Hardcoded `null` |
+
+The softmax is recomputed independently in four places (`Sampler.Sample`,
+`CandidatesFor`, `SoftmaxEntropy`, `CausalTracer.SoftmaxProb`). There is no
+single point of computation — every consumer re-derives it from raw logits.
+
+## 3. Data model
+
+### 3.1 `LogprobsResult` — per-token statistics
+
+A new type in `Amql.Inference` that carries everything derivable from one
+logits row in a single pass:
+
+```csharp
+/// <summary>Per-token statistical output from one logits row: log-probabilities,
+/// entropy, and the top-K candidates with their tokens and probabilities.</summary>
+public sealed class LogprobsResult
+{
+    /// <summary>The selected token's log-probability (natural log).</summary>
+    public float TokenLogprob { get; init; }
+
+    /// <summary>Shannon entropy (nats) of the full next-token distribution.</summary>
+    public float Entropy { get; init; }
+
+    /// <summary>The probability of the top-1 token minus the probability of the
+    /// top-2 token — zero when the top two are equally likely, near 1.0 when
+    /// the model is certain.</summary>
+    public float Top1Margin { get; init; }
+
+    /// <summary>Top-K candidates ordered by descending probability. The list
+    /// always includes at least the selected token.</summary>
+    public IReadOnlyList<TokenLogprob> TopLogprobs { get; init; }
+
+    /// <summary>Raw vocab-size distribution — null unless the caller asked
+    /// for it (large vocab × many steps = impractically large).</summary>
+    public float[]? FullLogprobs { get; init; }
+}
+
+/// <summary>One token in the top-K: its id, log-probability, and softmax
+/// probability, plus an optional text decoration.</summary>
+public sealed record TokenLogprob(int Token, float Logprob, float Probability,
+    string? Text = null);
+```
+
+### 3.2 Extended `StepOutcome`
+
+The CLI's `StepOutcome` gains an optional `LogprobsResult` field:
+
+```csharp
+public sealed record StepOutcome(int Token, int Position,
+    IReadOnlyList<Candidate>? Candidates,
+    IReadOnlyList<LayerTraceLine>? Trace,
+    LogprobsResult? Logprobs);   // NEW
+```
+
+### 3.3 Extended `GenerationResult`
+
+The server's `GenerationResult` gains per-token logprobs plus aggregate stats:
+
+```csharp
+public sealed record GenerationResult(string Text, string FinishReason,
+    int PromptTokens, int CompletionTokens)
+{
+    public IReadOnlyList<int> Tokens { get; init; } = Array.Empty<int>();
+    public IReadOnlyList<LogprobsResult>? Logprobs { get; init; }  // NEW
+    public float? Perplexity { get; init; }                          // NEW
+    public float? MeanEntropy { get; init; }                         // NEW
+}
+```
+
+Perplexity is `exp(average NLL)` over the completion tokens. Mean entropy is the
+arithmetic mean of per-token entropies.
+
+### 3.4 Why not store the full distribution by default
+
+A full 151,936-entry float array (Qwen3.5) × 1,024 steps = ~600 MiB of logprobs
+— impractical as a default. The top-K list (typically 5–20 entries) is enough
+for calibration and uncertainty display. The full distribution (`FullLogprobs`)
+is opt-in and only sensible for short generations or single-step inspection.
+
+## 4. Where computation lives
+
+### 4.1 Centralised softmax in `Sampler`
+
+The refactored `Sampler` computes the softmax **once** and returns both the
+selected token and the logprobs result. A new method:
+
+```csharp
+public static (int Token, LogprobsResult Logprobs) SampleWithLogprobs(
+    ReadOnlySpan<float> logits, SamplingConfig config, Random rng, int topK);
+```
+
+This replaces the current `Sample` call in the generation loop. The existing
+`Sample` / `ArgMax` remain for callers that don't want logprobs (zero overhead
+for the non-logprobs path — no LogprobsResult allocation).
+
+The softmax path inside `ApplyTemperatureAndSample` is refactored to produce
+a `LogprobsResult` in one go:
+1. Temperature-scale → exp → normalize → (top-k/top-p filter) → probabilities
+2. Compute entropy: `H = -Σ p_i · ln(p_i)` over the filtered distribution
+3. Compute top-1 margin: `p[0] - p[1]`
+4. Select top-K by probability, with log-probability
+5. Sample token, record its logprob
+6. Return `(token, result)`
+
+### 4.2 `CandidatesFor` and `SoftmaxEntropy` become consumers
+
+After the refactor, `CandidatesFor` is replaced by reading `LogprobsResult.TopLo
+
+using System.Text.Json;
+using Amql.Safetensors;
+using Amql.Vindex3;
+
+namespace Amql.Merge;
+
+public sealed record ModelSpec(
+    string ModelName,
+    string Family,
+    int HiddenSize,
+    int NumLayers,
+    int NumQHeads,
+    int NumKvHeads,
+    int HeadDim,
+    int IntermediateSize,
+    int VocabSize,
+    int ContextLength,
+    double NormEps,
+    bool TieEmbeddings,
+    IReadOnlyList<string> LayerTypes)
+{
+    public static ModelSpec Default =>
+        new(
+            ModelName: "untitled-model",
+            Family: "qwen3_5",
+            HiddenSize: 768,
+            NumLayers: 12,
+            NumQHeads: 12,
+            NumKvHeads: 2,
+            HeadDim: 64,
+            IntermediateSize: 2048,
+            VocabSize: 32000,
+            ContextLength: 2048,
+            NormEps: 1e-5,
+            TieEmbeddings: true,
+            LayerTypes: Enumerable.Repeat("full_attention", 12).ToList()
+        );
+}
+
+/// <summary>
+/// Creates a new VINDEX3 container from scratch with randomly initialised
+/// weights and a user-defined architecture. The resulting container is ready
+/// for training via <c>fine-tune</c> and all other AMQL commands.
+/// </summary>
+public static class ModelInitializer
+{
+    public static string Create(ModelSpec spec, string outDir, int seed = 42)
+    {
+        if (Directory.Exists(outDir))
+        {
+            throw new MergeException($"container output '{outDir}' already exists");
+        }
+        if (spec.LayerTypes.Count != spec.NumLayers)
+        {
+            throw new MergeException(
+                $"layer_types count ({spec.LayerTypes.Count}) != num_layers ({spec.NumLayers})");
+        }
+
+        var rng = new Random(seed);
+        var notes = new List<string>();
+
+        int hidden = spec.HiddenSize;
+        int layers = spec.NumLayers;
+        int qDim = spec.NumQHeads * spec.HeadDim;
+        int kvDim = spec.NumKvHeads * spec.HeadDim;
+        int intermediate = spec.IntermediateSize;
+        int vocab = spec.VocabSize;
+
+        Directory.CreateDirectory(outDir);
+
+        // ── 1. Create the weight tensors ────────────────────────────────
+        var decoderTensors = new List<NamedTensorData>();
+        void Matrix(List<NamedTensorData> list, string name, int rows, int cols)
+        {
+            var data = XavierInit(rng, rows, cols);
+            list.Add(new NamedTensorData
+            {
+                Name = name, Dtype = Dtype.F32,
+                Shape = new long[] { rows, cols },
+                Data = FloatToBytes(data),
+            });
+        }
+
+        void Vector(List<NamedTensorData> list, string name, int width)
+        {
+            var data = new float[width];
+            for (int i = 0; i < width; i++)
+            {
+                // RMSNorm weights start at 1.0 (identity)
+                data[i] = 1.0f;
+            }
+            list.Add(new NamedTensorData
+            {
+                Name = name, Dtype = Dtype.F32,
+                Shape = new long[] { width },
+                Data = FloatToBytes(data),
+            });
+        }
+
+        // Embedding (always written, even when tied — it's the source)
+        var embTensors = new List<NamedTensorData>();
+        Matrix(embTensors, "weight", vocab, hidden);
+
+        // Decoder stack: per-layer weights
+        for (int l = 0; l < layers; l++)
+        {
+            string prefix = $"{l}.";
+            Matrix(decoderTensors, $"{prefix}self_attn.q_proj.weight", hidden, qDim);
+            Matrix(decoderTensors, $"{prefix}self_attn.k_proj.weight", hidden, kvDim);
+            Matrix(decoderTensors, $"{prefix}self_attn.v_proj.weight", hidden, kvDim);
+            Matrix(decoderTensors, $"{prefix}self_attn.o_proj.weight", hidden, qDim);
+            Vector(decoderTensors, $"{prefix}input_layernorm.weight", hidden);
+            Vector(decoderTensors, $"{prefix}post_attention_layernorm.weight", hidden);
+            Matrix(decoderTensors, $"{prefix}mlp.gate_proj.weight", intermediate, hidden);
+            Matrix(decoderTensors, $"{prefix}mlp.up_proj.weight", intermediate, hidden);
+            Matrix(decoderTensors, $"{prefix}mlp.down_proj.weight", hidden, intermediate);
+        }
+
+        // Final norm
+        var normTensors = new List<NamedTensorData>();
+        Vector(normTensors, "weight", hidden);
+
+        // Output head (only if untied)
+        var headTensors = new List<NamedTensorData>();
+        bool untied = !spec.TieEmbeddings;
+        if (untied)
+        {
+            Matrix(headTensors, "weight", vocab, hidden);
+        }
+
+        // ── 2. Write segments ───────────────────────────────────────────
+        string embSegmentPath = "segments/target.embedding.bin";
+        var embResult = SegmentWriter.Write(
+            Path.Combine(outDir, embSegmentPath), "target.embedding@F32", embTensors);
+
+        string decoderSegmentPath = "segments/target.decoder_stack.bin";
+        var decoderResult = SegmentWriter.Write(
+            Path.Combine(outDir, decoderSegmentPath), "target.decoder_stack@F32", decoderTensors);
+
+        string normSegmentPath = "segments/target.final_norm.bin";
+        var normResult = SegmentWriter.Write(
+            Path.Combine(outDir, normSegmentPath), "target.final_norm@F32", normTensors);
+
+        string headSegmentPath = "segments/target.output_head.bin";
+        var headResult = untied
+            ? SegmentWriter.Write(Path.Combine(outDir, headSegmentPath), "target.output_head@F32", headTensors)
+            : null;
+
+        // ── 3. Build representations map ────────────────────────────────
+        var representations = new Dictionary<string, RepresentationEntry>
+        {
+            ["target.embedding@F32"] = new()
+            {
+                Object = "target.embedding", Encoding = "F32",
+                Segment = embSegmentPath,
+                TensorCount = embTensors.Count,
+                PayloadBytes = embResult.PayloadBytes,
+                PayloadSha256 = embResult.PayloadSha256Hex,
+                SegmentSha256 = embResult.SegmentSha256Hex,
+            },
+   
+
+# N-gram packs: a domain's next-token statistics as a logit prior
+
+An n-gram pack is a corpus's next-token statistics, counted in the model's own tokens: for every context of 1 to 3
+tokens seen at least twice, its 8 most frequent continuations and their counts. Blended into the model's logits at
+the sampler, kNN-LM style, it is meant to supply what a small model cannot recall, such as the exact spelling of a
+rare member name. This page is how packs are built and served, and what they did and did not do for Qwen 3.5 0.8B
+writing C#.
+
+**Result in one line:** a .NET pack lowers the model's invented-API errors, but it costs more builds than it saves,
+at every setting tried. N-grams are lexical, and whether `x.Member` exists depends on the type of `x`, so the right
+tool for API names is a type-aware symbol pack; an n-gram's frequencies can then rank the members that pack allows.
+
+## Building and inspecting a pack
+
+```bash
+# the SDK's reference docs, written as calls: Directory.GetDirectories(path, searchPattern);
+python scripts/ngram/make_dotnet_corpus.py "C:/Program Files/dotnet/packs/Microsoft.NETCore.App.Ref/11.0.0/ref/net11.0" corpus/docs
+# source code with comments removed and generated or very large files left out
+python scripts/ngram/make_code_corpus.py corpus/code src <other C# repos>
+amql-cli ngram build --tokenizer <model> --out dotnet.ngram --name dotnet --order 4 \
+    --keywords "C#,.NET,dotnet,csproj,.cs" --ext .txt corpus/docs corpus/code
+amql-cli ngram info dotnet.ngram
+amql-cli ngram eval <model> --pack dotnet.ngram --lambda 0.1,0.3 --ext .cs <held-out C#>
+```
+
+`ngram build` hashes every (context, next) pair, sorts and counts them, drops contexts seen fewer than
+`--min-count` times and keeps each context's `--top-k` continuations: 5.5M tokens become 568k contexts and a 16 MB
+file in 7 s. A pack records its tokenizer (vocabulary size and a hash of its pieces), and `ngram eval` warns when a
+model's differs. `ngram eval` reads held-out text token by token on the GPU and reports the model's loss and top-1
+accuracy alone and blended at each λ, overall and at member names (the token after a `.`, or a `.Name` token).
+
+## The blend
+
+`NGramPrior` takes, among the request's packs, the one that knows the longest context ending the text (at least
+`MinContext` tokens; ties to more evidence), and mixes its distribution in:
+p = (1 − λ)·p_model + λ·p_pack over the pack's tokens, with λ = λ_max · total / (total + 4), so a context seen
+often speaks louder. It is applied in logit space: only the pack's tokens move, to
+log(exp(logit) + λ/(1 − λ) · p_pack · Z), which leaves every other token's relative odds as they were. Gates keep it
+silent where the model is already sure (`ModelConfident`), where the pack's own top continuation has little of the
+context's count (`PackConfident`), outside member names (`MembersOnly`), and outside code (`Scope`, by default only
+inside a fenced code block past its opening line or inside a tool call's value).
+
+## Serving
+
+```bash
+amql-server ... --ngram-pack dotnet.ngram [--ngram-lambda 0.3] [--ngram-min-context 3] \
+    [--ngram-model-confident 0.5] [--ngram-pack-confident 0.5] [--ngram-members-only]
+```
+
+**A container's own packs.** Each model's container may hold packs in an `ngram/` folder beside its weights. The
+server loads them at startup and keeps the folder current while it runs: a pack is loaded when its file is added
+or replaced and dropped when the file is deleted, with no restart (copy a pack in and the next request can use it).
+A file still being written is retried until it reads whole; a pack counted in another tokenizer, or a file that is
+not a pack, is refused with a log line; requests see a consistent set, never a pack half-swapped. The folder need not
+exist at startup. Container packs sit beside `--ngram-pack` ones (a container pack of the same name wins), and
+`/v1/models` lists each chat model's packs as `ngram_packs`.
+
+A request chooses packs with `"ngram_packs": ["dotnet"]` (`[]` for none), else the model's own (`"ngram_packs"` in
+`--config`), else every loaded pack one of whose keywords appears in the current task (the user's latest message and
+the tool results since). `"ngram_lambda"` and `"ngram_scope"` (`code`, `members`, `all`) override per request. The
+blend is applied before structured output and the tool-call grammar, so a constrained step chooses among blended
+probabilities. Given the results below, serve packs with `--ngram-lambda 0` (off unless a request sets
+`ngram_lambda`) until something better is found.
+
+## What was measured
+
+**Held-out loss.** Teacher-forced over 20,000 tokens of C# from three repositories the pack never saw
+(LetsEncrypt-Win, Discord-Bot, MultiplayerExtensions), the pack (docs, AMQL's source, OpenTK, Accord.NET; 26M
+tokens) raised the loss at every λ (1.2726 alone, 1.2800 at λ 0.05, 1.3686 at 0.3) and moved top-1 accuracy by at
+most 0.3 points. With all three gates it was neutral (1.3003 against 1.3009). An earlier run on AMQL's own tests
+showed a 5% gain, but that was the style of AMQL's source in the pack: held out properly, it disappeared.
+
+**Compile benchmark.** `scripts/ngram/compile_bench.py`: 24 small console tasks that lean on the base class library
+(file system, hashing, JSON, regex, HttpClient, processes, zip, drives), the model writes one Program.cs, and
+`dotnet build` judges it. "Invented" counts the errors that mean an API does not exist (CS0117, CS0103, CS0246,
+CS1061, CS0234). Qwen 3.5 0.8B, no thinking:
+
+| Pack and blend | Greedy, 24 | Invented | Sampled 0.6/0.95/20, 72 | Invented |
+|---|---|---|---|---|
+| none | 9 built | 19 | **19 built** | 41 |
+| first corpus (docs as declarations, comments in), λ 0.3 | 5 | 6 | | |
+| first corpus, λ 0.6 | 0 | 0 | | |
+| cleaned corpus, λ 0.2 | **10** | 14 | 12 | 40 |
+| cleaned, λ 0.4 | 5 | 14 | | |
+| cleaned, gated (model < 0.5, pack ≥ 0.5, context ≥ 3), λ 0.3 | 9 | 15 | | |
+| cleaned, code only, λ 0.2 | | | 12 | 40 |
+| cleaned, code only, λ 0.4 | | | 1 | 9 |
+
+
+namespace Amql.Inference;
+
+/// <summary>
+/// The caller-owned per-layer state of a linear-attention (GatedDeltaNet)
+/// layer: the per-(key)-head recurrence state S ∈ R^{headKDim × headVDim}
+/// and the causal-conv history window. Advances position by position —
+/// prefill of a stateful plan therefore runs position-major.
+/// </summary>
+public sealed class LinearAttentionState
+{
+    /// <summary>[head][kDim, vDim] — the delta-rule state.</summary>
+    public float[][,] S { get; }
+
+    /// <summary>[channel, kernel-1] — the causal conv history (zero-padded,
+    /// index 0 = the most recent input).</summary>
+    public float[,] ConvHistory { get; }
+
+    public LinearAttentionState(int heads, int kDim, int vDim, int channels, int convKernel)
+    {
+        S = new float[heads][,];
+        for (int h = 0; h < heads; h++)
+        {
+            S[h] = new float[kDim, vDim];
+        }
+        ConvHistory = new float[channels, Math.Max(0, convKernel - 1)];
+    }
+}
+
+/// <summary>
+/// The managed port of the reference <c>Qwen3_5GatedDeltaNet</c>: a
+/// depthwise causal conv1d (kernel K, left pad K-1, SiLU activation) over
+/// the qkv stream, then the gated delta-rule recurrence — per key head,
+/// <c>S ← exp(g)·S</c>, then <c>S ← S + k ⊗ (β·(v − Sᵀk))</c>, output
+/// <c>Sᵀq</c> — with Q/K
+/// L2-normalised (eps 1e-6), a z-gated RMSNorm over the value head dim,
+/// and the output projection. All arithmetic in f32, mirroring the
+/// reference's float32 computation. No positional rotation is applied by
+/// this operator.
+/// </summary>
+public static class GatedDeltaKernel
+{
+    public const double QkL2NormEps = 1e-6;
+
+    // ── causal conv over the qkv stream ─────────────────────────────────────
+
+    /// <summary>Runs the depthwise causal conv over a stream
+    /// [channels × T] with weight [channels × kernel] (channel-major,
+    /// kernel innermost), zero-padding the left by kernel-1, optionally
+    /// SiLU-activated. The conv history is advanced to the tail of the
+    /// sequence so a following step continues causally.</summary>
+    public static float[,] ConvForward(float[,] stream, float[] convWeight, int kernel, bool silu, LinearAttentionState state)
+    {
+        int channels = stream.GetLength(0);
+        int t = stream.GetLength(1);
+        int historyLen = kernel - 1;
+        var output = new float[channels, t];
+
+        for (int c = 0; c < channels; c++)
+        {
+            for (int pos = 0; pos < t; pos++)
+            {
+                float acc = 0f;
+                for (int k = 0; k < kernel; k++)
+                {
+                    int idx = pos - (kernel - 1) + k; // relative input index
+                    float x;
+                    if (idx < 0)
+                    {
+                        // History slot 0 = the most recent past input (idx -1).
+                        x = state.ConvHistory[c, -idx - 1];
+                    }
+                    else
+                    {
+                        x = stream[c, idx];
+                    }
+                    acc += convWeight[c * kernel + k] * x;
+                }
+                output[c, pos] = silu ? Silu(acc) : acc;
+            }
+        }
+
+        // History becomes the last (kernel-1) inputs, most recent first.
+        for (int c = 0; c < channels; c++)
+        {
+            for (int k = 0; k < historyLen; k++)
+            {
+                int source = t - 1 - k;
+                state.ConvHistory[c, k] = source >= 0 ? stream[c, source] : 0f;
+            }
+        }
+        return output;
+    }
+
+    /// <summary>Single-position causal conv (decode step); stream is
+    /// [channels × 1] and the history window is rotated in place.</summary>
+    /// <summary>
+    /// <see cref="ConvStep"/> over a flat single-position stream (one value
+    /// per channel, as the in-projection produced it), returning a flat
+    /// per-channel output. Each channel's arithmetic and history update are
+    /// <see cref="ConvStep"/>'s exactly; channels are independent, so wide
+    /// streams split across the kernel pool with identical results.
+    /// </summary>
+    public static float[] ConvStepFlat(ReadOnlySpan<float> stream, float[] convWeight, int kernel, bool silu, LinearAttentionState state)
+    {
+        int channels = state.ConvHistory.GetLength(0);
+        if (stream.Length < channels)
+        {
+            throw new ArgumentException($"stream holds {stream.Length} values for {channels} channels", nameof(stream));
+        }
+        var input = stream.Slice(0, channels).ToArray();
+        var output = new float[channels];
+        var history = state.ConvHistory;
+        int historyLen = kernel - 1;
+
+        void Channels(int c0, int c1)
+        {
+            var hist = System.Runtime.InteropServices.MemoryMarshal.CreateSpan(
+                ref System.Runtime.CompilerServices.Unsafe.As<byte, float>(
+                    ref System.Runtime.InteropServices.MemoryMarshal.GetArrayDataReference(history)),
+                channels * historyLen);
+            for (int c = c0; c < c1; c++)
+            {
+                var h = hist.Slice(c * historyLen, historyLen);
+                float acc = 0f;
+                for (int k = 0; k < kernel; k++)
+                {
+                    int idx = k - (kernel - 1); // relative input index (≤ 0 at decode)
+                    float x = idx < 0 ? h[-idx - 1] : input[c];
+                    acc += convWeight[c * kernel + k] * x;
+                }
+                output[c] = silu ? Silu(acc) : acc;
+                for (int k = historyLen - 1; k >= 1; k--)
+                {
+                    h[k] = h[k - 1];
+                }
+                if (historyLen > 0)
+                {
+                    h[0] = input[c];
+                }
+            }
+        }
+
+        const int ChannelsPerTask = 512;
+        int tasks = (channels + ChannelsPerTask - 1) / ChannelsPerTask;
+        if (tasks > 1)
+        {
+            KernelPool.For(tasks, t => Channels(t * ChannelsPerTask, Math.Min(channels, (t + 1) * Cha

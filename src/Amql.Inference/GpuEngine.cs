@@ -192,6 +192,7 @@ public sealed class GpuEngine : IDisposable
                 RowInvariant = true;
                 DraftVocab = _draftVocab;
             }
+            ChooseKvFormat();
             _main = NewSequence();
         }
         catch
@@ -467,6 +468,11 @@ public sealed class GpuEngine : IDisposable
             seq.MtpPending = Alloc(_hidden * 4);
         }
         _sequences.Add(seq);
+        if (_kvAllF16)
+        {
+            seq.ExactRows = AllRows;
+            seq.ExactF16 = true;
+        }
         EnsureKv(seq, 1024);
         Reset(seq);
         return seq;
@@ -500,7 +506,12 @@ public sealed class GpuEngine : IDisposable
     public void Reset(GpuSequence seq)
     {
         Live(seq);
-        Check(Native.amqe_memset(_engine, seq.Pos, 0, 16), "reset");
+        // Position 0, the sequence's exact rows kept (see SetExactRows).
+        UploadPos(seq.Pos, 0, ExactSpec(seq));
+        if (seq.MtpPos != IntPtr.Zero)
+        {
+            UploadPos(seq.MtpPos, 0, ExactSpec(seq));
+        }
         for (int i = 0; i < _layers.Length; i++)
         {
             if (seq.State[i] != IntPtr.Zero)
@@ -591,18 +602,411 @@ public sealed class GpuEngine : IDisposable
             seq.MtpValid = seq.MarkMtpValid;
         }
         seq.VerifyRows = 0;
-        var pos = new[] { seq.MarkedAt, 0, 0, 0 };
-        var handle = GCHandle.Alloc(pos, GCHandleType.Pinned);
+        UploadPos(seq.Pos, seq.MarkedAt, ExactSpec(seq));
+        Check(Native.amqe_sync(_engine), "rewind");
+        seq.Position = seq.MarkedAt;
+    }
+
+    // ── KV cache format ──────────────────────────────────────────────────
+
+    /// <summary>The KV format engines created from now on use: <c>"fp16"</c>
+    /// (the default), <c>"f32"</c> or <c>"nvfp4"</c> (also <c>AMQL_KV_FORMAT</c>).
+    /// FP16 rows are each value rounded to nearest FP16: half f32's memory, and
+    /// on Qwen 3.5 4B no measurable difference from f32. F32 rows are the values
+    /// as computed.
+    /// NVFP4 rows hold E2M1 codes, an E4M3 scale per 16 values and an f32
+    /// scale per head: 592 bytes instead of 4,096 a position on Qwen 3.5 4B.
+    /// Every path (prompt, decode, batch, verify, drafter) writes and reads the
+    /// same rows, so a reply does not depend on which path ran it, but it
+    /// differs from f32's.</summary>
+    public static string RequestedKvFormat { get; set; } =
+        Environment.GetEnvironmentVariable("AMQL_KV_FORMAT")?.Trim().ToLowerInvariant() switch
+        {
+            "nvfp4" or "fp4" => "nvfp4",
+            "f32" or "fp32" => "f32",
+            _ => "fp16",
+        };
+
+    /// <summary>The KV format this engine stores: <c>"f32"</c>, <c>"fp16"</c> or <c>"nvfp4"</c>.</summary>
+    public string KvFormat => _kvAllF16 ? "fp16" : _kvFp4 ? "nvfp4" : "f32";
+
+    /// <summary>Why the requested KV format was not used, or null.</summary>
+    public string? KvFormatRefusal { get; private set; }
+
+    // NVFP4 caches use the mixed layout (exact rows, then NVFP4 rows); an FP16
+    // cache is that layout with every row exact at FP16.
+    private bool _kvFp4, _kvAllF16;
+    private const int AllRows = (1 << 30) - 1;
+    private long[] _kvRow = Array.Empty<long>();   // bytes per cache row, by layer (0 without attention)
+    private long[] _kvRowF32 = Array.Empty<long>();   // the same row at f32 (a sequence's exact rows)
+    private long _mtpKvRow, _mtpKvRowF32;
+
+    private void ChooseKvFormat()
+    {
+        var heads = _layers.Select(l => l.Plan.Attention).Append(_mtp?.Layer.Plan.Attention).OfType<AttentionOp>().ToList();
+        if (RequestedKvFormat is "nvfp4" or "fp16")
+        {
+            if (heads.FirstOrDefault(a => a.HeadDim % 16 != 0) is { } odd)
+            {
+                KvFormatRefusal = $"{RequestedKvFormat.ToUpperInvariant()} KV needs heads a multiple of 16 wide, not {odd.HeadDim}";
+            }
+            else
+            {
+                _kvFp4 = true;
+                _kvAllF16 = RequestedKvFormat == "fp16";
+            }
+        }
+        int fmt = _kvFp4 ? 1 : 0;
+        Check(Native.amqe_set_kv_format(_engine, fmt), "kv format");
+        _kvRow = _layers.Select(l => l.Plan.Attention is { } a ? Native.amqe_kv_row_bytes(a.NumKvHeads, a.HeadDim, fmt) : 0L).ToArray();
+        _mtpKvRow = _mtp?.Layer.Plan.Attention is { } m ? Native.amqe_kv_row_bytes(m.NumKvHeads, m.HeadDim, fmt) : 0L;
+        _kvRowF32 = _layers.Select(l => l.Plan.Attention is { } a ? 4L * a.KvDim : 0L).ToArray();
+        _mtpKvRowF32 = _mtp?.Layer.Plan.Attention is { } mf ? 4L * mf.KvDim : 0L;
+    }
+
+    /// <summary>Bytes a cache row (one position, K or V) takes in layer i.</summary>
+    public long KvRowBytes(int layer) => _kvAllF16 ? _kvRowF32[layer] / 2 : _kvRow[layer];
+
+    // Bytes of a layer's first `rows` cache rows when the first `exact` stay f32.
+    private long KvBytes(int layer, long rows, GpuSequence seq) => MixedBytes(rows, seq, _kvRow[layer], _kvRowF32[layer]);
+    private long MtpKvBytes(long rows, GpuSequence seq) => MixedBytes(rows, seq, _mtpKvRow, _mtpKvRowF32);
+    private long MixedBytes(long rows, GpuSequence seq, long row, long rowF32) =>
+        _kvFp4 ? Math.Min(rows, seq.ExactRows) * (seq.ExactF16 ? rowF32 / 2 : rowF32) + Math.Max(0, rows - seq.ExactRows) * row : rows * row;
+
+    // The exact rows as the kernels read them: the count, and bit 30 for FP16.
+    private static int ExactSpec(GpuSequence seq) => seq.ExactRows | (seq.ExactF16 ? 1 << 30 : 0);
+
+    /// <summary>Keeps the sequence's first <paramref name="rows"/> positions
+    /// at f32 in an NVFP4 cache (a system prompt and first instruction, say),
+    /// and NVFP4 after them. Set while the sequence is empty; it holds until
+    /// <see cref="Reset(GpuSequence)"/>, through rewinds, paging and batches.
+    /// No effect on f32 caches. With <paramref name="f16"/> the exact rows are
+    /// FP16 (half the memory, ~2e-4 relative rounding) rather than f32.</summary>
+    public void SetExactRows(GpuSequence seq, int rows, bool f16 = false)
+    {
+        Live(seq);
+        if (seq.Position != 0)
+        {
+            throw new InvalidOperationException("exact rows are set before the sequence holds any");
+        }
+        if (_kvAllF16)
+        {
+            return;   // every row is FP16 already
+        }
+        rows = _kvFp4 ? Math.Clamp(rows, 0, AllRows) : 0;
+        f16 &= rows > 0;
+        if (rows == seq.ExactRows && f16 == seq.ExactF16)
+        {
+            return;
+        }
+        Check(Native.amqe_sync(_engine), "exact rows");
+        // The layout changes: buffers are laid out again from empty.
+        seq.ExactRows = rows;
+        seq.ExactF16 = f16;
+        int capacity = seq.KvCapacity;
+        seq.KvCapacity = 0;
+        for (int i = 0; i < _layers.Length; i++)
+        {
+            if (seq.K[i] != IntPtr.Zero)
+            {
+                Free(seq.K[i]);
+                Free(seq.V[i]);
+                seq.K[i] = seq.V[i] = IntPtr.Zero;
+            }
+        }
+        if (seq.MtpK != IntPtr.Zero)
+        {
+            Free(seq.MtpK);
+            Free(seq.MtpV);
+            seq.MtpK = seq.MtpV = IntPtr.Zero;
+        }
+        if (_graphFor is not null && _graphFor.Contains(seq))
+        {
+            _graphReady = false;
+        }
+        EnsureKv(seq, Math.Max(capacity, 1024));
+        UploadPos(seq.Pos, 0, ExactSpec(seq));
+        if (seq.MtpPos != IntPtr.Zero)
+        {
+            UploadPos(seq.MtpPos, 0, ExactSpec(seq));
+        }
+    }
+
+    private void UploadPos(IntPtr pos, int position, int exact)
+    {
+        var values = new[] { position, exact, 0, 0 };
+        var handle = GCHandle.Alloc(values, GCHandleType.Pinned);
         try
         {
-            Check(Native.amqe_upload(_engine, seq.Pos, handle.AddrOfPinnedObject(), 16), "rewind");
-            Check(Native.amqe_sync(_engine), "rewind");
+            Check(Native.amqe_upload(_engine, pos, handle.AddrOfPinnedObject(), 16), "position");
         }
         finally
         {
             handle.Free();
         }
-        seq.Position = seq.MarkedAt;
+    }
+
+    /// <summary>Research hook: when set, every softmax-attention layer of the
+    /// stack hands out its query rows as a prompt chunk runs (layer, position
+    /// of the chunk's first row, rows, [rows × heads × headDim] after norm and
+    /// rope). Not called for decode steps, verifies or the drafter.</summary>
+    public Action<int, int, int, float[]>? QueryProbe { get; set; }
+    private int _probeFrom = -1;
+
+    /// <summary>A layer's first <paramref name="rows"/> cache rows as stored
+    /// (f32 values, or NVFP4 rows of <see cref="KvRowBytes"/> bytes).</summary>
+    public byte[] DownloadKvRows(GpuSequence seq, int layer, bool values, int rows)
+    {
+        Live(seq);
+        var host = new byte[KvBytes(layer, rows, seq)];
+        var h = GCHandle.Alloc(host, GCHandleType.Pinned);
+        try
+        {
+            Check(Native.amqe_download(_engine, h.AddrOfPinnedObject(), values ? seq.V[layer] : seq.K[layer], (nuint)host.LongLength), "kv download");
+        }
+        finally
+        {
+            h.Free();
+        }
+        return host;
+    }
+
+    /// <summary>Research hook: a layer's first <paramref name="rows"/> cached
+    /// keys (or values) as f32, [rows × kvDim]. F32 caches only.</summary>
+    public float[] DownloadKv(GpuSequence seq, int layer, bool values, int rows)
+    {
+        Live(seq);
+        if (_kvFp4)
+        {
+            throw new InvalidOperationException("DownloadKv reads f32 caches");
+        }
+        var host = new float[rows * _kvRow[layer] / 4];
+        var h = GCHandle.Alloc(host, GCHandleType.Pinned);
+        try
+        {
+            Check(Native.amqe_download(_engine, h.AddrOfPinnedObject(), values ? seq.V[layer] : seq.K[layer], (nuint)(host.LongLength * 4)), "kv download");
+        }
+        finally
+        {
+            h.Free();
+        }
+        return host;
+    }
+
+    // ── paging a mark out and back ───────────────────────────────────────
+
+    /// <summary>What a saved mark depends on besides the weights: each layer's
+    /// cache and state sizes, the drafter's, and the prefill precision. A mark
+    /// saved under one geometry is only restored under the same.</summary>
+    public string MarkGeometry
+    {
+        get
+        {
+            var sb = new System.Text.StringBuilder($"h{_hidden};");
+            foreach (var layer in _layers)
+            {
+                sb.Append(layer.Plan.Attention is { } attn ? $"a{attn.KvDim}" : "").Append($"s{layer.StateBytes}c{layer.ConvHistoryBytes};");
+            }
+            sb.Append(_mtp is null ? "mtp-" : $"mtp{_mtp.KvDim}").Append(_exactPrefill ? ";f32" : ";bf16").Append(";kv-").Append(KvFormat);
+            return sb.ToString();
+        }
+    }
+
+    /// <summary>Device memory a sequence holds: its KV caches at their
+    /// capacity, its recurrent state, the copy saved at its mark and a
+    /// verify's snapshots.</summary>
+    public long DeviceBytes(GpuSequence seq)
+    {
+        long bytes = 0;
+        for (int i = 0; i < _layers.Length; i++)
+        {
+            if (_layers[i].Plan.Attention is { } attn)
+            {
+                bytes += 2L * KvBytes(i, seq.KvCapacity, seq);
+            }
+            if (seq.State[i] != IntPtr.Zero)
+            {
+                long state = _layers[i].StateBytes + _layers[i].ConvHistoryBytes;
+                int copies = 1 + (seq.MarkState?[i] is { } m && m != IntPtr.Zero ? 1 : 0) + (seq.SnapState?[i] is { } s && s != IntPtr.Zero ? seq.SnapRows : 0);
+                bytes += copies * state;
+            }
+        }
+        if (_mtp is not null)
+        {
+            bytes += 2L * MtpKvBytes(seq.KvCapacity, seq) + 2L * _hidden * 4;
+        }
+        return bytes;
+    }
+
+    // A saved mark's header: its position, whether the drafter kept up, the exact rows.
+    private const int MarkHeader = 16;
+
+    /// <summary>Bytes <see cref="SaveMark"/> writes for the sequence.</summary>
+    public long MarkBytes(GpuSequence seq)
+    {
+        long at = Math.Max(0, seq.MarkedAt);
+        long bytes = MarkHeader;
+        for (int i = 0; i < _layers.Length; i++)
+        {
+            if (_layers[i].Plan.Attention is { } attn)
+            {
+                bytes += 2 * KvBytes(i, at, seq);
+            }
+            if (seq.State[i] != IntPtr.Zero)
+            {
+                bytes += _layers[i].StateBytes + _layers[i].ConvHistoryBytes;
+            }
+        }
+        if (_mtp is not null)
+        {
+            bytes += 2 * MtpKvBytes(at, seq) + _hidden * 4L;
+        }
+        return bytes;
+    }
+
+    /// <summary>Writes what <see cref="Rewind"/> needs to take the sequence
+    /// back to its mark: the KV rows before the mark, the recurrent state
+    /// saved there and the drafter's side. Rows after the mark are left out;
+    /// <see cref="RestoreMark"/> rebuilds the sequence from what is written,
+    /// bit for bit, under the same <see cref="MarkGeometry"/>.</summary>
+    public void SaveMark(GpuSequence seq, Stream to)
+    {
+        Live(seq);
+        if (seq.MarkedAt < 0 || seq.MarkState is null || seq.MarkConv is null)
+        {
+            throw new InvalidOperationException("the sequence has no mark");
+        }
+        Check(Native.amqe_sync(_engine), "save mark");
+        int at = seq.MarkedAt;
+        var head = new byte[MarkHeader];
+        BitConverter.TryWriteBytes(head.AsSpan(0, 4), at);
+        head[4] = (byte)(seq.MarkMtpValid ? 1 : 0);
+        BitConverter.TryWriteBytes(head.AsSpan(8, 4), seq.ExactRows);
+        head[5] = (byte)(seq.ExactF16 ? 1 : 0);
+        to.Write(head);
+        var buffer = new byte[Math.Min(16 << 20, Math.Max(1 << 16, MarkBytes(seq)))];
+        var handle = GCHandle.Alloc(buffer, GCHandleType.Pinned);
+        try
+        {
+            void Out(IntPtr device, long bytes)
+            {
+                for (long done = 0; done < bytes;)
+                {
+                    int n = (int)Math.Min(buffer.Length, bytes - done);
+                    Check(Native.amqe_download(_engine, handle.AddrOfPinnedObject(), device + (nint)done, (nuint)n), "save mark");
+                    to.Write(buffer, 0, n);
+                    done += n;
+                }
+            }
+            for (int i = 0; i < _layers.Length; i++)
+            {
+                if (_layers[i].Plan.Attention is { } attn)
+                {
+                    Out(seq.K[i], KvBytes(i, at, seq));
+                    Out(seq.V[i], KvBytes(i, at, seq));
+                }
+                if (seq.State[i] != IntPtr.Zero)
+                {
+                    Out(seq.MarkState[i], _layers[i].StateBytes);
+                    if (_layers[i].ConvHistoryBytes > 0)
+                    {
+                        Out(seq.MarkConv[i], _layers[i].ConvHistoryBytes);
+                    }
+                }
+            }
+            if (_mtp is not null)
+            {
+                Out(seq.MtpK, MtpKvBytes(at, seq));
+                Out(seq.MtpV, MtpKvBytes(at, seq));
+                if (seq.MarkMtpPending != IntPtr.Zero)
+                {
+                    Out(seq.MarkMtpPending, _hidden * 4L);
+                }
+                else
+                {
+                    to.Write(new byte[_hidden * 4]);
+                }
+            }
+        }
+        finally
+        {
+            handle.Free();
+        }
+    }
+
+    /// <summary>A new sequence at the mark <see cref="SaveMark"/> wrote: its
+    /// position at the mark, the mark saved there again, so it continues (and
+    /// rewinds) exactly as the sequence that was saved.</summary>
+    public GpuSequence RestoreMark(Stream from)
+    {
+        var head = new byte[MarkHeader];
+        from.ReadExactly(head);
+        int at = BitConverter.ToInt32(head, 0);
+        if (at <= 0)
+        {
+            throw new InvalidDataException("a saved mark at position 0");
+        }
+        var seq = NewSequence();
+        try
+        {
+            SetExactRows(seq, BitConverter.ToInt32(head, 8), head[5] != 0);
+            EnsureKv(seq, at + 1);
+            seq.MarkState = new IntPtr[_layers.Length];
+            seq.MarkConv = new IntPtr[_layers.Length];
+            var buffer = new byte[16 << 20];
+            var handle = GCHandle.Alloc(buffer, GCHandleType.Pinned);
+            try
+            {
+                void In(IntPtr device, long bytes)
+                {
+                    for (long done = 0; done < bytes;)
+                    {
+                        int n = (int)Math.Min(buffer.Length, bytes - done);
+                        from.ReadExactly(buffer, 0, n);
+                        Check(Native.amqe_upload(_engine, device + (nint)done, handle.AddrOfPinnedObject(), (nuint)n), "restore mark");
+                        done += n;
+                    }
+                }
+                for (int i = 0; i < _layers.Length; i++)
+                {
+                    if (_layers[i].Plan.Attention is { } attn)
+                    {
+                        In(seq.K[i], KvBytes(i, at, seq));
+                        In(seq.V[i], KvBytes(i, at, seq));
+                    }
+                    if (seq.State[i] != IntPtr.Zero)
+                    {
+                        seq.MarkState[i] = Alloc(_layers[i].StateBytes);
+                        In(seq.MarkState[i], _layers[i].StateBytes);
+                        if (_layers[i].ConvHistoryBytes > 0)
+                        {
+                            seq.MarkConv[i] = Alloc(_layers[i].ConvHistoryBytes);
+                            In(seq.MarkConv[i], _layers[i].ConvHistoryBytes);
+                        }
+                    }
+                }
+                if (_mtp is not null)
+                {
+                    In(seq.MtpK, MtpKvBytes(at, seq));
+                    In(seq.MtpV, MtpKvBytes(at, seq));
+                    seq.MarkMtpPending = Alloc(_hidden * 4);
+                    In(seq.MarkMtpPending, _hidden * 4L);
+                    seq.MarkMtpValid = head[4] != 0;
+                }
+            }
+            finally
+            {
+                handle.Free();
+            }
+            seq.MarkedAt = at;
+            Rewind(seq);
+            return seq;
+        }
+        catch
+        {
+            Release(seq);
+            throw;
+        }
     }
 
     private static void Live(GpuSequence seq)
@@ -662,7 +1066,15 @@ public sealed class GpuEngine : IDisposable
                 handle.Free();
             }
             bool drafting = _mtp is not null && seq.MtpValid;
-            Forward(new[] { seq }, rows, head: start + rows == ids.Length, hidden: drafting);
+            _probeFrom = QueryProbe is null ? -1 : seq.Position;
+            try
+            {
+                Forward(new[] { seq }, rows, head: start + rows == ids.Length, hidden: drafting);
+            }
+            finally
+            {
+                _probeFrom = -1;
+            }
             if (drafting)
             {
                 MtpCatchUp(seq, seq.Position, rows);
@@ -1017,12 +1429,12 @@ public sealed class GpuEngine : IDisposable
             {
                 continue;
             }
-            long bytes = (long)capacity * attn.KvDim * 4;
+            long bytes = KvBytes(i, capacity, seq);
             var k = Alloc(bytes);
             var v = Alloc(bytes);
             if (seq.K[i] != IntPtr.Zero)
             {
-                long used = (long)seq.Position * attn.KvDim * 4;
+                long used = KvBytes(i, seq.Position, seq);
                 if (used > 0)
                 {
                     Check(Native.amqe_copy_async(_engine, k, seq.K[i], (nuint)used, 3), "kv grow");
@@ -1037,12 +1449,12 @@ public sealed class GpuEngine : IDisposable
         }
         if (_mtp is not null)
         {
-            long bytes = (long)capacity * _mtp.KvDim * 4;
+            long bytes = MtpKvBytes(capacity, seq);
             var k = Alloc(bytes);
             var v = Alloc(bytes);
             if (seq.MtpK != IntPtr.Zero)
             {
-                long used = (long)seq.Position * _mtp.KvDim * 4;
+                long used = MtpKvBytes(seq.Position, seq);
                 if (used > 0)
                 {
                     Check(Native.amqe_copy_async(_engine, k, seq.MtpK, (nuint)used, 3), "kv grow");
@@ -1459,6 +1871,21 @@ public sealed class GpuEngine : IDisposable
                     l.QNormRow ? IntPtr.Zero : l.QNormW, l.QNormOff, l.QNormEps,
                     l.KNormRow ? IntPtr.Zero : l.KNormW, l.KNormOff, l.KNormEps,
                     l.InvFreq, l.RopePairs, l.RopeScale, attn.RopeInterleaved ? 1 : 0, l.InvFreq != IntPtr.Zero ? 1 : 0), "attn prep");
+                if (_probeFrom >= 0 && kv is null && QueryProbe is { } probe)
+                {
+                    // Prompt chunks only: never inside a captured graph.
+                    var host = new float[(long)n * attn.NumQHeads * attn.HeadDim];
+                    var h = GCHandle.Alloc(host, GCHandleType.Pinned);
+                    try
+                    {
+                        Check(Native.amqe_download(_engine, h.AddrOfPinnedObject(), q, (nuint)(host.LongLength * 4)), "query probe");
+                    }
+                    finally
+                    {
+                        h.Free();
+                    }
+                    probe(i, _probeFrom, n, host);
+                }
                 IntPtr gate = attn.OutputGate ? gateRow : IntPtr.Zero;
                 // A prompt chunk goes through cuBLAS (its position is known on
                 // the host: prompts are never captured); decode steps, and
@@ -1466,7 +1893,7 @@ public sealed class GpuEngine : IDisposable
                 // attention kernels.
                 int rc = n > 8 && RowsAttention
                     ? Native.amqe_attention_rows(_engine, q, kv?.K ?? seq.K[i], kv?.V ?? seq.V[i], gate, ctx, kv?.HostPos ?? seq.Position,
-                        n, attn.NumQHeads, attn.NumKvHeads, attn.HeadDim, (float)attn.ScoreScale, softcap, window)
+                        n, attn.NumQHeads, attn.NumKvHeads, attn.HeadDim, (float)attn.ScoreScale, softcap, window, ExactSpec(seq))
                     : -200;
                 if (rc == -200)
                 {
@@ -2084,6 +2511,8 @@ public sealed class GpuEngine : IDisposable
         [DllImport(Lib)] public static extern int amqe_sync(IntPtr e);
 
         [DllImport(Lib)] public static extern int amqe_set_prefill_f32(IntPtr e, int f32);
+        [DllImport(Lib)] public static extern int amqe_set_kv_format(IntPtr e, int fmt);
+        [DllImport(Lib)] public static extern long amqe_kv_row_bytes(int hkv, int d, int fmt);
         [DllImport(Lib)] public static extern int amqe_capture_begin(IntPtr e);
         [DllImport(Lib)] public static extern int amqe_capture_end(IntPtr e);
         [DllImport(Lib)] public static extern int amqe_capture_drop(IntPtr e);
@@ -2160,7 +2589,7 @@ public sealed class GpuEngine : IDisposable
         [DllImport(Lib)]
         public static extern int amqe_attention_rows(IntPtr e, IntPtr q, IntPtr kCache, IntPtr vCache,
             IntPtr gate, IntPtr output, int pos0, int rows, int hq, int hkv, int d,
-            float scale, float softcap, int window);
+            float scale, float softcap, int window, int exact);
     }
 }
 
@@ -2195,6 +2624,12 @@ public sealed class GpuSequence
     internal IntPtr[]? SnapState, SnapConv;
     internal int SnapRows;
     internal int VerifyFrom, VerifyRows;
+
+    /// <summary>Positions kept at f32 in an NVFP4 cache (see <see cref="GpuEngine.SetExactRows"/>).</summary>
+    public int ExactRows { get; internal set; }
+
+    /// <summary>Whether the exact rows are FP16 rather than f32.</summary>
+    public bool ExactF16 { get; internal set; }
 
     /// <summary>The position <see cref="GpuEngine.Mark"/> last saved, or -1:
     /// <see cref="GpuEngine.Rewind"/> takes the sequence back there.</summary>

@@ -1,16 +1,33 @@
 name: Release
 
+# Builds the Windows binaries and attaches them to a GitHub release as one ZIP.
+#
+# Pushing a tag that starts with v (git tag v1.2.0 && git push origin v1.2.0)
+# builds it and attaches the ZIP to that tag's release, creating the release
+# with generated notes if it does not exist yet. A release made in the GitHub
+# UI with a new tag pushes that tag, so it is covered too. Run by hand from the
+# Actions tab, the ZIP is kept as a workflow artifact only.
+
 on:
   push:
-    branches: [main]
     tags: ['v*']
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
     runs-on: windows-latest
-    permissions:
-      contents: write
+
+    env:
+      DOTNET_NOLOGO: true
+      DOTNET_CLI_TELEMETRY_OPTOUT: true
+      # The tag (e.g. v1.2.0) for a tag push, short commit hash for a manual run.
+      VERSION: ${{ github.ref_type == 'tag' && github.ref_name || github.sha }}
+      # Matches the toolkit amql_cuda is developed against.
+      CUDA_VERSION: 13.3.0
+      CUDA_COMPONENTS: cuda_nvcc cuda_crt cuda_cudart cccl libnvvm libcublas libcusolver
 
     steps:
       - name: Checkout
@@ -21,39 +38,116 @@ jobs:
         with:
           dotnet-version: '11.0.x'
 
-      - name: Publish amql-cli (self-contained win-x64)
-        run: dotnet publish src/Amql.Cli -c Release -p:PublishProfile=win-x64 --nologo
-        shell: cmd
+      # The CUDA backend is compiled without a GPU: nvcc only needs the toolkit
+      # and an MSVC host compiler. Only the pieces the build needs are fetched,
+      # from NVIDIA's redistributable archives, and cached between runs.
+      - name: Cache CUDA toolkit
+        id: cuda-cache
+        uses: actions/cache@v4
+        with:
+          path: C:\cuda
+          key: cuda-${{ env.CUDA_VERSION }}-${{ env.CUDA_COMPONENTS }}
 
-      - name: Publish amql-gui (self-contained win-x64)
-        run: dotnet publish src/Amql.Gui -c Release -r win-x64 --self-contained -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:DebugType=none -p:DebugSymbols=false --nologo
-        shell: cmd
-
-      - name: Collect release files
+      - name: Fetch CUDA toolkit
+        if: steps.cuda-cache.outputs.cache-hit != 'true'
+        shell: pwsh
         run: |
-          mkdir release\amql
-          copy bin\Release\win-x64\publish\amql-cli.exe release\amql\
-          copy bin\Release\win-x64\publish\amql-gui.exe release\amql\
-          copy README.md release\amql\
-          copy CHANGELOG.md release\amql\
-          copy LICENSE release\amql\
-        shell: cmd
+          $ErrorActionPreference = 'Stop'
+          $base = 'https://developer.download.nvidia.com/compute/cuda/redist'
+          $manifest = Invoke-RestMethod "$base/redistrib_$env:CUDA_VERSION.json"
+          New-Item -ItemType Directory -Force C:\cuda, "$env:RUNNER_TEMP\cuda-dl" | Out-Null
+          foreach ($name in $env:CUDA_COMPONENTS -split ' ') {
+            $entry = $manifest.$name.'windows-x86_64'
+            if (-not $entry) { throw "$name has no Windows archive in CUDA $env:CUDA_VERSION" }
+            $zip = "$env:RUNNER_TEMP\cuda-dl\$name.zip"
+            Write-Host "$name $($manifest.$name.version)"
+            Invoke-WebRequest "$base/$($entry.relative_path)" -OutFile $zip
+            if ((Get-FileHash $zip -Algorithm SHA256).Hash -ne $entry.sha256) { throw "$name failed its checksum" }
+            # Each archive holds one <name>-archive folder; strip it so they merge into one tree.
+            tar -xf $zip -C C:\cuda --strip-components=1
+            if ($LASTEXITCODE -ne 0) { throw "extracting $name failed" }
+            Remove-Item $zip
+          }
 
-      - name: Create release zip
+      # nvcc 13.3's cudafe++ crashes on the 14.5x MSVC headers, so the build is
+      # pinned to the 14.44 toolset (see native/amql_cuda/build-cuda.cmd).
+      - name: Build amql_cuda.dll
+        shell: pwsh
         run: |
-          powershell Compress-Archive -Path release\amql\* -DestinationPath release\amql-release.zip
-        shell: cmd
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          Write-Host "Visual Studio: $vs"
+          Write-Host "MSVC toolsets: $((Get-ChildItem "$vs\VC\Tools\MSVC").Name -join ', ')"
+          $env:VCVARS = "$vs\VC\Auxiliary\Build\vcvars64.bat"
+          $env:VCVARS_VER = '14.44'
+          $env:CUDA_ROOT = 'C:\cuda'
+          $env:CUDA_ARCH = 'sm_120'
+          $env:CLI_OUT = "$env:RUNNER_TEMP\no-stage"
+          cmd /c native\amql_cuda\build-cuda.cmd
+          if ($LASTEXITCODE -ne 0) { exit 1 }
 
-      - name: Upload artifact
+      - name: Name the package
+        shell: pwsh
+        run: |
+          $version = $env:VERSION
+          if ($version -match '^[0-9a-f]{40}$') { $version = $version.Substring(0, 7) }
+          "PACKAGE=amql-$version-win-x64" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      # Each entry point is published as a self-contained single-file EXE, so the
+      # ZIP runs on machines without the .NET runtime installed.
+      - name: Publish amql-cli
+        shell: pwsh
+        run: dotnet publish src/Amql.Cli -c Release -p:PublishProfile=win-x64 -o stage
+
+      - name: Publish amql-server
+        shell: pwsh
+        run: >
+          dotnet publish src/Amql.Server -c Release -r win-x64 --self-contained
+          -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true
+          -p:DebugType=none -p:DebugSymbols=false
+          -o stage
+
+      - name: Publish amql-gui
+        shell: pwsh
+        run: >
+          dotnet publish src/Amql.Gui -c Release -r win-x64 --self-contained
+          -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true
+          -p:DebugType=none -p:DebugSymbols=false
+          -o stage
+
+      # The publish folder also collects library PDBs, a web.config and a static
+      # assets manifest from the server; only the EXEs and docs go in the ZIP.
+      - name: Create ZIP
+        shell: pwsh
+        run: |
+          $dir = "package/$env:PACKAGE"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          foreach ($exe in 'amql-cli.exe', 'amql-server.exe', 'amql-gui.exe') {
+            Copy-Item "stage/$exe" $dir -ErrorAction Stop
+          }
+          # cuBLAS and cuSOLVER are not bundled (about 670 MB); the DLL finds them
+          # through a CUDA 13 install on PATH, and without them AMQL runs on the CPU.
+          Copy-Item native/amql_cuda/bin/amql_cuda.dll $dir -ErrorAction Stop
+          Copy-Item README.md, CHANGELOG.md, LICENSE -Destination $dir
+          Get-ChildItem $dir | Format-Table Name, Length
+          Compress-Archive -Path $dir -DestinationPath "$env:PACKAGE.zip"
+
+      - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: amql-release
-          path: release\amql-release.zip
+          name: ${{ env.PACKAGE }}
+          path: ${{ env.PACKAGE }}.zip
           if-no-files-found: error
 
-      - name: Create GitHub Release (tag push only)
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: release\amql-release.zip
-          generate_release_notes: true
+      - name: Attach ZIP to the release
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release view $env:TAG *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $env:TAG --verify-tag --title $env:TAG --generate-notes
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+          }
+          gh release upload $env:TAG "$env:PACKAGE.zip" --clobber

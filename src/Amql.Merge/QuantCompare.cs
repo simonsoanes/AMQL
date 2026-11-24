@@ -27,15 +27,19 @@ public sealed record QuantComparison(string Model, int Positions, double Nll, do
 public static class QuantCompare
 {
     public static (QuantComparison Reference, List<QuantComparison> Candidates) Run(
-        string referenceDir, IReadOnlyList<string> candidateDirs, string text, int maxTokens, Action<string>? log = null)
+        string referenceDir, IReadOnlyList<string> candidateDirs, string text, int maxTokens, Action<string>? log = null, int scoreFrom = 0)
     {
-        var tokenizer = HfTokenizer.FromModelDir(referenceDir);
+        int kvAt = referenceDir.LastIndexOf("@kv=", StringComparison.Ordinal);
+        var tokenizer = HfTokenizer.FromModelDir(kvAt > 0 ? referenceDir[..kvAt] : referenceDir);
         var ids = tokenizer.EncodeToIds(text).Take(maxTokens + 1).ToArray();
         if (ids.Length < 16)
         {
             throw new MergeException($"the text gives {ids.Length} tokens; compare needs at least 16");
         }
         int positions = ids.Length - 1;
+        // Only positions from scoreFrom on are scored (the text before still runs as context).
+        scoreFrom = Math.Clamp(scoreFrom, 0, positions - 1);
+        int scored = positions - scoreFrom;
         var reference = new float[positions][];
         var refTop = new int[positions];
         var started = System.Diagnostics.Stopwatch.StartNew();
@@ -45,10 +49,13 @@ public static class QuantCompare
             var lp = LogSoftmax(logits);
             reference[p] = lp;
             refTop[p] = ArgMax(lp);
-            refNll -= lp[ids[p + 1]];
+            if (p >= scoreFrom)
+            {
+                refNll -= lp[ids[p + 1]];
+            }
         });
-        var refResult = new QuantComparison(Path.GetFileName(Path.TrimEndingDirectorySeparator(referenceDir)), positions,
-            refNll / positions, Math.Exp(refNll / positions), 0, 0, 0, 1, started.Elapsed.TotalSeconds);
+        var refResult = new QuantComparison(Path.GetFileName(Path.TrimEndingDirectorySeparator(referenceDir)), scored,
+            refNll / scored, Math.Exp(refNll / scored), 0, 0, 0, 1, started.Elapsed.TotalSeconds);
         log?.Invoke(refResult.ToString());
 
         var results = new List<QuantComparison>();
@@ -57,9 +64,13 @@ public static class QuantCompare
             started.Restart();
             double nll = 0;
             int agree = 0;
-            var kl = new double[positions];
+            var kl = new double[scored];
             Read(dir, ids, (p, logits) =>
             {
+                if (p < scoreFrom)
+                {
+                    return;
+                }
                 var lp = LogSoftmax(logits);
                 nll -= lp[ids[p + 1]];
                 if (ArgMax(lp) == refTop[p])
@@ -76,12 +87,12 @@ public static class QuantCompare
                         sum += pr * (r[v] - lp[v]);
                     }
                 }
-                kl[p] = Math.Max(0, sum);
+                kl[p - scoreFrom] = Math.Max(0, sum);
             });
             var sorted = kl.OrderBy(x => x).ToArray();
-            var result = new QuantComparison(Path.GetFileName(Path.TrimEndingDirectorySeparator(dir)), positions,
-                nll / positions, Math.Exp(nll / positions), kl.Average(), sorted[(int)(0.95 * (positions - 1))], sorted[^1],
-                (double)agree / positions, started.Elapsed.TotalSeconds);
+            var result = new QuantComparison(Path.GetFileName(Path.TrimEndingDirectorySeparator(dir)), scored,
+                nll / scored, Math.Exp(nll / scored), kl.Average(), sorted[(int)(0.95 * (scored - 1))], sorted[^1],
+                (double)agree / scored, started.Elapsed.TotalSeconds);
             log?.Invoke(result.ToString());
             results.Add(result);
         }
@@ -89,8 +100,51 @@ public static class QuantCompare
     }
 
     /// <summary>Each position's next-token logits for the text, in order,
-    /// read 8 rows at a time through the engine's verify pass.</summary>
-    private static void Read(string dir, int[] ids, Action<int, float[]> each)
+    /// read 8 rows at a time through the engine's verify pass. A directory
+    /// written <c>&lt;dir&gt;@kv=nvfp4</c> (or <c>@kv=f32</c>) reads with
+    /// that KV cache format, so a container can be compared with itself.</summary>
+    private static void Read(string spec, int[] ids, Action<int, float[]> each)
+    {
+        string saved = GpuEngine.RequestedKvFormat;
+        // <dir>@exact=N keeps the first N positions at f32 in an NVFP4 cache; @exact16=N at FP16.
+        int exact = 0;
+        bool f16 = false;
+        foreach (var (tag, half) in new[] { ("@exact16=", true), ("@exact=", false) })
+        {
+            int ex = spec.LastIndexOf(tag, StringComparison.Ordinal);
+            if (ex > 0)
+            {
+                exact = int.TryParse(spec[(ex + tag.Length)..], out int n) && n >= 0 ? n
+                    : throw new MergeException($"'{spec}': {tag} takes a token count");
+                f16 = half;
+                spec = spec[..ex];
+                break;
+            }
+        }
+        string dir = spec;
+        int at0 = spec.LastIndexOf("@kv=", StringComparison.Ordinal);
+        if (at0 > 0)
+        {
+            dir = spec[..at0];
+            GpuEngine.RequestedKvFormat = spec[(at0 + 4)..].ToLowerInvariant() switch
+            {
+                "nvfp4" => "nvfp4",
+                "fp16" => "fp16",
+                "f32" => "f32",
+                var other => throw new MergeException($"unknown KV format '{other}' in '{spec}': use f32, fp16 or nvfp4"),
+            };
+        }
+        try
+        {
+            ReadWith(dir, ids, each, exact, f16);
+        }
+        finally
+        {
+            GpuEngine.RequestedKvFormat = saved;
+        }
+    }
+
+    private static void ReadWith(string dir, int[] ids, Action<int, float[]> each, int exact, bool f16)
     {
         using var container = Vindex3Container.Open(dir);
         using var store = container.CreateOperandStore();
@@ -99,7 +153,12 @@ public static class QuantCompare
         session.Prefill([ids[0]]);
         var engine = session.DeviceEngine()
             ?? throw new MergeException($"compare runs on the GPU, which is not available ({session.GpuRefusal})");
+        if (engine.KvFormatRefusal is { } refused)
+        {
+            throw new MergeException($"{dir}: {refused}");
+        }
         var seq = engine.NewSequence();
+        engine.SetExactRows(seq, exact, f16);
         try
         {
             each(0, engine.Prefill(seq, ids.AsSpan(0, 1)));

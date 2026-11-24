@@ -20,6 +20,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_fp4.h>
 #include <cublas_v2.h>
@@ -54,6 +55,9 @@ struct Engine
     float* chunk = nullptr;      // chunked Gated DeltaNet's W, U, G and P
     size_t chunkElems = 0;
     int rowInvariant = 0;        // 1: a decode GEMV computes each row the same for 1 to 8 rows
+    int kvFp4 = 0;               // 1: KV caches hold NVFP4 rows (see kv4_row_bytes), else f32
+    float* kvWiden = nullptr;    // prompt attention's f32 copy of an NVFP4 key/value span
+    size_t kvWidenElems = 0;
 };
 
 static int ok(cudaError_t e) { return e == cudaSuccess ? 0 : -(int)e; }
@@ -79,6 +83,7 @@ AMQE_EXPORT void amqe_destroy(Engine* e)
     if (e->widen) cudaFree(e->widen);
     if (e->xb) cudaFree(e->xb);
     if (e->scores) cudaFree(e->scores);
+    if (e->kvWiden) cudaFree(e->kvWiden);
     if (e->chunk) cudaFree(e->chunk);
     if (e->blas) cublasDestroy(e->blas);
     if (e->stream) cudaStreamDestroy(e->stream);
@@ -344,6 +349,80 @@ __device__ __forceinline__ float2 e2m1x2_value(unsigned char pair)
 {
     __half2_raw raw = __nv_cvt_fp4x2_to_halfraw2((__nv_fp4x2_storage_t)pair, __NV_E2M1);
     return __half22float2(*reinterpret_cast<__half2*>(&raw));
+}
+
+/// The E2M1 code nearest to x (ties to the smaller magnitude, as the managed
+/// encoder rounds).
+__device__ __forceinline__ unsigned int e2m1_code(float x)
+{
+    float a = fabsf(x);
+    unsigned int m = a <= 0.25f ? 0u : a < 0.75f ? 1u : a <= 1.25f ? 2u : a < 1.75f ? 3u
+                   : a <= 2.5f ? 4u : a < 3.5f ? 5u : a <= 5.f ? 6u : 7u;
+    return m | (x < 0.f ? 8u : 0u);
+}
+
+__device__ __forceinline__ float e2m1_of(unsigned int code)
+{
+    unsigned int m = code & 7u;
+    float v = m < 4 ? 0.5f * m : m == 4 ? 2.f : m == 5 ? 3.f : m == 6 ? 4.f : 6.f;
+    return (code & 8u) ? -v : v;
+}
+
+// ── NVFP4 KV rows ──────────────────────────────────────────────────────────
+//
+// With kvFp4 a cache row (one position, kvDim = hkv·d values) is: the E2M1
+// codes two to a byte (low nibble first), then an E4M3 scale per 16 values,
+// then an f32 scale per head (its |max| / (448·6), so every block scale fits
+// E4M3), padded to 16 bytes. A value is code · e4m3(block) · head scale.
+// The writer quantises each row once; every reader dequantises as it loads.
+
+__host__ __device__ __forceinline__ int kv4_head_off(int kvDim) { return ((kvDim / 2 + kvDim / 16) + 3) & ~3; }
+__host__ __device__ __forceinline__ int kv4_row_bytes(int kvDim, int hkv) { return (kv4_head_off(kvDim) + 4 * hkv + 15) & ~15; }
+
+// A sequence may keep its first rows exact (its position counter's second
+// int, `exact`: the row count in the low 30 bits, and bit 30 set when they are
+// FP16 rather than f32). An NVFP4 cache then holds those rows first, and NVFP4
+// rows after them.
+__host__ __device__ __forceinline__ int ex_rows(int exact) { return exact & 0x3FFFFFFF; }
+__host__ __device__ __forceinline__ bool ex_f16(int exact) { return (exact >> 30) & 1; }
+
+/// Byte offset of row key in such a cache.
+__host__ __device__ __forceinline__ long long kv4_row_at(long long key, int exact, int kvDim, int hkv)
+{
+    int rows = ex_rows(exact);
+    long long w = ex_f16(exact) ? 2 : 4;
+    return key < rows ? key * kvDim * w
+                      : rows * kvDim * w + (key - rows) * kv4_row_bytes(kvDim, hkv);
+}
+
+/// An exact row's value: f32, or FP16 when the sequence keeps them so.
+__device__ __forceinline__ float kv_exact_at(const float* cache, long long idx, int exact)
+{
+    return ex_f16(exact) ? __half2float(reinterpret_cast<const __half*>(cache)[idx]) : cache[idx];
+}
+
+/// Value col of row key in a cache of kvDim-wide rows with d-wide heads.
+template <bool FP4>
+__device__ __forceinline__ float kv_at(const float* cache, long long key, int col, int kvDim, int d, int exact = 0)
+{
+    if constexpr (!FP4)
+    {
+        return cache[key * kvDim + col];
+    }
+    else
+    {
+        if (key < ex_rows(exact)) return kv_exact_at(cache, key * kvDim + col, exact);
+        const unsigned char* row = reinterpret_cast<const unsigned char*>(cache) + kv4_row_at(key, exact, kvDim, kvDim / d);
+        unsigned int code = (row[col >> 1] >> ((col & 1) << 2)) & 15u;
+        float s = e4m3_value(row[kvDim / 2 + (col >> 4)]) * reinterpret_cast<const float*>(row + kv4_head_off(kvDim))[col / d];
+        return e2m1_of(code) * s;
+    }
+}
+
+AMQE_EXPORT long long amqe_kv_row_bytes(int hkv, int d, int fmt)
+{
+    int kvDim = hkv * d;
+    return fmt ? kv4_row_bytes(kvDim, hkv) : (long long)kvDim * 4;
 }
 
 // Eight E2M1 elements packed in one word, as f32, unscaled. Integer work
@@ -1115,6 +1194,15 @@ AMQE_EXPORT int amqe_set_prefill_f32(Engine* e, int f32)
     return 0;
 }
 
+/// 0: KV caches hold f32 rows; 1: NVFP4 rows (amqe_kv_row_bytes). Set before
+/// any cache is written; heads must be a multiple of 16 wide.
+AMQE_EXPORT int amqe_set_kv_format(Engine* e, int fmt)
+{
+    if (fmt < 0 || fmt > 1) return -100;
+    e->kvFp4 = fmt;
+    return 0;
+}
+
 // ── embedding ──────────────────────────────────────────────────────────────
 
 template <typename WT>
@@ -1195,6 +1283,76 @@ AMQE_EXPORT int amqe_add_scaled(Engine* e, float* y, const float* b, float scale
 
 // ── softmax attention: q/k prep (norm, rope, cache append) ────────────────
 
+__device__ __forceinline__ float warp_max(float v)
+{
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+    return v;
+}
+
+__device__ __forceinline__ float block_max(float v, float* shared)
+{
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    int warps = (blockDim.x + 31) >> 5;
+    v = warp_max(v);
+    __syncthreads();
+    if (lane == 0) shared[warp] = v;
+    __syncthreads();
+    if (threadIdx.x < 32)
+    {
+        float t = threadIdx.x < warps ? shared[threadIdx.x] : -INFINITY;
+        t = warp_max(t);
+        if (threadIdx.x == 0) shared[0] = t;
+    }
+    __syncthreads();
+    return shared[0];
+}
+
+/// Writes one head's d key and value values into NVFP4 cache rows (all the
+/// block's threads take part). k and v are in shared memory.
+__device__ void kv4_write_head(const float* k, const float* v, unsigned char* kRow, unsigned char* vRow,
+    int h, int d, int kvDim, float* red)
+{
+    float ka = 0.f, va = 0.f;
+    for (int c = threadIdx.x; c < d; c += blockDim.x)
+    {
+        ka = fmaxf(ka, fabsf(k[c]));
+        va = fmaxf(va, fabsf(v[c]));
+    }
+    ka = block_max(ka, red);
+    va = block_max(va, red);
+    const float kS = ka / (448.f * 6.f), vS = va / (448.f * 6.f);
+    int blocks = d / 16;
+    for (int t = threadIdx.x; t < 2 * blocks; t += blockDim.x)
+    {
+        bool isV = t >= blocks;
+        int b = isV ? t - blocks : t;
+        const float* src = (isV ? v : k) + b * 16;
+        float s0 = isV ? vS : kS;
+        unsigned char* row = isV ? vRow : kRow;
+        int col0 = h * d + b * 16;
+        float am = 0.f;
+        #pragma unroll
+        for (int j = 0; j < 16; j++) am = fmaxf(am, fabsf(src[j]));
+        unsigned char sb = s0 > 0.f ? (unsigned char)__nv_cvt_float_to_fp8(am / 6.f / s0, __NV_SATFINITE, __NV_E4M3) : 0;
+        float s = e4m3_value(sb) * s0;
+        float inv = s > 0.f ? 1.f / s : 0.f;
+        #pragma unroll
+        for (int j = 0; j < 8; j++)
+        {
+            unsigned int lo = s > 0.f ? e2m1_code(src[2 * j] * inv) : 0u;
+            unsigned int hi = s > 0.f ? e2m1_code(src[2 * j + 1] * inv) : 0u;
+            row[(col0 >> 1) + j] = (unsigned char)(lo | (hi << 4));
+        }
+        row[kvDim / 2 + (col0 >> 4)] = sb;
+    }
+    if (threadIdx.x == 0)
+    {
+        reinterpret_cast<float*>(kRow + kv4_head_off(kvDim))[h] = kS;
+        reinterpret_cast<float*>(vRow + kv4_head_off(kvDim))[h] = vS;
+    }
+}
+
 struct AttnPrepArgs
 {
     const float* qkv; int ldqkv;     // [rows, qProjWidth + 2·kvDim]
@@ -1211,10 +1369,11 @@ struct AttnPrepArgs
     float* const* kCaches; float* const* vCaches; const int* const* poss;
 };
 
+template <bool FP4>
 __global__ void attn_prep_kernel(AttnPrepArgs a)
 {
     pdl_enter();
-    extern __shared__ float buf[];   // d floats
+    extern __shared__ float buf[];   // d floats (2·d with NVFP4 caches: the value row too)
     __shared__ float red[32];
     int r = blockIdx.x;
     int head = blockIdx.y;           // [0, hq) q heads, [hq, hq + hkv) kv heads
@@ -1266,6 +1425,41 @@ __global__ void attn_prep_kernel(AttnPrepArgs a)
     {
         for (int c = threadIdx.x; c < d; c += blockDim.x) a.q[(long long)r * a.hq * d + h * d + c] = buf[c];
     }
+    else if constexpr (FP4)
+    {
+        int exact = a.poss ? a.poss[r][1] : a.pos[1];
+        const float* vsrc = row + qw + kvDim + (long long)h * d;
+        if (position < ex_rows(exact))
+        {
+            // The sequence's exact rows: f32, or FP16 (rounded to nearest).
+            long long dst = (long long)position * kvDim + h * d;
+            if (ex_f16(exact))
+            {
+                __half* kh = reinterpret_cast<__half*>(kCache);
+                __half* vh = reinterpret_cast<__half*>(vCache);
+                for (int c = threadIdx.x; c < d; c += blockDim.x)
+                {
+                    kh[dst + c] = __float2half_rn(buf[c]);
+                    vh[dst + c] = __float2half_rn(vsrc[c]);
+                }
+            }
+            else
+            {
+                for (int c = threadIdx.x; c < d; c += blockDim.x)
+                {
+                    kCache[dst + c] = buf[c];
+                    vCache[dst + c] = vsrc[c];
+                }
+            }
+            return;
+        }
+        float* vb = buf + d;
+        for (int c = threadIdx.x; c < d; c += blockDim.x) vb[c] = vsrc[c];
+        __syncthreads();
+        long long at = kv4_row_at(position, exact, kvDim, a.hkv);
+        kv4_write_head(buf, vb, reinterpret_cast<unsigned char*>(kCache) + at,
+            reinterpret_cast<unsigned char*>(vCache) + at, h, d, kvDim, red);
+    }
     else
     {
         long long dst = (long long)position * kvDim + h * d;
@@ -1278,6 +1472,21 @@ __global__ void attn_prep_kernel(AttnPrepArgs a)
     }
 }
 
+static int launch_attn_prep(Engine* e, dim3 grid, int d, const AttnPrepArgs& a)
+{
+    int threads = d >= 128 ? 128 : 64;
+    if (e->kvFp4)
+    {
+        if (d % 16 != 0) return -100;
+        launch(attn_prep_kernel<true>, grid, threads, 2 * d * sizeof(float), e->stream, a);
+    }
+    else
+    {
+        launch(attn_prep_kernel<false>, grid, threads, d * sizeof(float), e->stream, a);
+    }
+    return ok(cudaGetLastError());
+}
+
 AMQE_EXPORT int amqe_attn_prep(Engine* e, const float* qkv, int ldqkv, int rows, int hq, int hkv, int d, int gated,
     float* q, float* gate, float* kCache, float* vCache, const int* pos,
     const float* qNormW, float qNormOff, float qNormEps,
@@ -1287,10 +1496,7 @@ AMQE_EXPORT int amqe_attn_prep(Engine* e, const float* qkv, int ldqkv, int rows,
     AttnPrepArgs a{ qkv, ldqkv, rows, hq, hkv, d, gated, q, gate, kCache, vCache, pos,
         qNormW, qNormOff, qNormEps, kNormW, kNormOff, kNormEps, invFreq, pairs, ropeScale, interleaved, rope,
         nullptr, nullptr, nullptr };
-    dim3 grid(rows, hq + hkv);
-    int threads = d >= 128 ? 128 : 64;
-    launch(attn_prep_kernel, grid, threads, d * sizeof(float), e->stream, a);
-    return ok(cudaGetLastError());
+    return launch_attn_prep(e, dim3(rows, hq + hkv), d, a);
 }
 
 // One decode row for each of `batch` sequences: row r appends to kCaches[r] and
@@ -1304,10 +1510,7 @@ AMQE_EXPORT int amqe_attn_prep_batch(Engine* e, const float* qkv, int ldqkv, int
     AttnPrepArgs a{ qkv, ldqkv, batch, hq, hkv, d, gated, q, gate, nullptr, nullptr, nullptr,
         qNormW, qNormOff, qNormEps, kNormW, kNormOff, kNormEps, invFreq, pairs, ropeScale, interleaved, rope,
         kCaches, vCaches, poss };
-    dim3 grid(batch, hq + hkv);
-    int threads = d >= 128 ? 128 : 64;
-    launch(attn_prep_kernel, grid, threads, d * sizeof(float), e->stream, a);
-    return ok(cudaGetLastError());
+    return launch_attn_prep(e, dim3(batch, hq + hkv), d, a);
 }
 
 // ── softmax attention ──────────────────────────────────────────────────────
@@ -1319,31 +1522,6 @@ AMQE_EXPORT int amqe_attn_prep_batch(Engine* e, const float* qkv, int ldqkv, int
 // Prefill tiles queries and keys through shared memory with an online
 // softmax.
 
-__device__ __forceinline__ float warp_max(float v)
-{
-    #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
-    return v;
-}
-
-__device__ __forceinline__ float block_max(float v, float* shared)
-{
-    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    int warps = (blockDim.x + 31) >> 5;
-    v = warp_max(v);
-    __syncthreads();
-    if (lane == 0) shared[warp] = v;
-    __syncthreads();
-    if (threadIdx.x < 32)
-    {
-        float t = threadIdx.x < warps ? shared[threadIdx.x] : -INFINITY;
-        t = warp_max(t);
-        if (threadIdx.x == 0) shared[0] = t;
-    }
-    __syncthreads();
-    return shared[0];
-}
-
 constexpr int SPLIT_KEYS = 32;
 constexpr int SPLIT_THREADS = 256;
 
@@ -1352,7 +1530,7 @@ __device__ __forceinline__ float softcapped(float s, float softcap)
     return softcap > 0.f ? softcap * tanhf(s / softcap) : s;
 }
 
-template <int DPL>
+template <int DPL, bool FP4>
 __global__ void __launch_bounds__(SPLIT_THREADS) attention_split_kernel(const float* q, const float* kCache,
     const float* vCache, float* part, const int* pos, int hq, int hkv, int nsplit,
     float scale, float softcap, int window, int d,
@@ -1380,6 +1558,7 @@ __global__ void __launch_bounds__(SPLIT_THREADS) attention_split_kernel(const fl
     int n = k1 - k0;
     int kvh = h / (hq / hkv);
     int kvDim = hkv * D;
+    int exact = FP4 ? (poss ? poss[r][1] : pos[1]) : 0;
     const float* qr = q + ((long long)r * hq + h) * D;
     float qv[DPL];
     #pragma unroll
@@ -1395,9 +1574,9 @@ __global__ void __launch_bounds__(SPLIT_THREADS) attention_split_kernel(const fl
             int j = j0 + u;
             if (j < n)
             {
-                const float* kr = kCache + (long long)(k0 + j) * kvDim + kvh * D;
                 #pragma unroll
-                for (int i = 0; i < DPL; i++) if (lane + 32 * i < D) s[u] = fmaf(qv[i], kr[lane + 32 * i], s[u]);
+                for (int i = 0; i < DPL; i++)
+                    if (lane + 32 * i < D) s[u] = fmaf(qv[i], kv_at<FP4>(kCache, k0 + j, kvh * D + lane + 32 * i, kvDim, D, exact), s[u]);
             }
         }
         #pragma unroll
@@ -1421,13 +1600,184 @@ __global__ void __launch_bounds__(SPLIT_THREADS) attention_split_kernel(const fl
     l = block_sum(l, red);   // its barriers also publish sp
     for (int c = threadIdx.x; c < D; c += blockDim.x)
     {
-        const float* vr = vCache + (long long)k0 * kvDim + kvh * D + c;
         float acc = 0.f;
         #pragma unroll 16
-        for (int j = 0; j < n; j++) acc = fmaf(sp[j], vr[(long long)j * kvDim], acc);
+        for (int j = 0; j < n; j++) acc = fmaf(sp[j], kv_at<FP4>(vCache, k0 + j, kvh * D + c, kvDim, D, exact), acc);
         out[2 + c] = acc;
     }
     if (threadIdx.x == 0) { out[0] = m; out[1] = l; }
+}
+
+// DPL contiguous NVFP4 values from a cache row, unscaled, and their scale
+// (block E4M3 times the head's f32). DPL is 2, 4 or 8: one block scale covers them.
+template <int DPL>
+__device__ __forceinline__ float kv4_load(const unsigned char* row, int col0, int kvDim, int headOff, int head, float* v);
+
+// The same from a mixed cache: an exact (f32 or FP16) row before the boundary, scale 1.
+template <int DPL>
+__device__ __forceinline__ float kv_load_mixed(const unsigned char* base, long long key, int exact, int col0, int kvDim,
+    int hkv, int headOff, int head, float* v)
+{
+    if (key < ex_rows(exact))
+    {
+        if (ex_f16(exact))
+        {
+            const __half* f = reinterpret_cast<const __half*>(base) + key * kvDim + col0;
+            #pragma unroll
+            for (int i = 0; i < DPL; i++) v[i] = __half2float(f[i]);
+        }
+        else
+        {
+            const float* f = reinterpret_cast<const float*>(base) + key * kvDim + col0;
+            #pragma unroll
+            for (int i = 0; i < DPL; i++) v[i] = f[i];
+        }
+        return 1.f;
+    }
+    return kv4_load<DPL>(base + kv4_row_at(key, exact, kvDim, hkv), col0, kvDim, headOff, head, v);
+}
+
+template <int DPL>
+__device__ __forceinline__ float kv4_load(const unsigned char* row, int col0, int kvDim, int headOff, int head, float* v)
+{
+    float s = e4m3_value(row[kvDim / 2 + (col0 >> 4)]) * reinterpret_cast<const float*>(row + headOff)[head];
+    const unsigned char* codes = row + (col0 >> 1);
+    if constexpr (DPL == 8)
+    {
+        decode8_e2m1(*reinterpret_cast<const unsigned int*>(codes), v);
+    }
+    else
+    {
+        #pragma unroll
+        for (int i = 0; i < DPL / 2; i++)
+        {
+            float2 p = e2m1x2_value(codes[i]);
+            v[2 * i] = p.x;
+            v[2 * i + 1] = p.y;
+        }
+    }
+    return s;
+}
+
+// Decode attention over NVFP4 caches for heads of 32·DPL (DPL 2, 4 or 8): each
+// lane owns DPL contiguous dimensions, so a key costs a lane one code load, one
+// block scale and one head scale. Scores as attention_split_kernel; values are
+// summed per warp over every WARPS-th key, then across warps.
+template <int DPL>
+__global__ void __launch_bounds__(SPLIT_THREADS) attention_split_fp4_kernel(const float* q, const float* kCache,
+    const float* vCache, float* part, const int* pos, int hq, int hkv, int nsplit,
+    float scale, float softcap, int window,
+    const float* const* kCaches, const float* const* vCaches, const int* const* poss)
+{
+    pdl_enter();
+    constexpr int D = 32 * DPL;
+    constexpr int WARPS = SPLIT_THREADS / 32;
+    __shared__ float sp[SPLIT_KEYS];
+    __shared__ float red[32];
+    __shared__ float accs[WARPS][D];
+    int h = blockIdx.x, r = blockIdx.y, split = blockIdx.z;
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    if (kCaches) { kCache = kCaches[r]; vCache = vCaches[r]; }
+    int qPos = poss ? *poss[r] : *pos + r;
+    int first = window > 0 ? max(0, qPos - window + 1) : 0;
+    int k0 = max(split * SPLIT_KEYS, first);
+    int k1 = min(split * SPLIT_KEYS + SPLIT_KEYS, qPos + 1);
+    float* out = part + (((long long)r * hq + h) * nsplit + split) * (D + 2);
+    if (k0 >= k1)
+    {
+        if (threadIdx.x == 0) { out[0] = -INFINITY; out[1] = 0.f; }
+        return;
+    }
+    int n = k1 - k0;
+    int kvh = h / (hq / hkv);
+    int kvDim = hkv * D;
+    int exact = poss ? poss[r][1] : pos[1];
+    int headOff = kv4_head_off(kvDim);
+    const unsigned char* kb = reinterpret_cast<const unsigned char*>(kCache);
+    const unsigned char* vb = reinterpret_cast<const unsigned char*>(vCache);
+    int dim0 = lane * DPL;
+    int col0 = kvh * D + dim0;
+    const float* qr = q + ((long long)r * hq + h) * D;
+    float qv[DPL];
+    #pragma unroll
+    for (int i = 0; i < DPL; i++) qv[i] = qr[dim0 + i];
+
+    for (int j0 = warp * 4; j0 < n; j0 += WARPS * 4)
+    {
+        float s[4] = { 0.f, 0.f, 0.f, 0.f };
+        #pragma unroll
+        for (int u = 0; u < 4; u++)
+        {
+            int j = j0 + u;
+            if (j < n)
+            {
+                float v[DPL];
+                float sc = kv_load_mixed<DPL>(kb, k0 + j, exact, col0, kvDim, hkv, headOff, kvh, v);
+                float t = 0.f;
+                #pragma unroll
+                for (int i = 0; i < DPL; i++) t = fmaf(qv[i], v[i], t);
+                s[u] = t * sc;
+            }
+        }
+        #pragma unroll
+        for (int u = 0; u < 4; u++)
+        {
+            float t = warp_sum(s[u]) * scale;
+            if (lane == 0 && j0 + u < n) sp[j0 + u] = softcapped(t, softcap);
+        }
+    }
+    __syncthreads();
+    float m = -INFINITY;
+    for (int j = threadIdx.x; j < n; j += blockDim.x) m = fmaxf(m, sp[j]);
+    m = block_max(m, red);
+    float l = 0.f;
+    for (int j = threadIdx.x; j < n; j += blockDim.x)
+    {
+        float p = __expf(sp[j] - m);
+        sp[j] = p;
+        l += p;
+    }
+    l = block_sum(l, red);   // its barriers also publish sp
+
+    float acc[DPL];
+    #pragma unroll
+    for (int i = 0; i < DPL; i++) acc[i] = 0.f;
+    for (int j = warp; j < n; j += WARPS)
+    {
+        float v[DPL];
+        float pj = sp[j] * kv_load_mixed<DPL>(vb, k0 + j, exact, col0, kvDim, hkv, headOff, kvh, v);
+        #pragma unroll
+        for (int i = 0; i < DPL; i++) acc[i] = fmaf(pj, v[i], acc[i]);
+    }
+    #pragma unroll
+    for (int i = 0; i < DPL; i++) accs[warp][dim0 + i] = acc[i];
+    __syncthreads();
+    for (int c = threadIdx.x; c < D; c += blockDim.x)
+    {
+        float t = 0.f;
+        #pragma unroll
+        for (int w = 0; w < WARPS; w++) t += accs[w][c];
+        out[2 + c] = t;
+    }
+    if (threadIdx.x == 0) { out[0] = m; out[1] = l; }
+}
+
+template <int DPL>
+static void launch_split_fp4(Engine* e, dim3 grid, const float* q, const float* kCache, const float* vCache, float* part,
+    const int* pos, int hq, int hkv, int nsplit, float scale, float softcap, int window, int d,
+    const float* const* kCaches, const float* const* vCaches, const int* const* poss)
+{
+    if constexpr (DPL == 2 || DPL == 4 || DPL == 8)
+    {
+        if (d == 32 * DPL)
+        {
+            launch(attention_split_fp4_kernel<DPL>, grid, SPLIT_THREADS, 0, e->stream, q, kCache, vCache, part, pos, hq, hkv, nsplit,
+                scale, softcap, window, kCaches, vCaches, poss);
+            return;
+        }
+    }
+    launch(attention_split_kernel<DPL, true>, grid, SPLIT_THREADS, 0, e->stream, q, kCache, vCache, part, pos, hq, hkv, nsplit,
+        scale, softcap, window, d, kCaches, vCaches, poss);
 }
 
 __global__ void attention_combine_kernel(const float* part, const float* gate, float* out, int hq, int d, int nsplit)
@@ -1465,7 +1815,7 @@ __global__ void attention_combine_kernel(const float* part, const float* gate, f
 constexpr int PF_QT = 16;   // query rows per block (4 per warp)
 constexpr int PF_KT = 32;   // keys per tile (one per lane)
 
-template <int DPL>
+template <int DPL, bool FP4>
 __global__ void __launch_bounds__(128) attention_prefill_kernel(const float* q, const float* kCache, const float* vCache,
     const float* gate, float* out, const int* pos, int rows, int hq, int hkv, float scale, float softcap, int window, int d)
 {
@@ -1481,6 +1831,7 @@ __global__ void __launch_bounds__(128) attention_prefill_kernel(const float* q, 
     int kvh = h / (hq / hkv);
     int kvDim = hkv * D;
     int pos0 = *pos;
+    int exact = FP4 ? pos[1] : 0;
     int lastRow = min(t0 + PF_QT, rows) - 1;
     int maxQ = pos0 + lastRow;
     int minQ = pos0 + t0;
@@ -1510,9 +1861,8 @@ __global__ void __launch_bounds__(128) attention_prefill_kernel(const float* q, 
             int j = i / D, c = i % D;
             int key = kt + j;
             bool valid = key <= maxQ;
-            long long src = (long long)key * kvDim + kvh * D + c;
-            sK[j * (D + 1) + c] = valid ? kCache[src] : 0.f;
-            sV[j * D + c] = valid ? vCache[src] : 0.f;
+            sK[j * (D + 1) + c] = valid ? kv_at<FP4>(kCache, key, kvh * D + c, kvDim, D, exact) : 0.f;
+            sV[j * D + c] = valid ? kv_at<FP4>(vCache, key, kvh * D + c, kvDim, D, exact) : 0.f;
         }
         __syncthreads();
         #pragma unroll
@@ -1567,8 +1917,8 @@ __global__ void __launch_bounds__(128) attention_prefill_kernel(const float* q, 
     }
 }
 
-template <int DPL>
-static int launch_attention(Engine* e, const float* q, const float* kCache, const float* vCache,
+template <int DPL, bool FP4>
+static int launch_attention_as(Engine* e, const float* q, const float* kCache, const float* vCache,
     const float* gate, float* out, const int* pos, int rows, int hq, int hkv,
     float scale, float softcap, int window, float* part, int nsplit, int d)
 {
@@ -1576,8 +1926,12 @@ static int launch_attention(Engine* e, const float* q, const float* kCache, cons
     if (rows <= 8)
     {
         dim3 grid(hq, rows, nsplit);
-        launch(attention_split_kernel<DPL>, grid, SPLIT_THREADS, 0, e->stream, q, kCache, vCache, part, pos, hq, hkv, nsplit, scale, softcap, window, d,
-            (const float* const*)nullptr, (const float* const*)nullptr, (const int* const*)nullptr);
+        if constexpr (FP4)
+            launch_split_fp4<DPL>(e, grid, q, kCache, vCache, part, pos, hq, hkv, nsplit, scale, softcap, window, d,
+                (const float* const*)nullptr, (const float* const*)nullptr, (const int* const*)nullptr);
+        else
+            launch(attention_split_kernel<DPL, FP4>, grid, SPLIT_THREADS, 0, e->stream, q, kCache, vCache, part, pos, hq, hkv, nsplit, scale, softcap, window, d,
+                (const float* const*)nullptr, (const float* const*)nullptr, (const int* const*)nullptr);
         launch(attention_combine_kernel, dim3(hq, rows), D < 128 ? 128 : D, nsplit * sizeof(float), e->stream, part, gate, out, hq, D, nsplit);
         return ok(cudaGetLastError());
     }
@@ -1587,12 +1941,31 @@ static int launch_attention(Engine* e, const float* q, const float* kCache, cons
     {
         constexpr int DM = 32 * DPL;   // the widest head this instantiation serves
         size_t most = (size_t)(PF_KT * (DM + 1) + PF_KT * DM + PF_QT * DM) * sizeof(float);
-        cudaFuncSetAttribute(attention_prefill_kernel<DPL>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)most);
+        cudaFuncSetAttribute(attention_prefill_kernel<DPL, FP4>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)most);
         configured[DPL] = true;
     }
     dim3 grid(hq, (rows + PF_QT - 1) / PF_QT);
-    launch(attention_prefill_kernel<DPL>, grid, 128, smem, e->stream, q, kCache, vCache, gate, out, pos, rows, hq, hkv, scale, softcap, window, d);
+    launch(attention_prefill_kernel<DPL, FP4>, grid, 128, smem, e->stream, q, kCache, vCache, gate, out, pos, rows, hq, hkv, scale, softcap, window, d);
     return ok(cudaGetLastError());
+}
+
+template <int DPL>
+static int launch_attention(Engine* e, const float* q, const float* kCache, const float* vCache,
+    const float* gate, float* out, const int* pos, int rows, int hq, int hkv,
+    float scale, float softcap, int window, float* part, int nsplit, int d)
+{
+    return e->kvFp4
+        ? launch_attention_as<DPL, true>(e, q, kCache, vCache, gate, out, pos, rows, hq, hkv, scale, softcap, window, part, nsplit, d)
+        : launch_attention_as<DPL, false>(e, q, kCache, vCache, gate, out, pos, rows, hq, hkv, scale, softcap, window, part, nsplit, d);
+}
+
+// An NVFP4 cache span widened to f32 rows for the prompt GEMMs: rows kStart..kStart+keys-1.
+__global__ void kv4_widen_kernel(const float* cache, float* out, int kStart, int keys, int kvDim, int d, int exact)
+{
+    pdl_enter();
+    int j = blockIdx.x;
+    for (int c = threadIdx.x; c < kvDim; c += blockDim.x)
+        out[(long long)j * kvDim + c] = kv_at<true>(cache, kStart + j, c, kvDim, d, exact);
 }
 
 // ── prompt attention as GEMMs ──────────────────────────────────────────────
@@ -1646,7 +2019,7 @@ __global__ void attn_gate_kernel(float* out, const float* gate, long long count)
 /// would pass its budget, and the caller falls back to amqe_attention.
 AMQE_EXPORT int amqe_attention_rows(Engine* e, const float* q, const float* kCache, const float* vCache,
     const float* gate, float* out, int pos0, int rows, int hq, int hkv, int d,
-    float scale, float softcap, int window)
+    float scale, float softcap, int window, int exact)
 {
     if (rows <= 0 || hkv <= 0 || hq % hkv != 0) return -100;
     int g = hq / hkv;
@@ -1664,13 +2037,34 @@ AMQE_EXPORT int amqe_attention_rows(Engine* e, const float* q, const float* kCac
         if (cudaMalloc(&e->scores, need * sizeof(float)) != cudaSuccess) return -2;
         e->scoresElems = need;
     }
+    // NVFP4 caches: the span is widened to f32 once, then the same GEMMs run over it.
+    const float* kSpan = kCache + (long long)kStart * kvDim;
+    const float* vSpan = vCache + (long long)kStart * kvDim;
+    if (e->kvFp4)
+    {
+        size_t span = (size_t)2 * keys * kvDim;
+        if (span * sizeof(float) > ((size_t)1 << 30)) return -200;
+        if (span > e->kvWidenElems)
+        {
+            if (e->kvWiden) cudaFree(e->kvWiden);
+            e->kvWiden = nullptr;
+            e->kvWidenElems = 0;
+            if (cudaMalloc(&e->kvWiden, span * sizeof(float)) != cudaSuccess) return -2;
+            e->kvWidenElems = span;
+        }
+        int threads = kvDim >= 256 ? 256 : 128;
+        launch(kv4_widen_kernel, keys, threads, 0, e->stream, kCache, e->kvWiden, kStart, keys, kvDim, d, exact);
+        launch(kv4_widen_kernel, keys, threads, 0, e->stream, vCache, e->kvWiden + (size_t)keys * kvDim, kStart, keys, kvDim, d, exact);
+        kSpan = e->kvWiden;
+        vSpan = e->kvWiden + (size_t)keys * kvDim;
+    }
     cublasComputeType_t ct = e->prefillF32 ? CUBLAS_COMPUTE_32F : CUBLAS_COMPUTE_32F_FAST_TF32;
     const float one = 1.f, zero = 0.f;
     long long strideS = (long long)rows * keys;
     for (int kh = 0; kh < hkv; kh++)
     {
-        const float* K = kCache + (long long)kStart * kvDim + kh * d;
-        const float* V = vCache + (long long)kStart * kvDim + kh * d;
+        const float* K = kSpan + kh * d;
+        const float* V = vSpan + kh * d;
         const float* Q = q + (long long)kh * g * d;
         float* O = out + (long long)kh * g * d;
         // Column-major: S[keys x rows] = K^T . Q, per head of the group.
@@ -1718,8 +2112,12 @@ static int launch_attention_batch(Engine* e, const float* q, const float* const*
     float scale, float softcap, int window, float* part, int nsplit, int d)
 {
     dim3 grid(hq, batch, nsplit);
-    launch(attention_split_kernel<DPL>, grid, SPLIT_THREADS, 0, e->stream, q, (const float*)nullptr, (const float*)nullptr, part,
-        (const int*)nullptr, hq, hkv, nsplit, scale, softcap, window, d, kCaches, vCaches, poss);
+    if (e->kvFp4)
+        launch_split_fp4<DPL>(e, grid, q, (const float*)nullptr, (const float*)nullptr, part,
+            (const int*)nullptr, hq, hkv, nsplit, scale, softcap, window, d, kCaches, vCaches, poss);
+    else
+        launch(attention_split_kernel<DPL, false>, grid, SPLIT_THREADS, 0, e->stream, q, (const float*)nullptr, (const float*)nullptr, part,
+            (const int*)nullptr, hq, hkv, nsplit, scale, softcap, window, d, kCaches, vCaches, poss);
     launch(attention_combine_kernel, dim3(hq, batch), d < 128 ? 128 : d, nsplit * sizeof(float), e->stream, part, gate, out, hq, d, nsplit);
     return ok(cudaGetLastError());
 }
@@ -2931,23 +3329,6 @@ AMQE_EXPORT int amqe_gptq_prepare(Engine* e, float* h, int k, float* u)
     cusolverDnDestroy(s);
     if (rc == 0) rc = ok(cudaGetLastError());
     return rc;
-}
-
-/// The E2M1 code nearest to x (ties to the smaller magnitude, as the managed
-/// encoder rounds).
-__device__ __forceinline__ unsigned int e2m1_code(float x)
-{
-    float a = fabsf(x);
-    unsigned int m = a <= 0.25f ? 0u : a < 0.75f ? 1u : a <= 1.25f ? 2u : a < 1.75f ? 3u
-                   : a <= 2.5f ? 4u : a < 3.5f ? 5u : a <= 5.f ? 6u : 7u;
-    return m | (x < 0.f ? 8u : 0u);
-}
-
-__device__ __forceinline__ float e2m1_of(unsigned int code)
-{
-    unsigned int m = code & 7u;
-    float v = m < 4 ? 0.5f * m : m == 4 ? 2.f : m == 5 ? 3.f : m == 6 ? 4.f : 6.f;
-    return (code & 8u) ? -v : v;
 }
 
 constexpr int GPTQ_B = 32;   // columns a block takes; both group sizes divide it

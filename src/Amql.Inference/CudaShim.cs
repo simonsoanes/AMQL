@@ -495,6 +495,35 @@ public static class CudaShim
     public static bool FuseFfn { get; set; } =
         Environment.GetEnvironmentVariable("AMQL_FUSED_FFN")?.Trim() is not ("0" or "false" or "off");
 
+    [DllImport("amql_cuda")]
+    private static extern void amql_cuda_set_grouped_ffn(int on);
+
+    [DllImport("amql_cuda")]
+    private static extern int amql_cuda_get_grouped_ffn();
+
+    [DllImport("amql_cuda")]
+    private static extern long amql_cuda_grouped_ffn_calls();
+
+    /// <summary>Whether a routed layer whose experts are all NVFP4, with up to
+    /// 32 rows each (decode, small batches), runs every expert's gate and up
+    /// as one launch and every down as another (grouped GEMV), instead of six
+    /// launches an expert. Bit for bit the same output. On by default;
+    /// <c>AMQL_GROUPED_FFN=0</c> turns it off.</summary>
+    public static bool GroupedFfn
+    {
+        get => Enabled && amql_cuda_get_grouped_ffn() == 1;
+        set
+        {
+            if (Enabled)
+            {
+                amql_cuda_set_grouped_ffn(value ? 1 : 0);
+            }
+        }
+    }
+
+    /// <summary>Routed layers run as grouped launches so far.</summary>
+    public static long GroupedFfnCalls => Enabled ? amql_cuda_grouped_ffn_calls() : 0;
+
     /// <summary>
     /// Runs FFN jobs over rows of <paramref name="x"/> ([m, k]) on the device:
     /// x goes up once, each job gathers its rows, multiplies gate and up, takes

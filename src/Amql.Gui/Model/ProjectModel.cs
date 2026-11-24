@@ -6,7 +6,7 @@ namespace Amql.Gui.Model;
 
 /// <summary>
 /// The .amqlproj file format (JSON). One file stores everything:
-///   • CLI invocation settings (how to reach amql-cli, device/weights env),
+///   • the CLI's global options (device, memory limits, weights env),
 ///   • project-wide defaults (container / tokenizer / patch / component),
 ///   • the last-entered parameter values for every command,
 ///   • the run history — status, progress, timing, exit code and an output
@@ -87,20 +87,44 @@ public sealed class ProjectModel
     }
 }
 
-/// <summary>How the GUI reaches amql-cli, plus the global --cpu/--gpu and AMQL_WEIGHTS knobs.</summary>
+/// <summary>The CLI's global options for a project's runs. Where amql-cli
+/// lives is not a setting: <see cref="Services.ToolLocator"/> finds it.</summary>
 public sealed class CliSettings
 {
-    /// <summary>Path to a built amql-cli.exe (or 'amql-cli' on PATH). When set, it wins over RepoPath.</summary>
-    public string? CliExePath { get; set; }
-
-    /// <summary>Repository root; when CliExePath is empty the CLI is run via 'dotnet run --project &lt;repo&gt;/src/Amql.Cli'.</summary>
-    public string? RepoPath { get; set; }
-
     /// <summary>"auto" (no flag), "cpu" (--cpu) or "gpu" (--gpu).</summary>
     public string Device { get; set; } = "auto";
 
     /// <summary>Value for the AMQL_WEIGHTS environment variable; empty means "do not set".</summary>
     public string WeightsEnv { get; set; } = string.Empty;
+
+    /// <summary>--max-ram GiB (the lean working set's process target); null leaves it to the CLI.</summary>
+    public double? MaxRamGb { get; set; }
+
+    /// <summary>--gpu-memory GiB the weights may take on the GPU; null leaves it to the CLI.</summary>
+    public double? GpuMemoryGb { get; set; }
+
+    /// <summary>--gpu-format: "" (as stored), "nvfp4", "mxfp4" or "fp16".</summary>
+    public string GpuFormat { get; set; } = string.Empty;
+
+    /// <summary>--fp4-prefill: "" (default), "on" or "off".</summary>
+    public string Fp4Prefill { get; set; } = string.Empty;
+
+    /// <summary>--verbose.</summary>
+    public bool Verbose { get; set; }
+
+    /// <summary>The global flags these settings add before the command name.</summary>
+    public IEnumerable<string> GlobalArguments()
+    {
+        if (Device == "cpu") yield return "--cpu";
+        else if (Device == "gpu") yield return "--gpu";
+        if (MaxRamGb is { } ram) { yield return "--max-ram"; yield return Num(ram); }
+        if (GpuMemoryGb is { } vram) { yield return "--gpu-memory"; yield return Num(vram); }
+        if (GpuFormat is { Length: > 0 } f) { yield return "--gpu-format"; yield return f; }
+        if (Fp4Prefill is { Length: > 0 } p) { yield return "--fp4-prefill"; yield return p; }
+        if (Verbose) yield return "--verbose";
+    }
+
+    private static string Num(double v) => v.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture);
 }
 
 /// <summary>Project-wide defaults the user can stamp into any command form.</summary>
@@ -137,6 +161,8 @@ public sealed class RunRecord
     /// <summary>Trailing output lines kept in the project file (bounded).</summary>
     public List<string> OutputTail { get; set; } = new();
     public string? Error { get; set; }
+
+    public string StartedLocal => StartedUtc.ToLocalTime().ToString("d MMM HH:mm");
 
     public string Display =>
         $"#{Id} {Command} — {Status}" +

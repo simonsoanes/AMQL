@@ -32,9 +32,10 @@ public enum Fp4Rounding
 
 public sealed record QuantiseOptions(Fp4Format Format)
 {
-    public Fp4Rounding Rounding { get; init; } = Fp4Rounding.Nearest;
+    public Fp4Rounding Rounding { get; init; } = Fp4Rounding.Gptq;
 
-    /// <summary>Text the model reads to calibrate GPTQ (required for it).</summary>
+    /// <summary>Text the model reads to calibrate GPTQ; without it (or
+    /// <see cref="CalibrationIds"/>), <see cref="DefaultCalibration"/>.</summary>
     public string? CalibrationText { get; init; }
 
     /// <summary>Calibration as token ids, in place of text.</summary>
@@ -51,6 +52,20 @@ public sealed record QuantiseOptions(Fp4Format Format)
 
     /// <summary>Progress lines, if anyone is listening.</summary>
     public Action<string>? Log { get; init; }
+
+    /// <summary>The calibration GPTQ reads when none is given: about 130 KB of
+    /// this repository's docs and C#. On Qwen 3.5 4B it took NVFP4's added
+    /// perplexity from +4.9% to +1.3% on Python it never saw, so it carries
+    /// beyond its own domain; text from the model's real use does better.</summary>
+    public static string DefaultCalibration => _default.Value;
+
+    private static readonly Lazy<string> _default = new(() =>
+    {
+        using var stream = typeof(QuantiseOptions).Assembly.GetManifestResourceStream("Amql.Merge.Calibration.default.txt")
+            ?? throw new MergeException("the default calibration text is missing from Amql.Merge");
+        using var reader = new StreamReader(stream);
+        return reader.ReadToEnd();
+    });
 }
 
 public sealed record QuantiseReport(string OutDir, Fp4Format Format, int Quantised, int Kept,
@@ -85,7 +100,8 @@ public static class QuantiseContainer
         var format = options.Format;
         if (options.Rounding == Fp4Rounding.Gptq && string.IsNullOrWhiteSpace(options.CalibrationText) && options.CalibrationIds is null)
         {
-            throw new MergeException("GPTQ needs calibration text");
+            options = options with { CalibrationText = QuantiseOptions.DefaultCalibration };
+            options.Log?.Invoke("calibrating on the built-in text (--calibration for your own)");
         }
         if (Directory.Exists(outDir) && Directory.EnumerateFileSystemEntries(outDir).Any())
         {
@@ -298,26 +314,36 @@ public static class QuantiseContainer
         {
             _options = options;
             _store = container.CreateOperandStore();
-            var plan = Planner.Plan(container, "target", _store);
-            _session = new DecodeSession(plan, _store);
-            _session.Prefill([0]);
-            _engine = _session.DeviceEngine()
-                ?? throw new MergeException($"searched and GPTQ rounding run on the GPU, which is not available ({_session.GpuRefusal})");
-            if (_engine.Fp4Matrices > 0)
+            try
             {
-                throw new MergeException("the source must be at full precision (unset AMQL_GPU_FORMAT)");
-            }
-            if (options.Rounding == Fp4Rounding.Gptq)
-            {
-                var ids = (options.CalibrationIds ?? HfTokenizer.FromModelDir(container.Root).EncodeToIds(options.CalibrationText!).ToArray())
-                    .Take(options.CalibrationTokens).ToArray();
-                if (ids.Length < 64)
+                var plan = Planner.Plan(container, "target", _store);
+                _session = new DecodeSession(plan, _store);
+                _session.Prefill([0]);
+                _engine = _session.DeviceEngine()
+                    ?? throw new MergeException($"searched and GPTQ rounding run on the GPU, which is not available ({_session.GpuRefusal})");
+                if (_engine.Fp4Matrices > 0)
                 {
-                    throw new MergeException($"calibration gives {ids.Length} tokens, too few to calibrate on");
+                    throw new MergeException("the source must be at full precision (unset AMQL_GPU_FORMAT)");
                 }
-                _sequences = ids.Chunk(options.SequenceTokens).Where(c => c.Length > 8).ToArray();
-                Tokens = _sequences.Sum(s => s.Length);
-                options.Log?.Invoke($"calibrating on {Tokens} tokens in {_sequences.Length} sequences");
+                if (options.Rounding == Fp4Rounding.Gptq)
+                {
+                    var ids = (options.CalibrationIds ?? HfTokenizer.FromModelDir(container.Root).EncodeToIds(options.CalibrationText!).ToArray())
+                        .Take(options.CalibrationTokens).ToArray();
+                    if (ids.Length < 64)
+                    {
+                        throw new MergeException($"calibration gives {ids.Length} tokens, too few to calibrate on");
+                    }
+                    _sequences = ids.Chunk(options.SequenceTokens).Where(c => c.Length > 8).ToArray();
+                    Tokens = _sequences.Sum(s => s.Length);
+                    options.Log?.Invoke($"calibrating on {Tokens} tokens in {_sequences.Length} sequences");
+                }
+            }
+            catch
+            {
+                // Nothing calibrated: let go of the model before the error leaves.
+                _session?.Dispose();
+                _store.Dispose();
+                throw;
             }
         }
 

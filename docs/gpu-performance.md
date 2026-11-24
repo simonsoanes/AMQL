@@ -352,6 +352,16 @@ from the reference's next-token distribution at every position, perplexity, and
 top-1 agreement. Perplexity alone hides a lot: a model can keep its average loss
 while changing its choices.
 
+GPTQ is the default. `amql-cli quantise` uses it without being asked,
+calibrating on a built-in text (this repository's docs and C#, which
+carried over to Python it never saw) unless `--calibration` names your own.
+Asking to *run* at 4 bits (`--gpu-format nvfp4`, `AMQL_GPU_FORMAT`, or
+`"format": "nvfp4"` for a model in amql-server's `--config`) loads the
+container's GPTQ copy, `{container}-nvfp4-gptq`, built beside it the
+first time (about a minute for the 4B) and reused while it is newer than
+the container. Rounding each weight to nearest as it loads is what is left
+for a container GPTQ cannot calibrate.
+
 Qwen 3.5 4B, calibrated on 32k tokens of this repo's other docs and C#.
 Evaluated on 4,096 tokens of held-out docs and C#, and on 4,096 tokens of
 Python (vLLM model code, a domain the calibration never saw):
@@ -374,7 +384,62 @@ The 4-bit kernels move fewer bytes per second than BF16: the decode is work BF16
 does not do. A 4-bit row also finishes in a quarter of the time, so its fixed
 costs show.
 
+## Routed experts: grouped launches
+
+Routed (MoE) layers do not run on the device engine yet; the managed path
+runs them, with every expert held on the GPU done in one call
+(`amql_cuda_ffn`). That call used to run expert by expert: six launches each
+(gather, gate, up, SiLU, down, scatter), so a decode token on Flash-Next's
+geometry (10 experts routed of 512, 48 layers) took ~2,900 launches, each too
+small to fill the GPU.
+
+Following NVIDIA's grouped GEMM for dropless MoE (one kernel over every
+expert's actual rows, no padding to a capacity, no per-expert host
+round trip), when every expert is NVFP4 with at most 32 rows (decode, small
+batches) a layer now runs as five launches whatever the expert count:
+
+- one gather of every expert's rows;
+- one launch of every expert's gate and up products. A task is one product over
+  up to 8 rows; `blockIdx.y` picks the task and the warps of `blockIdx.x` its
+  output rows;
+- one SiLU over every hidden unit;
+- one launch of every down product;
+- one combine that adds each row's experts in the order the per-expert scatter
+  did.
+
+Each warp does `nvfp4_gemv`'s arithmetic term for term, so the output is
+bit for bit the per-expert path's (tested). Products that share an input
+(q/k/v, the GDN's in-projections) group the same way when all are NVFP4.
+`AMQL_GROUPED_FFN=0` turns both off.
+
+A routed layer at hidden 2560 with experts 640 wide, top 10 of 64, NVFP4, timed
+end to end through `FfnKernel.Routed` (routing on the host included, Debug build):
+
+| Rows | Per expert | Grouped | Speed-up |
+|---|---|---|---|
+| 1 (decode) | 566–595 µs | 181–194 µs | 3.1x |
+| 4 | 2.28–2.50 ms | 306–331 µs | 7.5x |
+| 8 | 3.40–3.70 ms | 507–545 µs | 6.8x |
+
+The weights the 1-row case reads (30 matrices of 0.9 MB) take ~15 µs at the
+card's bandwidth, so the remaining ~180 µs is fixed cost. That is the next
+target: routing on the host, three uploads and a download, and a stream
+sync each layer.
+
 ## What would go further
+
+- **Routed experts on the device engine.** Bringing MoE layers into `GpuEngine`
+  would remove that fixed cost, as the post's own gains did:
+  - a fused router on the device (softmax, top-k, and the per-expert slot lists
+    built there);
+  - the grouped launches above reading device-side counts, so no host round trip
+    and no copy of expert sizes back to the host;
+  - the whole step captured in a CUDA graph, which a host-sized expert loop rules
+    out.
+
+  The same grouping extends to MXFP8 and FP16 experts and, for prefill, to a
+  grouped tensor-core GEMM (cuBLASLt grouped, or one W4A4 launch over a
+  ragged batch) in place of a GEMM per expert.
 
 - **Faster 4-bit GEMVs.** They reach 0.9–1.0 TB/s against 1.66 for BF16, and
   each extra activation row costs ~0.6 ms a token, where BF16 hides it under

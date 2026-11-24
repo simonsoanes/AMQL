@@ -277,4 +277,36 @@ public sealed class ServerTests : IClassFixture<ServerTests.Hosts>
         Assert.Equal(HttpStatusCode.Unauthorized, r.StatusCode);
         Assert.Equal(HttpStatusCode.OK, (await anonymous.GetAsync("/health")).StatusCode);
     }
+
+    [Fact]
+    public async Task Status_Reports_What_The_Server_Did()
+    {
+        // ServerStats is process-wide, so compare against a snapshot taken first.
+        async Task<JsonNode> Status() => JsonNode.Parse(await _h.Client.GetStringAsync("/amql/status"))!;
+        static JsonNode Lm(JsonNode s) => s["models"]!.AsArray().First(m => m!["id"]!.GetValue<string>() == "lm")!;
+        var before = await Status();
+        long requests = before["totals"]!["requests"]!.GetValue<long>();
+        long tokens = Lm(before)["completion_tokens"]!.GetValue<long>();
+
+        var (status, _) = await Post("/v1/chat/completions",
+            """{"model":"lm","messages":[{"role":"user","content":"hello"}],"max_tokens":8,"temperature":0}""");
+        Assert.Equal(HttpStatusCode.OK, status);
+        await _h.Client.GetAsync("/health");
+
+        var after = await Status();
+        // The chat counts; the health and status polls do not.
+        Assert.Equal(requests + 1, after["totals"]!["requests"]!.GetValue<long>());
+        Assert.Equal(tokens + 8, Lm(after)["completion_tokens"]!.GetValue<long>());
+        var recent = after["recent"]!.AsArray().First()!;
+        Assert.Equal("/v1/chat/completions", recent["path"]!.GetValue<string>());
+        Assert.Equal("lm", recent["model"]!.GetValue<string>());
+        Assert.Equal(8, recent["completion_tokens"]!.GetValue<int>());
+        Assert.Equal(200, recent["status"]!.GetValue<int>());
+        Assert.NotNull(recent["ttft_seconds"]);
+        Assert.Empty(after["active"]!.AsArray());
+        Assert.True(after["process"]!["working_set_bytes"]!.GetValue<long>() > 0);
+
+        using var anonymous = new HttpClient { BaseAddress = _h.Client.BaseAddress };
+        Assert.Equal(HttpStatusCode.Unauthorized, (await anonymous.GetAsync("/amql/status")).StatusCode);
+    }
 }
