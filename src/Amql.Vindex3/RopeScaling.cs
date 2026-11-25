@@ -22,7 +22,11 @@ namespace Amql.Vindex3;
 /// <item><c>dynamic</c> — NTK: once the sequence is longer than
 /// <c>max_position_embeddings</c>, the base grows to
 /// <c>theta·(factor·len/max − (factor − 1))^(d/(d−2))</c>.</item>
+/// <item><c>ntk</c> — NTK-aware at a fixed factor: the base is
+/// <c>theta·factor^(d/(d−2))</c>.</item>
 /// </list>
+/// Any of the fixed kinds may name a length it is for (<see cref="EngageBeyond"/>):
+/// a sequence no longer than that rotates unscaled.
 /// The last two depend on the sequence length, which transformers takes as
 /// the largest position in the forward pass plus one; <see cref="Frequencies"/>
 /// takes it the same way. Keys already in a cache keep the rotation they were
@@ -31,7 +35,7 @@ namespace Amql.Vindex3;
 /// </summary>
 public sealed class RopeScaling
 {
-    public static readonly IReadOnlyList<string> Types = new[] { "linear", "llama3", "yarn", "longrope", "dynamic" };
+    public static readonly IReadOnlyList<string> Types = new[] { "linear", "llama3", "yarn", "longrope", "dynamic", "ntk" };
 
     public required string Type { get; init; }
     public required double Factor { get; init; }
@@ -49,15 +53,21 @@ public sealed class RopeScaling
     /// <summary>longrope: per-pair divisors beyond the original length.</summary>
     public double[]? LongFactor { get; init; }
 
+    /// <summary>A context extension for long sequences only: one no longer than
+    /// this rotates at the trained frequencies. The engine settles which a
+    /// sequence is when it starts, from the length it is to reach; the managed
+    /// path reads it off each call's positions, as it does for longrope.</summary>
+    public long? EngageBeyond { get; init; }
+
     /// <summary>Whether the frequencies change with the sequence length.</summary>
     [System.Text.Json.Serialization.JsonIgnore]
-    public bool DependsOnLength => Type is "longrope" or "dynamic";
+    public bool DependsOnLength => Type is "longrope" or "dynamic" || EngageBeyond is not null;
 
     /// <summary>The sequence length past which a length-dependent scaling
     /// changes regime (longrope: the original length; dynamic: the model's
     /// maximum).</summary>
     [System.Text.Json.Serialization.JsonIgnore]
-    public long Threshold => OriginalMaxPositions ?? throw Missing("original_max_position_embeddings");
+    public long Threshold => EngageBeyond ?? OriginalMaxPositions ?? throw Missing("original_max_position_embeddings");
 
     /// <summary>Inverse frequencies for a rotary window of <paramref name="width"/>
     /// dims at base <paramref name="theta"/>, and the factor cos/sin are
@@ -67,6 +77,15 @@ public sealed class RopeScaling
     public static (double[] InvFreq, double AttentionScale) Frequencies(double theta, int width, RopeScaling? scaling,
         long sequenceLength = 0)
     {
+        if (scaling?.EngageBeyond is { } beyond && sequenceLength <= beyond)
+        {
+            scaling = null;
+        }
+        if (scaling is { Type: "ntk" })
+        {
+            theta *= Math.Pow(scaling.Factor, width / (width - 2.0));
+            scaling = null;
+        }
         if (scaling is { Type: "dynamic" })
         {
             double max = scaling.Threshold;
@@ -211,6 +230,11 @@ public sealed class RopeScaling
     /// <summary>The block's keys, as a checkpoint config spells them.</summary>
     public void WriteConfigKeys(System.Text.Json.Nodes.JsonObject block)
     {
+        if (EngageBeyond is not null || Type == "ntk")
+        {
+            throw new InvalidOperationException(
+                "a context extension that only long sequences use has no checkpoint spelling; name the method (--rope-extend none, yarn, ntk or linear) to export one");
+        }
         block["rope_type"] = Type;
         block["factor"] = Factor;
         if (LowFreqFactor is { } lf) block["low_freq_factor"] = lf;
@@ -240,6 +264,7 @@ public sealed class RopeScaling
         if (Mscale is { } m) writer.WriteNumber("mscale", m);
         if (MscaleAllDim is { } ma) writer.WriteNumber("mscale_all_dim", ma);
         if (!Truncate) writer.WriteBoolean("truncate", false);
+        if (EngageBeyond is { } eb) writer.WriteNumber("engage_beyond", eb);
         WriteList(writer, "short_factor", ShortFactor);
         WriteList(writer, "long_factor", LongFactor);
         writer.WriteEndObject();
@@ -279,6 +304,7 @@ public sealed class RopeScaling
             Mscale = Num("mscale"),
             MscaleAllDim = Num("mscale_all_dim"),
             Truncate = !s.TryGetProperty("truncate", out var tr) || tr.ValueKind != JsonValueKind.False,
+            EngageBeyond = s.TryGetProperty("engage_beyond", out var eb) ? eb.GetInt64() : null,
             ShortFactor = s.TryGetProperty("short_factor", out var sf) ? sf.EnumerateArray().Select(e => e.GetDouble()).ToArray() : null,
             LongFactor = s.TryGetProperty("long_factor", out var lf2) ? lf2.EnumerateArray().Select(e => e.GetDouble()).ToArray() : null,
         };

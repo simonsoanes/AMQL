@@ -295,6 +295,9 @@ public static class CommandCatalog
             new ParamDef("steps", "--steps", ParamKind.Option, EditorKind.Int, Flag: "--steps", DefaultValue: "",
                 Help: "Tokens to generate. Empty = until an end token (8 for raw --tokens without a tokenizer); "
                       + "-1 also means until an end token. For a diffusion model, the number of denoising steps."),
+            Opt("maxContext", "--max-context", EditorKind.Text, "", "Run at this context length instead of the model's own, e.g. 1M."),
+            Opt("kvFormat", "--kv-format", EditorKind.Choice, "", "How the conversation is held in GPU memory (nvfp4 for long contexts).",
+                choices: new[] { "", "fp16", "nvfp4", "f32" }),
             new ParamDef("temperature", "--temperature", ParamKind.Option, EditorKind.Float, Flag: "--temperature", DefaultValue: "0"),
             new ParamDef("topK", "--top-k", ParamKind.Option, EditorKind.Int, Flag: "--top-k", DefaultValue: "0"),
             new ParamDef("topP", "--top-p", ParamKind.Option, EditorKind.Float, Flag: "--top-p", DefaultValue: "0"),
@@ -390,6 +393,19 @@ public static class CommandCatalog
             Flag("profile", "--profile", "Break the time down per operator."),
             Flag("compare", "--compare", "Also check the device's logits against the CPU reference."),
             Opt("batch", "--batch N", EditorKind.Int, "", "Decode N sequences together and report the batched rate."),
+        }),
+        new("context bench", CatBench, "Measure how well a model uses a long context: facts recalled, passages quoted, speed.", new[]
+        {
+            ContainerParam,
+            Opt("text", "--text file or folder", EditorKind.File, "", "Text the long document is made of (';' separates several).", required: true),
+            Opt("lengths", "--lengths", EditorKind.Text, "8K,32K,128K,256K", "Context lengths to measure at, in one reading."),
+            Opt("questions", "--questions", EditorKind.Int, "24", "Questions asked at each length."),
+            Opt("needleEvery", "--needle-every", EditorKind.Int, "2048", "Tokens between the facts planted in the document."),
+            Flag("plain", "--plain", "Read the document as bare text and measure perplexity instead of questions."),
+            Opt("maxContext", "--max-context", EditorKind.Text, "", "Run the model at this context length, e.g. 1M."),
+            Opt("ropeExtend", "--rope-extend", EditorKind.Choice, "auto", "How positions past the trained length rotate.",
+                choices: new[] { "auto", "none", "yarn", "ntk", "linear" }),
+            Opt("out", "--out report.json", EditorKind.File, "", "Report to write."),
         }),
         new("tool-trace", CatBench, "Trace how a model reads the tools in its prompt, case by case.", new[]
         {
@@ -908,7 +924,7 @@ public static class CommandCatalog
         {
             ContainerParam,
             Opt("suite", "--suite", EditorKind.Choice, "reasoning", "Built-in generated problem suite.",
-                choices: new[] { "reasoning" }),
+                choices: new[] { "reasoning", "hard" }),
             Opt("per", "--per", EditorKind.Int, "10", "Problems per family."),
             Opt("seed", "--seed", EditorKind.Int, "7", "Seed for generating the suite."),
             Opt("families", "--families a,b", EditorKind.Text, "", "Only these problem families."),

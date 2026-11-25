@@ -2,12 +2,14 @@ using Amql.Server;
 
 // amql-server --model [id=]<container-dir> [--model …] [--urls http://127.0.0.1:8000]
 //             [--api-key KEY | AMQL_API_KEY] [--max-tokens N] [--no-warm]
-//             [--adapter [id=]<dir>[,<dir>…]] [--think] [--temperature T] [--top-p P] [--top-k K]
+//             [--adapter [id=]<dir>[,<dir>…]] [--think] [--thinking-budget N] [--temperature T] [--top-p P] [--top-k K]
 //             [--config <models.json>] [--gpu-format nvfp4|mxfp4|fp16]
 using System.Globalization;
 using System.Text.Json;
 
-var containers = new List<(string Id, string Path, List<string> Adapters, ModelDefaults Defaults, string? Format, string? KvDir)>();
+var containers = new List<(string Id, string Path, List<string> Adapters, ModelDefaults Defaults, string? Format, string? KvDir, Amql.Vindex3.ContextExtension? Context)>();
+string? maxContext = null, ropeExtend = null;
+int thinkingBudget = 0;
 var adapterSpecs = new List<(string? Id, string[] Dirs)>();
 string urls = "http://127.0.0.1:8000";
 // A 4-bit format serves each container's GPTQ copy (Fp4Cache), not weights rounded to nearest as they load.
@@ -36,13 +38,13 @@ for (int i = 0; i < args.Length; i++)
             int eq = spec.IndexOf('=');
             string path = eq > 0 ? spec[(eq + 1)..] : spec;
             string id = eq > 0 ? spec[..eq] : Path.GetFileName(Path.GetFullPath(path).TrimEnd('/', '\\'));
-            containers.Add((id, path, new List<string>(), new ModelDefaults(), null, null));
+            containers.Add((id, path, new List<string>(), new ModelDefaults(), null, null, null));
             break;
         }
         case "--config":
             try
             {
-                containers.AddRange(ServerConfig.Read(Next()).Select(m => (m.Id, m.Path, m.Adapters.ToList(), m.Defaults, m.Format, m.KvDir)));
+                containers.AddRange(ServerConfig.Read(Next()).Select(m => (m.Id, m.Path, m.Adapters.ToList(), m.Defaults, m.Format, m.KvDir, m.Context)));
             }
             catch (Exception e) when (e is JsonException or InvalidDataException or IOException)
             {
@@ -147,6 +149,8 @@ for (int i = 0; i < args.Length; i++)
             Amql.Inference.GpuEngine.RequestedKvFormat = f;
             break;
         }
+        case "--max-context": maxContext = Next(); break;
+        case "--rope-extend": ropeExtend = Next(); break;
         case "--kv-dir": KvPaging.DiskRoot = Next(); KvPaging.DiskEnabled = true; break;
         case "--no-loop-guard": TextGenerator.LoopGuardEnabled = false; break;
         case "--free-tool-calls": TextGenerator.ToolGrammarEnabled = false; break;
@@ -172,6 +176,13 @@ for (int i = 0; i < args.Length; i++)
             Environment.SetEnvironmentVariable("AMQE_GEMM_FROM", "4");
             break;
         case "--think": think = true; break;
+        case "--thinking-budget":
+            if (!int.TryParse(Next(), out thinkingBudget) || thinkingBudget < 0)
+            {
+                Console.Error.WriteLine("--thinking-budget needs a token count (0: no limit)");
+                return 2;
+            }
+            break;
         case "--temperature": temperature = float.Parse(Next(), CultureInfo.InvariantCulture); break;
         case "--top-p": topP = float.Parse(Next(), CultureInfo.InvariantCulture); break;
         case "--top-k": topK = int.Parse(Next()); break;
@@ -188,8 +199,8 @@ for (int i = 0; i < args.Length; i++)
             Console.WriteLine("""
                 amql-server --model [id=]<container-dir> [--model …] [--urls http://127.0.0.1:8000]
                             [--api-key KEY] [--max-tokens N] [--no-warm]
-                            [--adapter [id=]<dir>[,<dir>…]] [--think] [--temperature T] [--top-p P] [--top-k K]
-                            [--config <models.json>] [--gpu-format nvfp4|mxfp4|fp16] [--max-ram GB] [--gpu-memory GB] [--cpu] [--no-batch] [--no-prefix-reuse] [--kv-format f32|fp16|nvfp4] [--kv-exact-prefix auto|N|0] [--kv-exact-format f16|f32] [--kv-idle S] [--kv-gpu-budget GB] [--kv-disk] [--kv-dir DIR] [--kv-disk-budget GB] [--kv-expire S] [--batch-bf16] [--no-loop-guard] [--free-tool-calls] [--no-mention-rule]
+                            [--adapter [id=]<dir>[,<dir>…]] [--think] [--thinking-budget N] [--temperature T] [--top-p P] [--top-k K]
+                            [--config <models.json>] [--gpu-format nvfp4|mxfp4|fp16] [--max-context N] [--rope-extend auto|none|yarn|ntk|linear] [--max-ram GB] [--gpu-memory GB] [--cpu] [--no-batch] [--no-prefix-reuse] [--kv-format f32|fp16|nvfp4] [--kv-exact-prefix auto|N|0] [--kv-exact-format f16|f32] [--kv-idle S] [--kv-gpu-budget GB] [--kv-disk] [--kv-dir DIR] [--kv-disk-budget GB] [--kv-expire S] [--batch-bf16] [--no-loop-guard] [--free-tool-calls] [--no-mention-rule]
 
                 Serves each container on the endpoints it can answer:
                   Von decision model          POST /v1/decisions, /v1/systemone, /api/v1/decisions (jevai envelope)
@@ -211,10 +222,18 @@ for (int i = 0; i < args.Length; i++)
                   --gpu-memory  GiB of GPU memory the weights may take (0 keeps every weight on the host)
                   --cpu         run on the CPU even when a GPU is available
                   --think       think when a request does not say (enable_thinking / reasoning effort)
+                  --thinking-budget N  close a reply's thinking after N tokens (at the end of a line) so that it
+                                commits to an answer, and before its token limit would leave no room for one
+                                (default 0, no limit; "thinking_budget" per model in --config and per request)
                   --max-tokens  default token limit per reply: 1024, or 4096 with --think
                   --temperature, --top-p, --top-k   sampling defaults for requests that leave them out
                   --no-batch    one request at a time per model, even on the GPU engine (which otherwise
                                 batches up to 8 requests per step)
+                  --max-context N  serve the models at this context length instead of their own (1048576, 512K,
+                                1M; "max_context" per model in --config). Longer than a model was trained to needs
+                                the KV memory too: --kv-format nvfp4 holds 1M tokens of Qwen 3.5 4B in about 11 GB
+                  --rope-extend M  how positions past the trained length rotate: auto (the default), none (as
+                                trained), yarn, ntk or linear ("rope_extend" per model in --config)
                   --no-prefix-reuse  prefill every prompt whole (by default a prompt that starts like an
                                 earlier one, up to that one's last turn, picks up from the state saved there)
                   --kv-format F fp16 (the default) stores the GPU engine's KV cache as FP16: half f32's memory, a
@@ -269,6 +288,23 @@ for (int i = 0; i < args.Length; i++)
             return 2;
     }
 }
+if (ropeExtend is not null && maxContext is null)
+{
+    Console.Error.WriteLine("--rope-extend needs --max-context");
+    return 2;
+}
+if (maxContext is not null)
+{
+    try
+    {
+        Amql.Vindex3.ContextExtension.Requested = Amql.Vindex3.ContextExtension.Parse(maxContext, ropeExtend);
+    }
+    catch (FormatException e)
+    {
+        Console.Error.WriteLine(e.Message);
+        return 2;
+    }
+}
 if (containers.Count == 0)
 {
     Console.Error.WriteLine("amql-server needs at least one --model <container-dir> or --config <models.json> (see --help)");
@@ -281,7 +317,7 @@ if (containers.GroupBy(c => c.Id).FirstOrDefault(g => g.Count() > 1) is { } dup)
 }
 
 var models = new List<ModelHost>();
-foreach (var (id, given, own, defaults, format, kvDir) in containers)
+foreach (var (id, given, own, defaults, format, kvDir, context) in containers)
 {
     string path = (format ?? gpuFormat) switch
     {
@@ -291,7 +327,7 @@ foreach (var (id, given, own, defaults, format, kvDir) in containers)
     };
     Console.WriteLine($"loading {id} from {path} …");
     var adapters = own.Concat(adapterSpecs.Where(a => a.Id is null || a.Id == id).SelectMany(a => a.Dirs)).ToList();
-    var host = ModelHost.Load(id, path, adapters, defaults, kvDir);
+    var host = ModelHost.Load(id, path, adapters, defaults, kvDir, context);
     if (warm)
     {
         host.Warm();
@@ -351,6 +387,7 @@ var app = ServerApp.Build(models, new ServerSettings(apiKey, maxTokens ?? (think
 {
     NGramPacks = ngramPacks,
     NGramDefaults = ngram,
+    ThinkingBudget = thinkingBudget,
 });
 app.Urls.Add(urls);
 Console.WriteLine($"listening on {urls}{(apiKey is null ? " (no API key — requests are not authenticated)" : "")}");

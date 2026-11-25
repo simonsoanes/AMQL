@@ -384,6 +384,9 @@ public class KvFormatTests
         Assert.Equal(0, PromptMark.Exact([T, 5, 6, T, A], -1, T, U));   // no user turn
         Assert.Equal(5, PromptMark.Exact([T, U, 7, 8, 9], -1, T, U));   // an unfinished first message
         Assert.Equal(0, PromptMark.Exact(prompt, -1, null, U));
+        // A first message that is a whole document: its start, not all of it.
+        int[] document = [T, U, .. Enumerable.Repeat(7, 100_000), T, A];
+        Assert.Equal(PromptMark.AutoExactMost, PromptMark.Exact(document, -1, T, U));
     }
 
     private static double Rel(float[] a, float[] b)

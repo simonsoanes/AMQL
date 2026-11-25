@@ -45,8 +45,73 @@ public class ReasoningBenchTests
         }
     }
 
+    [Fact]
+    public void The_Hard_Suite_Is_Fixed_By_Its_Seed_And_Right_By_Construction()
+    {
+        var problems = ProblemSuite.Generate(5, 25, suite: "hard");
+        Assert.Equal(problems, ProblemSuite.Generate(5, 25, suite: "hard"));
+        Assert.Equal(25 * ProblemSuite.HardFamilies.Count, problems.Count);
+        Assert.Throws<ArgumentException>(() => ProblemSuite.Generate(1, 1, suite: "impossible"));
+        Assert.Throws<ArgumentException>(() => ProblemSuite.Generate(1, 1, ["plan"], "hard"));
+        foreach (var p in problems)
+        {
+            var n = System.Text.RegularExpressions.Regex.Matches(p.Prompt, @"-?\d+").Select(m => long.Parse(m.Value)).ToArray();
+            switch (p.Family)
+            {
+                case "sieve":
+                    Assert.Equal(Enumerable.Range(1, (int)n[1]).Count(i => (i % n[2] == 0 || i % n[3] == 0) && i % n[4] != 0), p.Answer);
+                    break;
+                case "recurrence":
+                {
+                    // The four terms shown, the two multipliers, and the constant they imply.
+                    long c = n[2] - n[4] * n[1] - n[5] * n[0];
+                    Assert.Equal(n[3], n[4] * n[2] + n[5] * n[1] + c);
+                    var seq = n[..4].ToList();
+                    while (seq.Count < 7)
+                    {
+                        seq.Add(n[4] * seq[^1] + n[5] * seq[^2] + c);
+                    }
+                    Assert.Equal(seq[6], p.Answer);
+                    break;
+                }
+                case "route":
+                {
+                    // Every simple path, rather than the relaxation the generator uses.
+                    var roads = System.Text.RegularExpressions.Regex.Matches(p.Prompt, @"([A-G]) to ([A-G]) costs (\d+)")
+                        .Select(m => (From: m.Groups[1].Value[0], To: m.Groups[2].Value[0], Cost: int.Parse(m.Groups[3].Value))).ToList();
+                    int best = int.MaxValue;
+                    void Walk(char at, int cost, string seen)
+                    {
+                        if (at == 'G')
+                        {
+                            best = Math.Min(best, cost);
+                            return;
+                        }
+                        foreach (var road in roads.Where(x => x.From == at && !seen.Contains(x.To)))
+                        {
+                            Walk(road.To, cost + road.Cost, seen + road.To);
+                        }
+                    }
+                    Walk('A', 0, "A");
+                    Assert.Equal(best, p.Answer);
+                    break;
+                }
+            }
+        }
+    }
+
     private static ReplyAnalysis Read(string[] pieces, string expected, bool thinking = true, bool budget = false) =>
         ReplyAnalysis.Read(pieces.Select(x => x.GetHashCode()).ToArray(), pieces, expected, thinking, budget);
+
+    [Theory]
+    [InlineData("There are **12** of them.\n\nAnswer: 12\n\n(They are 5, 10 and 70.)", "12")]
+    [InlineData("**Final answer:** -1,200", "-1200")]
+    [InlineData("Answer: 3\nWait, no.\nAnswer: 4.", "4")]
+    [InlineData("\\boxed{7}\nAnswer: 8", "7")]
+    [InlineData("The answer: 5 apples, then 6 more", "6")]   // not a line of its own: the last number
+    [InlineData("So 14 - 2 = 12", "12")]
+    public void An_Answer_Line_Is_Read_Over_The_Explanation_Around_It(string text, string expected) =>
+        Assert.Equal(expected, ReplyAnalysis.Extract(text));
 
     [Fact]
     public void Only_A_Committed_Answer_Counts()

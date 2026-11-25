@@ -114,7 +114,7 @@ public sealed class GpuEngine : IDisposable
     // A batch's per-sequence pointers, by layer: K caches, V caches, positions,
     // recurrent states, conv histories, MaxBatch of each (see BatchTable).
     private readonly IntPtr _batchTable;
-    private const int TableKinds = 5;
+    private const int TableKinds = 6;
     private bool _graphReady;
     private bool _disposed;
 
@@ -245,6 +245,12 @@ public sealed class GpuEngine : IDisposable
                         ld.InvFreq = UploadFloats(r.InvFreq.Select(f => (float)f).ToArray());
                         ld.RopePairs = r.InvFreq.Length;
                         ld.RopeScale = r.Scale;
+                        ld.InvFreqLong = ld.InvFreq;
+                        if (ExtensionOf(attn) is { } beyond && RopeFor(attn, extended: true) is { } longer)
+                        {
+                            ld.InvFreqLong = UploadFloats(longer.InvFreq.Select(f => (float)f).ToArray());
+                            RopeExtendsBeyond = Math.Min(RopeExtendsBeyond ?? long.MaxValue, beyond);
+                        }
                     }
                     projWidth = Math.Max(projWidth, ld.Qkv.Rows);
                     qWidth = Math.Max(qWidth, attn.QDim);
@@ -418,11 +424,50 @@ public sealed class GpuEngine : IDisposable
         return null;
     }
 
+    private static long? ExtensionOf(AttentionOp attn) => attn.Position switch
+    {
+        PositionRope r => r.Scaling?.EngageBeyond,
+        PositionPartialRope p => p.Scaling?.EngageBeyond,
+        _ => null,
+    };
+
+    /// <summary>The length past which a sequence runs at the model's extended
+    /// rotary frequencies (see <see cref="ContextExtension"/>), or null when
+    /// every sequence rotates alike. Which it is is settled while the sequence
+    /// is empty, from the length <see cref="Reserve"/> or the first prefill
+    /// gives it, and holds until it is reset: keys are stored rotated.</summary>
+    public long? RopeExtendsBeyond { get; private set; }
+
+    /// <summary>Whether a sequence to reach <paramref name="positions"/> runs extended.</summary>
+    public bool Extends(long positions) => RopeExtendsBeyond is { } beyond && positions > beyond;
+
+    private void ChooseRope(GpuSequence seq, long positions)
+    {
+        if (seq.Position != 0 || seq.RopeChosen)
+        {
+            return;
+        }
+        seq.RopeChosen = true;
+        bool extended = Extends(positions);
+        if (seq.Extended != extended)
+        {
+            seq.Extended = extended;
+            if (_graphFor is not null && _graphFor.Contains(seq))
+            {
+                _graphReady = false;   // a captured graph holds the frequencies' address
+            }
+        }
+    }
+
+    private static IntPtr InvFreq(LayerDevice l, GpuSequence seq) => seq.Extended ? l.InvFreqLong : l.InvFreq;
+
     /// <summary>Rotary tables for a layer: the inverse frequencies and the
     /// cos/sin multiplier, or null for a NoPE layer. Length-dependent scaling
     /// (dynamic, longrope) would need the tables rebuilt as the sequence grows,
     /// so it is refused.</summary>
-    private static (double[] InvFreq, double Scale)? RopeFor(AttentionOp attn)
+    /// <param name="extended">The frequencies of a sequence past the length a
+    /// context extension is for; without one, the same.</param>
+    private static (double[] InvFreq, double Scale)? RopeFor(AttentionOp attn, bool extended = false)
     {
         if (attn.Position is PositionNone)
         {
@@ -436,6 +481,10 @@ public sealed class GpuEngine : IDisposable
         };
         var shortSeq = RopeScaling.Frequencies(theta, width, scaling, 1);
         var longSeq = RopeScaling.Frequencies(theta, width, scaling, 1L << 22);
+        if (scaling?.EngageBeyond is not null && scaling.Type is "ntk" or "linear" && shortSeq.AttentionScale == longSeq.AttentionScale)
+        {
+            return extended ? longSeq : shortSeq;   // which of the two is settled as a sequence starts
+        }
         if (shortSeq.AttentionScale != longSeq.AttentionScale || !shortSeq.InvFreq.SequenceEqual(longSeq.InvFreq))
         {
             throw new UnsupportedOperatorException("length-dependent rope scaling");
@@ -525,6 +574,7 @@ public sealed class GpuEngine : IDisposable
         }
         Check(Native.amqe_sync(_engine), "reset");
         seq.Position = 0;
+        seq.RopeChosen = false;
         seq.MarkedAt = -1;
         seq.MtpValid = _mtp is not null;
         seq.VerifyRows = 0;
@@ -808,6 +858,23 @@ public sealed class GpuEngine : IDisposable
                 sb.Append(layer.Plan.Attention is { } attn ? $"a{attn.KvDim}" : "").Append($"s{layer.StateBytes}c{layer.ConvHistoryBytes};");
             }
             sb.Append(_mtp is null ? "mtp-" : $"mtp{_mtp.KvDim}").Append(_exactPrefill ? ";f32" : ";bf16").Append(";kv-").Append(KvFormat);
+            // Keys are stored rotated, so state is only good under the rotation that made it
+            // (a context extension changes it without changing the container).
+            var rope = new System.Text.StringBuilder();
+            foreach (var layer in _layers)
+            {
+                foreach (bool extended in new[] { false, true })
+                if (layer.Plan.Attention is { } attn && RopeFor(attn, extended) is { } r)
+                {
+                    rope.Append(r.Scale.ToString("R", System.Globalization.CultureInfo.InvariantCulture));
+                    foreach (var f in r.InvFreq)
+                    {
+                        rope.Append(',').Append(f.ToString("R", System.Globalization.CultureInfo.InvariantCulture));
+                    }
+                    rope.Append(';');
+                }
+            }
+            sb.Append(";rope-").Append(Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.ASCII.GetBytes(rope.ToString()))).AsSpan(0, 16));
             return sb.ToString();
         }
     }
@@ -883,6 +950,7 @@ public sealed class GpuEngine : IDisposable
         head[4] = (byte)(seq.MarkMtpValid ? 1 : 0);
         BitConverter.TryWriteBytes(head.AsSpan(8, 4), seq.ExactRows);
         head[5] = (byte)(seq.ExactF16 ? 1 : 0);
+        head[6] = (byte)(seq.Extended ? 1 : 0);
         to.Write(head);
         var buffer = new byte[Math.Min(16 << 20, Math.Max(1 << 16, MarkBytes(seq)))];
         var handle = GCHandle.Alloc(buffer, GCHandleType.Pinned);
@@ -950,6 +1018,8 @@ public sealed class GpuEngine : IDisposable
         try
         {
             SetExactRows(seq, BitConverter.ToInt32(head, 8), head[5] != 0);
+            seq.Extended = head[6] != 0;
+            seq.RopeChosen = true;
             EnsureKv(seq, at + 1);
             seq.MarkState = new IntPtr[_layers.Length];
             seq.MarkConv = new IntPtr[_layers.Length];
@@ -1046,6 +1116,7 @@ public sealed class GpuEngine : IDisposable
         {
             throw new ArgumentException("prefill requires at least one token", nameof(tokens));
         }
+        ChooseRope(seq, tokens.Length);
         // Growing moves the KV buffers, and the captured decode graph holds their old
         // addresses: replaying it after a long prefill read freed memory (status -700).
         if (EnsureKv(seq, seq.Position + tokens.Length))
@@ -1069,11 +1140,19 @@ public sealed class GpuEngine : IDisposable
             _probeFrom = QueryProbe is null ? -1 : seq.Position;
             try
             {
+                if (_massOut != IntPtr.Zero)
+                {
+                    Check(Native.amqe_set_attention_mass(_engine, _massOut, _massScratch, _massSplits), "attention mass");
+                }
                 Forward(new[] { seq }, rows, head: start + rows == ids.Length, hidden: drafting);
             }
             finally
             {
                 _probeFrom = -1;
+                if (_massOut != IntPtr.Zero)
+                {
+                    Check(Native.amqe_set_attention_mass(_engine, IntPtr.Zero, IntPtr.Zero, 0), "attention mass");
+                }
             }
             if (drafting)
             {
@@ -1410,6 +1489,93 @@ public sealed class GpuEngine : IDisposable
         return logits;
     }
 
+    /// <summary>For tests: the decode splits and prompt keys a long cache's
+    /// attention takes at a time, and the scratch bytes past which a prompt is
+    /// taken so; 0 is the default. Set before an engine grows its caches.</summary>
+    public static void SetAttentionSegments(int splits, int keys, long budget) =>
+        Check(Native.amqe_set_attention_segments(splits, keys, budget), "attention segments");
+
+    /// <summary>Says how long an empty sequence is to get, which settles
+    /// whether it runs at a context extension's frequencies (no memory is taken;
+    /// see <see cref="RopeExtendsBeyond"/>).</summary>
+    public void Plan(GpuSequence seq, long positions)
+    {
+        Live(seq);
+        ChooseRope(seq, positions);
+    }
+
+    /// <summary>Positions in each window <see cref="ReadAttention"/> reports.</summary>
+    public static int AttentionWindow => Native.amqe_attention_split_keys();
+
+    /// <summary>
+    /// Reads the tokens on, one at a time, and returns where the softmax layers'
+    /// attention went as they were read: for each window of
+    /// <see cref="AttentionWindow"/> positions from the start, the share of
+    /// attention it took, summed over the tokens, layers and heads. The last
+    /// token's logits come back too.
+    /// </summary>
+    public (float[] Mass, float[] Logits) ReadAttention(GpuSequence seq, ReadOnlySpan<int> tokens)
+    {
+        Live(seq);
+        int end = seq.Position + tokens.Length;
+        Reserve(seq, end);
+        int splits = Splits(seq);
+        var mass = Alloc(splits * 4L);
+        IntPtr scratch = IntPtr.Zero;
+        try
+        {
+            scratch = Alloc(_maxHeads * (2L * splits + 2) * 4);
+            Check(Native.amqe_memset(_engine, mass, 0, (nuint)(splits * 4L)), "attention mass");
+            _massOut = mass;
+            _massScratch = scratch;
+            _massSplits = splits;
+            var logits = Array.Empty<float>();
+            for (int i = 0; i < tokens.Length; i++)
+            {
+                logits = Prefill(seq, tokens.Slice(i, 1));
+            }
+            var host = new float[splits];
+            var handle = GCHandle.Alloc(host, GCHandleType.Pinned);
+            try
+            {
+                Check(Native.amqe_download(_engine, handle.AddrOfPinnedObject(), mass, (nuint)(splits * 4L)), "attention mass");
+            }
+            finally
+            {
+                handle.Free();
+            }
+            return (host, logits);
+        }
+        finally
+        {
+            _massOut = IntPtr.Zero;
+            Check(Native.amqe_sync(_engine), "attention mass");
+            Free(mass);
+            if (scratch != IntPtr.Zero)
+            {
+                Free(scratch);
+            }
+        }
+    }
+
+    private IntPtr _massOut, _massScratch;
+    private int _massSplits;
+
+    /// <summary>Makes a sequence's KV caches long enough for
+    /// <paramref name="positions"/> positions, so reading up to there does not
+    /// grow them step by step. An empty sequence that is to go past the trained
+    /// length of an extended model takes the extended rotary frequencies here.
+    /// Throws when the device has no room.</summary>
+    public void Reserve(GpuSequence seq, int positions)
+    {
+        Live(seq);
+        ChooseRope(seq, positions);
+        if (EnsureKv(seq, positions))
+        {
+            _graphReady = false;
+        }
+    }
+
     /// <summary>Grows a sequence's KV caches to hold <paramref name="needed"/> rows;
     /// true when buffers moved (a captured graph is then stale).</summary>
     private bool EnsureKv(GpuSequence seq, int needed)
@@ -1418,10 +1584,12 @@ public sealed class GpuEngine : IDisposable
         {
             return false;
         }
+        // Doubling to 128K rows, then a quarter at a time: at long contexts a
+        // doubled cache would be gigabytes nothing fills.
         int capacity = Math.Max(1024, seq.KvCapacity);
         while (capacity < needed)
         {
-            capacity *= 2;
+            capacity = capacity < GrowStep ? capacity * 2 : checked(capacity + Math.Max(GrowStep, capacity / 4 / GrowStep * GrowStep));
         }
         for (int i = 0; i < _layers.Length; i++)
         {
@@ -1430,8 +1598,7 @@ public sealed class GpuEngine : IDisposable
                 continue;
             }
             long bytes = KvBytes(i, capacity, seq);
-            var k = Alloc(bytes);
-            var v = Alloc(bytes);
+            var (k, v) = AllocPair(bytes);
             if (seq.K[i] != IntPtr.Zero)
             {
                 long used = KvBytes(i, seq.Position, seq);
@@ -1450,8 +1617,7 @@ public sealed class GpuEngine : IDisposable
         if (_mtp is not null)
         {
             long bytes = MtpKvBytes(capacity, seq);
-            var k = Alloc(bytes);
-            var v = Alloc(bytes);
+            var (k, v) = AllocPair(bytes);
             if (seq.MtpK != IntPtr.Zero)
             {
                 long used = MtpKvBytes(seq.Position, seq);
@@ -1471,15 +1637,18 @@ public sealed class GpuEngine : IDisposable
         // The decode attention's partial softmaxes: one slice per
         // amqe_attention_split_keys keys of capacity, for up to 8 query rows,
         // sized for the longest sequence (they run one after another).
-        if (_maxHeads > 0 && Splits(seq) > _attnPartSplits)
+        if (_maxHeads > 0 && PartSlots(seq) > _attnPartSplits)
         {
             Check(Native.amqe_sync(_engine), "kv grow");
+            // The new one first: with no room for it the old one still stands.
+            int slots = PartSlots(seq);
+            var part = Alloc(8L * _maxHeads * slots * (_maxHeadDim + 2) * 4);
             if (_attnPart != IntPtr.Zero)
             {
                 Free(_attnPart);
             }
-            _attnPartSplits = Splits(seq);
-            _attnPart = Alloc(8L * _maxHeads * _attnPartSplits * (_maxHeadDim + 2) * 4);
+            _attnPart = part;
+            _attnPartSplits = slots;
         }
         return true;
     }
@@ -1500,6 +1669,7 @@ public sealed class GpuEngine : IDisposable
                 table[at + 2 * MaxBatch] = batch[r].Pos;
                 table[at + 3 * MaxBatch] = batch[r].State[i];
                 table[at + 4 * MaxBatch] = batch[r].Conv[i];
+                table[at + 5 * MaxBatch] = InvFreq(_layers[i], batch[r]);
             }
         }
         var handle = GCHandle.Alloc(table, GCHandleType.Pinned);
@@ -1514,6 +1684,11 @@ public sealed class GpuEngine : IDisposable
     }
 
     private IntPtr Table(int layer, int kind) => _batchTable + (layer * TableKinds + kind) * MaxBatch * 8;
+
+    private const int GrowStep = 1 << 17;
+
+    // Scratch slots the decode attention needs for a cache this long.
+    private static int PartSlots(GpuSequence seq) => Native.amqe_attention_part_slots(Splits(seq));
 
     private static int Splits(GpuSequence seq)
     {
@@ -1855,7 +2030,7 @@ public sealed class GpuEngine : IDisposable
                     attn.OutputGate ? 1 : 0, _q, _gate, Table(i, 0), Table(i, 1), Table(i, 2),
                     l.QNormRow ? IntPtr.Zero : l.QNormW, l.QNormOff, l.QNormEps,
                     l.KNormRow ? IntPtr.Zero : l.KNormW, l.KNormOff, l.KNormEps,
-                    l.InvFreq, l.RopePairs, l.RopeScale, attn.RopeInterleaved ? 1 : 0, l.InvFreq != IntPtr.Zero ? 1 : 0), "attn prep");
+                    Table(i, 5), l.RopePairs, l.RopeScale, attn.RopeInterleaved ? 1 : 0, l.InvFreq != IntPtr.Zero ? 1 : 0), "attn prep");
                 Check(Native.amqe_attention_batch(_engine, _q, Table(i, 0), Table(i, 1), attn.OutputGate ? _gate : IntPtr.Zero, _ctx,
                     Table(i, 2), rows, attn.NumQHeads, attn.NumKvHeads, attn.HeadDim, (float)attn.ScoreScale, softcap, window,
                     _attnPart, seqs.Max(Splits)), "attention");
@@ -1870,7 +2045,7 @@ public sealed class GpuEngine : IDisposable
                     attn.HeadDim, attn.OutputGate ? 1 : 0, q, gateRow, kv?.K ?? seq.K[i], kv?.V ?? seq.V[i], kv?.Pos ?? seq.Pos,
                     l.QNormRow ? IntPtr.Zero : l.QNormW, l.QNormOff, l.QNormEps,
                     l.KNormRow ? IntPtr.Zero : l.KNormW, l.KNormOff, l.KNormEps,
-                    l.InvFreq, l.RopePairs, l.RopeScale, attn.RopeInterleaved ? 1 : 0, l.InvFreq != IntPtr.Zero ? 1 : 0), "attn prep");
+                    InvFreq(l, seq), l.RopePairs, l.RopeScale, attn.RopeInterleaved ? 1 : 0, l.InvFreq != IntPtr.Zero ? 1 : 0), "attn prep");
                 if (_probeFrom >= 0 && kv is null && QueryProbe is { } probe)
                 {
                     // Prompt chunks only: never inside a captured graph.
@@ -2188,6 +2363,7 @@ public sealed class GpuEngine : IDisposable
         /// per-head prep.</summary>
         public bool QNormRow, KNormRow;
         public IntPtr InvFreq;
+        public IntPtr InvFreqLong;   // for sequences past the trained length; InvFreq without a context extension
         public int RopePairs;
         public double RopeScale = 1.0;
         public IntPtr ConvW, ALog, DtBias, GdnNormW;
@@ -2440,6 +2616,20 @@ public sealed class GpuEngine : IDisposable
         return ptr;
     }
 
+    private (IntPtr K, IntPtr V) AllocPair(long bytes)
+    {
+        var k = Alloc(bytes);
+        try
+        {
+            return (k, Alloc(bytes));
+        }
+        catch
+        {
+            Free(k);
+            throw;
+        }
+    }
+
     private void Free(IntPtr ptr)
     {
         _allocations.Remove(ptr);
@@ -2585,6 +2775,9 @@ public sealed class GpuEngine : IDisposable
             IntPtr aLog, IntPtr dtBias, IntPtr normW, float normEps,
             IntPtr states, IntPtr conv, IntPtr qk, IntPtr gb, IntPtr output);
         [DllImport(Lib)] public static extern int amqe_attention_split_keys();
+        [DllImport(Lib)] public static extern int amqe_attention_part_slots(int nsplit);
+        [DllImport(Lib)] public static extern int amqe_set_attention_mass(IntPtr e, IntPtr output, IntPtr scratch, int splits);
+        [DllImport(Lib)] public static extern int amqe_set_attention_segments(int splits, int keys, long budget);
 
         [DllImport(Lib)]
         public static extern int amqe_attention_rows(IntPtr e, IntPtr q, IntPtr kCache, IntPtr vCache,
@@ -2627,6 +2820,11 @@ public sealed class GpuSequence
 
     /// <summary>Positions kept at f32 in an NVFP4 cache (see <see cref="GpuEngine.SetExactRows"/>).</summary>
     public int ExactRows { get; internal set; }
+
+    /// <summary>Whether the sequence runs at the model's extended rotary
+    /// frequencies (see <see cref="GpuEngine.RopeExtendsBeyond"/>).</summary>
+    public bool Extended { get; internal set; }
+    internal bool RopeChosen;
 
     /// <summary>Whether the exact rows are FP16 rather than f32.</summary>
     public bool ExactF16 { get; internal set; }

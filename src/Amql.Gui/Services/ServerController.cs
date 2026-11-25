@@ -369,6 +369,7 @@ public sealed class ServerController : INotifyPropertyChanged
         if (p.MaxRamGb is { } ram) { a.Add("--max-ram"); a.Add(Num(ram)); }
         if (p.GpuMemoryGb is { } vram && p.Device != "cpu") { a.Add("--gpu-memory"); a.Add(Num(vram)); }
         if (p.GpuFormat is { Length: > 0 } f) { a.Add("--gpu-format"); a.Add(f); }
+        if (p.KvFormat is { Length: > 0 } kv) { a.Add("--kv-format"); a.Add(kv); }
         if (p.Think) a.Add("--think");
         if (p.MaxTokens is { } mt) { a.Add("--max-tokens"); a.Add(mt.ToString(CultureInfo.InvariantCulture)); }
         if (p.Temperature is { } t) { a.Add("--temperature"); a.Add(Num(t)); }
@@ -407,6 +408,7 @@ public sealed class ServerController : INotifyPropertyChanged
             };
             if (m.Adapters.Count > 0) o["adapters"] = new JsonArray(m.Adapters.Select(x => (JsonNode?)Path.GetFullPath(x)).ToArray());
             if (m.Format is { Length: > 0 } f) o["format"] = f;
+            if (m.MaxContext.Trim() is { Length: > 0 } context) o["max_context"] = context;
             if (m.Think is { } think) o["think"] = think;
             if (m.MaxTokens is { } mt) o["max_tokens"] = mt;
             if (m.Temperature is { } t) o["temperature"] = t;

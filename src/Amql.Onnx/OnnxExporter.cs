@@ -284,6 +284,10 @@ public static class OnnxExporter
             default:
                 throw new NotSupportedException($"position policy '{attn.Position.GetType().Name}' has no ONNX rotary implementation");
         }
+        if (scaling?.EngageBeyond is not null)
+        {
+            throw new NotSupportedException("a context extension that only long sequences use has no ONNX export; name the method (--rope-extend none, yarn, ntk or linear)");
+        }
         int half = width / 2;
         // The graph is one forward pass over positions 0..seq-1, so the
         // sequence length the length-dependent kinds read is seq itself.

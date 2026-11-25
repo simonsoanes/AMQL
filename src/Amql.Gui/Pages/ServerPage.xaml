@@ -149,6 +149,7 @@
                                 <RowDefinition Height="Auto"/>
                                 <RowDefinition Height="Auto"/>
                                 <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
                             </Grid.RowDefinitions>
                             <TextBlock Grid.ColumnSpan="2" Text="Defaults for chat requests" Style="{StaticResource SectionTitle}"/>
                             <TextBlock Grid.Row="1" Grid.ColumnSpan="2" Style="{StaticResource Caption}" Margin="0,0,0,8"
@@ -171,6 +172,14 @@
                                 <ComboBoxItem Content="FP16" Tag="fp16"/>
                                 <ComboBoxItem Content="NVFP4 (4-bit, GPTQ copy)" Tag="nvfp4"/>
                                 <ComboBoxItem Content="MXFP4 (4-bit, GPTQ copy)" Tag="mxfp4"/>
+                            </ComboBox>
+                            <TextBlock Grid.Row="8" Text="Prompt state (KV) format" Style="{StaticResource FieldLabel}"/>
+                            <ComboBox Grid.Row="8" Grid.Column="1" x:Name="KvFormatBox" SelectionChanged="OnSettingChanged" MinWidth="220"
+                                      HorizontalAlignment="Left" Margin="0,2"
+                                      ToolTip="How a conversation is held in GPU memory. NVFP4 takes about a third of FP16's memory, for contexts past 256K.">
+                                <ComboBoxItem Content="Server default (FP16)" Tag=""/>
+                                <ComboBoxItem Content="NVFP4 (4-bit, long contexts)" Tag="nvfp4"/>
+                                <ComboBoxItem Content="F32" Tag="f32"/>
                             </ComboBox>
                         </Grid>
                     </Border>

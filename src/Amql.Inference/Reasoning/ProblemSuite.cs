@@ -43,16 +43,30 @@ public static class ProblemSuite
             ["counterfactual"] = Counterfactual,
         };
 
-    /// <summary><paramref name="per"/> problems of each family, in family order.</summary>
-    public static List<Problem> Generate(int seed, int per, IEnumerable<string>? families = null)
+    /// <summary>What a problem is followed by when its answer is to be read off a line
+    /// of its own, whatever explanation the model puts around it.</summary>
+    public const string AnswerLine = "\n\nEnd your reply with a line of the form \"Answer: N\", where N is the number.";
+
+    /// <summary>The second suite: the same traits with more steps and constraints.</summary>
+    public static IReadOnlyDictionary<string, Func<Random, Problem>> HardFamilies => HardProblems.Families;
+
+    /// <summary><paramref name="per"/> problems of each family, in family order;
+    /// <paramref name="suite"/> is <c>reasoning</c> or <c>hard</c>.</summary>
+    public static List<Problem> Generate(int seed, int per, IEnumerable<string>? families = null, string suite = "reasoning")
     {
+        var known = suite switch
+        {
+            "reasoning" => Families,
+            "hard" => HardFamilies,
+            _ => throw new ArgumentException($"unknown suite '{suite}': use reasoning or hard"),
+        };
         var r = new Random(seed);
         var problems = new List<Problem>();
-        foreach (string name in families ?? Families.Keys)
+        foreach (string name in families ?? known.Keys)
         {
-            var make = Families.TryGetValue(name, out var f)
+            var make = known.TryGetValue(name, out var f)
                 ? f
-                : throw new ArgumentException($"unknown problem family '{name}': use {string.Join(", ", Families.Keys)}");
+                : throw new ArgumentException($"unknown problem family '{name}': use {string.Join(", ", known.Keys)}");
             for (int i = 0; i < per; i++)
             {
                 problems.Add(make(r));

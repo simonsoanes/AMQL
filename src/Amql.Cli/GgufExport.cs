@@ -75,6 +75,10 @@ public static class GgufExport
         }
         var scaling = ropes.FirstOrDefault()?.Scaling;
         float[]? ropeFreqs = null;
+        if (scaling?.EngageBeyond is not null)
+        {
+            throw new CliException("a context extension that only long sequences use has no GGUF spelling; name the method (--rope-extend none, ntk or linear) to export one");
+        }
         switch (scaling?.Type)
         {
             case null:

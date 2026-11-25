@@ -58,6 +58,11 @@ struct Engine
     int kvFp4 = 0;               // 1: KV caches hold NVFP4 rows (see kv4_row_bytes), else f32
     float* kvWiden = nullptr;    // prompt attention's f32 copy of an NVFP4 key/value span
     size_t kvWidenElems = 0;
+    // Where one-row attention lands: when set, each decode-path attention adds the
+    // share every SPLIT_KEYS-key window takes, summed over heads (amqe_set_attention_mass).
+    float* massOut = nullptr;       // [massSplits]
+    float* massScratch = nullptr;   // [heads x (2 x massSplits + 2)]
+    int massSplits = 0;
 };
 
 static int ok(cudaError_t e) { return e == cudaSuccess ? 0 : -(int)e; }
@@ -392,7 +397,7 @@ __host__ __device__ __forceinline__ long long kv4_row_at(long long key, int exac
     int rows = ex_rows(exact);
     long long w = ex_f16(exact) ? 2 : 4;
     return key < rows ? key * kvDim * w
-                      : rows * kvDim * w + (key - rows) * kv4_row_bytes(kvDim, hkv);
+                      : (long long)rows * kvDim * w + (key - rows) * kv4_row_bytes(kvDim, hkv);
 }
 
 /// An exact row's value: f32, or FP16 when the sequence keeps them so.
@@ -1367,6 +1372,7 @@ struct AttnPrepArgs
     const float* invFreq; int pairs; double ropeScale; int interleaved; int rope;
     // A batch (null otherwise): row r is its own sequence, with its own caches and position.
     float* const* kCaches; float* const* vCaches; const int* const* poss;
+    const float* const* invFreqs;    // a batch: row r's own rotary frequencies
 };
 
 template <bool FP4>
@@ -1406,11 +1412,12 @@ __global__ void attn_prep_kernel(AttnPrepArgs a)
 
     if (a.rope)
     {
+        const float* invFreq = a.invFreqs ? a.invFreqs[r] : a.invFreq;
         for (int i = threadIdx.x; i < a.pairs; i += blockDim.x)
         {
             int ia = a.interleaved ? 2 * i : i;
             int ib = a.interleaved ? ia + 1 : i + a.pairs;
-            double angle = (double)position * a.invFreq[i];
+            double angle = (double)position * invFreq[i];
             double s, c;
             sincos(angle, &s, &c);
             c *= a.ropeScale; s *= a.ropeScale;
@@ -1495,7 +1502,7 @@ AMQE_EXPORT int amqe_attn_prep(Engine* e, const float* qkv, int ldqkv, int rows,
 {
     AttnPrepArgs a{ qkv, ldqkv, rows, hq, hkv, d, gated, q, gate, kCache, vCache, pos,
         qNormW, qNormOff, qNormEps, kNormW, kNormOff, kNormEps, invFreq, pairs, ropeScale, interleaved, rope,
-        nullptr, nullptr, nullptr };
+        nullptr, nullptr, nullptr, nullptr };
     return launch_attn_prep(e, dim3(rows, hq + hkv), d, a);
 }
 
@@ -1505,11 +1512,11 @@ AMQE_EXPORT int amqe_attn_prep_batch(Engine* e, const float* qkv, int ldqkv, int
     float* q, float* gate, float* const* kCaches, float* const* vCaches, const int* const* poss,
     const float* qNormW, float qNormOff, float qNormEps,
     const float* kNormW, float kNormOff, float kNormEps,
-    const float* invFreq, int pairs, double ropeScale, int interleaved, int rope)
+    const float* const* invFreqs, int pairs, double ropeScale, int interleaved, int rope)
 {
     AttnPrepArgs a{ qkv, ldqkv, batch, hq, hkv, d, gated, q, gate, nullptr, nullptr, nullptr,
-        qNormW, qNormOff, qNormEps, kNormW, kNormOff, kNormEps, invFreq, pairs, ropeScale, interleaved, rope,
-        kCaches, vCaches, poss };
+        qNormW, qNormOff, qNormEps, kNormW, kNormOff, kNormEps, nullptr, pairs, ropeScale, interleaved, rope,
+        kCaches, vCaches, poss, rope ? invFreqs : nullptr };
     return launch_attn_prep(e, dim3(batch, hq + hkv), d, a);
 }
 
@@ -1534,14 +1541,14 @@ template <int DPL, bool FP4>
 __global__ void __launch_bounds__(SPLIT_THREADS) attention_split_kernel(const float* q, const float* kCache,
     const float* vCache, float* part, const int* pos, int hq, int hkv, int nsplit,
     float scale, float softcap, int window, int d,
-    const float* const* kCaches, const float* const* vCaches, const int* const* poss)
+    const float* const* kCaches, const float* const* vCaches, const int* const* poss, int split0)
 {
     pdl_enter();
     const int D = d;   // DPL = ceil(d / 32) dims per lane
     constexpr int WARPS = SPLIT_THREADS / 32;
     __shared__ float sp[SPLIT_KEYS];
     __shared__ float red[32];
-    int h = blockIdx.x, r = blockIdx.y, split = blockIdx.z;
+    int h = blockIdx.x, r = blockIdx.y, split = split0 + (int)blockIdx.z;
     int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     // A batch: row r is its own sequence, with its own caches and position.
     if (kCaches) { kCache = kCaches[r]; vCache = vCaches[r]; }
@@ -1549,7 +1556,7 @@ __global__ void __launch_bounds__(SPLIT_THREADS) attention_split_kernel(const fl
     int first = window > 0 ? max(0, qPos - window + 1) : 0;
     int k0 = max(split * SPLIT_KEYS, first);
     int k1 = min(split * SPLIT_KEYS + SPLIT_KEYS, qPos + 1);
-    float* out = part + (((long long)r * hq + h) * nsplit + split) * (D + 2);
+    float* out = part + (((long long)r * hq + h) * nsplit + (int)blockIdx.z) * (D + 2);
     if (k0 >= k1)
     {
         if (threadIdx.x == 0) { out[0] = -INFINITY; out[1] = 0.f; }
@@ -1667,7 +1674,7 @@ template <int DPL>
 __global__ void __launch_bounds__(SPLIT_THREADS) attention_split_fp4_kernel(const float* q, const float* kCache,
     const float* vCache, float* part, const int* pos, int hq, int hkv, int nsplit,
     float scale, float softcap, int window,
-    const float* const* kCaches, const float* const* vCaches, const int* const* poss)
+    const float* const* kCaches, const float* const* vCaches, const int* const* poss, int split0)
 {
     pdl_enter();
     constexpr int D = 32 * DPL;
@@ -1675,14 +1682,14 @@ __global__ void __launch_bounds__(SPLIT_THREADS) attention_split_fp4_kernel(cons
     __shared__ float sp[SPLIT_KEYS];
     __shared__ float red[32];
     __shared__ float accs[WARPS][D];
-    int h = blockIdx.x, r = blockIdx.y, split = blockIdx.z;
+    int h = blockIdx.x, r = blockIdx.y, split = split0 + (int)blockIdx.z;
     int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     if (kCaches) { kCache = kCaches[r]; vCache = vCaches[r]; }
     int qPos = poss ? *poss[r] : *pos + r;
     int first = window > 0 ? max(0, qPos - window + 1) : 0;
     int k0 = max(split * SPLIT_KEYS, first);
     int k1 = min(split * SPLIT_KEYS + SPLIT_KEYS, qPos + 1);
-    float* out = part + (((long long)r * hq + h) * nsplit + split) * (D + 2);
+    float* out = part + (((long long)r * hq + h) * nsplit + (int)blockIdx.z) * (D + 2);
     if (k0 >= k1)
     {
         if (threadIdx.x == 0) { out[0] = -INFINITY; out[1] = 0.f; }
@@ -1762,25 +1769,155 @@ __global__ void __launch_bounds__(SPLIT_THREADS) attention_split_fp4_kernel(cons
     if (threadIdx.x == 0) { out[0] = m; out[1] = l; }
 }
 
+// The same for the G query heads that share one KV head: their rows are loaded
+// and decoded once. Each head's arithmetic is that of the kernel above, in the
+// same order, so its result is the same to the bit.
+template <int DPL, int G>
+__global__ void __launch_bounds__(SPLIT_THREADS) attention_split_group_fp4_kernel(const float* q, const float* kCache,
+    const float* vCache, float* part, const int* pos, int hq, int hkv, int nsplit,
+    float scale, float softcap, int window,
+    const float* const* kCaches, const float* const* vCaches, const int* const* poss, int split0)
+{
+    pdl_enter();
+    constexpr int D = 32 * DPL;
+    constexpr int WARPS = SPLIT_THREADS / 32;
+    __shared__ float sp[G][SPLIT_KEYS];
+    __shared__ float red[32];
+    __shared__ float accs[WARPS][G][D];
+    int kvh = blockIdx.x, r = blockIdx.y, split = split0 + (int)blockIdx.z;
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    if (kCaches) { kCache = kCaches[r]; vCache = vCaches[r]; }
+    int qPos = poss ? *poss[r] : *pos + r;
+    int first = window > 0 ? max(0, qPos - window + 1) : 0;
+    int k0 = max(split * SPLIT_KEYS, first);
+    int k1 = min(split * SPLIT_KEYS + SPLIT_KEYS, qPos + 1);
+    float* outs[G];
+    #pragma unroll
+    for (int g = 0; g < G; g++)
+        outs[g] = part + (((long long)r * hq + kvh * G + g) * nsplit + (int)blockIdx.z) * (D + 2);
+    if (k0 >= k1)
+    {
+        if (threadIdx.x < G) { outs[threadIdx.x][0] = -INFINITY; outs[threadIdx.x][1] = 0.f; }
+        return;
+    }
+    int n = k1 - k0;
+    int kvDim = hkv * D;
+    int exact = poss ? poss[r][1] : pos[1];
+    int headOff = kv4_head_off(kvDim);
+    const unsigned char* kb = reinterpret_cast<const unsigned char*>(kCache);
+    const unsigned char* vb = reinterpret_cast<const unsigned char*>(vCache);
+    int dim0 = lane * DPL;
+    int col0 = kvh * D + dim0;
+    float qv[G][DPL];
+    #pragma unroll
+    for (int g = 0; g < G; g++)
+    {
+        const float* qr = q + ((long long)r * hq + kvh * G + g) * D;
+        #pragma unroll
+        for (int i = 0; i < DPL; i++) qv[g][i] = qr[dim0 + i];
+    }
+
+    for (int j = warp; j < n; j += WARPS)
+    {
+        float v[DPL];
+        float sc = kv_load_mixed<DPL>(kb, k0 + j, exact, col0, kvDim, hkv, headOff, kvh, v);
+        #pragma unroll
+        for (int g = 0; g < G; g++)
+        {
+            float t = 0.f;
+            #pragma unroll
+            for (int i = 0; i < DPL; i++) t = fmaf(qv[g][i], v[i], t);
+            t = warp_sum(t * sc) * scale;
+            if (lane == 0) sp[g][j] = softcapped(t, softcap);
+        }
+    }
+    __syncthreads();
+    float ms[G], ls[G];
+    #pragma unroll
+    for (int g = 0; g < G; g++)
+    {
+        float m = -INFINITY;
+        for (int j = threadIdx.x; j < n; j += blockDim.x) m = fmaxf(m, sp[g][j]);
+        m = block_max(m, red);
+        float l = 0.f;
+        for (int j = threadIdx.x; j < n; j += blockDim.x)
+        {
+            float p = __expf(sp[g][j] - m);
+            sp[g][j] = p;
+            l += p;
+        }
+        ls[g] = block_sum(l, red);   // its barriers also publish sp
+        ms[g] = m;
+    }
+
+    float acc[G][DPL];
+    #pragma unroll
+    for (int g = 0; g < G; g++)
+        #pragma unroll
+        for (int i = 0; i < DPL; i++) acc[g][i] = 0.f;
+    for (int j = warp; j < n; j += WARPS)
+    {
+        float v[DPL];
+        float sc = kv_load_mixed<DPL>(vb, k0 + j, exact, col0, kvDim, hkv, headOff, kvh, v);
+        #pragma unroll
+        for (int g = 0; g < G; g++)
+        {
+            float pj = sp[g][j] * sc;
+            #pragma unroll
+            for (int i = 0; i < DPL; i++) acc[g][i] = fmaf(pj, v[i], acc[g][i]);
+        }
+    }
+    #pragma unroll
+    for (int g = 0; g < G; g++)
+        #pragma unroll
+        for (int i = 0; i < DPL; i++) accs[warp][g][dim0 + i] = acc[g][i];
+    __syncthreads();
+    for (int c = threadIdx.x; c < G * D; c += blockDim.x)
+    {
+        int g = c / D, at = c % D;
+        float t = 0.f;
+        #pragma unroll
+        for (int w = 0; w < WARPS; w++) t += accs[w][g][at];
+        outs[g][2 + at] = t;
+    }
+    if (threadIdx.x < G) { outs[threadIdx.x][0] = ms[threadIdx.x]; outs[threadIdx.x][1] = ls[threadIdx.x]; }
+}
+
 template <int DPL>
 static void launch_split_fp4(Engine* e, dim3 grid, const float* q, const float* kCache, const float* vCache, float* part,
     const int* pos, int hq, int hkv, int nsplit, float scale, float softcap, int window, int d,
-    const float* const* kCaches, const float* const* vCaches, const int* const* poss)
+    const float* const* kCaches, const float* const* vCaches, const int* const* poss, int split0)
 {
     if constexpr (DPL == 2 || DPL == 4 || DPL == 8)
     {
+        if (d == 32 * DPL && hq == 4 * hkv)
+        {
+            launch(attention_split_group_fp4_kernel<DPL, 4>, dim3(hkv, grid.y, grid.z), SPLIT_THREADS, 0, e->stream, q, kCache, vCache, part, pos,
+                hq, hkv, nsplit, scale, softcap, window, kCaches, vCaches, poss, split0);
+            return;
+        }
+        if (d == 32 * DPL && hq == 2 * hkv)
+        {
+            launch(attention_split_group_fp4_kernel<DPL, 2>, dim3(hkv, grid.y, grid.z), SPLIT_THREADS, 0, e->stream, q, kCache, vCache, part, pos,
+                hq, hkv, nsplit, scale, softcap, window, kCaches, vCaches, poss, split0);
+            return;
+        }
         if (d == 32 * DPL)
         {
             launch(attention_split_fp4_kernel<DPL>, grid, SPLIT_THREADS, 0, e->stream, q, kCache, vCache, part, pos, hq, hkv, nsplit,
-                scale, softcap, window, kCaches, vCaches, poss);
+                scale, softcap, window, kCaches, vCaches, poss, split0);
             return;
         }
     }
     launch(attention_split_kernel<DPL, true>, grid, SPLIT_THREADS, 0, e->stream, q, kCache, vCache, part, pos, hq, hkv, nsplit,
-        scale, softcap, window, d, kCaches, vCaches, poss);
+        scale, softcap, window, d, kCaches, vCaches, poss, split0);
 }
 
-__global__ void attention_combine_kernel(const float* part, const float* gate, float* out, int hq, int d, int nsplit)
+// Merges a row and head's partial softmaxes. With segOut the result stays a
+// partial (its max, sum and unnormalised values) at segment seg of nseg;
+// otherwise it is normalised, gated and written to out.
+__global__ void attention_combine_kernel(const float* part, const float* gate, float* out, int hq, int d, int nsplit,
+    float* segOut, int seg, int nseg)
 {
     pdl_enter();
     extern __shared__ float wts[];   // nsplit
@@ -1800,16 +1937,107 @@ __global__ void attention_combine_kernel(const float* part, const float* gate, f
     }
     l = block_sum(l, red);
     float inv = l > 0.f ? 1.f / l : 0.f;
+    float* so = segOut ? segOut + (((long long)r * hq + h) * nseg + seg) * (d + 2) : nullptr;
     for (int c = threadIdx.x; c < d; c += blockDim.x)
     {
         float v = 0.f;
         for (int s = 0; s < nsplit; s++)
             if (wts[s] != 0.f) v = fmaf(wts[s], base[(long long)s * (d + 2) + 2 + c], v);
+        if (so) { so[2 + c] = v; continue; }
         v *= inv;
         long long o = ((long long)r * hq + h) * d + c;
         if (gate) v *= sigmoidf_(gate[o]);
         out[o] = v;
     }
+    if (so && threadIdx.x == 0) { so[0] = m; so[1] = l; }
+}
+
+// Splits run at once. A longer cache is taken in segments of this many, each
+// merged to one partial before the next, so the scratch (and the merge's shared
+// memory) stay the same size whatever the context. Shorter caches run in one.
+constexpr int SEG_SPLITS_MAX = 2048;
+static int SEG_SPLITS = SEG_SPLITS_MAX;   // amqe_set_attention_segments, for tests
+
+// Keeps a segment's partial maxima and sums (they are overwritten by the next segment).
+__global__ void mass_collect_kernel(const float* part, float* scratch, int d, int n, int split0, int total)
+{
+    pdl_enter();
+    int h = blockIdx.x;
+    const float* base = part + (long long)h * n * (d + 2);
+    float* row = scratch + (long long)h * (2 * (long long)total + 2);
+    for (int s = threadIdx.x; s < n; s += blockDim.x)
+    {
+        row[2 + 2 * (split0 + s)] = base[(long long)s * (d + 2)];
+        row[2 + 2 * (split0 + s) + 1] = base[(long long)s * (d + 2) + 1];
+    }
+}
+
+__global__ void mass_head_kernel(float* scratch, int splits, int total)
+{
+    pdl_enter();
+    __shared__ float red[32];
+    float* row = scratch + (long long)blockIdx.x * (2 * (long long)total + 2);
+    float m = -INFINITY;
+    for (int s = threadIdx.x; s < splits; s += blockDim.x) m = fmaxf(m, row[2 + 2 * s]);
+    m = block_max(m, red);
+    float l = 0.f;
+    for (int s = threadIdx.x; s < splits; s += blockDim.x)
+    {
+        float ms = row[2 + 2 * s];
+        if (ms != -INFINITY) l += __expf(ms - m) * row[2 + 2 * s + 1];
+    }
+    l = block_sum(l, red);
+    if (threadIdx.x == 0) { row[0] = m; row[1] = l; }
+}
+
+// One thread per window, the heads in order: the same sum every run.
+__global__ void mass_add_kernel(const float* scratch, float* out, int hq, int splits, int total)
+{
+    pdl_enter();
+    int s = blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= splits) return;
+    float sum = 0.f;
+    for (int h = 0; h < hq; h++)
+    {
+        const float* row = scratch + (long long)h * (2 * (long long)total + 2);
+        float ms = row[2 + 2 * s];
+        if (ms != -INFINITY && row[1] > 0.f) sum += __expf(ms - row[0]) * row[2 + 2 * s + 1] / row[1];
+    }
+    out[s] += sum;
+}
+
+template <int DPL, bool FP4>
+static int launch_split_attention(Engine* e, const float* q, const float* kCache, const float* vCache,
+    const float* gate, float* out, const int* pos, int rows, int hq, int hkv,
+    float scale, float softcap, int window, float* part, int nsplit, int d,
+    const float* const* kCaches, const float* const* vCaches, const int* const* poss)
+{
+    int nseg = (nsplit + SEG_SPLITS - 1) / SEG_SPLITS;
+    int threads = d < 128 ? 128 : d;
+    float* segs = nseg > 1 ? part + (long long)8 * hq * SEG_SPLITS * (d + 2) : nullptr;
+    for (int seg = 0; seg < nseg; seg++)
+    {
+        int split0 = seg * SEG_SPLITS;
+        int n = min(SEG_SPLITS, nsplit - split0);
+        dim3 grid(hq, rows, n);
+        if constexpr (FP4)
+            launch_split_fp4<DPL>(e, grid, q, kCache, vCache, part, pos, hq, hkv, n, scale, softcap, window, d, kCaches, vCaches, poss, split0);
+        else
+            launch(attention_split_kernel<DPL, false>, grid, SPLIT_THREADS, 0, e->stream, q, kCache, vCache, part, pos, hq, hkv, n,
+                scale, softcap, window, d, kCaches, vCaches, poss, split0);
+        if (e->massOut && rows == 1 && !kCaches && nsplit <= e->massSplits)
+            launch(mass_collect_kernel, hq, 256, 0, e->stream, part, e->massScratch, d, n, split0, e->massSplits);
+        launch(attention_combine_kernel, dim3(hq, rows), threads, n * sizeof(float), e->stream, part, gate, out, hq, d, n, segs, seg, nseg);
+    }
+    if (e->massOut && rows == 1 && !kCaches && nsplit <= e->massSplits)
+    {
+        launch(mass_head_kernel, hq, 256, 0, e->stream, e->massScratch, nsplit, e->massSplits);
+        launch(mass_add_kernel, (nsplit + 255) / 256, 256, 0, e->stream, e->massScratch, e->massOut, hq, nsplit, e->massSplits);
+    }
+    if (nseg > 1)
+        launch(attention_combine_kernel, dim3(hq, rows), threads, nseg * sizeof(float), e->stream, segs, gate, out, hq, d, nseg,
+            (float*)nullptr, 0, 0);
+    return ok(cudaGetLastError());
 }
 
 constexpr int PF_QT = 16;   // query rows per block (4 per warp)
@@ -1925,15 +2153,8 @@ static int launch_attention_as(Engine* e, const float* q, const float* kCache, c
     const int D = d;
     if (rows <= 8)
     {
-        dim3 grid(hq, rows, nsplit);
-        if constexpr (FP4)
-            launch_split_fp4<DPL>(e, grid, q, kCache, vCache, part, pos, hq, hkv, nsplit, scale, softcap, window, d,
-                (const float* const*)nullptr, (const float* const*)nullptr, (const int* const*)nullptr);
-        else
-            launch(attention_split_kernel<DPL, FP4>, grid, SPLIT_THREADS, 0, e->stream, q, kCache, vCache, part, pos, hq, hkv, nsplit, scale, softcap, window, d,
-                (const float* const*)nullptr, (const float* const*)nullptr, (const int* const*)nullptr);
-        launch(attention_combine_kernel, dim3(hq, rows), D < 128 ? 128 : D, nsplit * sizeof(float), e->stream, part, gate, out, hq, D, nsplit);
-        return ok(cudaGetLastError());
+        return launch_split_attention<DPL, FP4>(e, q, kCache, vCache, gate, out, pos, rows, hq, hkv, scale, softcap, window, part, nsplit, d,
+            (const float* const*)nullptr, (const float* const*)nullptr, (const int* const*)nullptr);
     }
     size_t smem = (size_t)(PF_KT * (D + 1) + PF_KT * D + PF_QT * D) * sizeof(float);
     static bool configured[9] = {};
@@ -2014,9 +2235,151 @@ __global__ void attn_gate_kernel(float* out, const float* gate, long long count)
     if (i < count) out[i] *= sigmoidf_(gate[i]);
 }
 
+// One segment's part of a score row: masked, softmaxed against the segment's
+// own maximum, and its maximum and sum kept for the merge.
+__global__ void attn_seg_softmax_kernel(float* scores, float* segM, float* segS, int rows, int keys, int kStart, int pos0,
+    float scale, float softcap, int window, int hq, int head0)
+{
+    pdl_enter();
+    __shared__ float red[32];
+    int r = blockIdx.x;
+    float* row = scores + ((long long)blockIdx.y * rows + r) * keys;
+    int qPos = pos0 + r;
+    float m = -INFINITY;
+    for (int j = threadIdx.x; j < keys; j += blockDim.x)
+    {
+        int key = kStart + j;
+        bool masked = key > qPos || (window > 0 && qPos - key >= window);
+        float v = masked ? -INFINITY : softcapped(row[j] * scale, softcap);
+        row[j] = v;
+        m = fmaxf(m, v);
+    }
+    m = block_max(m, red);
+    float sum = 0.f;
+    for (int j = threadIdx.x; j < keys; j += blockDim.x)
+    {
+        float v = row[j];
+        float ev = v == -INFINITY ? 0.f : __expf(v - m);
+        row[j] = ev;
+        sum += ev;
+    }
+    sum = block_sum(sum, red);
+    if (threadIdx.x == 0)
+    {
+        int at = r * hq + head0 + (int)blockIdx.y;
+        segM[at] = m;
+        segS[at] = sum;
+    }
+}
+
+// Adds a segment's values (relative to the segment's maximum) to the running
+// output (relative to the running maximum), for every row and head.
+__global__ void attn_seg_merge_kernel(float* out, const float* seg, float* runM, float* runS, const float* segM, const float* segS,
+    int hq, int d, int first, int last)
+{
+    pdl_enter();
+    int h = blockIdx.x, r = blockIdx.y;
+    int at = r * hq + h;
+    float M = first ? -INFINITY : runM[at], S = first ? 0.f : runS[at];
+    float m = segM[at], s = segS[at];
+    float top = fmaxf(M, m);
+    float a = M == -INFINITY ? 0.f : __expf(M - top);
+    float b = m == -INFINITY ? 0.f : __expf(m - top);
+    float total = a * S + b * s;
+    float norm = last ? (total > 0.f ? 1.f / total : 0.f) : 1.f;
+    for (int c = threadIdx.x; c < d; c += blockDim.x)
+    {
+        long long o = (long long)at * d + c;
+        float v = first ? 0.f : a * out[o];
+        out[o] = (v + b * seg[o]) * norm;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) { runM[at] = top; runS[at] = total; }
+}
+
+constexpr int SEG_KEYS_MAX = 32768;
+constexpr int SEG_KEYS_DEFAULT = 8192;   // measured: reading 60K-190K on Qwen 3.5 4B is 12% faster than with 32,768
+static int SEG_KEYS = SEG_KEYS_DEFAULT;   // amqe_set_attention_segments, for tests
+static size_t ROWS_BUDGET = (size_t)1 << 30;
+
+// amqe_attention_rows for a span of keys too long to hold its scores at once:
+// SEG_KEYS keys at a time, each segment softmaxed against its own maximum and
+// merged into the running output. The scratch is the same size at any context.
+static int attention_rows_segmented(Engine* e, const float* q, const float* kCache, const float* vCache,
+    const float* gate, float* out, int pos0, int rows, int hq, int hkv, int d,
+    float scale, float softcap, int window, int exact, int kStart, int keys)
+{
+    int g = hq / hkv, kvDim = hkv * d;
+    size_t state = (size_t)rows * hq;
+    size_t segScores = (size_t)g * rows * SEG_KEYS;
+    size_t need = segScores + state * d + 4 * state;
+    if (need > e->scoresElems)
+    {
+        if (e->scores) cudaFree(e->scores);
+        e->scores = nullptr;
+        e->scoresElems = 0;
+        if (cudaMalloc(&e->scores, need * sizeof(float)) != cudaSuccess) return -200;
+        e->scoresElems = need;
+    }
+    size_t span = (size_t)2 * SEG_KEYS * kvDim;
+    if (e->kvFp4 && span > e->kvWidenElems)
+    {
+        if (e->kvWiden) cudaFree(e->kvWiden);
+        e->kvWiden = nullptr;
+        e->kvWidenElems = 0;
+        if (cudaMalloc(&e->kvWiden, span * sizeof(float)) != cudaSuccess) return -200;
+        e->kvWidenElems = span;
+    }
+    float* tmp = e->scores + segScores;
+    float* runM = tmp + state * d;
+    float* runS = runM + state;
+    float* segM = runS + state;
+    float* segS = segM + state;
+    cublasComputeType_t ct = e->prefillF32 ? CUBLAS_COMPUTE_32F : CUBLAS_COMPUTE_32F_FAST_TF32;
+    const float one = 1.f, zero = 0.f;
+    for (int s0 = 0; s0 < keys; s0 += SEG_KEYS)
+    {
+        int n = min(SEG_KEYS, keys - s0);
+        int from = kStart + s0;
+        const float* kSpan = kCache + (long long)from * kvDim;
+        const float* vSpan = vCache + (long long)from * kvDim;
+        if (e->kvFp4)
+        {
+            int threads = kvDim >= 256 ? 256 : 128;
+            launch(kv4_widen_kernel, n, threads, 0, e->stream, kCache, e->kvWiden, from, n, kvDim, d, exact);
+            launch(kv4_widen_kernel, n, threads, 0, e->stream, vCache, e->kvWiden + (size_t)n * kvDim, from, n, kvDim, d, exact);
+            kSpan = e->kvWiden;
+            vSpan = e->kvWiden + (size_t)n * kvDim;
+        }
+        long long strideS = (long long)rows * n;
+        for (int kh = 0; kh < hkv; kh++)
+        {
+            auto st = cublasGemmStridedBatchedEx(e->blas, CUBLAS_OP_T, CUBLAS_OP_N, n, rows, d,
+                &one, kSpan + kh * d, CUDA_R_32F, kvDim, 0, q + (long long)kh * g * d, CUDA_R_32F, hq * d, d,
+                &zero, e->scores, CUDA_R_32F, n, strideS, g, ct, CUBLAS_GEMM_DEFAULT);
+            if (st != CUBLAS_STATUS_SUCCESS) return -(1000 + (int)st);
+            launch(attn_seg_softmax_kernel, dim3(rows, g), 256, 0, e->stream, e->scores, segM, segS, rows, n, from, pos0,
+                scale, softcap, window, hq, kh * g);
+            st = cublasGemmStridedBatchedEx(e->blas, CUBLAS_OP_N, CUBLAS_OP_N, d, rows, n,
+                &one, vSpan + kh * d, CUDA_R_32F, kvDim, 0, e->scores, CUDA_R_32F, n, strideS,
+                &zero, tmp + (long long)kh * g * d, CUDA_R_32F, hq * d, d, g, ct, CUBLAS_GEMM_DEFAULT);
+            if (st != CUBLAS_STATUS_SUCCESS) return -(1000 + (int)st);
+        }
+        launch(attn_seg_merge_kernel, dim3(hq, rows), d < 128 ? 64 : 128, 0, e->stream, out, tmp, runM, runS, segM, segS,
+            hq, d, s0 == 0 ? 1 : 0, s0 + SEG_KEYS >= keys ? 1 : 0);
+    }
+    if (gate)
+    {
+        long long count = (long long)rows * hq * d;
+        launch(attn_gate_kernel, (unsigned)((count + 255) / 256), 256, 0, e->stream, out, gate, count);
+    }
+    return ok(cudaGetLastError());
+}
+
 /// Prompt attention through cuBLAS; pos0 is the chunk's first position (the
-/// host's copy of the device counter). Returns -200 when the score scratch
-/// would pass its budget, and the caller falls back to amqe_attention.
+/// host's copy of the device counter). A span whose scores would pass the
+/// scratch budget runs in segments. Returns -200 when there is no memory for
+/// those either, and the caller falls back to amqe_attention.
 AMQE_EXPORT int amqe_attention_rows(Engine* e, const float* q, const float* kCache, const float* vCache,
     const float* gate, float* out, int pos0, int rows, int hq, int hkv, int d,
     float scale, float softcap, int window, int exact)
@@ -2028,7 +2391,12 @@ AMQE_EXPORT int amqe_attention_rows(Engine* e, const float* q, const float* kCac
     int kStart = window > 0 ? max(0, pos0 - window + 1) : 0;
     int keys = last + 1 - kStart;
     size_t need = (size_t)g * rows * keys;
-    if (need * sizeof(float) > ((size_t)1 << 30)) return -200;
+    // Past a budget (128K keys for a group of 4 heads, or for a widened
+    // 1,024-wide cache) the span runs in segments.
+    size_t widened = e->kvFp4 ? (size_t)2 * keys * kvDim : 0;
+    size_t largest = need > widened ? need : widened;
+    if (largest * sizeof(float) > ROWS_BUDGET)
+        return attention_rows_segmented(e, q, kCache, vCache, gate, out, pos0, rows, hq, hkv, d, scale, softcap, window, exact, kStart, keys);
     if (need > e->scoresElems)
     {
         if (e->scores) cudaFree(e->scores);
@@ -2043,7 +2411,6 @@ AMQE_EXPORT int amqe_attention_rows(Engine* e, const float* q, const float* kCac
     if (e->kvFp4)
     {
         size_t span = (size_t)2 * keys * kvDim;
-        if (span * sizeof(float) > ((size_t)1 << 30)) return -200;
         if (span > e->kvWidenElems)
         {
             if (e->kvWiden) cudaFree(e->kvWiden);
@@ -2088,9 +2455,36 @@ AMQE_EXPORT int amqe_attention_rows(Engine* e, const float* q, const float* kCac
     return ok(cudaGetLastError());
 }
 
-/// part: scratch of [8 × hq × nsplit × (d + 2)] floats for the decode split;
-/// nsplit = ceil(cache capacity / SPLIT_KEYS) — see amqe_attention_split_keys.
+/// For tests: how many splits (decode) and keys (prompts) a segment takes, and
+/// the scratch bytes past which a prompt runs in segments. 0 is the default.
+/// Set before any sequence grows its cache: the scratch is sized by it.
+AMQE_EXPORT int amqe_set_attention_segments(int splits, int keys, long long budget)
+{
+    SEG_SPLITS = splits > 0 ? min(splits, SEG_SPLITS_MAX) : SEG_SPLITS_MAX;
+    SEG_KEYS = keys > 0 ? min(keys, SEG_KEYS_MAX) : SEG_KEYS_DEFAULT;
+    ROWS_BUDGET = budget > 0 ? (size_t)budget : (size_t)1 << 30;
+    return 0;
+}
+
+/// While set, every one-row attention adds the share of its attention each
+/// window of amqe_attention_split_keys keys takes to out[splits], summed over
+/// its heads. scratch: heads x (2 x splits + 2) floats. Null turns it off.
+AMQE_EXPORT int amqe_set_attention_mass(Engine* e, float* out, float* scratch, int splits)
+{
+    e->massOut = out;
+    e->massScratch = scratch;
+    e->massSplits = out ? splits : 0;
+    return 0;
+}
+
+/// part: scratch of [8 x hq x amqe_attention_part_slots(nsplit) x (d + 2)] floats
+/// for the decode split; nsplit = ceil(cache capacity / SPLIT_KEYS), see
+/// amqe_attention_split_keys.
 AMQE_EXPORT int amqe_attention_split_keys(void) { return SPLIT_KEYS; }
+AMQE_EXPORT int amqe_attention_part_slots(int nsplit)
+{
+    return nsplit <= SEG_SPLITS ? nsplit : SEG_SPLITS + (nsplit + SEG_SPLITS - 1) / SEG_SPLITS;
+}
 
 AMQE_EXPORT int amqe_attention(Engine* e, const float* q, const float* kCache, const float* vCache,
     const float* gate, float* out, const int* pos, int rows, int hq, int hkv, int d,
@@ -2111,15 +2505,11 @@ static int launch_attention_batch(Engine* e, const float* q, const float* const*
     const float* gate, float* out, const int* const* poss, int batch, int hq, int hkv,
     float scale, float softcap, int window, float* part, int nsplit, int d)
 {
-    dim3 grid(hq, batch, nsplit);
-    if (e->kvFp4)
-        launch_split_fp4<DPL>(e, grid, q, (const float*)nullptr, (const float*)nullptr, part,
-            (const int*)nullptr, hq, hkv, nsplit, scale, softcap, window, d, kCaches, vCaches, poss);
-    else
-        launch(attention_split_kernel<DPL, false>, grid, SPLIT_THREADS, 0, e->stream, q, (const float*)nullptr, (const float*)nullptr, part,
-            (const int*)nullptr, hq, hkv, nsplit, scale, softcap, window, d, kCaches, vCaches, poss);
-    launch(attention_combine_kernel, dim3(hq, batch), d < 128 ? 128 : d, nsplit * sizeof(float), e->stream, part, gate, out, hq, d, nsplit);
-    return ok(cudaGetLastError());
+    return e->kvFp4
+        ? launch_split_attention<DPL, true>(e, q, (const float*)nullptr, (const float*)nullptr, gate, out, (const int*)nullptr, batch,
+            hq, hkv, scale, softcap, window, part, nsplit, d, kCaches, vCaches, poss)
+        : launch_split_attention<DPL, false>(e, q, (const float*)nullptr, (const float*)nullptr, gate, out, (const int*)nullptr, batch,
+            hq, hkv, scale, softcap, window, part, nsplit, d, kCaches, vCaches, poss);
 }
 
 // One decode row for each of up to 8 sequences: row r attends over its own

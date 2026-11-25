@@ -111,9 +111,12 @@ public sealed class ModelHost : IDisposable
     /// generative model; each must have been built for this model's tokenizer.</param>
     /// <param name="kvDir">This model's own folder for paged-out prompt state
     /// (its <c>kv_dir</c> in <c>--config</c>); see <see cref="KvPaging.For"/>.</param>
-    public static ModelHost Load(string id, string path, IReadOnlyList<string>? adapters = null, ModelDefaults? defaults = null, string? kvDir = null)
+    /// <param name="context">A context length other than the model's own; null is
+    /// <see cref="ContextExtension.Requested"/> (<c>--max-context</c>), or none.</param>
+    public static ModelHost Load(string id, string path, IReadOnlyList<string>? adapters = null, ModelDefaults? defaults = null, string? kvDir = null,
+        ContextExtension? context = null)
     {
-        var host = LoadEngines(id, path, adapters);
+        var host = LoadEngines(id, path, adapters, context);
         void Log(string line) => Console.Error.WriteLine($"{DateTime.Now:HH:mm:ss.fff} {id}: {line}");
         var library = host.Generator is { } g
             ? new NGramLibrary(path, TokenizerFingerprint(g.Tokenizer), Log)
@@ -156,10 +159,10 @@ public sealed class ModelHost : IDisposable
         AdapterNames = loaded.Generator is null ? Array.Empty<string>() : adapterNames;
     }
 
-    private static ModelHost LoadEngines(string id, string path, IReadOnlyList<string>? adapters)
+    private static ModelHost LoadEngines(string id, string path, IReadOnlyList<string>? adapters, ContextExtension? context)
     {
-        var container = Vindex3Container.Open(path);
-        var notes = new List<string>();
+        var container = Vindex3Container.Open(path, context);
+        var notes = new List<string>(container.ContextNotes);
         try
         {
             var component = container.Graph?.Components.FirstOrDefault(c => c.Role == ComponentRole.PrimaryText)
@@ -357,6 +360,23 @@ public sealed record ModelDefaults(bool? Think = null, int? MaxTokens = null, fl
 {
     /// <summary>The n-gram packs this model blends by default (names of loaded packs).</summary>
     public IReadOnlyList<string>? NGramPacks { get; init; }
+
+    /// <summary>Thinking tokens after which the block is closed (null: the server's, 0: never).</summary>
+    public int? ThinkingBudget { get; init; }
+}
+
+/// <summary>Where a reply with a thinking budget closes its block.</summary>
+public static class ThinkingLimit
+{
+    /// <summary>How long past its budget thinking may run to reach the end of a line.</summary>
+    public const int LineWait = 64;
+
+    /// <summary>The thinking token at which a reply of at most
+    /// <paramref name="maxTokens"/> closes its block: the budget, or sooner when
+    /// the reply's own limit would leave no room for an answer (a quarter of it,
+    /// at most 512 tokens, is kept).</summary>
+    public static int For(int budget, int maxTokens) =>
+        Math.Max(1, Math.Min(budget, maxTokens - Math.Min(maxTokens / 4, 512) - LineWait));
 }
 
 public sealed record GenerationParams(
@@ -376,6 +396,10 @@ public sealed record GenerationParams(
 
     /// <summary>The prompt ended inside an open think block.</summary>
     public bool Thinking { get; init; }
+
+    /// <summary>Thinking tokens after which the block is closed and the reply
+    /// goes on to its answer (0: never). See <see cref="ThinkingLimit"/>.</summary>
+    public int ThinkingBudget { get; init; }
 
     /// <summary>Structured output: the reply must be a JSON value this schema allows.</summary>
     public JsonSchemaNode? Json { get; init; }
@@ -755,6 +779,12 @@ internal sealed class GenerationRun
     private readonly GenerationParams _p;
     private readonly Action<string>? _onDelta;
     private readonly CancellationToken _cancel;
+
+    /// <summary>Whether the request was given up.</summary>
+    public bool Cancelled => _cancel.IsCancellationRequested;
+
+    /// <summary>The most tokens the reply may take.</summary>
+    public int Budget => _budget;
     private readonly int? _logprobsTopK;
     private readonly SamplingConfig _config;
     private readonly Random _rng;
@@ -924,6 +954,18 @@ internal sealed class GenerationRun
         if (_forcePending && _p.Thinking && token == _g.ThinkClose)
         {
             Enqueue("\n\n" + _p.Forced);
+        }
+
+        if (_p.ThinkingBudget > 0 && _p.Thinking && !_thinkClosed && _g.ThinkClose is not null && _json is null && _call is null && _forced.Count == 0
+            && ThinkingLimit.For(_p.ThinkingBudget, _budget) is var limit && _generated.Count >= limit
+            && (piece.EndsWith('\n') || _generated.Count >= limit + ThinkingLimit.LineWait))
+        {
+            // Out of thinking budget: close the block, at the end of a line when one comes soon.
+            foreach (int id in _g.Tokenizer.EncodeToIds(piece.EndsWith('\n') ? "</think>\n\n" : "\n</think>\n\n"))
+            {
+                _forced.Enqueue(id);
+            }
+            _loopFrom = _generated.Count;
         }
 
         string text = Text();
@@ -1457,10 +1499,16 @@ public static class PromptMark
         return prompt.Length - 1;
     }
 
+    /// <summary>The most first positions auto keeps exact.</summary>
+    public const int AutoExactMost = 16384;
+
     /// <summary>How many first positions to keep exact: <paramref name="mode"/>
     /// tokens when positive, none at 0, and at -1 (auto) everything through the
     /// first user message, up to the turn after it: the system prompt, the tools
-    /// and the first instruction. None when the prompt has no user turn.</summary>
+    /// and the first instruction, up to <see cref="AutoExactMost"/> tokens (a first
+    /// message that is a whole document is not all instruction, and at FP16 a
+    /// million tokens of it would not fit a GPU). None when the prompt has no
+    /// user turn.</summary>
     public static int Exact(int[] prompt, int mode, int? turnStart, int? userRole)
     {
         if (mode >= 0)
@@ -1476,7 +1524,7 @@ public static class PromptMark
             if (prompt[i] == start && prompt[i + 1] == user)
             {
                 int next = Array.IndexOf(prompt, start, i + 2);
-                return next < 0 ? prompt.Length : next;
+                return Math.Min(next < 0 ? prompt.Length : next, AutoExactMost);
             }
         }
         return 0;
@@ -1643,85 +1691,7 @@ internal sealed class BatchScheduler : IDisposable
                     continue;
                 }
 
-                long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
-                // Each reply picks its next token on its own core: sampling reads the
-                // whole vocabulary, and the replies share nothing but the device.
-                var next = new int?[active.Count];
-                int? NextOf(Job job)
-                {
-                    var pending = job.Pending;
-                    job.Pending = null;
-                    return pending ?? job.Run.Next();
-                }
-                if (active.Count > 1)
-                {
-                    Parallel.For(0, active.Count, i => next[i] = NextOf(active[i]));
-                }
-                else
-                {
-                    next[0] = NextOf(active[0]);
-                }
-                for (int i = active.Count - 1; i >= 0; i--)
-                {
-                    var job = active[i];
-                    if (next[i] is { } token)
-                    {
-                        job.Token = token;
-                    }
-                    else
-                    {
-                        active.RemoveAt(i);
-                        Complete(job);
-                    }
-                }
-                if (active.Count == 0)
-                {
-                    continue;
-                }
-
-                var seqs = active.Select(j => j.Seq!).ToList();
-                var tokens = active.Select(j => j.Token).ToArray();
-                long t1 = System.Diagnostics.Stopwatch.GetTimestamp();
-                Device(() =>
-                {
-                    _engine.StepInPlace(seqs, tokens);
-                    return 0;
-                });
-                long t2 = System.Diagnostics.Stopwatch.GetTimestamp();
-                void Feed(int i)
-                {
-                    var job = active[i];
-                    job.Row = i;
-                    job.Context?.Add(job.Token);
-                    var verdict = EntailVerdict.Merge(job.Adapters.Select(a => a.Step(job.Token)).ToList());
-                    // Read in place, before the next step overwrites it: no copy of the vocabulary per row.
-                    job.Run.Fed(() => _engine.HostLogits(job.Row), verdict);
-                }
-                if (active.Count > 1 && active[0].Adapters.Length > 0)
-                {
-                    Parallel.For(0, active.Count, Feed);
-                }
-                else
-                {
-                    for (int i = 0; i < active.Count; i++)
-                    {
-                        Feed(i);
-                    }
-                }
-                if (Timing)
-                {
-                    _tChoose += t1 - t0;
-                    _tDevice += t2 - t1;
-                    _tFeed += System.Diagnostics.Stopwatch.GetTimestamp() - t2;
-                    _rows += active.Count;
-                    if (++_steps % 500 == 0)
-                    {
-                        double us(long t) => t * 1e6 / System.Diagnostics.Stopwatch.Frequency / _steps;
-                        Console.Error.WriteLine($"batch: {_steps} steps, {(double)_rows / _steps:F1} rows/step; per step choose {us(_tChoose):F0} us, " +
-                            $"device {us(_tDevice):F0} us, feed {us(_tFeed):F0} us");
-                        _tChoose = _tDevice = _tFeed = _steps = _rows = 0;
-                    }
-                }
+                StepAll(active);
             }
             catch (InvalidOperationException) when (_waiting.IsAddingCompleted)
             {
@@ -1729,24 +1699,113 @@ internal sealed class BatchScheduler : IDisposable
             }
             catch (Exception e)
             {
-                // The device failed under the batch: every running reply ends with the error.
-                foreach (var job in active)
-                {
-                    job.Run.Abort("error");
-                    if (job.Seq is { } failed)
-                    {
-                        _held.Remove(failed);   // its state is not to be trusted
-                    }
-                    Release(job);
-                    job.Done.TrySetException(e);
-                }
-                active.Clear();
+                FailAll(active, e);
             }
         }
         foreach (var job in active)
         {
             job.Run.Abort("cancelled");
             Complete(job);
+        }
+    }
+
+    /// <summary>The device failed under the batch: every running reply ends with the error.</summary>
+    private void FailAll(List<Job> active, Exception e)
+    {
+        foreach (var job in active)
+        {
+            job.Run.Abort("error");
+            if (job.Seq is { } failed)
+            {
+                _held.Remove(failed);   // its state is not to be trusted
+            }
+            Release(job);
+            job.Done.TrySetException(e);
+        }
+        active.Clear();
+    }
+
+    /// <summary>One token for every running reply; those that end leave the list.</summary>
+    private void StepAll(List<Job> active)
+    {
+        long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
+        // Each reply picks its next token on its own core: sampling reads the
+        // whole vocabulary, and the replies share nothing but the device.
+        var next = new int?[active.Count];
+        int? NextOf(Job job)
+        {
+            var pending = job.Pending;
+            job.Pending = null;
+            return pending ?? job.Run.Next();
+        }
+        if (active.Count > 1)
+        {
+            Parallel.For(0, active.Count, i => next[i] = NextOf(active[i]));
+        }
+        else
+        {
+            next[0] = NextOf(active[0]);
+        }
+        for (int i = active.Count - 1; i >= 0; i--)
+        {
+            var job = active[i];
+            if (next[i] is { } token)
+            {
+                job.Token = token;
+            }
+            else
+            {
+                active.RemoveAt(i);
+                Complete(job);
+            }
+        }
+        if (active.Count == 0)
+        {
+            return;
+        }
+
+        var seqs = active.Select(j => j.Seq!).ToList();
+        var tokens = active.Select(j => j.Token).ToArray();
+        long t1 = System.Diagnostics.Stopwatch.GetTimestamp();
+        Device(() =>
+        {
+            _engine.StepInPlace(seqs, tokens);
+            return 0;
+        });
+        long t2 = System.Diagnostics.Stopwatch.GetTimestamp();
+        void Feed(int i)
+        {
+            var job = active[i];
+            job.Row = i;
+            job.Context?.Add(job.Token);
+            var verdict = EntailVerdict.Merge(job.Adapters.Select(a => a.Step(job.Token)).ToList());
+            // Read in place, before the next step overwrites it: no copy of the vocabulary per row.
+            job.Run.Fed(() => _engine.HostLogits(job.Row), verdict);
+        }
+        if (active.Count > 1 && active[0].Adapters.Length > 0)
+        {
+            Parallel.For(0, active.Count, Feed);
+        }
+        else
+        {
+            for (int i = 0; i < active.Count; i++)
+            {
+                Feed(i);
+            }
+        }
+        if (Timing)
+        {
+            _tChoose += t1 - t0;
+            _tDevice += t2 - t1;
+            _tFeed += System.Diagnostics.Stopwatch.GetTimestamp() - t2;
+            _rows += active.Count;
+            if (++_steps % 500 == 0)
+            {
+                double us(long t) => t * 1e6 / System.Diagnostics.Stopwatch.Frequency / _steps;
+                Console.Error.WriteLine($"batch: {_steps} steps, {(double)_rows / _steps:F1} rows/step; per step choose {us(_tChoose):F0} us, " +
+                    $"device {us(_tDevice):F0} us, feed {us(_tFeed):F0} us");
+                _tChoose = _tDevice = _tFeed = _steps = _rows = 0;
+            }
         }
     }
 
@@ -1844,6 +1903,9 @@ internal sealed class BatchScheduler : IDisposable
         {
             int[] prompt = job.Run.Prompt;
             int mark = MarkFor(prompt);
+            // How far the conversation may get this turn: a model with a context extension
+            // keeps its trained frequencies for one that stays inside its trained length.
+            long plannedLength = (long)prompt.Length + Math.Min(job.Run.Budget, 16384);
             int reused = 0;
             bool fromDisk = false;
             var paged = job.Paged;
@@ -1858,7 +1920,7 @@ internal sealed class BatchScheduler : IDisposable
                         Console.Error.WriteLine($"reuse: kept sequence marked at {kept.MarkedAt}, agrees for {common} tokens");
                     }
                 }
-                var seq = PrefixReuse ? Reusable(prompt) : null;
+                var seq = PrefixReuse ? Reusable(prompt, _engine.Extends(plannedLength)) : null;
                 if (paged is { } p && (seq is null || p.Mark > seq.MarkedAt))
                 {
                     try
@@ -1868,6 +1930,11 @@ internal sealed class BatchScheduler : IDisposable
                         {
                             _engine.Release(restored);
                             throw new InvalidDataException($"the state was saved at {restored.MarkedAt}, not {p.Mark}");
+                        }
+                        if (restored.Extended != _engine.Extends(plannedLength))
+                        {
+                            _engine.Release(restored);
+                            throw new InvalidDataException("the conversation has passed the model's trained length since it was saved");
                         }
                         seq = restored;
                         reused = seq.Position;
@@ -1914,16 +1981,18 @@ internal sealed class BatchScheduler : IDisposable
             }
             long a0 = System.Diagnostics.Stopwatch.GetTimestamp();
             var seqNow = job.Seq;
-            var logits = Device(() =>
+            Reserve(seqNow, prompt.Length + 1, plannedLength);
+            // Up to the mark, save the state there, then the rest of the prompt.
+            if (PrefixReuse && mark > reused)
             {
-                // Up to the mark, save the state there, then the rest of the prompt.
-                if (PrefixReuse && mark > reused)
+                Read(job, seqNow, prompt, mark, active);
+                Device(() =>
                 {
-                    _engine.Prefill(seqNow, prompt.AsSpan(reused, mark - reused));
                     _engine.Mark(seqNow);
-                }
-                return _engine.Prefill(seqNow, prompt.AsSpan(seqNow.Position));
-            });
+                    return 0;
+                });
+            }
+            var logits = Read(job, seqNow, prompt, prompt.Length, active);
             _held[seqNow] = prompt;
             ReusedTokens += reused;
             PrefilledTokens += prompt.Length - reused;
@@ -1957,6 +2026,71 @@ internal sealed class BatchScheduler : IDisposable
         }
     }
 
+    /// <summary>Tokens of a long prompt read before the running replies get a
+    /// turn (whole prompt chunks, so reading in slices changes nothing).</summary>
+    private const int ReadSlice = 4096;
+
+    /// <summary>How long the running replies generate between two slices of a long prompt.</summary>
+    private const double TurnMilliseconds = 250;
+
+    /// <summary>Reads the prompt up to <paramref name="to"/>, in slices while
+    /// other replies are running so that they go on between them, and gives up
+    /// if the request is cancelled.</summary>
+    private float[] Read(Job job, GpuSequence seq, int[] prompt, int to, List<Job> active)
+    {
+        while (true)
+        {
+            int at = seq.Position;
+            // Slices end where the chunks of one read of the whole would.
+            int n = to - at <= ReadSlice ? to - at : ReadSlice;
+            var logits = Device(() => _engine.Prefill(seq, prompt.AsSpan(at, n)));
+            if (seq.Position >= to)
+            {
+                return logits;
+            }
+            if (job.Run.Cancelled)
+            {
+                throw new OperationCanceledException("the request was cancelled while its prompt was read");
+            }
+            long start = System.Diagnostics.Stopwatch.GetTimestamp();
+            while (active.Count > 0 && System.Diagnostics.Stopwatch.GetElapsedTime(start).TotalMilliseconds < TurnMilliseconds)
+            {
+                try
+                {
+                    StepAll(active);
+                }
+                catch (Exception e)
+                {
+                    FailAll(active, e);
+                }
+            }
+        }
+    }
+
+    /// <summary>Makes the sequence's cache long enough for the whole prompt at
+    /// once. Without the memory for it, kept sequences leave the device, least
+    /// recently used first, before the request fails.</summary>
+    private void Reserve(GpuSequence seq, int positions, long planned)
+    {
+        while (true)
+        {
+            try
+            {
+                Device(() =>
+                {
+                    _engine.Plan(seq, planned);
+                    _engine.Reserve(seq, positions);
+                    return 0;
+                });
+                return;
+            }
+            catch (InvalidOperationException) when (_free.Count > 0)
+            {
+                Evict(_free[0], "making room for a longer prompt");
+            }
+        }
+    }
+
     private int MarkFor(int[] prompt) => PromptMark.At(prompt, _turnStart);
 
     /// <summary>How many of a new conversation's first positions stay f32 in an NVFP4 cache.</summary>
@@ -1965,13 +2099,13 @@ internal sealed class BatchScheduler : IDisposable
     /// <summary>The kept sequence that the prompt can rewind into: its mark is
     /// short of the prompt's end and the prompt agrees with what it held up to
     /// there. The latest mark wins.</summary>
-    private GpuSequence? Reusable(int[] prompt)
+    private GpuSequence? Reusable(int[] prompt, bool extended)
     {
         GpuSequence? best = null;
         foreach (var seq in _free)
         {
             int at = seq.MarkedAt;
-            if (at > 0 && at < prompt.Length && at > (best?.MarkedAt ?? 0) && _held.TryGetValue(seq, out var held)
+            if (at > 0 && at < prompt.Length && at > (best?.MarkedAt ?? 0) && seq.Extended == extended && _held.TryGetValue(seq, out var held)
                 && held.Length >= at && held.AsSpan(0, at).SequenceEqual(prompt.AsSpan(0, at)))
             {
                 best = seq;

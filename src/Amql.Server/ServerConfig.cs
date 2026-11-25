@@ -13,6 +13,10 @@ public sealed record ConfiguredModel(string Id, string Path, IReadOnlyList<strin
     /// <summary>The model's own folder for paged-out prompt state, which turns
     /// its disk tier on; null leaves it to --kv-disk / --kv-dir.</summary>
     public string? KvDir { get; init; }
+
+    /// <summary>A context length other than the model's own (<c>"max_context"</c>,
+    /// with <c>"rope_extend"</c>); null leaves it to --max-context.</summary>
+    public Amql.Vindex3.ContextExtension? Context { get; init; }
 }
 
 /// <summary>amql-server's <c>--config</c> file, for serving several models each with its own settings.</summary>
@@ -29,7 +33,7 @@ public static class ServerConfig
         {
             throw new InvalidDataException($"{file} needs a \"models\" array");
         }
-        var known = new HashSet<string> { "id", "path", "adapters", "think", "max_tokens", "temperature", "top_p", "top_k", "ngram_packs", "format", "kv_dir" };
+        var known = new HashSet<string> { "id", "path", "adapters", "think", "max_tokens", "temperature", "top_p", "top_k", "ngram_packs", "format", "kv_dir", "max_context", "rope_extend", "thinking_budget" };
         var list = new List<ConfiguredModel>();
         int i = 0;
         foreach (var m in models.EnumerateArray())
@@ -57,12 +61,36 @@ public static class ServerConfig
             {
                 throw new InvalidDataException($"{where}: format is nvfp4, mxfp4 or fp16, not '{format}'");
             }
+            string? Text(string name) => !m.TryGetProperty(name, out var v) ? null : v.ValueKind switch
+            {
+                JsonValueKind.String => v.GetString(),
+                JsonValueKind.Number => v.GetRawText(),
+                _ => throw new InvalidDataException($"{where}: {name} is a string or a number"),
+            };
+            Amql.Vindex3.ContextExtension? context = null;
+            if (Text("max_context") is { } length)
+            {
+                try
+                {
+                    context = Amql.Vindex3.ContextExtension.Parse(length, Text("rope_extend"));
+                }
+                catch (FormatException e)
+                {
+                    throw new InvalidDataException($"{where}: {e.Message}");
+                }
+            }
+            else if (m.TryGetProperty("rope_extend", out _))
+            {
+                throw new InvalidDataException($"{where}: rope_extend needs max_context");
+            }
             list.Add(new ConfiguredModel(id, path, adapters, new ModelDefaults(think, Int("max_tokens"), Float("temperature"), Float("top_p"), Int("top_k"))
             {
                 NGramPacks = packs,
+                ThinkingBudget = Int("thinking_budget") is { } tb ? tb >= 0 ? tb : throw new InvalidDataException($"{where}: thinking_budget is 0 (no limit) or more") : null,
             })
             {
                 Format = format,
+                Context = context,
                 KvDir = m.TryGetProperty("kv_dir", out var kv) && kv.ValueKind == JsonValueKind.String ? Resolve(kv.GetString()!) : null,
             });
         }

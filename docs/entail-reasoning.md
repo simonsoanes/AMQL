@@ -208,6 +208,70 @@ What the real session had that these prompts lack is not known yet: its actual s
 and tool schemas, the server's template and sampling, and the conversation before the
 request. Reproducing the prose reply needs those.
 
+## The 4B
+
+The served model is now Qwen 3.5 4B (NVFP4), so the same questions were asked of it
+(2026-11-25).
+
+**The first suite is too easy for it, and its scoring was wrong for it.** With thinking and
+`stop-circling` the scorer gave it 70 of 80. All ten misses are right answers: the reply says
+"there are **12** ..." and then explains, and the last number, which the scorer takes as the
+answer, belongs to the explanation. Two changes followed:
+
+- `entail bench --suite hard` is eight harder families (two nested operators, conditional
+  registers, cheapest routes, second-order recurrences, three-way sieves, ledgers, seating
+  puzzles, truth-tellers). The answers are computed by brute force, and the tests check three
+  families against independent solvers.
+- Its prompts ask for a line `Answer: N`, which is read before the last number.
+  `--answer-line` asks for it in the first suite.
+
+The scoring flaw means the 0.8B figures above may be understated too. In the saved reports, up
+to 7 to 9 of the 80 "wrong" replies in the thinking-off and `stop-circling` runs state the
+right answer in bold. Those figures
+have not been re-scored, but the 0.8B was measured again with answer lines on the first suite's
+seed 11 (greedy, thinking closed after N tokens): 44 of 80 at 1 token, 47 at 256, 48 at 512 and
+at 1,024, 55 at 1,536 and at 3,072, and 0 with no limit. Thinking is worth more to the smaller
+model, and 1,536 is still where it stops paying.
+
+**It has the same weakness, more clearly.** On the first suite it first writes the right number
+after a median of 308 thinking tokens and stops at a median of 1,538, where `stop-circling`
+cuts it off. On the hard suite, thinking unaided to a 6,144-token reply, it gets 60 of 80 on
+held-out seed 11 (56 on seed 7): in all 20 misses the right number was in its thinking, and 18
+of them never left the block.
+
+**What fixes it is being made to answer, at almost any point.** Closing the block after N
+thinking tokens, on held-out seed 11, greedy except where said:
+
+| Thinking closed after | Correct | Tokens a reply |
+|---|---|---|
+| 1 token | 75 | 1,778 |
+| 512 | 76 | 1,563 |
+| 1,024 | 78 | 1,978 |
+| **1,536** | **80** | 2,128 |
+| 2,048 | 79 | 2,592 |
+| 3,072 | 79 | 3,318 |
+| never | 60 | 4,311 |
+| 1,536, sampled as served (0.6, 0.95, 20) | 79 | 2,281 |
+| never, sampled as served | 52 | 4,847 |
+
+Closing after a single token costs five problems against the best, because the model then works
+the problem in its answer. Thinking is worth a little; finishing is worth a lot. `stop-circling`'s
+1,536-token cutoff, tuned on the 0.8B, happens to be right for the 4B too. The server's
+[thinking budget](server.md#the-thinking-budget) does the same without an adapter, for any
+model, and also when a reply's own limit is about to run out.
+
+**A cleverer stopping rule did not beat a budget.** `entail settle` probes what the model would
+answer if its thinking ended now (close the block on the sequence, read a few greedy tokens,
+rewind), every N tokens, and can stop when K probes agree. Offline on the trace of seed 7, five
+agreeing probes 256 tokens apart would have given 77 of 80 at a mean of 1,837 thinking tokens. A
+plain cutoff at 2,048 would have given 77 at 1,860. The probes show when the answer stops
+moving, and that is not worth its cost. (The same offline estimate put a 1,536 cutoff at 72:
+live it is 80, because the reply goes on working after the block closes. Estimates from probes
+understate short budgets.)
+
+The differences between budgets are one or two problems of 80 on one seed, so only the gap to
+unlimited thinking is a finding.
+
 ## What this says about small models
 
 - **The weakest trait is not solving but finishing.** The 0.8B model writes the right
@@ -222,7 +286,7 @@ request. Reproducing the prose reply needs those.
 
 ## Limits
 
-- 80 problems per seed, on one model, greedy. The two seeds agree to the case count, which
+- Each suite is 80 problems per seed, on one model at a time, mostly greedy. The two seeds agree to the case count, which
   is encouraging, but each family has only 10 problems.
 - The span, the count and the budget were chosen on the development seed and only checked
   on one held-out seed.

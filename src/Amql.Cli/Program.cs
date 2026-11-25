@@ -45,6 +45,7 @@ internal static partial class Program
         double? maxRamGb = null;
         bool? fp4Prefill = null;
         double? gpuMemoryGb = null;
+        string? maxContext = null, ropeExtend = null;
         for (int i = 0; i < args.Length; i++)
         {
             string a = args[i];
@@ -90,6 +91,19 @@ internal static partial class Program
                 i++;
                 continue;
             }
+            if (a is "--max-context" or "--rope-extend")
+            {
+                string? value = i + 1 < args.Length ? args[i + 1] : null;
+                if (value is null || value.StartsWith("--", StringComparison.Ordinal))
+                {
+                    Console.Error.WriteLine(a == "--max-context" ? "error: --max-context needs a length, e.g. 1M"
+                        : $"error: --rope-extend needs {string.Join(", ", ContextExtension.Methods)}");
+                    return ExitUsage;
+                }
+                if (a == "--max-context") maxContext = value; else ropeExtend = value;
+                i++;
+                continue;
+            }
             if (a is "--max-ram" or "--gpu-memory")
             {
                 if (i + 1 >= args.Length ||
@@ -109,6 +123,23 @@ internal static partial class Program
             if (a == "--progress") { progress = true; continue; }
             if (a == "--verbose") { verbose = true; continue; }
             filtered.Add(a);
+        }
+        if (ropeExtend is not null && maxContext is null)
+        {
+            Console.Error.WriteLine("error: --rope-extend needs --max-context");
+            return ExitUsage;
+        }
+        if (maxContext is not null)
+        {
+            try
+            {
+                ContextExtension.Requested = ContextExtension.Parse(maxContext, ropeExtend);
+            }
+            catch (FormatException e)
+            {
+                Console.Error.WriteLine($"error: {e.Message}");
+                return ExitUsage;
+            }
         }
         if (forceCpu && forceGpu)
         {
@@ -203,6 +234,7 @@ internal static partial class Program
                 "lora-train" => LoraTrain(args[1..]),
                 "tool-trace" => ToolTrace(args[1..]),
                 "kv-probe" => KvProbe(args[1..]),
+                "context" => ContextCommand(args[1..]),
                 "entail" => EntailCommand(args[1..]),
                 "ngram" => NGramCommand(args[1..]),
                 "classify" => Classify(args[1..]),
@@ -2920,7 +2952,7 @@ internal static partial class Program
             then run and inspect inference against it
 
             USAGE:
-              amql-cli [--cpu | --gpu] [--max-ram GB] [--gpu-memory GB] [--gpu-format nvfp4|fp16] [--kv-format fp16|f32|nvfp4] [--fp4-prefill on|off] [--progress] [--verbose] <command> [args]
+              amql-cli [--cpu | --gpu] [--max-ram GB] [--gpu-memory GB] [--gpu-format nvfp4|fp16] [--kv-format fp16|f32|nvfp4] [--max-context N [--rope-extend auto|none|yarn|ntk|linear]] [--fp4-prefill on|off] [--progress] [--verbose] <command> [args]
               amql-cli --version | -V
 
             Commands:
@@ -2932,6 +2964,12 @@ internal static partial class Program
                               fetch a checkpoint from the Hugging Face Hub (resumable, SHA-256 checked)
               amql-cli strip <container-dir> --keep <encoding> [--out <slim-dir>]   slim copy
               amql-cli verify <container-dir>                     integrity + readiness
+              amql-cli context bench <container> --text <file|dir>[;…] [--lengths 8K,32K,128K,256K]
+                              [--questions 24] [--needle-every 2048] [--score-tokens 1024]
+                              [--text-offset N] [--seed 1] [--plain] [--out <json>]
+                              how well the model uses a context of each length: facts recalled from all
+                              of it, quoting passages, read and decode speed; --plain: perplexity (with the
+                              global --max-context / --rope-extend, lengths past the trained one)
               amql-cli classify <classifier-container>
                               (--premise "…" --hypothesis "…" | --text "premise|hypothesis"
                                | --input "text" | --jsonl <path | ->)
@@ -3034,7 +3072,9 @@ internal static partial class Program
               amql-cli entail side <container-dir> --adapter <dir>[,<dir>] --prompt <text> [--chat] [--think] [--max-tokens N] [--weights f32|disk]
               amql-cli entail run <program> --expr <text>|--cases <cases.jsonl> [--tokenizer <dir>] [--report <json>]
               amql-cli entail eval <container-dir> --cases <cases.jsonl> [--adapter <dir>[,<dir>]] [--batch N] [--watch TOKEN] [--prefix TEXT] [--logprobs] [--text <file>] [--report <json>] [--weights f32|disk]
-              amql-cli entail bench <container-dir> [--suite reasoning --per 10 --seed 7 --families a,b | --cases <jsonl>] [--no-think] [--max-tokens 2048] [--temperature 0 --top-p 0 --top-k 0 --sample-seed 1] [--watch TOKEN] [--score answer|tools] [--simulate N] [--adapter <dir>[,<dir>]] [--report <json>] [--compare <json>] [--write-cases <jsonl>]
+              amql-cli entail settle <container-dir> [--suite reasoning|hard --per 10 --seed 7 | --cases <jsonl>] [--every 64] [--agree 0] [--least 0] [--budget 0] [--max-tokens 4096] [--batch 8] [--temperature 0 --top-p 0 --top-k 0 --sample-seed 1] [--report <json>] [--compare <json>]
+                              the suite in a batch, thinking: probe what the model would answer every N tokens, and close thinking when K probes agree or at a budget
+              amql-cli entail bench <container-dir> [--suite reasoning|hard --per 10 --seed 7 --families a,b --answer-line | --cases <jsonl>] [--no-think] [--max-tokens 2048] [--temperature 0 --top-p 0 --top-k 0 --sample-seed 1] [--watch TOKEN] [--score answer|tools] [--simulate N] [--adapter <dir>[,<dir>]] [--report <json>] [--compare <json>] [--write-cases <jsonl>]
               amql-cli entail find <container-dir> --subject <file> --out <dir> [--top 64] [--verify]
               amql-cli entail extract <container-dir> --subject <file> --out <dir>
               amql-cli entail from-lora <container-dir> --lora <dir> --cases <jsonl> --out <file.entail.txt> [--occlude 3]

@@ -309,4 +309,27 @@ public sealed class ServerTests : IClassFixture<ServerTests.Hosts>
         using var anonymous = new HttpClient { BaseAddress = _h.Client.BaseAddress };
         Assert.Equal(HttpStatusCode.Unauthorized, (await anonymous.GetAsync("/amql/status")).StatusCode);
     }
+
+    [Theory]
+    [InlineData(3072, 8192, 3072)]   // room to spare: the budget
+    [InlineData(3072, 4096, 3072)]
+    [InlineData(3072, 2048, 1472)]   // the reply's own limit comes first, with 512 tokens kept for an answer
+    [InlineData(100, 400, 100)]
+    [InlineData(3072, 100, 11)]
+    [InlineData(5, 10, 1)]
+    public void Thinking_Stops_In_Time_For_An_Answer(int budget, int maxTokens, int expected) =>
+        Assert.Equal(expected, ThinkingLimit.For(budget, maxTokens));
+
+    [Fact]
+    public void Server_Config_Reads_A_Thinking_Budget()
+    {
+        using var dir = new TempDir();
+        string file = Path.Combine(dir.Path, "models.json");
+        File.WriteAllText(file, "{\"models\":[{\"path\":\"a\",\"thinking_budget\":3072},{\"path\":\"b\"}]}");
+        var models = ServerConfig.Read(file);
+        Assert.Equal(3072, models[0].Defaults.ThinkingBudget);
+        Assert.Null(models[1].Defaults.ThinkingBudget);
+        File.WriteAllText(file, "{\"models\":[{\"path\":\"a\",\"thinking_budget\":-1}]}");
+        Assert.Throws<InvalidDataException>(() => ServerConfig.Read(file));
+    }
 }

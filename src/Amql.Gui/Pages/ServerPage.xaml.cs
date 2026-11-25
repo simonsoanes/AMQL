@@ -95,6 +95,7 @@ public partial class ServerPage : UserControl
         TopPBox.Text = Num(Profile.TopP);
         TopKBox.Text = Profile.TopK?.ToString(CultureInfo.InvariantCulture) ?? "";
         GpuFormatBox.SelectedItem = GpuFormatBox.Items.Cast<ComboBoxItem>().FirstOrDefault(i => (string)i.Tag == Profile.GpuFormat) ?? GpuFormatBox.Items[0];
+        KvFormatBox.SelectedItem = KvFormatBox.Items.Cast<ComboBoxItem>().FirstOrDefault(i => (string)i.Tag == Profile.KvFormat) ?? KvFormatBox.Items[0];
         for (int i = 0; i < Behaviours.Length; i++)
         {
             _behaviourChecks[i].IsChecked = Behaviours[i].Get(Profile);
@@ -127,6 +128,7 @@ public partial class ServerPage : UserControl
         Profile.TopP = Double(TopPBox.Text);
         Profile.TopK = Int(TopKBox.Text);
         Profile.GpuFormat = (GpuFormatBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "";
+        Profile.KvFormat = (KvFormatBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "";
         for (int i = 0; i < Behaviours.Length; i++)
         {
             Behaviours[i].Set(Profile, _behaviourChecks[i].IsChecked == true);
@@ -332,7 +334,7 @@ public partial class ServerPage : UserControl
     {
         Ensure(m).Enabled = enabled;
         // Unticked models with nothing set are dropped, so the list does not fill with leftovers.
-        Profile.Models.RemoveAll(s => !s.Enabled && s.Id.Length == 0 && s.Format.Length == 0 && s.Think is null && s.MaxTokens is null
+        Profile.Models.RemoveAll(s => !s.Enabled && s.Id.Length == 0 && s.Format.Length == 0 && s.MaxContext.Length == 0 && s.Think is null && s.MaxTokens is null
                                       && s.Temperature is null && s.TopP is null && s.TopK is null && s.Adapters.Count == 0);
         Changed();
     }
@@ -385,6 +387,31 @@ public partial class ServerPage : UserControl
             think.SelectedItem = think.Items.Cast<ComboBoxItem>().First(i => (bool?)i.Tag == s.Think);
             think.SelectionChanged += (_, _) => { Ensure(m).Think = (bool?)((ComboBoxItem)think.SelectedItem).Tag; Changed(); };
             Add("Reasoning", think);
+            var context = new StackPanel { Orientation = Orientation.Horizontal };
+            var contextChoice = new ComboBox { MinWidth = 200 };
+            foreach (var (text, tag) in new[] { ("The model's own (default)", ""), ("512K tokens", "512K"), ("1M tokens", "1M"), ("Other…", "other") })
+            {
+                contextChoice.Items.Add(new ComboBoxItem { Content = text, Tag = tag });
+            }
+            contextChoice.SelectedItem = contextChoice.Items.Cast<ComboBoxItem>()
+                .FirstOrDefault(i => string.Equals((string)i.Tag, s.MaxContext.Trim(), StringComparison.OrdinalIgnoreCase)) ?? contextChoice.Items[^1];
+            var contextBox = Box(s.MaxContext, v => Ensure(m).MaxContext = v.Trim());
+            contextBox.Margin = new Thickness(6, 0, 0, 0);
+            contextBox.ToolTip = "A token count, or K and M: 1048576, 768K, 1M";
+            contextBox.Visibility = ReferenceEquals(contextChoice.SelectedItem, contextChoice.Items[^1]) ? Visibility.Visible : Visibility.Collapsed;
+            contextChoice.SelectionChanged += (_, _) =>
+            {
+                string tag = (string)((ComboBoxItem)contextChoice.SelectedItem).Tag;
+                contextBox.Visibility = tag == "other" ? Visibility.Visible : Visibility.Collapsed;
+                if (tag != "other")
+                {
+                    contextBox.Text = tag;
+                }
+            };
+            context.Children.Add(contextChoice);
+            context.Children.Add(contextBox);
+            Add("Context length", context,
+                "How many tokens the model can hold. Longer than the model was trained to needs the GPU memory for it: see Prompt state (KV) format under Defaults.");
             Add("Max reply tokens", Box(s.MaxTokens?.ToString(CultureInfo.InvariantCulture) ?? "", v => Ensure(m).MaxTokens = Int(v)));
             Add("Temperature", Box(Num(s.Temperature), v => Ensure(m).Temperature = Double(v)));
             Add("Top-p", Box(Num(s.TopP), v => Ensure(m).TopP = Double(v)));

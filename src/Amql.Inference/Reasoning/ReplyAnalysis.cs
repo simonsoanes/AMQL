@@ -42,6 +42,9 @@ public sealed record ReplyAnalysis(
 
     private static readonly Regex Number = new(@"(?<![\w.])-?\d[\d,]*(?:\.\d+)?", RegexOptions.Compiled);
     private static readonly Regex Boxed = new(@"\\boxed\{([^{}]*)\}", RegexOptions.Compiled);
+    // A line that is only an answer: "Answer: 12", "**Final answer:** 12".
+    private static readonly Regex AnswerLine = new(@"^[\s*#>_]*(?:final\s+)?answer[\s*_]*[:=][\s*_$]*(-?\d[\d,]*(?:\.\d+)?)[\s*_$.]*$",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.Multiline);
 
     /// <summary>
     /// Reads a reply. <paramref name="tokens"/> are the reply's ids, <paramref name="pieces"/>
@@ -68,7 +71,11 @@ public sealed record ReplyAnalysis(
     }
 
     /// <summary>The answer in a final text: the last <c>\boxed{}</c> holding a number, or else
-    /// the last number. Thousands separators are dropped and a whole decimal is read whole.</summary>
+    /// the last line that is only an answer (<c>Answer: 12</c>), or else the last number. The
+    /// last number is a guess: a reply that gives its answer and then explains it ends on a
+    /// number of the explanation, so a suite should ask for an answer line
+    /// (<see cref="ProblemSuite.AnswerLine"/>). Thousands separators are dropped and a whole
+    /// decimal is read whole.</summary>
     public static string? Extract(string answerText)
     {
         var boxed = Boxed.Matches(answerText);
@@ -78,6 +85,10 @@ public sealed record ReplyAnalysis(
             {
                 return Normalise(inBox[^1].Value);
             }
+        }
+        if (AnswerLine.Matches(answerText) is { Count: > 0 } lines)
+        {
+            return Normalise(lines[^1].Groups[1].Value);
         }
         var numbers = Number.Matches(answerText);
         return numbers.Count == 0 ? null : Normalise(numbers[^1].Value);

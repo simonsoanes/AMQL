@@ -116,6 +116,9 @@ public sealed class ServerProfile
     /// <summary>--gpu-format for every model that does not choose: "", "nvfp4", "mxfp4", "fp16".</summary>
     public string GpuFormat { get; set; } = string.Empty;
 
+    /// <summary>--kv-format: "" (the server's, FP16), "nvfp4" or "f32".</summary>
+    public string KvFormat { get; set; } = string.Empty;
+
     // Defaults for chat models.
     public bool Think { get; set; }
     public int? MaxTokens { get; set; }
@@ -169,6 +172,9 @@ public sealed class ServedModel
     public double? Temperature { get; set; }
     public double? TopP { get; set; }
     public int? TopK { get; set; }
+
+    /// <summary>A context length other than the model's own ("1M", "512K"); empty keeps it.</summary>
+    public string MaxContext { get; set; } = string.Empty;
 
     /// <summary>Entail adapter folders run beside a chat model.</summary>
     public List<string> Adapters { get; set; } = new();

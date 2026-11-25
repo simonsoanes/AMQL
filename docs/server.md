@@ -78,12 +78,19 @@ defaults it applies, and `GET /v1/models/{id}` returns one (404 `model_not_found
   Qwen 3.5 4B), a little faster decode at long contexts, and on the 4B no measurable difference from f32
   (perplexity 10.325 against 10.326, the same top token at all 8,192 positions). Paged-out files are half the size
   too. `--kv-format f32` (or `AMQL_KV_FORMAT=f32`) keeps the values as computed.
+- `--max-context N` (`1M`, `512K`, a token count; `"max_context"` per model in `--config`) serves a model at a
+  context length other than its own. A conversation that fits the trained length runs exactly as before; one
+  that will go past it runs extended rotary frequencies (`--rope-extend`). Past 256K, use `--kv-format nvfp4` and
+  a `--kv-gpu-budget` that holds the state (about 11 GB at 1M on Qwen 3.5 4B), or it is released after each
+  reply. Reading 1M tokens takes about half an hour. See [Running a model past its trained
+  context](context-extension.md).
 - `--kv-format nvfp4` stores the GPU engine's KV cache as NVFP4: ~7x less memory a token on Qwen 3.5 4B
   (592 bytes a position instead of 4,096), faster decode at long contexts, and paged-out files 7x smaller.
   Replies differ slightly from f32 KV's (perplexity +0.4%, KL 0.008 on the 4B). See [The KV cache](kv-cache.md).
   With it, each conversation's system prompt, tools and first user message stay out of the 4-bit rounding
   (`--kv-exact-prefix auto`, the default; `N` tokens, or `0` for none), so the instructions every later token
-  reads keep their precision. They are kept at FP16 by default: half f32's memory, and on the 4B no measurable
+  reads keep their precision (at most 16,384 tokens of them, so a document as the first message does not fill
+  the GPU). They are kept at FP16 by default: half f32's memory, and on the 4B no measurable
   difference from f32 (KL under 0.00005, the same top token at all 8,192 positions). `--kv-exact-format f32`
   keeps them at f32, bit for bit an f32 cache's.
 
@@ -380,6 +387,16 @@ user's own message only, since the notes name tools too ("tool:edit_file (graph 
 with text, as the start of the reply: the prompt is the conversation's generation prompt followed by that text,
 and the model carries on from it. The reply holds only the continuation. With `logprobs`, it shows what a model
 would write at any point of a reply, which is how the call habits above were measured.
+
+### The thinking budget
+
+A small reasoning model often has its answer long before it stops thinking, and a reply that runs out of tokens
+while still thinking has no answer at all. `--thinking-budget N` (or `"thinking_budget"` in a model's config, or in
+the request, top level or in `chat_template_kwargs`) closes the block after N thinking tokens, at the end of the
+line, and lets the answer follow. It closes earlier when the reply's own `max_tokens` would leave too little room: a
+quarter of the limit, at most 512 tokens, is kept. 0, the default, is no limit. On 80 held-out hard problems
+Qwen 3.5 4B got 60 thinking without a limit and 80 with a budget of 1,536 (79 at 2,048 and 3,072; see
+[Reasoning](entail-reasoning.md#the-4b)). It applies to free text only; structured output never thinks.
 
 ### The loop guard
 

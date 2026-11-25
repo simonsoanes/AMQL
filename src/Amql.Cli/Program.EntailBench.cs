@@ -225,14 +225,15 @@ internal static partial class Program
             }).ToList();
         }
         string suite = OptionValue(args, "--suite") ?? "reasoning";
-        if (suite != "reasoning")
-        {
-            throw new CliException($"unknown suite '{suite}': use reasoning, or --cases <file>");
-        }
         var families = OptionValue(args, "--families")?.Split(',', StringSplitOptions.RemoveEmptyEntries);
         try
         {
-            return ProblemSuite.Generate(IntOption(args, "--seed", 7), IntOption(args, "--per", 10), families);
+            var problems = ProblemSuite.Generate(IntOption(args, "--seed", 7), IntOption(args, "--per", 10), families, suite);
+            // The hard suite always asks for an answer line. The first suite's prompts stay as its
+            // published results had them unless it is asked for.
+            return suite == "hard" || args.Contains("--answer-line")
+                ? problems.Select(p => p with { Prompt = p.Prompt + ProblemSuite.AnswerLine }).ToList()
+                : problems;
         }
         catch (ArgumentException e)
         {

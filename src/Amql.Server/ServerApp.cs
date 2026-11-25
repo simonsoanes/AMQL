@@ -34,6 +34,10 @@ public sealed class ApiException : Exception
 public sealed record ServerSettings(string? ApiKey = null, int DefaultMaxTokens = 1024, bool Think = false,
     float? Temperature = null, float? TopP = null, int? TopK = null)
 {
+    /// <summary>Thinking tokens after which a reply's block is closed, for models and
+    /// requests that do not say (<c>--thinking-budget</c>; 0: never).</summary>
+    public int ThinkingBudget { get; init; }
+
     /// <summary>N-gram packs by name (<c>--ngram-pack</c>), for requests and models to choose from.</summary>
     public IReadOnlyDictionary<string, Amql.Inference.NGram.NGramPack> NGramPacks { get; init; } =
         new Dictionary<string, Amql.Inference.NGram.NGramPack>();
@@ -213,6 +217,7 @@ public static class ServerApp
                 ["temperature"] = m.Defaults.Temperature ?? settings.Temperature ?? 1f,
                 ["top_p"] = m.Defaults.TopP ?? settings.TopP ?? 1f,
                 ["top_k"] = m.Defaults.TopK ?? settings.TopK ?? 0,
+                ["thinking_budget"] = m.Defaults.ThinkingBudget ?? settings.ThinkingBudget,
             };
         }
         return o;
@@ -1641,7 +1646,14 @@ public static class ServerApp
                 throw new ApiException(400, "'stop' takes up to 4 non-empty strings", param: "stop");
             }
         }
-        return new GenerationParams(maxTokens, temperature, topP, seed, stop) { TopK = topK };
+        int thinkingBudget = IntField(body, "thinking_budget")
+            ?? (body.TryGetProperty("chat_template_kwargs", out var kw) && kw.ValueKind == JsonValueKind.Object ? IntField(kw, "thinking_budget") : null)
+            ?? defaults.ThinkingBudget ?? settings.ThinkingBudget;
+        if (thinkingBudget < 0)
+        {
+            throw new ApiException(400, "'thinking_budget' must be 0 (no limit) or more", param: "thinking_budget");
+        }
+        return new GenerationParams(maxTokens, temperature, topP, seed, stop) { TopK = topK, ThinkingBudget = thinkingBudget };
     }
 
     /// <summary>A chat message's role and its content flattened to text: a

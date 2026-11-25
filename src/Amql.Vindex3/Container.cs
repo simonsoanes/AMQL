@@ -37,8 +37,18 @@ public sealed class Vindex3Container : IDisposable
     public Vindex3Index Index { get; }
     public SystemGraph? Graph { get; }
 
-    public static Vindex3Container Open(string root)
+    /// <summary>What a context extension changed as this container opened
+    /// (empty without one).</summary>
+    public IReadOnlyList<string> ContextNotes { get; private init; } = Array.Empty<string>();
+
+    /// <param name="context">Runs the model at another context length than its
+    /// own (see <see cref="ContextExtension"/>); null is
+    /// <see cref="ContextExtension.Requested"/>, usually none. Only the graph in
+    /// memory changes.</param>
+    public static Vindex3Container Open(string root, ContextExtension? context = null)
     {
+        context ??= ContextExtension.Requested;
+        IReadOnlyList<string> contextNotes = Array.Empty<string>();
         var indexPath = Path.Combine(root, "index.json");
         if (!File.Exists(indexPath))
         {
@@ -74,7 +84,13 @@ public sealed class Vindex3Container : IDisposable
             }
             try
             {
-                graph = JsonSerializer.Deserialize<SystemGraph>(File.ReadAllBytes(graphFile), ViJson.Options)
+                var bytes = File.ReadAllBytes(graphFile);
+                if (context is not null && System.Text.Json.Nodes.JsonNode.Parse(bytes) is System.Text.Json.Nodes.JsonObject tree)
+                {
+                    contextNotes = context.Apply(tree);
+                    bytes = System.Text.Encoding.UTF8.GetBytes(tree.ToJsonString());
+                }
+                graph = JsonSerializer.Deserialize<SystemGraph>(bytes, ViJson.Options)
                         ?? throw new ContainerException($"container '{root}': {graphPath} is empty");
             }
             catch (JsonException e)
@@ -90,7 +106,7 @@ public sealed class Vindex3Container : IDisposable
             }
         }
 
-        var container = new Vindex3Container(root, index, graph);
+        var container = new Vindex3Container(root, index, graph) { ContextNotes = contextNotes };
         container.ValidateStructure();
         return container;
     }

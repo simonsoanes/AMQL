@@ -29,6 +29,7 @@ internal static partial class Program
             "side" => EntailSide(rest),
             "eval" => EntailEval(rest),
             "bench" => EntailBench(rest),
+            "settle" => EntailSettle(rest),
             "find" => EntailFind(rest),
             "decompile" => EntailDecompile(rest),
             "from-lora" => EntailFromLora(rest),
