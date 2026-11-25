@@ -17,6 +17,15 @@ public sealed record FamilyConventions
     public bool ZeroTailPartialRotary { get; init; }
     public bool RopeOnFullLayers { get; init; } = true;
 
+    /// <summary>The factor on q·k for a config that states none; null is 1/√head_dim.</summary>
+    public double? AttentionScale { get; init; }
+
+    /// <summary>Each head's value is RMS-normalised, with no weight (Gemma 4).</summary>
+    public bool ValueRmsNorm { get; init; }
+
+    /// <summary>The expert router reads its input RMS-normalised, with no weight (Gemma 4).</summary>
+    public bool RouterInputRmsNorm { get; init; }
+
     /// <summary>Which of the facts above came from an entry (fact → source).</summary>
     public Dictionary<string, string> Provenance { get; init; } = new(StringComparer.Ordinal);
 
@@ -34,7 +43,8 @@ public sealed record FamilyConventions
         string source = $"family-conventions.json[{modelType}]";
         var provenance = new Dictionary<string, string>(StringComparer.Ordinal);
         float offset = 0f;
-        bool sqrtHidden = false, interleaved = false, zeroTail = false, ropeOnFull = true;
+        bool sqrtHidden = false, interleaved = false, zeroTail = false, ropeOnFull = true, valueNorm = false, routerNorm = false;
+        double? attentionScale = null;
         foreach (var fact in entry.EnumerateObject())
         {
             switch (fact.Name)
@@ -58,6 +68,19 @@ public sealed record FamilyConventions
                 case "rope_on_full_layers":
                     ropeOnFull = fact.Value.GetBoolean();
                     break;
+                case "attention_scale":
+                    attentionScale = fact.Value.GetDouble();
+                    break;
+                case "value_norm":
+                    valueNorm = fact.Value.GetString() == "rms"
+                        ? true
+                        : throw new ModelConfigException($"{source}: value_norm '{fact.Value}' is not a known convention");
+                    break;
+                case "router_input_norm":
+                    routerNorm = fact.Value.GetString() == "rms"
+                        ? true
+                        : throw new ModelConfigException($"{source}: router_input_norm '{fact.Value}' is not a known convention");
+                    break;
                 default:
                     throw new ModelConfigException($"{source}: unknown convention '{fact.Name}' — refusing rather than ignoring it");
             }
@@ -70,6 +93,9 @@ public sealed record FamilyConventions
             RopeInterleaved = interleaved,
             ZeroTailPartialRotary = zeroTail,
             RopeOnFullLayers = ropeOnFull,
+            AttentionScale = attentionScale,
+            ValueRmsNorm = valueNorm,
+            RouterInputRmsNorm = routerNorm,
             Provenance = provenance,
         };
     }

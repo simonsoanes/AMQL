@@ -26,7 +26,7 @@ internal static partial class Program
         string tokenizerDir = ResolveTokenizerDir(containerDir, args);
         var tokenizer = Tokenizer(tokenizerDir);
         var stop = ResolveStopTokens(tokenizerDir, tokenizer);
-        string? template = ChatTemplate.Load(tokenizerDir);
+        var template = ChatTemplate.Load(tokenizerDir);
         bool think = !args.Contains("--no-think");
         int maxTokens = IntOption(args, "--max-tokens", think ? 2048 : 512);
         string? reportPath = OptionValue(args, "--report");

@@ -19,7 +19,7 @@ doing; everything below applies whichever way it is started.
 |---|---|
 | Von decision model (ModernBERT + option-marker head) | `POST /v1/decisions`, `POST /v1/systemone` (OpenJEV's path), `POST /api/v1/decisions` (jevai.org's `{ code, message, data }` envelope) |
 | Embedding container (`convert-to-embedding`, an `embedding` surface) | `POST /v1/embeddings` |
-| Generative decoder with a chat template this build renders | `POST /v1/chat/completions`, `POST /v1/responses` — streaming (SSE) or not; tools and reasoning for Qwen3.5-family templates |
+| Generative decoder with a chat template | `POST /v1/chat/completions`, `POST /v1/responses`, streaming (SSE) or not, with the reasoning and tools its [template](#chat-templates) writes |
 | Every model | `GET /v1/models`, `GET /v1/models/{id}` (with `capabilities`, and for chat models `context_length`, `tools`, `thinking`, `adapters` and `defaults`), `GET /health` |
 | The server itself | `GET /amql/status`: what it is doing (see [Status](#status)) |
 
@@ -131,9 +131,9 @@ takes its place at once. Up to 64 requests per model are accepted; past 8 they w
 - `--no-batch` turns it off. `--batch-bf16` runs batches of 4 or more on tensor cores (cuBLAS, activations
   rounded to BF16, as prompts already are): about 1.6x the throughput at 8, but a reply then depends slightly
   on what shares its batch.
-- **Speculative decoding.** A reply running alone on a model with an MTP drafter (Qwen 3.5) takes several
-  tokens a step. The drafter proposes 3 tokens, or the context does when the reply's last 8 tokens appeared in it
-  before. The model runs them as rows of one pass, and the reply takes each row exactly as a plain step would:
+- **Speculative decoding.** A reply running alone on a model with a drafter (Qwen 3.5's MTP layer, or one
+  [attached](gemma-4.md#the-drafter) to its container) takes several tokens a step. The drafter proposes as many
+  as have been holding, or the context does when the reply's last 8 tokens appeared in it before. The model runs them as rows of one pass, and the reply takes each row exactly as a plain step would:
   adapters, constraints and the sampler, in order, for as long as it chooses the next draft. The replies are
   the same token for token, greedy or sampled with a seed; on Qwen 3.5 4B they come 1.4–1.65x faster.
   `AMQL_MTP_DRAFTS=0` turns it off, `AMQL_SUFFIX_DRAFT=0` the context's drafts, and `AMQL_SERVER_TIMING=1` logs
@@ -251,10 +251,8 @@ prompt tokens.
 
 ## Chat completions and responses
 
-Messages are rendered with the container's own chat template, reproduced exactly for the families this build
-knows — Qwen3/Qwen3.5 ChatML (trimmed contents, `<think>` handling, the empty think block unless thinking is on,
-tools, calls and tool results), plain ChatML and Llama 3 — and tokenised without extra special tokens, as
-`apply_chat_template` does. Any other template is refused at load rather than approximated.
+Messages are rendered by the container's own chat template ([below](#chat-templates)) and tokenised without extra
+special tokens, as `apply_chat_template` does.
 
 - **Content**: strings or arrays of text parts (`text`, `input_text`, `output_text`); `developer` is a system
   message; the Responses API's `instructions` is a system message placed first.
@@ -262,7 +260,7 @@ tools, calls and tool results), plain ChatML and Llama 3 — and tokenised witho
   (up to 4 strings, never streamed past), `max_tokens` / `max_completion_tokens` / `max_output_tokens` (default
   `--max-tokens`, bounded by the context). `--temperature`, `--top-p` and `--top-k` set the defaults for requests
   that leave them out. Generation stops at the tokens named by `generation_config.json`'s `eos_token_id`, the
-  tokenizer's `eos_token`, and the template's end-of-turn marker. Other sampling fields (penalties, `min_p`) are
+  tokenizer's `eos_token`, and the tokens the template ends a turn with, after words and after calls. Other sampling fields (penalties, `min_p`) are
   ignored.
 - **Text** is decoded from the accumulated bytes at every step, so a character split across tokens is sent once,
   whole.
@@ -271,7 +269,7 @@ tools, calls and tool results), plain ChatML and Llama 3 — and tokenised witho
   thinking block comes back apart from the answer: `reasoning_content` on the chat message (and in stream
   deltas), a `reasoning` output item with `reasoning_text` in Responses. Sent back on a later turn
   (`reasoning_content` on an assistant message, or a `reasoning` input item), it is rendered as the template
-  renders it.
+  renders it. The other `chat_template_kwargs`, and `reasoning_effort`, are passed to the template.
 - **Finish**: `stop`, `length` or `tool_calls` for chat; Responses reports `completed`, or `incomplete` with
   `incomplete_details.reason: "max_output_tokens"`.
 - **Streaming**: chat sends `chat.completion.chunk` deltas (role first, `finish_reason` last, a `usage` chunk
@@ -280,17 +278,59 @@ tools, calls and tool results), plain ChatML and Llama 3 — and tokenised witho
   its deltas (`response.reasoning_text.delta`, `response.output_text.delta`, or
   `response.function_call_arguments.delta`), their `.done`, `response.content_part.done`,
   `response.output_item.done`, and finally `response.completed` or `response.incomplete`, each with a
-  `sequence_number`. Nothing is sent before it is certain: text that could begin `</think>` or `<tool_call>`
+  `sequence_number`. Nothing is sent before it is certain: text that could begin `</think>` or a call
   waits for the next token.
-- **Refused** (400, OpenAI error shape), rather than silently ignored: legacy `functions`, `n > 1`, audio, image
-  or other non-text content parts, tool types other than functions, and the Responses API's `conversation`.
+- **Refused** (400, OpenAI error shape), rather than silently ignored: legacy `functions`, `n > 1`, audio and
+  other content parts, images where the model reads none, tool types other than functions, and the Responses API's
+  `conversation`.
+
+### Chat templates
+
+A model is served by the template it ships (`chat_template.jinja`, or `chat_template` in
+`tokenizer_config.json`), run by AMQL's own Jinja interpreter. It keeps to transformers' rules (trimmed blocks,
+`tojson`, `raise_exception`, `strftime_now`). On 23 models' templates, 966 conversations came out exactly as
+transformers renders them. What a template raises is the request's 400.
+
+No family is named in the code. When a model loads, the server renders probe conversations and compares what comes
+out to learn:
+
+| | from |
+|---|---|
+| What opens and closes thinking, and the empty block that stands for none | an assistant message with reasoning; the prompt with thinking on and off |
+| What ends a turn, opens the next and opens a tool's result | conversations with one more message each |
+| Whether tools, calls, results and images are written at all; what is not is refused | the same conversations with and without them |
+| How calls are written | calls with no arguments, one, two and a number, and two calls in one turn |
+
+Calls come in four forms:
+
+| Form | Example | Models |
+|---|---|---|
+| JSON object | `<tool_call>{"name": "f", "arguments": {"k": "v"}}</tool_call>`, `[TOOL_CALLS]f[ARGS]{"k": "v"}` | Qwen 3, Granite, Mellum, Mistral |
+| Parameters one by one | `<function=f><parameter=k>v</parameter></function>`, `<param name="k">v</param>`, `<arg_key>k</arg_key><arg_value>v</arg_value>` | Qwen 3.5 and later, Nemotron, MiniCPM, GLM |
+| Python call | `<\|tool_call_start\|>[f(k='v')]<\|tool_call_end\|>` | LFM 2.5 |
+| Object with marked strings | `<\|tool_call>call:f{k:<\|"\|>v<\|"\|>}<tool_call\|>` | Gemma 4 |
+
+Each form is checked by writing calls with the template, reading them back and holding them to their tools: on the
+models' own templates, and for Mistral's and GLM's on templates cut down to the same form. Live, on 32 tool tests
+each (one call, several, loops, forced, streamed, with thinking and without): Qwen 3.5 4B 32, Gemma 4 26B 31,
+MiniCPM5 2B 31.
+
+The log says at load whether a model serves tools, and why not when it does not. Refused: a template that writes no
+calls or no results (Gemma 3, Phi-3), and calls that start with no mark of their own (gpt-oss's, which start
+in the middle of a header). LFM 2.5 1.2B's template writes strings between quotes with nothing escaped, so a call
+whose text holds a quote before a comma or a bracket cannot be read for certain.
+
+A conversation is rendered as transformers would render it, with three exceptions. A result that names no call
+answers the calls in order. What was said along with a call is written before it where the template would put it
+after the call's results. And a reply that goes on from an image in a tool result, with thinking off, starts with
+the empty thinking block.
 
 ### Calls held to the tools
 
 A small model writes calls the harness cannot run: a parameter the tool does not have (`edit_file` with
-`content`), an array parameter whose JSON does not parse, a tool that does not exist. So once a reply writes
-`<tool_call>` (outside thinking), the rest of the call is held to the request's tools by the same constrained
-decoding as structured output, until `</tool_call>`:
+`content`), an array parameter whose JSON does not parse, a tool that does not exist. So once a reply opens
+a call (outside thinking), the rest of it is held to the request's tools by the same constrained
+decoding as structured output, until it closes. In the form Qwen 3.5 writes, and likewise in the others:
 
 - `<function=NAME>` names a declared tool; each `<parameter=K>` is one of its parameters, not given yet;
   `</function>` comes only once every required parameter is there.
@@ -439,8 +479,7 @@ whatever the model would have written; a token limit can still cut a long one sh
 
 ### Tools (function calling)
 
-For Qwen3.5-family templates (they write calls as `<tool_call><function=NAME><parameter=K>…` XML), requests may
-carry `tools`: chat's `{"type":"function","function":{name, description, parameters}}`, rendered exactly as the
+Where the [template](#chat-templates) writes tools, calls and results, requests may carry `tools`: chat's `{"type":"function","function":{name, description, parameters}}`, rendered exactly as the
 client sent them, or the Responses API's flat `{"type":"function", name, description, parameters}`.
 
 - **Calls** in the reply become `tool_calls` (chat, `finish_reason: "tool_calls"`) or `function_call` output
@@ -448,18 +487,25 @@ client sent them, or the Responses API's flat `{"type":"function", name, descrip
   the type its schema gives it — integer, number, boolean, object or array — and a value that does not read as
   that type stays a string for the client to report. Text the model writes after its last call is dropped, as
   the template asks; a call that never closed (the token limit cut it off) is returned as content, never as a
-  call. In a stream, each call is sent whole once its `</tool_call>` arrives.
+  call. In a stream, each call is sent whole once it closes.
 - **History**: assistant messages with `tool_calls` and `tool` messages (chat), or `function_call` and
-  `function_call_output` items (Responses), are rendered as the template renders them: calls in the assistant
-  turn, results as `<tool_response>` blocks in a user turn.
+  `function_call_output` items (Responses), are rendered as the template renders them.
 - **`tool_choice`**: `auto` (default); `none` leaves the tools out of the prompt; `required` writes
-  `<tool_call>` and `<function=` for the model, and a named function writes the whole opening of its call, so the
+  a call's opening for the model, and a named function writes the whole opening of its call, so the
   model can only continue a call — after its thinking block when it thinks. A function the request does not
   offer is a 400.
 - **`parallel_tool_calls: false`** keeps the first call, and stops generating once it closes.
 - **`previous_response_id`**: responses are kept in memory (the newest 512, unless `"store": false`), so a
   request can continue one without resending it; the earlier response's `instructions` are not carried over, as
   in OpenAI's API. An unknown id is a 404 `previous_response_not_found`.
+
+### Images
+
+A chat model whose container carries a vision tower this build runs (Gemma 4's) reads images: `images` is true
+in `/v1/models`. Chat's `{"type":"image_url","image_url":{"url":"data:image/png;base64,…","detail":"auto"}}` and the
+Responses API's `{"type":"input_image","image_url":"data:…"}` go in user messages and tool results. PNG and JPEG are
+read, and only `data:` URLs: the server fetches nothing on a client's behalf. A request may be 256 MB.
+See [gemma-4.md](gemma-4.md#images).
 
 ### Entail adapters
 

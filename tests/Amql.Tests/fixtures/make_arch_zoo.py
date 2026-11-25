@@ -95,6 +95,34 @@ FAMILIES = {
                         linear_key_head_dim=64, linear_value_head_dim=64, linear_conv_kernel_dim=4,
                         partial_rotary_factor=0.25, attn_output_gate=True,
                         layer_types=["linear_attention", "full_attention", "linear_attention", "full_attention"]),
+    # Gemma 4's MoE: a dense FFN and routed experts side by side in each layer
+    # (each with its own norms), packed experts outside the mlp module, a scaled
+    # router, a multiplier on every layer's output, and full layers with their own
+    # heads, one projection for keys and values, and a zero-tail rotary.
+    "gemma4-moe": dict(model_type="gemma4_text", hidden_activation="gelu_pytorch_tanh", sliding_window=4,
+                       num_hidden_layers=6, hidden_size_per_layer_input=0, attention_k_eq_v=True,
+                       global_head_dim=32, num_global_key_value_heads=1, enable_moe_block=True, num_experts=8,
+                       top_k_experts=2, moe_intermediate_size=32, final_logit_softcapping=30.0,
+                       tie_word_embeddings=True,
+                       layer_types=["sliding_attention", "sliding_attention", "full_attention"] * 2,
+                       rope_parameters={"full_attention": {"rope_type": "proportional", "partial_rotary_factor": 0.25,
+                                                           "rope_theta": 1000000.0},
+                                        "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0}}),
+    # Wide heads (256 on the sliding layer, 512 on the full one, four to a KV head), over a window.
+    "gemma4-wide": dict(model_type="gemma4_text", hidden_activation="gelu_pytorch_tanh", sliding_window=8,
+                        num_hidden_layers=2, hidden_size_per_layer_input=0, attention_k_eq_v=True, head_dim=256,
+                        global_head_dim=512, num_global_key_value_heads=1, tie_word_embeddings=True,
+                        layer_types=["sliding_attention", "full_attention"],
+                        rope_parameters={"full_attention": {"rope_type": "proportional", "partial_rotary_factor": 0.25,
+                                                            "rope_theta": 1000000.0},
+                                         "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0}}),
+    # The same family without experts, its global layers sharing the sliding ones' geometry.
+    "gemma4-dense": dict(model_type="gemma4_text", hidden_activation="gelu_pytorch_tanh", sliding_window=4,
+                         hidden_size_per_layer_input=0, tie_word_embeddings=True,
+                         layer_types=["sliding_attention", "sliding_attention", "sliding_attention", "full_attention"],
+                         rope_parameters={"full_attention": {"rope_type": "proportional", "partial_rotary_factor": 0.25,
+                                                             "rope_theta": 1000000.0},
+                                          "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0}}),
 }
 
 
@@ -119,6 +147,11 @@ def build(name, overrides):
             # Non-trivial norms and biases, so a dropped offset or bias shows.
             p.copy_(0.2 * torch.randn_like(p) + (1.0 if p.dim() == 1 and "norm" in pname and model_type not in
                                                  ("gemma", "gemma2", "gemma3_text") else 0.0))
+            if pname.endswith(("router.scale", "router.per_expert_scale")):
+                p.add_(1.0)
+        for bname, b in model.named_buffers():
+            if bname.endswith("layer_scalar"):
+                b.copy_(0.5 + 0.3 * torch.rand_like(b))
     out = os.path.join(OUT, name)
     shutil.rmtree(out, ignore_errors=True)
     model.save_pretrained(out, safe_serialization=True)

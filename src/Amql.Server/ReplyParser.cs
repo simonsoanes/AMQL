@@ -1,7 +1,4 @@
-using System.Globalization;
 using System.Text.Json;
-using System.Text.Json.Nodes;
-using System.Text.RegularExpressions;
 
 namespace Amql.Server;
 
@@ -10,7 +7,7 @@ namespace Amql.Server;
 public sealed record ParsedToolCall(string Name, string Arguments);
 
 /// <summary>Something a reply said, as it is read: reasoning or content text
-/// (deltas), or a whole tool call once its <c>&lt;/tool_call&gt;</c> arrives.</summary>
+/// (deltas), or a whole tool call once it closes.</summary>
 public abstract record ReplyEvent
 {
     public sealed record Reasoning(string Delta) : ReplyEvent;
@@ -21,13 +18,12 @@ public abstract record ReplyEvent
 }
 
 /// <summary>
-/// Reads a Qwen3.5 reply as it is generated and splits it the way the
+/// Reads a reply as it is generated and splits it the way the
 /// OpenAI APIs report it: the thinking block becomes reasoning, the text
-/// after it content, and each
-/// <c>&lt;tool_call&gt;&lt;function=NAME&gt;&lt;parameter=K&gt;V&lt;/parameter&gt;…</c>
-/// block a call whose arguments are a JSON object. Nothing is sent before it
-/// is certain: text that could be the start of <c>&lt;/think&gt;</c> or
-/// <c>&lt;tool_call&gt;</c>, and trailing whitespace, wait for the next delta.
+/// after it content, and what its model's <see cref="CallSyntax"/> reads as calls
+/// calls whose arguments are a JSON object. Nothing is sent before it
+/// is certain: text that could be the start of <c>&lt;/think&gt;</c> or of a
+/// call, and trailing whitespace, wait for the next delta.
 /// Text after the last call is dropped, since the template tells the model to
 /// write nothing there; a call that never closed is returned as content, so a
 /// reply cut off by the token limit never writes a truncated file.
@@ -36,18 +32,8 @@ public sealed class ReplyParser
 {
     private const string ThinkOpen = "<think>";
     private const string ThinkClose = "</think>";
-    private const string CallOpen = "<tool_call>";
-    private const string CallClose = "</tool_call>";
 
-    private static readonly Regex Function = new(@"^\s*<function=([^>\n]+)>(.*?)(?:</function>\s*)?$", RegexOptions.Singleline);
-    private static readonly Regex Parameter = new(@"<parameter=([^>\n]+)>(.*?)</parameter>", RegexOptions.Singleline);
-
-    // Arguments as a client would write them: "<", ">" and "&" stay as they are (still valid JSON).
-    private static readonly JsonSerializerOptions Relaxed = new()
-    {
-        Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
-    };
-
+    private readonly CallSyntax? _calling;
     private readonly bool _promptOpenedThink;
     private readonly bool _parseTools;
     private readonly IReadOnlyDictionary<string, JsonElement> _schemas;
@@ -55,6 +41,7 @@ public sealed class ReplyParser
     private string _text = string.Empty;
     private int _reasoningSent;
     private int _contentSent;
+    private int _blocksRead;
     private readonly List<ParsedToolCall> _calls = new();
 
     /// <param name="promptOpenedThink">The prompt ended inside a think block
@@ -62,14 +49,16 @@ public sealed class ReplyParser
     /// <param name="tools">The request's tools in chat form
     /// (<c>{"type":"function","function":{name, parameters}}</c>), whose
     /// parameter types decide how each value is read; null when the request
-    /// offered none, and then a <c>&lt;tool_call&gt;</c> is ordinary text.</param>
+    /// offered none, and then a call is ordinary text.</param>
     /// <param name="decoration">The tool results' per-line decoration, removed from a value that
     /// copied it (null: values are read as written).</param>
-    public ReplyParser(bool promptOpenedThink, IReadOnlyList<JsonElement>? tools, LineDecoration? decoration = null)
+    /// <param name="syntax">How the model writes its calls (null: it writes none).</param>
+    public ReplyParser(bool promptOpenedThink, IReadOnlyList<JsonElement>? tools, LineDecoration? decoration = null, CallSyntax? syntax = null)
     {
+        _calling = syntax;
         _promptOpenedThink = promptOpenedThink;
         _decoration = decoration;
-        _parseTools = tools is { Count: > 0 };
+        _parseTools = syntax is not null && tools is { Count: > 0 };
         var schemas = new Dictionary<string, JsonElement>(StringComparer.Ordinal);
         foreach (var t in tools ?? Array.Empty<JsonElement>())
         {
@@ -115,9 +104,10 @@ public sealed class ReplyParser
     public IReadOnlyList<ReplyEvent> Finish() => Read(final: true);
 
     /// <summary>Parses a whole reply at once.</summary>
-    public static ReplyParser Parse(string text, bool promptOpenedThink, IReadOnlyList<JsonElement>? tools, LineDecoration? decoration = null)
+    public static ReplyParser Parse(string text, bool promptOpenedThink, IReadOnlyList<JsonElement>? tools, LineDecoration? decoration = null,
+        CallSyntax? syntax = null)
     {
-        var parser = new ReplyParser(promptOpenedThink, tools, decoration);
+        var parser = new ReplyParser(promptOpenedThink, tools, decoration, syntax);
         parser.Feed(text);
         parser.Finish();
         return parser;
@@ -190,11 +180,12 @@ public sealed class ReplyParser
 
         // ── content, then calls ──
         string body = text[bodyStart..];
-        int call = _parseTools ? body.IndexOf(CallOpen, StringComparison.Ordinal) : -1;
+        int call = _parseTools ? NextCall(body, 0) : -1;
         string content = call >= 0 ? body[..call] : body;
         if (call < 0 && _parseTools && !final)
         {
-            content = HoldBack(content, CallOpen);
+            content = !_calling!.AtStartOnly ? HoldBack(content, _calling.Open)
+                : _calling.Open.StartsWith(body.TrimStart(), StringComparison.Ordinal) ? "" : content;
         }
         content = content.TrimStart();
         // Trailing whitespace waits: it may be the gap before a call or the end.
@@ -202,11 +193,10 @@ public sealed class ReplyParser
 
         if (call >= 0)
         {
-            int at = call;
+            int at = call, blocks = 0;
             while (at >= 0)
             {
-                int end = body.IndexOf(CallClose, at, StringComparison.Ordinal);
-                if (end < 0)
+                if (_calling!.Block(body, at, final) is not { } block)
                 {
                     if (final && _calls.Count == 0)
                     {
@@ -215,14 +205,16 @@ public sealed class ReplyParser
                     }
                     break;
                 }
-                string inner = body[(at + CallOpen.Length)..end];
-                int index = CountCalls(body, call, at);
-                if (index >= _calls.Count && ReadCall(inner) is { } parsed)
+                if (blocks++ == _blocksRead)
                 {
-                    _calls.Add(parsed);
-                    events.Add(new ReplyEvent.ToolCall(_calls.Count - 1, parsed));
+                    _blocksRead++;
+                    foreach (var parsed in ReadCalls(body[block.From..block.To]))
+                    {
+                        _calls.Add(parsed);
+                        events.Add(new ReplyEvent.ToolCall(_calls.Count - 1, parsed));
+                    }
                 }
-                at = body.IndexOf(CallOpen, end + CallClose.Length, StringComparison.Ordinal);
+                at = NextCall(body, block.Next);
             }
         }
 
@@ -241,130 +233,30 @@ public sealed class ReplyParser
         return events;
     }
 
-    /// <summary>How many complete call blocks precede the one at <paramref name="at"/>.</summary>
-    private static int CountCalls(string body, int first, int at)
+    /// <summary>Where the next calls open, or −1.</summary>
+    private int NextCall(string body, int from)
     {
-        int n = 0;
-        for (int i = first; i < at;)
+        if (!_calling!.AtStartOnly)
         {
-            int end = body.IndexOf(CallClose, i, StringComparison.Ordinal);
-            if (end < 0 || end >= at)
-            {
-                break;
-            }
-            n++;
-            i = body.IndexOf(CallOpen, end, StringComparison.Ordinal);
-            if (i < 0)
-            {
-                break;
-            }
+            return body.IndexOf(_calling.Open, from, StringComparison.Ordinal);
         }
-        return n;
+        while (from < body.Length && (char.IsWhiteSpace(body[from]) || (from > 0 && body[from] is ';' or ',')))
+        {
+            from++;
+        }
+        return string.CompareOrdinal(body, from, _calling.Open, 0, _calling.Open.Length) == 0 ? from : -1;
     }
 
-    private ParsedToolCall? ReadCall(string inner)
+    private IReadOnlyList<ParsedToolCall> ReadCalls(string inner) => _calling!.Read(inner, _schemas, value =>
     {
-        var m = Function.Match(inner);
-        if (!m.Success)
+        if (_decoration is null)
         {
-            return null;
+            return value;
         }
-        string name = m.Groups[1].Value.Trim();
-        var properties = _schemas.TryGetValue(name, out var schema) && schema.ValueKind == JsonValueKind.Object
-            && schema.TryGetProperty("properties", out var props) && props.ValueKind == JsonValueKind.Object
-            ? props
-            : default;
-        var args = new JsonObject();
-        foreach (Match p in Parameter.Matches(m.Groups[2].Value))
-        {
-            string key = p.Groups[1].Value.Trim();
-            string value = p.Groups[2].Value;
-            // The template writes "<parameter=K>\nVALUE\n</parameter>".
-            if (value.StartsWith('\n'))
-            {
-                value = value[1..];
-            }
-            if (value.EndsWith('\n'))
-            {
-                value = value[..^1];
-            }
-            string? type = properties.ValueKind == JsonValueKind.Object && properties.TryGetProperty(key, out var ps)
-                ? TypeOf(ps)
-                : null;
-            if (_decoration is not null && value.Contains('\n') && type is null or "string")
-            {
-                value = _decoration.Strip(value, out bool stripped);
-                Undecorated += stripped ? 1 : 0;
-            }
-            args[key] = Value(value, type);
-        }
-        return new ParsedToolCall(name, args.ToJsonString(Relaxed));
-    }
-
-    private static string? TypeOf(JsonElement schema)
-    {
-        if (!schema.TryGetProperty("type", out var t))
-        {
-            return null;
-        }
-        if (t.ValueKind == JsonValueKind.String)
-        {
-            return t.GetString();
-        }
-        // ["integer", "null"] and the like: the first non-null type.
-        return t.ValueKind == JsonValueKind.Array
-            ? t.EnumerateArray().Select(x => x.GetString()).FirstOrDefault(x => x is not null and not "null")
-            : null;
-    }
-
-    /// <summary>A parameter's text as the JSON value its schema asks for. A
-    /// value that does not read as that type stays a string, and the client's
-    /// own validation reports it.</summary>
-    private static JsonNode? Value(string text, string? type)
-    {
-        string t = text.Trim();
-        switch (type)
-        {
-            case "integer" when long.TryParse(t, NumberStyles.Integer, CultureInfo.InvariantCulture, out long l):
-                return JsonValue.Create(l);
-            case "integer" or "number" when JsonNumber(t) is { } big:
-                return big;   // a valid JSON number too large for a long or double, kept as written
-            case "number" when double.TryParse(t, NumberStyles.Float, CultureInfo.InvariantCulture, out double d) && double.IsFinite(d):
-                return t.Contains('.') || t.Contains('e') || t.Contains('E') ? JsonValue.Create(d)
-                    : long.TryParse(t, NumberStyles.Integer, CultureInfo.InvariantCulture, out long whole) ? JsonValue.Create(whole) : JsonValue.Create(d);
-            case "boolean" when t.Equals("true", StringComparison.OrdinalIgnoreCase) || t.Equals("false", StringComparison.OrdinalIgnoreCase):
-                return JsonValue.Create(t.Equals("true", StringComparison.OrdinalIgnoreCase));
-            case "object" or "array":
-                try
-                {
-                    var node = JsonNode.Parse(t);
-                    if (node is JsonObject or JsonArray)
-                    {
-                        return node;
-                    }
-                }
-                catch (JsonException)
-                {
-                }
-                return JsonValue.Create(text);
-            case "null" when t == "null" || t == "None":
-                return null;
-            default:
-                return JsonValue.Create(text);
-        }
-    }
-
-    private static JsonNode? JsonNumber(string t)
-    {
-        try
-        {
-            return JsonNode.Parse(t) is JsonValue v && v.GetValueKind() == JsonValueKind.Number ? v : null;
-        }
-        catch (JsonException)
-        {
-            return null;
-        }
-    }
+        value = _decoration.Strip(value, out bool stripped);
+        Undecorated += stripped ? 1 : 0;
+        return value;
+    });
 
     /// <summary>The text without a suffix that could be the start of <paramref name="marker"/>.</summary>
     private static string HoldBack(string text, string marker)

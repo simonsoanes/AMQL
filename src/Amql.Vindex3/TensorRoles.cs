@@ -101,6 +101,16 @@ public static class TensorRoles
     public const string SharedDown = "shared_down";
     public const string SharedExpertGate = "shared_expert_gate";
 
+    // A router that scales what it reads, and the weight it gives each expert
+    // (Gemma 4); a dense FFN beside the experts, with the norms of each side; and
+    // a multiplier on the layer's whole output.
+    public const string RouterScale = "moe_router_scale";
+    public const string ExpertScale = "moe_expert_scale";
+    public const string RoutedIn = "routed_in_norm";
+    public const string RoutedOut = "routed_out_norm";
+    public const string DenseOut = "dense_out_norm";
+    public const string LayerScale = "layer_scale";
+
     /// <summary>Expert projection stems, by role, as each family spells them
     /// inside <c>experts.N.</c>.</summary>
     private static readonly (string Role, string[] Stems)[] ExpertStems =
@@ -123,7 +133,7 @@ public static class TensorRoles
         [Gate] = new[] { "mlp.gate_proj", "feed_forward.w1", "mlp.w1", "feed_forward.gate_proj" },
         [Up] = new[] { "mlp.up_proj", "feed_forward.w3", "mlp.w3", "feed_forward.up_proj", "mlp.c_fc", "mlp.fc1", "mlp.dense_h_to_4h" },
         [Down] = new[] { "mlp.down_proj", "feed_forward.w2", "mlp.w2", "feed_forward.down_proj", "mlp.c_proj", "mlp.fc2", "mlp.dense_4h_to_h" },
-        [Router] = new[] { "mlp.gate", "mlp.router", "block_sparse_moe.gate", "feed_forward.router", "feed_forward.gate" },
+        [Router] = new[] { "mlp.gate", "mlp.router", "router.proj", "block_sparse_moe.gate", "feed_forward.router", "feed_forward.gate" },
         [SharedGate] = new[] { "mlp.shared_expert.gate_proj", "mlp.shared_experts.gate_proj", "feed_forward.shared_expert.gate_proj" },
         [SharedUp] = new[] { "mlp.shared_expert.up_proj", "mlp.shared_experts.up_proj", "feed_forward.shared_expert.up_proj" },
         [SharedDown] = new[] { "mlp.shared_expert.down_proj", "mlp.shared_experts.down_proj", "feed_forward.shared_expert.down_proj" },
@@ -261,6 +271,19 @@ public static class TensorRoles
             Bind(FfnIn, new[] { "post_attention_layernorm", "ffn_norm", "ln_2", "ln_mlp" }.FirstOrDefault(Has));
         }
 
+        // A second set of FFN norms belongs to experts that run beside the dense FFN.
+        Bind(DenseOut, "post_feedforward_layernorm_1");
+        Bind(RoutedIn, "pre_feedforward_layernorm_2");
+        Bind(RoutedOut, "post_feedforward_layernorm_2");
+        // Bare parameters, without a ".weight".
+        foreach (var (role, bare) in new[] { (RouterScale, "router.scale"), (ExpertScale, "router.per_expert_scale"), (LayerScale, "layer_scalar") })
+        {
+            if (suffixes.Contains(bare))
+            {
+                roles[role + ".weight"] = bare;
+            }
+        }
+
         var experts = JudgeExperts(suffixes);
         if (experts is not null && !roles.ContainsKey(Router + ".weight"))
         {
@@ -273,6 +296,10 @@ public static class TensorRoles
             // A lone tensor spelled like a router is not one without experts.
             roles.Remove(Router + ".weight");
             roles.Remove(Router + ".bias");
+            foreach (var role in new[] { RouterScale, ExpertScale, RoutedIn, RoutedOut, DenseOut })
+            {
+                roles.Remove(role + ".weight");
+            }
         }
 
         return new LayerRoleMap
@@ -289,7 +316,7 @@ public static class TensorRoles
     /// families and is not stated in the checkpoint.</summary>
     private static ExpertLayout? JudgeExperts(HashSet<string> suffixes)
     {
-        var pattern = new System.Text.RegularExpressions.Regex(@"^(.+\.experts\.)(\d+)\.(.+)$");
+        var pattern = new System.Text.RegularExpressions.Regex(@"^((?:.+\.)?experts\.)(\d+)\.(.+)$");
         var stemsByPrefix = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
         foreach (var suffix in suffixes)
         {
@@ -305,7 +332,7 @@ public static class TensorRoles
         }
         if (stemsByPrefix.Count == 0)
         {
-            foreach (var packed in new[] { "block_sparse_moe.input_linear.weight", "mlp.experts.gate_up_proj", "feed_forward.experts.gate_up_proj" })
+            foreach (var packed in new[] { "block_sparse_moe.input_linear.weight", "mlp.experts.gate_up_proj", "feed_forward.experts.gate_up_proj", "experts.gate_up_proj" })
             {
                 if (suffixes.Contains(packed))
                 {

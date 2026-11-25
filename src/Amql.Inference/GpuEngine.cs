@@ -13,12 +13,12 @@ namespace Amql.Inference;
 /// the token id going up and the logits coming back.
 /// <para>
 /// This is what <see cref="DecodeSession"/> runs when CUDA is available and
-/// the plan is within reach (see <see cref="Unsupported"/>): dense FFNs,
-/// softmax attention (GQA, output gate, weighted per-head QK norm, rotary,
-/// sliding window, softcap), Gated DeltaNet linear attention, RMS/LayerNorm
-/// in any placement, parallel residuals and residual scaling. Everything
-/// else — routed experts, short convs, traces, captures, residual patches —
-/// stays on the managed path.
+/// the plan is within reach (see <see cref="Unsupported"/>): dense FFNs, routed
+/// experts (alone or beside a dense FFN), softmax attention (GQA, output gate,
+/// weighted per-head QK norm, rotary, sliding window, softcap), Gated DeltaNet
+/// linear attention, RMS/LayerNorm in any placement, parallel residuals and
+/// residual scaling. Everything else — short convs, traces, captures, residual
+/// patches — stays on the managed path.
 /// </para>
 /// <para>
 /// Numerics: f32 activations and accumulation, the container's weights
@@ -26,11 +26,15 @@ namespace Amql.Inference;
 /// kernels, so results agree to rounding rather than bit for bit.
 /// </para>
 /// </summary>
-public sealed class GpuEngine : IDisposable
+public sealed partial class GpuEngine : IDisposable
 {
     /// <summary>Rows a prefill pushes through the layers at once; longer
     /// prompts run in chunks (the recurrent state and KV cache carry over).</summary>
     public const int ChunkRows = 512;
+
+    // A routed layer decodes its experts once a chunk, whatever the rows: longer chunks.
+    private const int MoeChunkRows = 1024;
+    private readonly int _chunkRows = ChunkRows;
 
     private const int BF16 = 0, F32 = 1;
 
@@ -53,6 +57,9 @@ public sealed class GpuEngine : IDisposable
 
     // Activations, [ChunkRows × width] each.
     private readonly IntPtr _tokens, _x, _hn, _proj, _q, _gate, _ctx, _conv, _gdn, _qk, _gb, _ffn, _branch, _branch2, _raw, _logits;
+    private readonly IntPtr _routeIdx, _routeW, _moeOrder, _moeGroups, _moeGlu, _moeSlots, _moeIn;
+    private int _moePairs, _moeInter, _moeExperts;   // the most experts a row picks in any layer, the widest, and the most there are
+    private int _window;                // the longest sliding window of any layer, 0 without one
     private IntPtr _attnPart;
     private int _attnPartSplits;
     private int _maxHeads, _maxHeadDim;
@@ -66,9 +73,9 @@ public sealed class GpuEngine : IDisposable
     /// the chosen token and up to this many drafts, within the 8-row GEMV.</summary>
     public const int MaxDrafts = 7;
 
-    /// <summary>Whether the model ships an MTP drafter the engine runs
-    /// (<c>AMQL_MTP=0</c> turns it off).</summary>
-    public bool HasDrafter => _mtp is not null;
+    /// <summary>Whether the container carries a drafter the engine runs: the model's own MTP
+    /// layer, or one that reads its caches (<c>AMQL_MTP=0</c> turns it off).</summary>
+    public bool HasDrafter => _mtp is not null || _drafter is not null;
 
     /// <summary>True makes every decode projection sum each row in the order
     /// one-row decode does, so a <see cref="Verify"/> row's logits equal a
@@ -115,7 +122,18 @@ public sealed class GpuEngine : IDisposable
     // recurrent states, conv histories, MaxBatch of each (see BatchTable).
     private readonly IntPtr _batchTable;
     private const int TableKinds = 6;
-    private bool _graphReady;
+    private bool _graphReady
+    {
+        get;
+        set
+        {
+            field = value;
+            if (!value)
+            {
+                DropPasses();   // what makes the step's graph stale makes the others so
+            }
+        }
+    }
     private bool _disposed;
 
     /// <summary>The <see cref="WeightLoader.Version"/> the uploaded weights
@@ -151,6 +169,10 @@ public sealed class GpuEngine : IDisposable
                 _layers[i] = UploadLayer(weights, plan.Layers[i]);
             }
             _mtp = Environment.GetEnvironmentVariable("AMQL_MTP") is "0" ? null : MtpDevice.TryUpload(this, weights, plan);
+            if (Environment.GetEnvironmentVariable("AMQL_MTP") is not "0")
+            {
+                _drafter = DrafterDevice.TryUpload(this, weights, plan.Drafter);
+            }
             if (_mtp is not null)
             {
                 _projWidth = Math.Max(_projWidth, _mtp.Layer.Qkv!.Rows);
@@ -159,13 +181,18 @@ public sealed class GpuEngine : IDisposable
             int projWidth = _projWidth, qWidth = _qWidth, ctxWidth = _ctxWidth, convWidth = _convWidth, gdnWidth = _gdnWidth,
                 ffnWidth = _ffnWidth, keyWidth = _keyWidth, vHeads = _vHeads;
 
-            long rows = ChunkRows;
+            if (long.TryParse(Environment.GetEnvironmentVariable("AMQL_ATTENTION_SCRATCH_MB"), out long scratch) && scratch > 0)
+            {
+                SetAttentionSegments(0, 0, scratch << 20);
+            }
+            _chunkRows = _moePairs > 0 ? MoeChunkRows : ChunkRows;
+            long rows = _chunkRows;
             _tokens = Alloc(rows * 4);
             _x = Alloc(rows * _hidden * 4);
             _hn = Alloc(rows * _hidden * 4);
             _proj = Alloc(rows * projWidth * 4);
             _q = Alloc(rows * qWidth * 4);
-            _gate = Alloc(rows * qWidth * 4);
+            _gate = Alloc(plan.Layers.Any(l => l.Attention is { OutputGate: true }) || _mtp is not null ? rows * qWidth * 4 : 16);
             _ctx = Alloc(rows * ctxWidth * 4);
             _conv = Alloc(rows * convWidth * 4);
             _gdn = Alloc(rows * gdnWidth * 4);
@@ -175,22 +202,33 @@ public sealed class GpuEngine : IDisposable
             _branch = Alloc(rows * _hidden * 4);
             _branch2 = Alloc(rows * _hidden * 4);
             _raw = Alloc(rows * projWidth * 4);
+            if (_moePairs > 0)
+            {
+                _routeIdx = Alloc(rows * _moePairs * 4);
+                _routeW = Alloc(rows * _moePairs * 4);
+                _moeOrder = Alloc(rows * _moePairs * 4);
+                _moeGroups = Alloc((rows * _moePairs + _moeExperts) * 3 * 4);
+                _moeGlu = Alloc(rows * _moePairs * _moeInter * 4);
+                _moeSlots = Alloc(rows * _moePairs * _hidden * 4);
+                _moeIn = Alloc(rows * _hidden * 4);
+            }
             _logits = Alloc((long)MaxBatch * _vocab * 4);
             _batchTable = Alloc((long)_layers.Length * TableKinds * MaxBatch * 8);
             Check(Native.amqe_host_alloc(out _hostToken, MaxBatch * 4), "host alloc");
             Check(Native.amqe_host_alloc(out _hostLogits, (nuint)((long)MaxBatch * _vocab * 4)), "host alloc");
             Check(Native.amqe_host_alloc(out _hostPrefillLogits, (nuint)((long)_vocab * 4)), "host alloc");
-            if (_mtp is not null)
+            if (HasDrafter)
             {
                 _hfin = Alloc(rows * _hidden * 4);
-                _cat = Alloc(rows * 2 * _hidden * 4);
+                _cat = Alloc(_mtp is null ? 16 : rows * 2 * _hidden * 4);
                 _mtpH = Alloc(_hidden * 4);
                 _mtpLogits = Alloc((long)_vocab * 4);
                 _mtpTok = Alloc((MaxDrafts + 1) * 4);
-                _drafts = Alloc(MaxDrafts * 4);
-                Check(Native.amqe_host_alloc(out _hostDrafts, MaxDrafts * 4), "host alloc");
+                // The drafts, then the drafter's share of its softmax on each; on the host, the token drafted from too.
+                _drafts = Alloc(2 * MaxDrafts * 4);
+                Check(Native.amqe_host_alloc(out _hostDrafts, DraftTokenAt + 4), "host alloc");
                 RowInvariant = true;
-                DraftVocab = _draftVocab;
+                DraftVocab = _drafter is not null && Environment.GetEnvironmentVariable("AMQL_MTP_VOCAB") is null ? _vocab : _draftVocab;
             }
             ChooseKvFormat();
             _main = NewSequence();
@@ -239,6 +277,14 @@ public sealed class GpuEngine : IDisposable
                         ld.KNormEps = (float)kn.Eps;
                         ld.KNormRow = kn.Width != attn.HeadDim;
                     }
+                    if (attn.ParameterFreeQkNorm.V)
+                    {
+                        ld.VNormEps = (float)attn.ParameterFreeQkNormEps;
+                    }
+                    if (attn.Window is { } window)
+                    {
+                        _window = Math.Max(_window, (int)window);
+                    }
                     var rope = RopeFor(attn);
                     if (rope is { } r)
                     {
@@ -277,7 +323,18 @@ public sealed class GpuEngine : IDisposable
                     vHeads = Math.Max(vHeads, lin.NumVHeads);
                 }
 
-                if (lp.Ffn?.Dense is { } dense)
+                if (lp.OutputScale is { } outputScale)
+                {
+                    ld.OutScale = weights.Vector(outputScale, 1)[0];
+                }
+                if (lp.Ffn?.Routed is { } routed)
+                {
+                    ld.Moe = UploadExperts(weights, routed);
+                    _moePairs = Math.Max(_moePairs, routed.TopK);
+                    _moeInter = Math.Max(_moeInter, routed.ExpertIntermediateSize);
+                    _moeExperts = Math.Max(_moeExperts, routed.NumExperts);
+                }
+                if ((lp.Ffn?.Dense ?? lp.Ffn?.Routed?.Hybrid?.Dense) is { } dense)
                 {
                     if (dense.IsGated)
                     {
@@ -306,6 +363,80 @@ public sealed class GpuEngine : IDisposable
                 return ld;
             }
         }
+    }
+
+    private MoeDevice UploadExperts(WeightLoader weights, RoutedFfnOp op)
+    {
+        string stack = op.Router.ObjectId;
+        OperandRef Expert(string prefix, int e, string stem) => new(stack, $"{prefix}{e}.{stem}");
+        var gateUp = new List<(OperandRef, int)>(2 * op.NumExperts);
+        var down = new List<(OperandRef, int)>(op.NumExperts);
+        for (int e = 0; e < op.NumExperts; e++)
+        {
+            gateUp.Add((Expert(op.ExpertGatePrefix, e, op.ExpertGateStem), op.ExpertIntermediateSize));
+            gateUp.Add((Expert(op.ExpertUpPrefix, e, op.ExpertUpStem), op.ExpertIntermediateSize));
+            down.Add((Expert(op.ExpertDownPrefix, e, op.ExpertDownStem), op.HiddenSize));
+        }
+        return new MoeDevice
+        {
+            Op = op,
+            Router = Matrix(weights, op.Router, op.NumExperts, op.HiddenSize),
+            RouterScale = OptionalVector(weights, op.RouterScale, op.HiddenSize),
+            ExpertScale = OptionalVector(weights, op.ExpertScale, op.NumExperts),
+            GateUp = Stack(weights, op.HiddenSize, gateUp),
+            Down = Stack(weights, op.ExpertIntermediateSize, down),
+            Act = ActivationCode(op.Activation),
+            DenseOut = op.Hybrid?.DenseOut is { } n1 ? Norm(weights, n1) : null,
+            RoutedIn = op.Hybrid?.RoutedIn is { } n2 ? Norm(weights, n2) : null,
+            RoutedOut = op.Hybrid?.RoutedOut is { } n3 ? Norm(weights, n3) : null,
+        };
+    }
+
+    private static int ActivationCode(Activation activation) => activation switch
+    {
+        Activation.Silu => 1,
+        Activation.Gelu or Activation.GeluTanh => 2,
+        Activation.Relu => 3,
+        _ => throw new UnsupportedOperatorException($"activation {activation}"),
+    };
+
+    /// <summary>Many small matrices as one, rows end to end (a layer's experts):
+    /// what <see cref="Concat"/> gives, uploaded a part at a time so the host never
+    /// holds the whole. Parts that are not all 4-bit in one format go the other way.</summary>
+    private DeviceMatrix Stack(WeightLoader weights, int cols, IReadOnlyList<(OperandRef Operand, int Rows)> parts)
+    {
+        var first = Fp4Of(weights, parts[0].Operand, parts[0].Rows, cols, project: true);
+        if (first is null)
+        {
+            return Concat(weights, cols, parts.ToArray());
+        }
+        int rows = parts.Sum(p => p.Rows);
+        int block = first.Type == NVFP4 ? 16 : 32;
+        var matrix = new DeviceMatrix
+        {
+            Ptr = Alloc((long)rows * cols / 2),
+            Scales = Alloc((long)rows * cols / block),
+            RowScale = Alloc(rows * 4L),
+            Type = first.Type,
+            Rows = rows,
+            Cols = cols,
+        };
+        long at = 0;
+        for (int i = 0; i < parts.Count; i++)
+        {
+            var source = i == 0 ? first : Fp4Of(weights, parts[i].Operand, parts[i].Rows, cols, project: true);
+            if (source is null || source.Type != first.Type)
+            {
+                throw new ContainerException($"'{parts[i].Operand.TensorName}' is not 4-bit in the form of the experts beside it");
+            }
+            Upload(matrix.Ptr + (nint)(at * cols / 2), source.Packed);
+            Upload(matrix.Scales + (nint)(at * cols / block), source.Scales);
+            Upload(matrix.RowScale + (nint)(at * 4), source.RowScale);
+            at += parts[i].Rows;
+        }
+        Fp4Matrices += parts.Count;
+        Fp4Bytes += (long)rows * cols / 2 + (long)rows * cols / block + rows * 4L;
+        return matrix;
     }
 
     /// <summary>The engine for this plan, or null with the reason it cannot
@@ -368,17 +499,33 @@ public sealed class GpuEngine : IDisposable
             {
                 return "short-conv layer";
             }
-            if (layer.Ffn?.Routed is not null)
+            if (layer.Ffn?.Routed is { } experts)
             {
-                return "routed experts";
+                if (experts.SharedExpert is not null)
+                {
+                    return "a shared expert";
+                }
+                if (experts.TopK > 64 || experts.NumExperts > 2048 || experts.HiddenSize + experts.NumExperts > 11 * 1024)
+                {
+                    return "routed experts beyond the router kernel";
+                }
+                if (experts.Hybrid is { } hybrid && (layer.ParallelResidual || (hybrid.Dense.IsGated && hybrid.Dense.Activation == Activation.Relu)))
+                {
+                    return "experts beside a dense FFN in this form";
+                }
+                if (layer.ParallelResidual)
+                {
+                    return "routed experts in a parallel block";
+                }
             }
             if (layer.Attention is { } attn)
             {
-                if (!attn.Causal || attn.VFromK || attn.HeadGate is not null || attn.ParameterFreeQkNorm.Any)
+                if (!attn.Causal || attn.VFromK || attn.HeadGate is not null ||
+                    attn.ParameterFreeQkNorm.Q || attn.ParameterFreeQkNorm.K)
                 {
                     return "attention variant";
                 }
-                if (attn.HeadDim is < 2 or > 256 || attn.NumQHeads % attn.NumKvHeads != 0)
+                if (attn.HeadDim is < 2 or (> 256 and not 512) || attn.NumQHeads % attn.NumKvHeads != 0)
                 {
                     return $"attention head dim {attn.HeadDim}";
                 }
@@ -473,6 +620,17 @@ public sealed class GpuEngine : IDisposable
         {
             return null;
         }
+        if (attn.Position is PositionZeroTailRope zeroTail && !attn.RopeInterleaved)
+        {
+            // Pairs (i, i + d/2) over the whole head; the tail's frequency is zero,
+            // which rotates it by nothing.
+            var tail = new double[attn.HeadDim / 2];
+            for (int i = 0; i < zeroTail.RotatedPairs(attn.HeadDim); i++)
+            {
+                tail[i] = 1.0 / Math.Pow(zeroTail.Theta, 2.0 * i / attn.HeadDim);
+            }
+            return (tail, 1.0);
+        }
         (double theta, int width, RopeScaling? scaling) = attn.Position switch
         {
             PositionRope r => (r.Theta, attn.HeadDim, r.Scaling),
@@ -511,9 +669,16 @@ public sealed class GpuEngine : IDisposable
                 seq.Conv[i] = _layers[i].ConvHistoryBytes > 0 ? Alloc(_layers[i].ConvHistoryBytes) : IntPtr.Zero;
             }
         }
+        if (_window > 0)
+        {
+            seq.WinPos = Alloc(16);
+        }
         if (_mtp is not null)
         {
             seq.MtpPos = Alloc(16);
+        }
+        if (HasDrafter)
+        {
             seq.MtpPending = Alloc(_hidden * 4);
         }
         _sequences.Add(seq);
@@ -535,13 +700,14 @@ public sealed class GpuEngine : IDisposable
             return;
         }
         Check(Native.amqe_sync(_engine), "release");
-        if (_graphFor is not null && _graphFor.Contains(seq))
+        if ((_graphFor is not null && _graphFor.Contains(seq)) || ReferenceEquals(_passesFor, seq))
         {
             _graphReady = false;
         }
         foreach (var ptr in seq.K.Concat(seq.V).Concat(seq.State).Concat(seq.Conv).Concat(seq.MarkState ?? []).Concat(seq.MarkConv ?? [])
                      .Concat(seq.SnapState ?? []).Concat(seq.SnapConv ?? [])
-                     .Concat([seq.Pos, seq.MtpK, seq.MtpV, seq.MtpPos, seq.MtpPending, seq.MarkMtpPending]))
+                     .Concat(seq.MarkWinK ?? []).Concat(seq.MarkWinV ?? [])
+                     .Concat([seq.Pos, seq.WinPos, seq.MtpK, seq.MtpV, seq.MtpPos, seq.MtpPending, seq.MarkMtpPending]))
         {
             if (ptr != IntPtr.Zero)
             {
@@ -557,6 +723,9 @@ public sealed class GpuEngine : IDisposable
         Live(seq);
         // Position 0, the sequence's exact rows kept (see SetExactRows).
         UploadPos(seq.Pos, 0, ExactSpec(seq));
+        seq.WinBase = 0;
+        seq.MarkWinRows = 0;
+        UploadWinPos(seq, 0);
         if (seq.MtpPos != IntPtr.Zero)
         {
             UploadPos(seq.MtpPos, 0, ExactSpec(seq));
@@ -623,6 +792,7 @@ public sealed class GpuEngine : IDisposable
         }
         Check(Native.amqe_sync(_engine), "mark");
         seq.MarkedAt = seq.Position;
+        seq.MarkWinRows = 0;   // the windowed rows before it are in the cache until it slides
     }
 
     /// <summary>Takes the sequence back to its <see cref="Mark"/>: the recurrent
@@ -651,8 +821,27 @@ public sealed class GpuEngine : IDisposable
             Check(Native.amqe_copy_async(_engine, seq.MtpPending, seq.MarkMtpPending, (nuint)(_hidden * 4), 3), "rewind");
             seq.MtpValid = seq.MarkMtpValid;
         }
+        else
+        {
+            seq.MtpValid = false;   // its hidden state is the next prompt's to write
+        }
         seq.VerifyRows = 0;
+        if (_window > 0 && seq.MarkWinRows > 0 && seq.WinBase != seq.MarkedAt - seq.MarkWinRows)
+        {
+            // The windowed caches have slid past the mark: the rows it needs, put back.
+            for (int i = 0; i < _layers.Length; i++)
+            {
+                if (Windowed(i))
+                {
+                    long bytes = WinBytes(i, seq.MarkWinRows);
+                    Check(Native.amqe_copy_async(_engine, seq.K[i], seq.MarkWinK![i], (nuint)bytes, 3), "rewind");
+                    Check(Native.amqe_copy_async(_engine, seq.V[i], seq.MarkWinV![i], (nuint)bytes, 3), "rewind");
+                }
+            }
+            seq.WinBase = seq.MarkedAt - seq.MarkWinRows;
+        }
         UploadPos(seq.Pos, seq.MarkedAt, ExactSpec(seq));
+        UploadWinPos(seq, seq.MarkedAt);
         Check(Native.amqe_sync(_engine), "rewind");
         seq.Position = seq.MarkedAt;
     }
@@ -776,15 +965,101 @@ public sealed class GpuEngine : IDisposable
         }
         EnsureKv(seq, Math.Max(capacity, 1024));
         UploadPos(seq.Pos, 0, ExactSpec(seq));
+        UploadWinPos(seq, 0);
         if (seq.MtpPos != IntPtr.Zero)
         {
             UploadPos(seq.MtpPos, 0, ExactSpec(seq));
         }
     }
 
-    private void UploadPos(IntPtr pos, int position, int exact)
+    // ── windowed caches ──────────────────────────────────────────────────
+
+    /// <summary>A layer with a sliding window needs only the window's rows, so its
+    /// cache stops growing at <see cref="WinRows"/> and slides: when it is full its
+    /// last <see cref="WinKeep"/> rows move to the front. Those layers count rows
+    /// from the sequence's <c>WinBase</c> (in the third int of their position
+    /// counter; the rotary position adds it back), and nothing else differs.</summary>
+    private bool Windowed(int layer) => layer >= 0 && _layers[layer].Plan.Attention?.Window is not null;
+
+    private const int WinMargin = 64;   // rows a verify may take back, and alignment
+    private int WinKeep => _window + WinMargin;
+    private int WinRows => 2 * WinKeep + _chunkRows;
+
+    private int WinCapacity(GpuSequence seq) => Math.Min(seq.KvCapacity, WinRows);
+
+    // Bytes of a windowed layer's cache rows: FP16 or NVFP4 throughout (a kept exact
+    // prefix leaves the window, so it stays NVFP4 there), or f32.
+    private long WinBytes(int layer, long rows) => rows * KvRowBytes(layer);
+
+    // Cache rows a layer holds for this many positions.
+    private long LayerBytes(int layer, long positions, GpuSequence seq) =>
+        Windowed(layer) ? WinBytes(layer, Math.Min(positions, WinRows)) : KvBytes(layer, positions, seq);
+
+    private IntPtr PosOf(GpuSequence seq, int layer) => Windowed(layer) ? seq.WinPos : seq.Pos;
+    private int RowOf(GpuSequence seq, int layer) => Windowed(layer) ? seq.Position - seq.WinBase : seq.Position;
+    private int LayerExact(GpuSequence seq, int layer) => Windowed(layer) ? WinExact(seq) : ExactSpec(seq);
+    private int WinExact(GpuSequence seq) => _kvAllF16 ? ExactSpec(seq) : 0;
+
+    private void UploadWinPos(GpuSequence seq, int position)
     {
-        var values = new[] { position, exact, 0, 0 };
+        if (seq.WinPos != IntPtr.Zero)
+        {
+            UploadPos(seq.WinPos, position - seq.WinBase, WinExact(seq), seq.WinBase);
+        }
+    }
+
+    /// <summary>Makes room in the windowed caches for the next rows, sliding them
+    /// when they are full. The buffers stay where they are.</summary>
+    private void Slide(GpuSequence seq, int rows)
+    {
+        if (_window == 0 || seq.Position - seq.WinBase + rows <= WinCapacity(seq))
+        {
+            return;
+        }
+        int row = seq.Position - seq.WinBase, from = row - WinKeep;
+        if (from < WinKeep)
+        {
+            throw new InvalidOperationException($"windowed caches of {WinCapacity(seq)} rows cannot take {rows} more at row {row}");
+        }
+        // What the mark needs is about to go: kept aside until the next mark.
+        if (seq.MarkedAt >= 0 && seq.MarkWinRows == 0 && seq.MarkedAt > 0)
+        {
+            int kept = Math.Min(seq.MarkedAt - seq.WinBase, WinKeep);
+            seq.MarkWinK ??= new IntPtr[_layers.Length];
+            seq.MarkWinV ??= new IntPtr[_layers.Length];
+            for (int i = 0; i < _layers.Length; i++)
+            {
+                if (!Windowed(i))
+                {
+                    continue;
+                }
+                if (seq.MarkWinK[i] == IntPtr.Zero)
+                {
+                    (seq.MarkWinK[i], seq.MarkWinV[i]) = AllocPair(WinBytes(i, WinKeep));
+                }
+                nint at = (nint)WinBytes(i, seq.MarkedAt - seq.WinBase - kept);
+                Check(Native.amqe_copy_async(_engine, seq.MarkWinK[i], seq.K[i] + at, (nuint)WinBytes(i, kept), 3), "slide");
+                Check(Native.amqe_copy_async(_engine, seq.MarkWinV[i], seq.V[i] + at, (nuint)WinBytes(i, kept), 3), "slide");
+            }
+            seq.MarkWinRows = kept;
+        }
+        for (int i = 0; i < _layers.Length; i++)
+        {
+            if (Windowed(i))
+            {
+                nint at = (nint)WinBytes(i, from);
+                nuint bytes = (nuint)WinBytes(i, WinKeep);
+                Check(Native.amqe_copy_async(_engine, seq.K[i], seq.K[i] + at, bytes, 3), "slide");
+                Check(Native.amqe_copy_async(_engine, seq.V[i], seq.V[i] + at, bytes, 3), "slide");
+            }
+        }
+        seq.WinBase += from;
+        UploadWinPos(seq, seq.Position);
+    }
+
+    private void UploadPos(IntPtr pos, int position, int exact, int rowBase = 0)
+    {
+        var values = new[] { position, exact, rowBase, 0 };
         var handle = GCHandle.Alloc(values, GCHandleType.Pinned);
         try
         {
@@ -858,6 +1133,10 @@ public sealed class GpuEngine : IDisposable
                 sb.Append(layer.Plan.Attention is { } attn ? $"a{attn.KvDim}" : "").Append($"s{layer.StateBytes}c{layer.ConvHistoryBytes};");
             }
             sb.Append(_mtp is null ? "mtp-" : $"mtp{_mtp.KvDim}").Append(_exactPrefill ? ";f32" : ";bf16").Append(";kv-").Append(KvFormat);
+            if (_window > 0)
+            {
+                sb.Append(";win").Append(_window);
+            }
             // Keys are stored rotated, so state is only good under the rotation that made it
             // (a context extension changes it without changing the container).
             var rope = new System.Text.StringBuilder();
@@ -889,7 +1168,11 @@ public sealed class GpuEngine : IDisposable
         {
             if (_layers[i].Plan.Attention is { } attn)
             {
-                bytes += 2L * KvBytes(i, seq.KvCapacity, seq);
+                bytes += 2L * LayerBytes(i, seq.KvCapacity, seq);
+                if (seq.MarkWinK?[i] is { } aside && aside != IntPtr.Zero)
+                {
+                    bytes += 2L * WinBytes(i, WinKeep);
+                }
             }
             if (seq.State[i] != IntPtr.Zero)
             {
@@ -908,6 +1191,10 @@ public sealed class GpuEngine : IDisposable
     // A saved mark's header: its position, whether the drafter kept up, the exact rows.
     private const int MarkHeader = 16;
 
+    // The windowed rows a mark needs, however far the caches have slid since.
+    private int MarkWindow(GpuSequence seq) =>
+        seq.MarkWinRows > 0 ? seq.MarkWinRows : Math.Min(Math.Max(0, seq.MarkedAt) - seq.WinBase, WinKeep);
+
     /// <summary>Bytes <see cref="SaveMark"/> writes for the sequence.</summary>
     public long MarkBytes(GpuSequence seq)
     {
@@ -917,7 +1204,7 @@ public sealed class GpuEngine : IDisposable
         {
             if (_layers[i].Plan.Attention is { } attn)
             {
-                bytes += 2 * KvBytes(i, at, seq);
+                bytes += 2 * (Windowed(i) ? WinBytes(i, MarkWindow(seq)) : KvBytes(i, at, seq));
             }
             if (seq.State[i] != IntPtr.Zero)
             {
@@ -935,7 +1222,9 @@ public sealed class GpuEngine : IDisposable
     /// back to its mark: the KV rows before the mark, the recurrent state
     /// saved there and the drafter's side. Rows after the mark are left out;
     /// <see cref="RestoreMark"/> rebuilds the sequence from what is written,
-    /// bit for bit, under the same <see cref="MarkGeometry"/>.</summary>
+    /// bit for bit, under the same <see cref="MarkGeometry"/>. (A windowed layer
+    /// saves its window alone and comes back with it at the front of its cache:
+    /// its rows are the same bytes, its steps the same to f32 rounding.)</summary>
     public void SaveMark(GpuSequence seq, Stream to)
     {
         Live(seq);
@@ -951,6 +1240,8 @@ public sealed class GpuEngine : IDisposable
         BitConverter.TryWriteBytes(head.AsSpan(8, 4), seq.ExactRows);
         head[5] = (byte)(seq.ExactF16 ? 1 : 0);
         head[6] = (byte)(seq.Extended ? 1 : 0);
+        int winRows = _window > 0 ? MarkWindow(seq) : 0;
+        BitConverter.TryWriteBytes(head.AsSpan(12, 4), winRows);
         to.Write(head);
         var buffer = new byte[Math.Min(16 << 20, Math.Max(1 << 16, MarkBytes(seq)))];
         var handle = GCHandle.Alloc(buffer, GCHandleType.Pinned);
@@ -968,7 +1259,13 @@ public sealed class GpuEngine : IDisposable
             }
             for (int i = 0; i < _layers.Length; i++)
             {
-                if (_layers[i].Plan.Attention is { } attn)
+                if (Windowed(i))
+                {
+                    nint skip = (nint)(seq.MarkWinRows > 0 ? 0 : WinBytes(i, at - seq.WinBase - winRows));
+                    Out((seq.MarkWinRows > 0 ? seq.MarkWinK![i] : seq.K[i]) + skip, WinBytes(i, winRows));
+                    Out((seq.MarkWinRows > 0 ? seq.MarkWinV![i] : seq.V[i]) + skip, WinBytes(i, winRows));
+                }
+                else if (_layers[i].Plan.Attention is { } attn)
                 {
                     Out(seq.K[i], KvBytes(i, at, seq));
                     Out(seq.V[i], KvBytes(i, at, seq));
@@ -1021,6 +1318,8 @@ public sealed class GpuEngine : IDisposable
             seq.Extended = head[6] != 0;
             seq.RopeChosen = true;
             EnsureKv(seq, at + 1);
+            int winRows = BitConverter.ToInt32(head, 12);
+            seq.WinBase = _window > 0 ? at - winRows : 0;
             seq.MarkState = new IntPtr[_layers.Length];
             seq.MarkConv = new IntPtr[_layers.Length];
             var buffer = new byte[16 << 20];
@@ -1039,7 +1338,12 @@ public sealed class GpuEngine : IDisposable
                 }
                 for (int i = 0; i < _layers.Length; i++)
                 {
-                    if (_layers[i].Plan.Attention is { } attn)
+                    if (Windowed(i))
+                    {
+                        In(seq.K[i], WinBytes(i, winRows));
+                        In(seq.V[i], WinBytes(i, winRows));
+                    }
+                    else if (_layers[i].Plan.Attention is { } attn)
                     {
                         In(seq.K[i], KvBytes(i, at, seq));
                         In(seq.V[i], KvBytes(i, at, seq));
@@ -1124,9 +1428,23 @@ public sealed class GpuEngine : IDisposable
             _graphReady = false;
         }
         var ids = tokens.ToArray();
-        for (int start = 0; start < ids.Length; start += ChunkRows)
+        for (int i = 0; i < ids.Length; i++)
         {
-            int rows = Math.Min(ChunkRows, ids.Length - start);
+            // An image's ids stand for no token: its rows are written over the embeddings.
+            if (ids[i] < 0)
+            {
+                int at = seq.Position + i;
+                if (seq.Images?.Any(s => at >= s.Start && at < s.Start + s.Tokens) != true)
+                {
+                    throw new ArgumentException($"the prompt's position {at} stands for an image that was not given", nameof(tokens));
+                }
+                ids[i] = 0;
+            }
+        }
+        for (int start = 0, rows; start < ids.Length; start += rows)
+        {
+            rows = WholeImages(seq, seq.Position, Math.Min(_chunkRows, ids.Length - start));
+            Slide(seq, rows);
             var handle = GCHandle.Alloc(ids, GCHandleType.Pinned);
             try
             {
@@ -1136,7 +1454,7 @@ public sealed class GpuEngine : IDisposable
             {
                 handle.Free();
             }
-            bool drafting = _mtp is not null && seq.MtpValid;
+            bool drafting = _mtp is not null ? seq.MtpValid : _drafter is not null && start + rows == ids.Length;
             _probeFrom = QueryProbe is null ? -1 : seq.Position;
             try
             {
@@ -1144,10 +1462,11 @@ public sealed class GpuEngine : IDisposable
                 {
                     Check(Native.amqe_set_attention_mass(_engine, _massOut, _massScratch, _massSplits), "attention mass");
                 }
-                Forward(new[] { seq }, rows, head: start + rows == ids.Length, hidden: drafting);
+                Forward(new[] { seq }, rows, head: start + rows == ids.Length, hidden: drafting, images: seq.Images is not null);
             }
             finally
             {
+                _reaching = false;
                 _probeFrom = -1;
                 if (_massOut != IntPtr.Zero)
                 {
@@ -1156,7 +1475,7 @@ public sealed class GpuEngine : IDisposable
             }
             if (drafting)
             {
-                MtpCatchUp(seq, seq.Position, rows);
+                CatchUp(seq, seq.Position, rows);
             }
             seq.Position += rows;
         }
@@ -1188,14 +1507,18 @@ public sealed class GpuEngine : IDisposable
             _graphReady = false;
         }
         EnsureSnapshots(seq, n - 1);
+        Slide(seq, n);
         for (int i = 0; i < n; i++)
         {
             Marshal.WriteInt32(_hostToken, i * 4, tokens[i]);
         }
-        bool drafting = _mtp is not null && seq.MtpValid;
-        Check(Native.amqe_copy_async(_engine, _tokens, _hostToken, (nuint)(n * 4), 1), "tokens");
-        Forward(new[] { seq }, n, head: true, allRows: true, hidden: drafting, snap: n > 1);
-        Check(Native.amqe_copy_async(_engine, _hostLogits, _logits, (nuint)((long)n * _vocab * 4), 2), "logits");
+        bool drafting = _drafter is not null || (_mtp is not null && seq.MtpValid);
+        Pass(seq, n + (drafting ? 16 : 0), () =>
+        {
+            Check(Native.amqe_copy_async(_engine, _tokens, _hostToken, (nuint)(n * 4), 1), "tokens");
+            Forward(new[] { seq }, n, head: true, allRows: true, hidden: drafting, snap: n > 1);
+            Check(Native.amqe_copy_async(_engine, _hostLogits, _logits, (nuint)((long)n * _vocab * 4), 2), "logits");
+        });
         Check(Native.amqe_sync(_engine), "verify");
         seq.VerifyFrom = seq.Position;
         seq.VerifyRows = n;
@@ -1230,11 +1553,15 @@ public sealed class GpuEngine : IDisposable
                 }
             }
             Check(Native.amqe_set_int(_engine, seq.Pos, seq.VerifyFrom + rows), "accept");
+            if (seq.WinPos != IntPtr.Zero)
+            {
+                Check(Native.amqe_set_int(_engine, seq.WinPos, seq.VerifyFrom + rows - seq.WinBase), "accept");
+            }
             seq.Position = seq.VerifyFrom + rows;
         }
-        if (_mtp is not null && seq.MtpValid)
+        if (_drafter is not null || (_mtp is not null && seq.MtpValid))
         {
-            MtpCatchUp(seq, seq.VerifyFrom, rows);
+            CatchUp(seq, seq.VerifyFrom, rows);
         }
         seq.VerifyRows = 0;
     }
@@ -1250,7 +1577,7 @@ public sealed class GpuEngine : IDisposable
     {
         Live(seq);
         count = Math.Min(count, MaxDrafts);
-        if (_mtp is null || !seq.MtpValid || seq.Position < 1 || count < 1)
+        if (!HasDrafter || !seq.MtpValid || seq.Position < 1 || count < 1)
         {
             return Array.Empty<int>();
         }
@@ -1258,16 +1585,26 @@ public sealed class GpuEngine : IDisposable
         {
             _graphReady = false;
         }
-        Check(Native.amqe_set_int(_engine, _mtpTok, token), "draft");
-        for (int i = 0; i < count; i++)
+        if (_drafter is not null)
         {
-            MtpPass(seq, 1, _mtpTok + i * 4, i == 0 ? seq.MtpPending : _mtpH, IntPtr.Zero, seq.Position - 1 + i,
-                draftTo: _drafts + i * 4, nextToken: _mtpTok + (i + 1) * 4);
+            Marshal.WriteInt32(_hostDrafts, DraftTokenAt, token);
+            Pass(seq, count + 32, () => DraftShared(seq, count));
         }
-        Check(Native.amqe_copy_async(_engine, _hostDrafts, _drafts, (nuint)(count * 4), 2), "draft");
+        else
+        {
+            Check(Native.amqe_set_int(_engine, _mtpTok, token), "draft");
+            for (int i = 0; i < count; i++)
+            {
+                MtpPass(seq, 1, _mtpTok + i * 4, i == 0 ? seq.MtpPending : _mtpH, IntPtr.Zero, seq.Position - 1 + i,
+                    draftTo: _drafts + i * 4, nextToken: _mtpTok + (i + 1) * 4);
+            }
+        }
+        Check(Native.amqe_copy_async(_engine, _hostDrafts, _drafts, 2 * MaxDrafts * 4, 2), "draft");
         Check(Native.amqe_sync(_engine), "draft");
         var drafts = new int[count];
         Marshal.Copy(_hostDrafts, drafts, 0, count);
+        DraftShares = new float[count];
+        Marshal.Copy(_hostDrafts + MaxDrafts * 4, DraftShares, 0, count);
         return drafts;
     }
 
@@ -1276,9 +1613,13 @@ public sealed class GpuEngine : IDisposable
     /// final-normed hidden states are in <c>_hfin</c>: pairs (hidden at p − 1,
     /// token at p) fill its cache at p − 1, and the last row's hidden state
     /// waits for the token chosen after it.</summary>
-    private void MtpCatchUp(GpuSequence seq, int from, int rows)
+    private void CatchUp(GpuSequence seq, int from, int rows)
     {
-        if (from == 0)
+        if (_drafter is not null)
+        {
+            seq.MtpValid = true;   // it reads the model's caches and has nothing of its own to fill
+        }
+        else if (from == 0)
         {
             if (rows > 1)
             {
@@ -1305,7 +1646,7 @@ public sealed class GpuEngine : IDisposable
         var m = _mtp!;
         int h = _hidden;
         long ld = 2L * h;
-        Check(Native.amqe_embed(_engine, _embed.Ptr, _embed.Type, tokens, rows, h, _embedScale, _hasEmbedScale ? 1 : 0, _hn), "mtp embed");
+        Check(Native.amqe_embed(_engine, _embed.Ptr, _embed.Type, _embed.Scales, _embed.RowScale, tokens, rows, h, _embedScale, _hasEmbedScale ? 1 : 0, _hn), "mtp embed");
         Check(Native.amqe_norm(_engine, _hn, h, _cat, ld, rows, h, m.PreEmbed.W, m.PreEmbed.Off, m.PreEmbed.B, m.PreEmbed.Eps, m.PreEmbed.Kind), "mtp norm");
         Check(Native.amqe_norm(_engine, hidden0, h, _cat + h * 4, ld, 1, h, m.PreHidden.W, m.PreHidden.Off, m.PreHidden.B, m.PreHidden.Eps, m.PreHidden.Kind), "mtp norm");
         if (rows > 1)
@@ -1321,7 +1662,7 @@ public sealed class GpuEngine : IDisposable
             Check(Native.amqe_norm(_engine, _x + (nint)((long)(rows - 1) * h * 4), h, _mtpH, h, 1, h,
                 m.Norm.W, m.Norm.Off, m.Norm.B, m.Norm.Eps, m.Norm.Kind), "mtp norm");
             Linear(_head, _mtpH, h, 1, _mtpLogits, _vocab, IntPtr.Zero, n: DraftVocab);
-            Check(Native.amqe_argmax(_engine, _mtpLogits, DraftVocab, draftTo, nextToken), "mtp argmax");
+            Check(Native.amqe_draft_pick(_engine, _mtpLogits, DraftVocab, draftTo, nextToken, draftTo + MaxDrafts * 4), "mtp argmax");
         }
     }
 
@@ -1333,6 +1674,7 @@ public sealed class GpuEngine : IDisposable
         {
             return;
         }
+        _graphReady = false;
         seq.SnapState ??= new IntPtr[_layers.Length];
         seq.SnapConv ??= new IntPtr[_layers.Length];
         for (int i = 0; i < _layers.Length; i++)
@@ -1403,6 +1745,7 @@ public sealed class GpuEngine : IDisposable
             {
                 _graphReady = false;
             }
+            Slide(seq, 1);
         }
         if (_graphFor is null || !_graphFor.SequenceEqual(batch))
         {
@@ -1597,11 +1940,15 @@ public sealed class GpuEngine : IDisposable
             {
                 continue;
             }
-            long bytes = KvBytes(i, capacity, seq);
+            long bytes = LayerBytes(i, capacity, seq);
+            if (seq.K[i] != IntPtr.Zero && bytes == LayerBytes(i, seq.KvCapacity, seq))
+            {
+                continue;   // a windowed cache already as long as it gets
+            }
             var (k, v) = AllocPair(bytes);
             if (seq.K[i] != IntPtr.Zero)
             {
-                long used = KvBytes(i, seq.Position, seq);
+                long used = Windowed(i) ? WinBytes(i, seq.Position - seq.WinBase) : KvBytes(i, seq.Position, seq);
                 if (used > 0)
                 {
                     Check(Native.amqe_copy_async(_engine, k, seq.K[i], (nuint)used, 3), "kv grow");
@@ -1666,7 +2013,7 @@ public sealed class GpuEngine : IDisposable
                 int at = i * TableKinds * MaxBatch + r;
                 table[at] = batch[r].K[i];
                 table[at + MaxBatch] = batch[r].V[i];
-                table[at + 2 * MaxBatch] = batch[r].Pos;
+                table[at + 2 * MaxBatch] = PosOf(batch[r], i);
                 table[at + 3 * MaxBatch] = batch[r].State[i];
                 table[at + 4 * MaxBatch] = batch[r].Conv[i];
                 table[at + 5 * MaxBatch] = InvFreq(_layers[i], batch[r]);
@@ -1690,10 +2037,14 @@ public sealed class GpuEngine : IDisposable
     // Scratch slots the decode attention needs for a cache this long.
     private static int PartSlots(GpuSequence seq) => Native.amqe_attention_part_slots(Splits(seq));
 
-    private static int Splits(GpuSequence seq)
+    private static int Splits(GpuSequence seq) => SplitsOf(seq.KvCapacity);
+
+    private int Splits(GpuSequence seq, int layer) => SplitsOf(Windowed(layer) ? WinCapacity(seq) : seq.KvCapacity);
+
+    private static int SplitsOf(int capacity)
     {
         int keys = Native.amqe_attention_split_keys();
-        return (seq.KvCapacity + keys - 1) / keys;
+        return (capacity + keys - 1) / keys;
     }
 
     // ── the forward pass ────────────────────────────────────────────────────
@@ -1705,13 +2056,23 @@ public sealed class GpuEngine : IDisposable
     /// and the recurrence treats the rows alike; those two run per sequence.
     /// The head reads the last row of one sequence, or every row of a batch.
     /// </summary>
-    private void Forward(GpuSequence[] seqs, int rows, bool head, bool allRows = false, bool hidden = false, bool snap = false)
+    private void Forward(GpuSequence[] seqs, int rows, bool head, bool allRows = false, bool hidden = false, bool snap = false, bool images = false)
     {
         bool batch = seqs.Length > 1;
-        Check(Native.amqe_embed(_engine, _embed.Ptr, _embed.Type, _tokens, rows, _hidden, _embedScale, _hasEmbedScale ? 1 : 0, _x), "embed");
+        Native.amqe_set_pdl(Fp4Matrices == 0 ? 1 : 0);
+        Check(Native.amqe_embed(_engine, _embed.Ptr, _embed.Type, _embed.Scales, _embed.RowScale, _tokens, rows, _hidden, _embedScale, _hasEmbedScale ? 1 : 0, _x), "embed");
+        if (images)
+        {
+            PlaceImages(seqs[0], seqs[0].Position, rows);
+        }
         for (int i = 0; i < _layers.Length; i++)
         {
             Layer(_layers[i], i, seqs, rows, null, snap);
+            if (_gramLayer == i)
+            {
+                head = hidden = false;   // calibrating: nothing past this layer is read
+                break;
+            }
         }
         if (hidden)
         {
@@ -1728,7 +2089,7 @@ public sealed class GpuEngine : IDisposable
             IntPtr first = batch || allRows ? _x : _x + (rows - 1) * _hidden * 4;
             if (FusesNorm(headRows, finalNorm))
             {
-                Linear(_head, first, _hidden, headRows, _logits, _vocab, IntPtr.Zero, norm: finalNorm);
+                Linear(_head, first, _hidden, headRows, _logits, _vocab, IntPtr.Zero, norm: finalNorm, what: "head");
             }
             else
             {
@@ -1745,6 +2106,10 @@ public sealed class GpuEngine : IDisposable
         foreach (var seq in seqs)
         {
             Check(Native.amqe_advance(_engine, seq.Pos, batch ? 1 : rows), "advance");
+            if (seq.WinPos != IntPtr.Zero)
+            {
+                Check(Native.amqe_advance(_engine, seq.WinPos, batch ? 1 : rows), "advance");
+            }
         }
     }
 
@@ -1755,6 +2120,90 @@ public sealed class GpuEngine : IDisposable
     /// attention context or Gated DeltaNet output), the FFN's gate and up (the
     /// normed residual again), and its down-projection (the gated activation).</summary>
     public const int GramMixerIn = 0, GramMixerOut = 1, GramFfnIn = 2, GramDownIn = 3;
+
+    /// <summary>What a layer's experts read: each expert has a Gram of its own, over
+    /// the rows routed to it (see <see cref="ExpertGram"/>).</summary>
+    public const int GramExpertIn = 4, GramExpertDown = 5;
+
+    private IntPtr _expertIn, _expertDown, _expertTmp;
+    private long[] _expertInRows = [], _expertDownRows = [];
+    private MoeDevice? _gramMoe;
+
+    /// <summary>One expert's Gram of the layer calibrated last, and how many rows it
+    /// sums; null when the layer has no experts. Held until the next
+    /// <see cref="BeginGrams"/> or <see cref="ReleaseGrams"/>.</summary>
+    public float[]? ExpertGram(int kind, int expert, out long rows)
+    {
+        rows = 0;
+        if (_gramMoe is not { } moe || _expertIn == IntPtr.Zero)
+        {
+            return null;
+        }
+        int k = kind == GramExpertIn ? _hidden : moe.Op.ExpertIntermediateSize;
+        rows = (kind == GramExpertIn ? _expertInRows : _expertDownRows)[expert];
+        var h = new float[(long)k * k];
+        Download(h, (kind == GramExpertIn ? _expertIn : _expertDown) + (nint)((long)expert * k * k * 4));
+        return h;
+    }
+
+    /// <summary>Frees the experts' Grams.</summary>
+    public void ReleaseGrams()
+    {
+        foreach (var p in new[] { _expertIn, _expertDown, _expertTmp })
+        {
+            if (p != IntPtr.Zero)
+            {
+                Native.amqe_free(p);
+            }
+        }
+        _expertIn = _expertDown = _expertTmp = IntPtr.Zero;
+        _gramMoe = null;
+    }
+
+    private void ExpertGrams(MoeDevice moe, IntPtr expertsIn, int rows)
+    {
+        var op = moe.Op;
+        int hidden = _hidden, inter = op.ExpertIntermediateSize;
+        if (_expertIn == IntPtr.Zero)
+        {
+            nuint inBytes = (nuint)((long)op.NumExperts * hidden * hidden * 4), downBytes = (nuint)((long)op.NumExperts * inter * inter * 4);
+            Check(Native.amqe_alloc(out _expertIn, inBytes), "expert grams");
+            Check(Native.amqe_alloc(out _expertDown, downBytes), "expert grams");
+            Check(Native.amqe_alloc(out _expertTmp, (nuint)((long)_chunkRows * op.TopK * Math.Max(hidden, inter) * 4)), "expert grams");
+            Check(Native.amqe_memset(_engine, _expertIn, 0, inBytes), "expert grams");
+            Check(Native.amqe_memset(_engine, _expertDown, 0, downBytes), "expert grams");
+            _expertInRows = new long[op.NumExperts];
+            _expertDownRows = new long[op.NumExperts];
+            _gramMoe = moe;
+        }
+        Check(Native.amqe_moe_gram(_engine, _routeIdx, _routeW, rows, op.TopK, op.NumExperts, expertsIn, hidden, op.TopK, hidden,
+            _moeOrder, _moeGroups, _expertTmp, _expertIn, _expertInRows), "expert grams");
+        Check(Native.amqe_moe_gram(_engine, _routeIdx, _routeW, rows, op.TopK, op.NumExperts, _moeGlu, inter, 1, inter,
+            _moeOrder, _moeGroups, _expertTmp, _expertDown, _expertDownRows), "expert grams");
+    }
+
+    /// <summary>An engine with no model, for <see cref="QuantiseFp4"/> alone; null
+    /// without a GPU.</summary>
+    public static GpuEngine? ForRounding()
+    {
+        try
+        {
+            return CudaShim.Enabled ? new GpuEngine() : null;
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or DllNotFoundException or EntryPointNotFoundException)
+        {
+            return null;
+        }
+    }
+
+    private GpuEngine()
+    {
+        _plan = null!;
+        _layers = [];
+        _embed = _head = null!;
+        _main = null!;
+        Check(Native.amqe_create(out _engine), "create");
+    }
 
     private int _gramLayer = -1;
     private readonly IntPtr[] _grams = new IntPtr[4];
@@ -1771,6 +2220,7 @@ public sealed class GpuEngine : IDisposable
     public void BeginGrams(int layer)
     {
         EndGrams(out _);
+        ReleaseGrams();
         _gramLayer = layer;
         _gramRows = 0;
     }
@@ -1828,8 +2278,10 @@ public sealed class GpuEngine : IDisposable
     /// Either way each block takes the scale, among those near its peak's,
     /// that leaves the least (weighted) error.</para>
     /// </summary>
+    /// <param name="hessianKey">Names the Gram: a call with the key of the call before
+    /// uses its factorisation again (an expert's gate and up rows share one).</param>
     public (byte[] Codes, byte[] Scales) QuantiseFp4(float[] weights, int rows, int cols, float[]? hessian,
-        bool mx, float global, double damp = 0.01)
+        bool mx, float global, double damp = 0.01, string? hessianKey = null)
     {
         if (cols % 32 != 0 || weights.LongLength != (long)rows * cols)
         {
@@ -1837,8 +2289,24 @@ public sealed class GpuEngine : IDisposable
         }
         long kk = (long)cols * cols;
         var w = weights;
-        var h = new float[kk];
-        if (hessian is null)
+        var unused = new List<int>();
+        bool factored = hessianKey is not null && hessianKey == _factorKey && _factorCols == cols && _factor != IntPtr.Zero;
+        var h = factored ? [] : new float[kk];
+        if (factored)
+        {
+            foreach (int i in _factorUnused)
+            {
+                if (w == weights)
+                {
+                    w = (float[])weights.Clone();
+                }
+                for (int r = 0; r < rows; r++)
+                {
+                    w[(long)r * cols + i] = 0f;
+                }
+            }
+        }
+        else if (hessian is null)
         {
             for (int i = 0; i < cols; i++)
             {
@@ -1865,6 +2333,7 @@ public sealed class GpuEngine : IDisposable
                 {
                     // No input ever reached this column: its weight is never used.
                     h[d] = 1f;
+                    unused.Add(i);
                     if (w == weights)
                     {
                         w = (float[])weights.Clone();
@@ -1877,15 +2346,32 @@ public sealed class GpuEngine : IDisposable
                 h[d] += (float)(damp * mean);
             }
         }
+        if (!factored)
+        {
+            _factorKey = null;
+        }
         int group = mx ? 32 : 16;
         var codes = new byte[(long)rows * cols / 2];
         var scales = new byte[(long)rows * cols / group];
         IntPtr dw = IntPtr.Zero, dh = IntPtr.Zero, du = IntPtr.Zero, dc = IntPtr.Zero, ds = IntPtr.Zero, de = IntPtr.Zero;
         try
         {
-            Check(Native.amqe_alloc(out dh, (nuint)(kk * 4)), "gptq");
-            Check(Native.amqe_alloc(out du, (nuint)(kk * 4)), "gptq");
-            int rc = 1;
+            int rc = factored ? 0 : 1;
+            if (!factored)
+            {
+                if (_factorCols != cols || _factor == IntPtr.Zero)
+                {
+                    if (_factor != IntPtr.Zero)
+                    {
+                        Native.amqe_free(_factor);
+                        _factor = IntPtr.Zero;
+                    }
+                    Check(Native.amqe_alloc(out _factor, (nuint)(kk * 4)), "gptq");
+                    _factorCols = cols;
+                }
+                Check(Native.amqe_alloc(out dh, (nuint)(kk * 4)), "gptq");
+            }
+            du = _factor;
             for (int attempt = 0; attempt < 4 && rc != 0; attempt++)
             {
                 if (attempt > 0)
@@ -1907,8 +2393,16 @@ public sealed class GpuEngine : IDisposable
             {
                 throw new InvalidOperationException($"the Gram for a [{rows}, {cols}] weight stayed singular after damping");
             }
-            Native.amqe_free(dh);
-            dh = IntPtr.Zero;
+            if (dh != IntPtr.Zero)
+            {
+                Native.amqe_free(dh);
+                dh = IntPtr.Zero;
+            }
+            if (!factored && hessianKey is not null)
+            {
+                _factorKey = hessianKey;
+                _factorUnused = unused;
+            }
             Check(Native.amqe_alloc(out dw, (nuint)(w.LongLength * 4)), "gptq");
             Check(Native.amqe_alloc(out dc, (nuint)codes.LongLength), "gptq");
             Check(Native.amqe_alloc(out ds, (nuint)scales.LongLength), "gptq");
@@ -1920,7 +2414,7 @@ public sealed class GpuEngine : IDisposable
         }
         finally
         {
-            foreach (var p in new[] { dw, dh, du, dc, ds, de })
+            foreach (var p in new[] { dw, dh, dc, ds, de })
             {
                 if (p != IntPtr.Zero)
                 {
@@ -1930,6 +2424,12 @@ public sealed class GpuEngine : IDisposable
         }
         return (codes, scales);
     }
+
+    // The last factored Gram, kept for the next weight that shares it.
+    private IntPtr _factor;
+    private int _factorCols;
+    private string? _factorKey;
+    private List<int> _factorUnused = [];
 
     private void Upload<T>(IntPtr device, T[] host) where T : unmanaged
     {
@@ -2008,7 +2508,7 @@ public sealed class GpuEngine : IDisposable
         if (lp.Attention is { } attn)
         {
             int qkvWidth = l.Qkv!.Rows;
-            Linear(l.Qkv!, hIn, hidden, rows, _proj, qkvWidth, l.QkvBias, norm: inNorm);
+            Linear(l.Qkv!, hIn, hidden, rows, _proj, qkvWidth, l.QkvBias, norm: inNorm, what: "qkv");
             if (l.QNormRow)
             {
                 Check(Native.amqe_norm(_engine, _proj, qkvWidth, _proj, qkvWidth, rows, attn.QDim,
@@ -2030,10 +2530,10 @@ public sealed class GpuEngine : IDisposable
                     attn.OutputGate ? 1 : 0, _q, _gate, Table(i, 0), Table(i, 1), Table(i, 2),
                     l.QNormRow ? IntPtr.Zero : l.QNormW, l.QNormOff, l.QNormEps,
                     l.KNormRow ? IntPtr.Zero : l.KNormW, l.KNormOff, l.KNormEps,
-                    Table(i, 5), l.RopePairs, l.RopeScale, attn.RopeInterleaved ? 1 : 0, l.InvFreq != IntPtr.Zero ? 1 : 0), "attn prep");
+                    Table(i, 5), l.RopePairs, l.RopeScale, attn.RopeInterleaved ? 1 : 0, l.InvFreq != IntPtr.Zero ? 1 : 0, l.VNormEps), "attn prep");
                 Check(Native.amqe_attention_batch(_engine, _q, Table(i, 0), Table(i, 1), attn.OutputGate ? _gate : IntPtr.Zero, _ctx,
                     Table(i, 2), rows, attn.NumQHeads, attn.NumKvHeads, attn.HeadDim, (float)attn.ScoreScale, softcap, window,
-                    _attnPart, seqs.Max(Splits)), "attention");
+                    _attnPart, seqs.Max(s => Splits(s, i))), "attention");
             }
             for (int s = 0; s < (batch ? 0 : seqs.Length); s++)
             {
@@ -2042,10 +2542,10 @@ public sealed class GpuEngine : IDisposable
                 long at = batch ? s : 0;
                 IntPtr q = _q + (nint)(at * qRow), gateRow = _gate + (nint)(at * qRow), ctx = _ctx + (nint)(at * qRow);
                 Check(Native.amqe_attn_prep(_engine, _proj + (nint)(at * qkvWidth * 4), qkvWidth, n, attn.NumQHeads, attn.NumKvHeads,
-                    attn.HeadDim, attn.OutputGate ? 1 : 0, q, gateRow, kv?.K ?? seq.K[i], kv?.V ?? seq.V[i], kv?.Pos ?? seq.Pos,
+                    attn.HeadDim, attn.OutputGate ? 1 : 0, q, gateRow, kv?.K ?? seq.K[i], kv?.V ?? seq.V[i], kv?.Pos ?? PosOf(seq, i),
                     l.QNormRow ? IntPtr.Zero : l.QNormW, l.QNormOff, l.QNormEps,
                     l.KNormRow ? IntPtr.Zero : l.KNormW, l.KNormOff, l.KNormEps,
-                    InvFreq(l, seq), l.RopePairs, l.RopeScale, attn.RopeInterleaved ? 1 : 0, l.InvFreq != IntPtr.Zero ? 1 : 0), "attn prep");
+                    InvFreq(l, seq), l.RopePairs, l.RopeScale, attn.RopeInterleaved ? 1 : 0, l.InvFreq != IntPtr.Zero ? 1 : 0, l.VNormEps), "attn prep");
                 if (_probeFrom >= 0 && kv is null && QueryProbe is { } probe)
                 {
                     // Prompt chunks only: never inside a captured graph.
@@ -2066,15 +2566,24 @@ public sealed class GpuEngine : IDisposable
                 // the host: prompts are never captured); decode steps, and
                 // chunks whose scores would pass the scratch budget, use the
                 // attention kernels.
-                int rc = n > 8 && RowsAttention
-                    ? Native.amqe_attention_rows(_engine, q, kv?.K ?? seq.K[i], kv?.V ?? seq.V[i], gate, ctx, kv?.HostPos ?? seq.Position,
-                        n, attn.NumQHeads, attn.NumKvHeads, attn.HeadDim, (float)attn.ScoreScale, softcap, window, ExactSpec(seq))
-                    : -200;
-                if (rc == -200)
+                bool reaching = _reaching && kv is null && window > 0;
+                if (reaching)
                 {
-                    rc = Native.amqe_attention(_engine, q, kv?.K ?? seq.K[i], kv?.V ?? seq.V[i], gate, ctx, kv?.Pos ?? seq.Pos,
+                    Check(Native.amqe_set_reach(_engine, _reach), "attention");
+                }
+                int rc = (n > 8 && RowsAttention) || reaching
+                    ? Native.amqe_attention_rows(_engine, q, kv?.K ?? seq.K[i], kv?.V ?? seq.V[i], gate, ctx, kv?.HostPos ?? RowOf(seq, i),
+                        n, attn.NumQHeads, attn.NumKvHeads, attn.HeadDim, (float)attn.ScoreScale, softcap, window, LayerExact(seq, i))
+                    : -200;
+                if (reaching)
+                {
+                    Check(Native.amqe_set_reach(_engine, IntPtr.Zero), "attention");
+                }
+                if (rc == -200 && !reaching)
+                {
+                    rc = Native.amqe_attention(_engine, q, kv?.K ?? seq.K[i], kv?.V ?? seq.V[i], gate, ctx, kv?.Pos ?? PosOf(seq, i),
                         n, attn.NumQHeads, attn.NumKvHeads, attn.HeadDim, (float)attn.ScoreScale,
-                        softcap, window, _attnPart, Splits(seq));
+                        softcap, window, _attnPart, Splits(seq, i));
                 }
                 Check(rc, "attention");
             }
@@ -2083,7 +2592,7 @@ public sealed class GpuEngine : IDisposable
                 Gram(GramMixerOut, _ctx, attn.QDim, rows, attn.QDim);
             }
             Linear(l.O!, _ctx, attn.QDim, rows, mixerOut, hidden, l.OBias,
-                residual: mixerDirect ? _x : IntPtr.Zero, resScale: residualScale);
+                residual: mixerDirect ? _x : IntPtr.Zero, resScale: residualScale, what: "o");
         }
         else
         {
@@ -2115,21 +2624,34 @@ public sealed class GpuEngine : IDisposable
 
         if (!mixerDirect)
         {
-            if (l.PostAttn is { } post)
+            if (l.PostAttn is { } joined && !parallel && Plain(joined))
+            {
+                Check(Native.amqe_norm_join(_engine, _x, _branch, rows, hidden, joined.W, joined.Off, joined.Eps, residualScale, 1f), "norm and residual");
+            }
+            else if (l.PostAttn is { } post)
             {
                 ApplyNorm(post, _branch, _branch, rows);
             }
-            if (!parallel)
+            if (!parallel && !(l.PostAttn is { } done && Plain(done)))
             {
                 Check(Native.amqe_add_scaled(_engine, _x, _branch, residualScale, (long)rows * hidden), "residual");
             }
         }
 
+        if (l.Moe is { } moe)
+        {
+            RoutedFfn(l, moe, rows, residualScale, gram);
+            return;
+        }
         if (l.Up is null)
         {
             if (parallel)
             {
-                Check(Native.amqe_add_scaled(_engine, _x, _branch, residualScale, (long)rows * hidden), "residual");
+                JoinResidual(l, _branch, residualScale, rows);
+            }
+            else if (l.OutScale != 1f)
+            {
+                Check(Native.amqe_add_scaled_mul(_engine, _x, _x, 0f, l.OutScale, (long)rows * hidden), "layer scale");
             }
             return;
         }
@@ -2163,11 +2685,16 @@ public sealed class GpuEngine : IDisposable
         {
             Gram(GramDownIn, _ffn, inter, rows, inter);
         }
-        bool ffnDirect = l.PostFfn is null && !parallel;
+        bool ffnDirect = l.PostFfn is null && !parallel && l.OutScale == 1f;
         Linear(l.Down!, _ffn, inter, rows, ffnDirect ? _x : _branch2, hidden, l.DownBias,
             residual: ffnDirect ? _x : IntPtr.Zero, resScale: residualScale);
         if (!ffnDirect)
         {
+            if (!parallel && l.PostFfn is { } joined && Plain(joined))
+            {
+                Check(Native.amqe_norm_join(_engine, _x, _branch2, rows, hidden, joined.W, joined.Off, joined.Eps, residualScale, l.OutScale), "norm and residual");
+                return;
+            }
             if (l.PostFfn is { } postFfn)
             {
                 ApplyNorm(postFfn, _branch2, _branch2, rows);
@@ -2175,13 +2702,166 @@ public sealed class GpuEngine : IDisposable
             if (parallel)
             {
                 Check(Native.amqe_add_scaled(_engine, _branch, _branch2, 1f, (long)rows * hidden), "residual");
-                Check(Native.amqe_add_scaled(_engine, _x, _branch, residualScale, (long)rows * hidden), "residual");
+                JoinResidual(l, _branch, residualScale, rows);
             }
             else
             {
-                Check(Native.amqe_add_scaled(_engine, _x, _branch2, residualScale, (long)rows * hidden), "residual");
+                JoinResidual(l, _branch2, residualScale, rows);
             }
         }
+    }
+
+    // An RMS norm without a bias: what the fused kernels apply.
+    private static bool Plain((IntPtr W, IntPtr B, float Off, float Eps, int Kind) norm) => norm.Kind == 0 && norm.B == IntPtr.Zero;
+
+    // x += scale · branch, and the layer's output scale when it has one.
+    private void JoinResidual(LayerDevice l, IntPtr branch, float scale, int rows)
+    {
+        long count = (long)rows * _hidden;
+        Check(l.OutScale == 1f
+            ? Native.amqe_add_scaled(_engine, _x, branch, scale, count)
+            : Native.amqe_add_scaled_mul(_engine, _x, branch, scale, l.OutScale, count), "residual");
+    }
+
+    private static readonly bool SideBySide = Environment.GetEnvironmentVariable("AMQE_SIDE") is not "0";
+
+    /// <summary>A layer's routed experts over the residual in <c>_x</c>, alone or
+    /// beside its dense FFN (<see cref="HybridFfn"/>), joined back to it.</summary>
+    private void RoutedFfn(LayerDevice l, MoeDevice moe, int rows, float residualScale, bool gram)
+    {
+        int hidden = _hidden;
+        var op = moe.Op;
+        IntPtr routerIn = _x, expertsIn = _moeIn;
+        (IntPtr W, IntPtr B, float Off, float Eps, int Kind)? inNorm = null;
+        if (op.Hybrid is not null)
+        {
+            // The router reads the residual; what the experts read, its normalised copy,
+            // is written as it routes (the same sum of squares serves both norms).
+            if (moe.RoutedIn is { } routedIn && Plain(routedIn))
+            {
+                inNorm = routedIn;
+            }
+            else if (moe.RoutedIn is { } general)
+            {
+                ApplyNorm(general, _x, _moeIn, rows);
+            }
+            else
+            {
+                expertsIn = _x;
+            }
+        }
+        else if (l.PreFfn is { } preFfn)
+        {
+            ApplyNorm(preFfn, _x, _moeIn, rows);
+            routerIn = _moeIn;
+        }
+        else
+        {
+            expertsIn = _x;
+        }
+        IntPtr dense = IntPtr.Zero;
+        bool beside = false;
+        if (op.Hybrid is { } hybrid)
+        {
+            var d = hybrid.Dense;
+            int inter = d.IntermediateSize;
+            IntPtr fIn = _x;
+            (IntPtr, IntPtr, float, float, int)? ffnNorm = null;
+            if (l.PreFfn is { } preFfn)
+            {
+                if (!gram && FusesNorm(rows, preFfn))
+                {
+                    ffnNorm = preFfn;
+                }
+                else
+                {
+                    ApplyNorm(preFfn, _x, _hn, rows);
+                    fIn = _hn;
+                }
+            }
+            if (gram)
+            {
+                Gram(GramFfnIn, fIn, hidden, rows, hidden);
+            }
+            // In a decode step the two FFNs run beside each other: every kernel of the
+            // dense one reads the residual or its own scratch.
+            beside = SideBySide && rows <= 8 && ffnNorm is not null && _markOn == IntPtr.Zero;
+            if (beside)
+            {
+                Check(Native.amqe_side_begin(_engine), "side stream");
+            }
+            Linear(l.Up!, fIn, hidden, rows, _ffn, inter, l.UpBias, act: l.Act, glu: d.IsGated, n: inter, norm: ffnNorm, what: "ffn up");
+            if (gram)
+            {
+                Gram(GramDownIn, _ffn, inter, rows, inter);
+            }
+            Linear(l.Down!, _ffn, inter, rows, _branch2, hidden, l.DownBias, what: "ffn down");
+            if (beside)
+            {
+                Check(Native.amqe_side_end(_engine), "side stream");
+            }
+            dense = _branch2;
+        }
+        var nm = inNorm ?? default;
+        Check(Native.amqe_moe_route(_engine, moe.Router.Ptr, moe.Router.Type, op.NumExperts, hidden, op.TopK, routerIn, hidden, rows,
+            (float)(op.RouterInputNormEps ?? 0), moe.RouterScale, moe.ExpertScale,
+            op.RoutingPolicy == ExpertRoutingPolicy.NormalisedOverSelected ? 1 : 0, _routeIdx, _routeW,
+            inNorm is null ? IntPtr.Zero : nm.W, nm.Off, nm.Eps, _moeIn), "route");
+
+        if (gram)
+        {
+            // The f32 kernels leave each pair's gated activation to be read.
+            Check(Native.amqe_set_prefill_f32(_engine, 1), "prefill precision");
+        }
+        Check(Native.amqe_moe_experts(_engine, moe.GateUp.Ptr, moe.GateUp.Type, moe.GateUp.Scales, moe.GateUp.RowScale,
+            moe.Down.Ptr, moe.Down.Type, moe.Down.Scales, moe.Down.RowScale,
+            op.NumExperts, hidden, op.ExpertIntermediateSize, op.TopK, moe.Act,
+            expertsIn, hidden, rows, _routeIdx, _routeW, _moeOrder, _moeGroups, _moeGlu, _moeSlots, out int mixed), "experts");
+        int slots = mixed != 0 ? 0 : op.TopK;
+        if (beside)
+        {
+            Check(Native.amqe_side_join(_engine), "side stream");
+        }
+        if (gram)
+        {
+            Check(Native.amqe_set_prefill_f32(_engine, _exactPrefill ? 1 : 0), "prefill precision");
+            ExpertGrams(moe, expertsIn, rows);
+        }
+
+        // The mixture, the norms around it and the residual, in one pass where every
+        // norm is a plain RMS norm.
+        static bool Fits((IntPtr W, IntPtr B, float Off, float Eps, int Kind)? norm) => norm is not { } n || Plain(n);
+        bool fused = Fits(moe.DenseOut) && Fits(moe.RoutedOut) && Fits(l.PostFfn);
+        var denseOut = fused ? moe.DenseOut ?? default : default;
+        var routedOut = fused ? moe.RoutedOut ?? default : default;
+        var outNorm = fused ? l.PostFfn ?? default : default;
+        if (fused)
+        {
+            Check(Native.amqe_moe_finish(_engine, _moeSlots, _routeW, slots, hidden, rows, dense,
+                denseOut.W, denseOut.Off, denseOut.Eps, routedOut.W, routedOut.Off, routedOut.Eps, outNorm.W, outNorm.Off, outNorm.Eps,
+                _x, residualScale, l.OutScale, 0), "experts join");
+            return;
+        }
+        // Any other norm: the mixture alone, and the norms as they are.
+        Check(Native.amqe_moe_finish(_engine, _moeSlots, _routeW, slots, hidden, rows, IntPtr.Zero,
+            IntPtr.Zero, 0, 0, IntPtr.Zero, 0, 0, IntPtr.Zero, 0, 0, _branch, 1f, 1f, 1), "experts join");
+        if (moe.RoutedOut is { } routedNorm)
+        {
+            ApplyNorm(routedNorm, _branch, _branch, rows);
+        }
+        if (dense != IntPtr.Zero)
+        {
+            if (moe.DenseOut is { } denseNorm)
+            {
+                ApplyNorm(denseNorm, dense, dense, rows);
+            }
+            Check(Native.amqe_add_scaled(_engine, _branch, dense, 1f, (long)rows * hidden), "experts and dense");
+        }
+        if (l.PostFfn is { } post)
+        {
+            ApplyNorm(post, _branch, _branch, rows);
+        }
+        JoinResidual(l, _branch, residualScale, rows);
     }
 
     /// <summary>y = epilogue(x · Wᵀ); with <paramref name="norm"/> the rows of
@@ -2189,13 +2869,13 @@ public sealed class GpuEngine : IDisposable
     /// <see cref="FusesNorm"/>).</summary>
     private void Linear(DeviceMatrix w, IntPtr x, int ldx, int rows, IntPtr y, int ldy, IntPtr bias,
         IntPtr residual = default, float resScale = 1f, int act = 0, bool glu = false, int n = -1,
-        (IntPtr W, IntPtr B, float Off, float Eps, int Kind)? norm = null)
+        (IntPtr W, IntPtr B, float Off, float Eps, int Kind)? norm = null, string what = "linear")
     {
         int outputs = n < 0 ? w.Rows : n;
         var nm = norm ?? default;
         Check(Native.amqe_linear(_engine, w.Ptr, w.Type, outputs, w.Cols, x, ldx, rows, y, ldy,
             bias, residual, ldy, resScale, act, glu ? 1 : 0, _raw,
-            norm is null ? IntPtr.Zero : nm.W, nm.Off, nm.B, nm.Eps, nm.Kind, w.Scales, w.RowScale), "linear");
+            norm is null ? IntPtr.Zero : nm.W, nm.Off, nm.B, nm.Eps, nm.Kind, w.Scales, w.RowScale), what);
     }
 
     /// <summary>Whether a norm can run inside the projection that reads it: a
@@ -2250,6 +2930,16 @@ public sealed class GpuEngine : IDisposable
 
     private Fp4Source? Fp4Of(WeightLoader weights, OperandRef operand, int rows, int cols, bool project)
     {
+        if (weights.StoredRawFp4(operand) is { } raw)
+        {
+            if (raw.Rows != rows || raw.Cols != cols)
+            {
+                throw new ContainerException($"'{operand.ObjectId}/{operand.TensorName}' is [{raw.Rows}, {raw.Cols}], expected [{rows}, {cols}]");
+            }
+            var rowScale = new float[rows];
+            Array.Fill(rowScale, raw.Global);
+            return new Fp4Source(raw.Elements, raw.Scales, rowScale, raw.Mxfp4 ? MXFP4 : NVFP4);
+        }
         if (weights.StoredFp4(operand) is { } stored)
         {
             if (stored.Rows != rows || stored.Cols != cols)
@@ -2368,6 +3058,22 @@ public sealed class GpuEngine : IDisposable
         public double RopeScale = 1.0;
         public IntPtr ConvW, ALog, DtBias, GdnNormW;
         public long StateBytes, ConvHistoryBytes;
+        public int Act;
+
+        /// <summary>&gt; 0: each head's value is RMS-normalised, without a weight.</summary>
+        public float VNormEps;
+        public float OutScale = 1f;
+        public MoeDevice? Moe;
+    }
+
+    /// <summary>A layer's routed experts: gate and up rows of every expert end to
+    /// end in one matrix, down rows in another.</summary>
+    private sealed class MoeDevice
+    {
+        public required RoutedFfnOp Op { get; init; }
+        public required DeviceMatrix Router, GateUp, Down;
+        public IntPtr RouterScale, ExpertScale;
+        public (IntPtr W, IntPtr B, float Off, float Eps, int Kind)? DenseOut, RoutedIn, RoutedOut;
         public int Act;
     }
 
@@ -2503,9 +3209,9 @@ public sealed class GpuEngine : IDisposable
         var fp4 = parts.Select(p => Fp4Of(weights, p.Operand, p.Rows, cols, project: true)).ToArray();
         if (fp4.All(f => f is not null) && fp4.Select(f => f!.Type).Distinct().Count() == 1)
         {
-            var packed = fp4.SelectMany(f => f!.Packed).ToArray();
-            var scales = fp4.SelectMany(f => f!.Scales).ToArray();
-            var rowScale = fp4.SelectMany(f => f!.RowScale).ToArray();
+            var packed = Joined(fp4.Select(f => f!.Packed));
+            var scales = Joined(fp4.Select(f => f!.Scales));
+            var rowScale = Joined(fp4.Select(f => f!.RowScale));
             return UploadFp4(new Fp4Source(packed, scales, rowScale, fp4[0]!.Type), rows, cols);
         }
         var sources = parts.Select(p => weights.DeviceSource(p.Operand, p.Rows, cols)).ToArray();
@@ -2538,6 +3244,19 @@ public sealed class GpuEngine : IDisposable
             }
         }
         return new DeviceMatrix { Ptr = UploadFloats(f32), Type = F32, Rows = rows, Cols = cols };
+    }
+
+    private static T[] Joined<T>(IEnumerable<T[]> parts) where T : unmanaged
+    {
+        var list = parts.ToList();
+        var all = new T[list.Sum(p => p.LongLength)];
+        long at = 0;
+        foreach (var part in list)
+        {
+            part.CopyTo(all, at);
+            at += part.LongLength;
+        }
+        return all;
     }
 
     /// <summary>The biases of stacked weights, zeros where a part has none;
@@ -2642,6 +3361,100 @@ public sealed class GpuEngine : IDisposable
         {
             throw new InvalidOperationException($"GPU engine: {what} failed (status {status})");
         }
+        if (_marks is not null && _markOn != IntPtr.Zero)
+        {
+            Native.amqe_mark(_markOn);
+            _marks.Add(what);
+            return;
+        }
+        if (OpTimes is { } times && _profiled != IntPtr.Zero)
+        {
+            Native.amqe_sync(_profiled);
+            long now = System.Diagnostics.Stopwatch.GetTimestamp();
+            times[what] = times.GetValueOrDefault(what) + (now - _profiledAt);
+            _profiledAt = System.Diagnostics.Stopwatch.GetTimestamp();
+        }
+    }
+
+    /// <summary>Profiling: while set, every device call is waited for and its
+    /// time added here by name (Stopwatch ticks), over the prompt rows run
+    /// through <see cref="Profile"/>. Waiting costs each call some microseconds
+    /// and loses the overlap between kernels: it says where time goes, not how much.</summary>
+    internal static Dictionary<string, long>? OpTimes { get; private set; }
+
+    // While a decode step is profiled: the device calls it made, in order.
+    [ThreadStatic] private static List<string>? _marks;
+    [ThreadStatic] private static IntPtr _markOn;
+
+    /// <summary>Time by device call in decode steps, as the GPU ran them (an event
+    /// after each call), microseconds a step. The kernels are launched one by one
+    /// rather than from a captured graph, whose events cannot be read.</summary>
+    /// <param name="rows">Tokens a step: more than one is what a verify runs, but for its head.</param>
+    public IReadOnlyList<(string Op, double Microseconds)> ProfileDecode(int[] prompt, int steps, int rows = 1)
+    {
+        var seq = NewSequence();
+        try
+        {
+            Reserve(seq, prompt.Length + steps * rows + 8);
+            int token = Sampler.ArgMax(Prefill(seq, prompt));
+            var totals = new Dictionary<string, double>();
+            float[] times = new float[4096];
+            for (int i = 0; i < steps; i++)
+            {
+                Check(Native.amqe_marks_begin(_engine), "marks");
+                _marks = [];
+                _markOn = _engine;
+                // The step's kernels, launched one by one.
+                var logits = Prefill(seq, Enumerable.Range(0, rows).Select(r => r == 0 ? token : prompt[(i * rows + r) % prompt.Length]).ToArray());
+                _markOn = IntPtr.Zero;
+                token = Sampler.ArgMax(logits);
+                int n = Native.amqe_marks_end(_engine, times, times.Length);
+                for (int k = 0; i > 0 && k < Math.Min(n, _marks.Count); k++)
+                {
+                    totals[_marks[k]] = totals.GetValueOrDefault(_marks[k]) + times[k];
+                }
+            }
+            return totals.OrderByDescending(kv => kv.Value).Select(kv => (kv.Key, kv.Value * 1000 / (steps - 1))).ToList();
+        }
+        finally
+        {
+            _marks = null;
+            _markOn = IntPtr.Zero;
+            _graphReady = false;
+            Release(seq);
+        }
+    }
+
+    [ThreadStatic] private static IntPtr _profiled;
+    [ThreadStatic] private static long _profiledAt;
+
+    /// <summary>Time by device call over <paramref name="repeat"/> runs of the
+    /// tokens as one prompt on a fresh sequence, microseconds a run.</summary>
+    public IReadOnlyList<(string Op, double Microseconds)> Profile(ReadOnlySpan<int> tokens, int repeat)
+    {
+        var seq = NewSequence();
+        try
+        {
+            Prefill(seq, tokens);
+            var ids = tokens.ToArray();
+            OpTimes = new Dictionary<string, long>();
+            for (int i = 0; i < repeat; i++)
+            {
+                _profiled = IntPtr.Zero;
+                Reset(seq);
+                _profiled = _engine;
+                _profiledAt = System.Diagnostics.Stopwatch.GetTimestamp();
+                Prefill(seq, ids);
+            }
+            return OpTimes.OrderByDescending(kv => kv.Value)
+                .Select(kv => (kv.Key, kv.Value * 1e6 / System.Diagnostics.Stopwatch.Frequency / repeat)).ToList();
+        }
+        finally
+        {
+            OpTimes = null;
+            _profiled = IntPtr.Zero;
+            Release(seq);
+        }
     }
 
     public void Dispose()
@@ -2660,12 +3473,19 @@ public sealed class GpuEngine : IDisposable
         if (_engine != IntPtr.Zero)
         {
             Native.amqe_sync(_engine);
+            DropPasses();
         }
         foreach (var ptr in _allocations)
         {
             Native.amqe_free(ptr);
         }
         _allocations.Clear();
+        ReleaseGrams();
+        if (_factor != IntPtr.Zero)
+        {
+            Native.amqe_free(_factor);
+            _factor = IntPtr.Zero;
+        }
         if (_hostToken != IntPtr.Zero)
         {
             Native.amqe_host_free(_hostToken);
@@ -2716,7 +3536,7 @@ public sealed class GpuEngine : IDisposable
             IntPtr normW, float normOff, IntPtr normBias, float normEps, int normKind, IntPtr wScales, IntPtr rowScale);
 
         [DllImport(Lib)]
-        public static extern int amqe_embed(IntPtr e, IntPtr table, int wType, IntPtr tokens, int rows, int hidden,
+        public static extern int amqe_embed(IntPtr e, IntPtr table, int wType, IntPtr scales, IntPtr rowScale, IntPtr tokens, int rows, int hidden,
             float scale, int hasScale, IntPtr output);
 
         [DllImport(Lib)]
@@ -2730,7 +3550,68 @@ public sealed class GpuEngine : IDisposable
             IntPtr q, IntPtr gate, IntPtr kCache, IntPtr vCache, IntPtr pos,
             IntPtr qNormW, float qNormOff, float qNormEps,
             IntPtr kNormW, float kNormOff, float kNormEps,
-            IntPtr invFreq, int pairs, double ropeScale, int interleaved, int rope);
+            IntPtr invFreq, int pairs, double ropeScale, int interleaved, int rope, float vNormEps);
+
+        [DllImport(Lib)]
+        public static extern int amqe_attn_query(IntPtr e, IntPtr proj, int hq, int d, IntPtr q, IntPtr pos,
+            IntPtr qNormW, float qNormOff, float qNormEps, IntPtr invFreq, int pairs, double ropeScale, int interleaved, int rope);
+
+        [DllImport(Lib)] public static extern int amqe_set_reach(IntPtr e, IntPtr reach);
+        [DllImport(Lib)] public static extern int amqe_pass_begin(IntPtr e);
+        [DllImport(Lib)] public static extern int amqe_pass_end(IntPtr e, out IntPtr pass);
+        [DllImport(Lib)] public static extern int amqe_pass_run(IntPtr e, IntPtr pass);
+        [DllImport(Lib)] public static extern int amqe_pass_free(IntPtr pass);
+        [DllImport(Lib)] public static extern int amqe_draft_pick(IntPtr e, IntPtr x, int n, IntPtr o, IntPtr o2, IntPtr share);
+
+        [DllImport(Lib)]
+        public static extern int amqe_vision_positions(IntPtr e, IntPtr x, IntPtr xs, IntPtr ys, IntPtr pos, int rows, int hidden);
+
+        [DllImport(Lib)]
+        public static extern int amqe_vision_prep(IntPtr e, IntPtr qkv, int ldqkv, int rows, int heads, int d, IntPtr q, IntPtr k, IntPtr v,
+            IntPtr pos, IntPtr qNormW, IntPtr kNormW, float eps, IntPtr invFreq);
+
+        [DllImport(Lib)]
+        public static extern int amqe_vision_pool(IntPtr e, IntPtr x, IntPtr output, int tokens, int hidden, int width, int side, float scale,
+            IntPtr bias, IntPtr stdScale, float eps);
+
+        [DllImport(Lib)]
+        public static extern int amqe_moe_route(IntPtr e, IntPtr w, int wType, int experts, int hidden, int topK,
+            IntPtr x, int ldx, int rows, float normEps, IntPtr inScale, IntPtr expertScale, int normaliseSelected,
+            IntPtr idx, IntPtr wt, IntPtr inNormW, float inNormOff, float inNormEps, IntPtr normed);
+
+        [DllImport(Lib)] public static extern int amqe_side_begin(IntPtr e);
+        [DllImport(Lib)] public static extern int amqe_side_end(IntPtr e);
+        [DllImport(Lib)] public static extern int amqe_side_join(IntPtr e);
+
+        [DllImport(Lib)]
+        public static extern int amqe_moe_finish(IntPtr e, IntPtr slots, IntPtr wt, int topK, int hidden, int rows,
+            IntPtr dense, IntPtr denseNormW, float denseNormOff, float denseNormEps,
+            IntPtr routedNormW, float routedNormOff, float routedNormEps,
+            IntPtr outNormW, float outNormOff, float outNormEps, IntPtr x, float resScale, float mul, int replace);
+
+        [DllImport(Lib)]
+        public static extern int amqe_norm_join(IntPtr e, IntPtr x, IntPtr b, int rows, int hidden, IntPtr w, float off, float eps,
+            float resScale, float mul);
+
+        [DllImport(Lib)]
+        public static extern int amqe_moe_experts(IntPtr e,
+            IntPtr gateUp, int guType, IntPtr guScales, IntPtr guRowScale,
+            IntPtr down, int dType, IntPtr dScales, IntPtr dRowScale,
+            int experts, int hidden, int inter, int topK, int act,
+            IntPtr x, int ldx, int rows, IntPtr idx, IntPtr wt,
+            IntPtr order, IntPtr groups, IntPtr glu, IntPtr slots, out int mixed);
+
+        [DllImport(Lib)] public static extern void amqe_set_pdl(int on);
+        [DllImport(Lib)] public static extern int amqe_marks_begin(IntPtr e);
+        [DllImport(Lib)] public static extern int amqe_mark(IntPtr e);
+        [DllImport(Lib)] public static extern int amqe_marks_end(IntPtr e, float[] milliseconds, int most);
+
+        [DllImport(Lib)]
+        public static extern int amqe_moe_gram(IntPtr e, IntPtr idx, IntPtr wt, int rows, int topK, int experts,
+            IntPtr x, int ldx, int xDiv, int k, IntPtr order, IntPtr groups, IntPtr tmp, IntPtr h, long[] rowsOf);
+
+        [DllImport(Lib)]
+        public static extern int amqe_add_scaled_mul(IntPtr e, IntPtr y, IntPtr b, float scale, float mul, long count);
 
         [DllImport(Lib)]
         public static extern int amqe_attention(IntPtr e, IntPtr q, IntPtr kCache, IntPtr vCache,
@@ -2762,7 +3643,7 @@ public sealed class GpuEngine : IDisposable
             IntPtr q, IntPtr gate, IntPtr kCaches, IntPtr vCaches, IntPtr poss,
             IntPtr qNormW, float qNormOff, float qNormEps,
             IntPtr kNormW, float kNormOff, float kNormEps,
-            IntPtr invFreq, int pairs, double ropeScale, int interleaved, int rope);
+            IntPtr invFreq, int pairs, double ropeScale, int interleaved, int rope, float vNormEps);
 
         [DllImport(Lib)]
         public static extern int amqe_attention_batch(IntPtr e, IntPtr q, IntPtr kCaches, IntPtr vCaches,
@@ -2812,11 +3693,23 @@ public sealed class GpuSequence
     internal IntPtr MtpK, MtpV, MtpPos, MtpPending, MarkMtpPending;
     internal bool MtpValid, MarkMtpValid;
 
+    /// <summary>The images of the prompt being read, by position in the sequence: set before
+    /// <see cref="GpuEngine.Prefill(GpuSequence, ReadOnlySpan{int})"/> reads them.</summary>
+    public IReadOnlyList<ImageSpan>? Images { get; set; }
+
+
     // A verify's recurrent state after each of its rows but the last, by layer,
     // so keeping only its first rows restores the state there.
     internal IntPtr[]? SnapState, SnapConv;
     internal int SnapRows;
     internal int VerifyFrom, VerifyRows;
+
+    // Windowed layers: their position counter, the position their first cache row
+    // stands for, and the rows before the mark once the caches have slid past it.
+    internal IntPtr WinPos;
+    internal int WinBase;
+    internal IntPtr[]? MarkWinK, MarkWinV;
+    internal int MarkWinRows;
 
     /// <summary>Positions kept at f32 in an NVFP4 cache (see <see cref="GpuEngine.SetExactRows"/>).</summary>
     public int ExactRows { get; internal set; }

@@ -1269,6 +1269,18 @@ public sealed class WeightLoader
         return _store.ResolveScaled(operand) is { Element: Dtype.FP4 } m ? m : null;
     }
 
+    /// <summary>The operand's stored NVFP4 or MXFP4 bytes, undecoded; null when it is
+    /// stored any other way or a patch covers it.</summary>
+    internal (byte[] Elements, byte[] Scales, float Global, bool Mxfp4, int Rows, int Cols)? StoredRawFp4(OperandRef operand)
+    {
+        var key = (operand.ObjectId, operand.TensorName);
+        if (_added.ContainsKey(key) || (_patch is not null && _patch.TryGet(operand.ObjectId, operand.TensorName, out _)))
+        {
+            return null;
+        }
+        return _store.ContainsTensor(operand.ObjectId, operand.TensorName) ? _store.ResolveRawFp4(operand.ObjectId, operand.TensorName) : null;
+    }
+
     /// <summary>The operand's values as stored, widened to f32 (patched, if a
     /// patch covers it), never through a BF16-resident copy.</summary>
     internal float[] StoredValues(OperandRef operand, int rows, int cols)

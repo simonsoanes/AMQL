@@ -4,6 +4,7 @@ using System.Text.Json.Nodes;
 using System.Threading.Channels;
 using Amql.Cli;
 using Amql.Hf;
+using Amql.Inference;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
@@ -101,6 +102,8 @@ public static class ServerApp
     {
         var builder = WebApplication.CreateSlimBuilder(args ?? Array.Empty<string>());
         builder.Logging.SetMinimumLevel(LogLevel.Warning);
+        // A conversation carries its images in every request, as text.
+        builder.WebHost.ConfigureKestrel(k => k.Limits.MaxRequestBodySize = 256L << 20);
         var app = builder.Build();
 
         // One line per request, whatever its path: a client calling the wrong URL shows up here.
@@ -202,6 +205,7 @@ public static class ServerApp
         {
             o["context_length"] = g.ContextLength == int.MaxValue ? null : g.ContextLength;
             o["tools"] = g.RendersTools;
+            o["images"] = g.Vision is not null;
             o["thinking"] = g.Thinks;
             o["adapters"] = new JsonArray(m.AdapterNames.Select(a => (JsonNode?)a).ToArray());
             o["concurrency"] = g.Concurrency;
@@ -881,7 +885,10 @@ public static class ServerApp
                 {
                     string name = item.TryGetProperty("name", out var nm) && nm.ValueKind == JsonValueKind.String ? nm.GetString()!
                         : throw new ApiException(400, $"{where}: a function_call needs a 'name'", param: where);
-                    var call = new ChatToolCall(name, Arguments(item.TryGetProperty("arguments", out var a) ? a : default, where));
+                    var call = new ChatToolCall(name, Arguments(item.TryGetProperty("arguments", out var a) ? a : default, where))
+                    {
+                        Id = item.TryGetProperty("call_id", out var cid) && cid.ValueKind == JsonValueKind.String ? cid.GetString() : null,
+                    };
                     if (messages.Count > 0 && messages[^1].Role == "assistant")
                     {
                         var last = messages[^1];
@@ -897,12 +904,17 @@ public static class ServerApp
                 case "function_call_output":
                 {
                     var o = item.TryGetProperty("output", out var ov) ? ov : default;
-                    messages.Add(new ChatMessage("tool", o.ValueKind switch
+                    var output = o.ValueKind switch
                     {
-                        JsonValueKind.String => o.GetString()!,
-                        JsonValueKind.Array => PartsText(o, where),
-                        _ => throw new ApiException(400, $"{where}: 'output' must be a string or text parts", param: where),
-                    }));
+                        JsonValueKind.String => new List<ChatPart> { new(o.GetString()!) },
+                        JsonValueKind.Array => Parts(o, where),
+                        _ => throw new ApiException(400, $"{where}: 'output' must be a string or parts", param: where),
+                    };
+                    messages.Add(new ChatMessage("tool", string.Concat(output.Select(p => p.Text)))
+                    {
+                        Parts = output.All(p => p.Text is not null) ? null : output,
+                        CallId = item.TryGetProperty("call_id", out var answers) && answers.ValueKind == JsonValueKind.String ? answers.GetString() : null,
+                    });
                     break;
                 }
                 case "reasoning":
@@ -1251,6 +1263,18 @@ public static class ServerApp
             thinking = et.ValueKind == JsonValueKind.True;
         }
         thinking &= generator.Thinks;
+        var variables = new Dictionary<string, JsonElement>(StringComparer.Ordinal);
+        if (effort is not null && body.TryGetProperty("reasoning_effort", out var asked) && asked.ValueKind == JsonValueKind.String)
+        {
+            variables["reasoning_effort"] = asked;
+        }
+        if (kw.ValueKind == JsonValueKind.Object)
+        {
+            foreach (var v in kw.EnumerateObject().Where(v => v.Name is not ("enable_thinking" or "thinking_budget")))
+            {
+                variables[v.Name] = v.Value;
+            }
+        }
 
         string? forced = null;
         if (body.TryGetProperty("tool_choice", out var choice) && choice.ValueKind != JsonValueKind.Null)
@@ -1269,14 +1293,14 @@ public static class ServerApp
                 case "auto":
                     break;
                 case "required" when tools is not null:
-                    forced = "<tool_call>\n<function=";
+                    forced = generator.Calls?.Start(null);
                     break;
                 case "function" when tools is not null:
                     if (!tools.Any(t => ToolName(t) == named))
                     {
                         throw new ApiException(400, $"'tool_choice' names '{named}', which is not among the tools", param: "tool_choice");
                     }
-                    forced = $"<tool_call>\n<function={named}>\n";
+                    forced = generator.Calls?.Start(named);
                     break;
                 case "required" or "function":
                     throw new ApiException(400, "'tool_choice' asks for a call but the request has no tools", param: "tool_choice");
@@ -1286,7 +1310,8 @@ public static class ServerApp
         }
         if (tools is not null && !generator.RendersTools)
         {
-            throw new ApiException(400, $"model '{model.Id}' has no chat template for tools", param: "tools");
+            throw new ApiException(400, $"model '{model.Id}' has no chat template for tools" +
+                (generator.Dialect.CallsRefusal is { } why ? $": {why}" : ""), param: "tools");
         }
         bool parallel = !(body.TryGetProperty("parallel_tool_calls", out var pc) && pc.ValueKind == JsonValueKind.False);
 
@@ -1327,13 +1352,22 @@ public static class ServerApp
         }
 
         int[] prompt;
+        IReadOnlyList<PromptImage>? images;
+        bool thinkOpened;
         try
         {
-            prompt = prefill is null
-                ? generator.EncodePrompt(messages, thinking, tools)
-                : generator.Tokenizer.EncodeToIds(ChatTemplate.ApplyMessages(generator.Template, messages, thinking, tools) + prefill).ToArray();
+            string rendered = generator.Template.Apply(messages, thinking, tools, variables);
+            thinkOpened = format is null && generator.Dialect.OpensThinking(rendered);
+            // Where there is no switch, the prompt or the model may open a block all the same.
+            thinking |= thinkOpened || (format is null && forced is null && !generator.Thinks && generator.Dialect.ThinkOpen is not null);
+            var pictures = messages.SelectMany(m => m.Parts ?? []).Where(x => x.Text is null).ToList();
+            if (pictures.Count > 0 && generator.Vision is null)
+            {
+                throw new ApiException(400, $"model '{model.Id}' does not read images", param: "messages");
+            }
+            (prompt, images) = generator.EncodeWithImages(rendered + prefill, pictures);
         }
-        catch (ChatTemplateException e)
+        catch (Exception e) when (e is ChatTemplateException or ImageException or ArgumentException)
         {
             throw new ApiException(400, e.Message, param: "messages");
         }
@@ -1344,7 +1378,7 @@ public static class ServerApp
         string recent = string.Join("\n", since.Where(m => m.Role is "user" or "tool").Select(m => m.Content));
         var p = Sampling(body, maxTokens, settings, model.Defaults) with
         {
-            Forced = forced, Thinking = thinking, Json = format?.Schema, Tools = tools,
+            Forced = forced, Thinking = thinking, ThinkOpened = thinkOpened, Images = images, Json = format?.Schema, Tools = tools,
             Recent = string.Join("\n", since.Where(m => m.Role == "user").Select(m => m.Content)),
             RecentResults = string.Join("\n", since.Where(m => m.Role == "tool").Select(m => m.Content)),
             Task = lastUser >= 0 ? messages[lastUser].Content : null,
@@ -1428,10 +1462,10 @@ public static class ServerApp
         GenerationResult first, string refused, Action<ReplyEvent>? onEvent, CancellationToken cancel)
     {
         var generator = model.Generator!;
-        int open = first.Text.IndexOf("<tool_call>", StringComparison.Ordinal);
+        int open = generator.Calls is { } calls ? first.Text.IndexOf(calls.Open, StringComparison.Ordinal) : -1;
         string before = (open >= 0 ? first.Text[..open] : first.Text).TrimEnd();
         Log($"{model.Id}: refused a repeated {refused} call (the same result twice already); answering without calls");
-        var reply = new ReplyParser(turn.Params.Thinking, null, turn.Decoration);
+        var reply = new ReplyParser(turn.Params.ThinkOpened, null, turn.Decoration, generator.Calls);
         reply.Feed(before);   // sent already, or part of the reply that is returned whole
         // Closing calls alone leaves a small model in the middle of writing one (it writes the markup
         // out as text); a lead-in that says why puts it on to the answer. It is part of the reply.
@@ -1442,10 +1476,10 @@ public static class ServerApp
         {
             onEvent?.Invoke(e);
         }
-        int[] prompt = turn.Prompt.Concat(generator.Tokenizer.EncodeToIds(before)).ToArray();
+        int[] prompt = turn.Prompt.Concat(generator.Tokenizer.EncodeToIds(generator.AsWritten(before))).ToArray();
         var p = turn.Params with
         {
-            Tools = null, NoCalls = true, Thinking = false, Forced = null,
+            Tools = null, NoCalls = true, Thinking = false, ThinkOpened = false, Forced = null,
             Prefill = (turn.Params.Prefill ?? "") + before,
             MaxTokens = Math.Max(1, turn.Params.MaxTokens - first.CompletionTokens),
         };
@@ -1482,7 +1516,7 @@ public static class ServerApp
     private static (GenerationResult Result, ReplyParser Reply) Run(ModelHost model, ChatTurn turn,
         Action<ReplyEvent>? onEvent, CancellationToken cancel, int? logprobsTopK)
     {
-        var reply = new ReplyParser(turn.Params.Thinking, turn.Tools, turn.Decoration);
+        var reply = new ReplyParser(turn.Params.ThinkOpened, turn.Tools, turn.Decoration, model.Generator!.Calls);
         using var enough = CancellationTokenSource.CreateLinkedTokenSource(cancel);
         string? refused = null;
         void Read(IReadOnlyList<ReplyEvent> events)
@@ -1532,7 +1566,7 @@ public static class ServerApp
         // ask for more. (A streamed reply has been sent as it came.)
         if (result.Looped is { } once && onEvent is null)
         {
-            reply = ReplyParser.Parse(once, turn.Params.Thinking, refused is null ? turn.Tools : null, turn.Decoration);
+            reply = ReplyParser.Parse(once, turn.Params.ThinkOpened, refused is null ? turn.Tools : null, turn.Decoration, model.Generator!.Calls);
             result = result with { Text = once, FinishReason = "stop" };
         }
         if (result.FinishReason == "cancelled" && !cancel.IsCancellationRequested)
@@ -1658,9 +1692,10 @@ public static class ServerApp
 
     /// <summary>A chat message's role and its content flattened to text: a
     /// string, or an array of text parts (<c>text</c>, <c>input_text</c>,
-    /// <c>output_text</c>). An assistant turn keeps its <c>tool_calls</c> and
-    /// its <c>reasoning_content</c>; a <c>tool</c> turn is a call's result.
-    /// Images and audio are refused, not dropped.</summary>
+    /// <c>output_text</c>) and images (<c>image_url</c>, <c>input_image</c>, as
+    /// <c>data:</c> URLs), which it then keeps in its parts. An assistant turn keeps its
+    /// <c>tool_calls</c> and its <c>reasoning_content</c>; a <c>tool</c> turn is a call's
+    /// result. Anything else is refused, not dropped.</summary>
     private static ChatMessage ChatMessageFrom(JsonElement m, string where)
     {
         if (m.ValueKind != JsonValueKind.Object || !m.TryGetProperty("role", out var role) || role.ValueKind != JsonValueKind.String)
@@ -1674,6 +1709,7 @@ public static class ServerApp
             var other => throw new ApiException(400, $"{where}: role '{other}' is not supported (system, developer, user, assistant, tool)", param: where),
         };
         string text;
+        List<ChatPart>? parts = null;
         if (!m.TryGetProperty("content", out var content) || content.ValueKind == JsonValueKind.Null)
         {
             text = "";
@@ -1684,14 +1720,31 @@ public static class ServerApp
         }
         else if (content.ValueKind == JsonValueKind.Array)
         {
-            text = PartsText(content, where);
+            parts = Parts(content, where);
+            text = string.Concat(parts.Select(p => p.Text));
+            if (parts.All(p => p.Text is not null))
+            {
+                parts = null;
+            }
+            else if (r is not ("user" or "tool"))
+            {
+                throw new ApiException(400, $"{where}: only a user's message or a tool's result holds images", param: where);
+            }
         }
         else
         {
             throw new ApiException(400, $"{where}.content must be a string or an array of parts", param: where);
         }
 
-        var message = new ChatMessage(r, text);
+        var message = new ChatMessage(r, text) { Parts = parts };
+        if (r == "tool")
+        {
+            message = message with
+            {
+                CallId = m.TryGetProperty("tool_call_id", out var answers) && answers.ValueKind == JsonValueKind.String ? answers.GetString() : null,
+                Name = m.TryGetProperty("name", out var named) && named.ValueKind == JsonValueKind.String ? named.GetString() : null,
+            };
+        }
         if (r == "assistant")
         {
             foreach (string field in new[] { "reasoning_content", "reasoning" })
@@ -1718,7 +1771,10 @@ public static class ServerApp
                     : throw new ApiException(400, $"{at} needs a 'function'", param: at);
                 string name = f.TryGetProperty("name", out var nm) && nm.ValueKind == JsonValueKind.String ? nm.GetString()!
                     : throw new ApiException(400, $"{at}.function needs a 'name'", param: at);
-                list.Add(new ChatToolCall(name, Arguments(f.TryGetProperty("arguments", out var a) ? a : default, at)));
+                list.Add(new ChatToolCall(name, Arguments(f.TryGetProperty("arguments", out var a) ? a : default, at))
+                {
+                    Id = call.TryGetProperty("id", out var cid) && cid.ValueKind == JsonValueKind.String ? cid.GetString() : null,
+                });
             }
             message = message with { ToolCalls = list };
         }
@@ -1758,25 +1814,63 @@ public static class ServerApp
         }
     }
 
-    private static string PartsText(JsonElement parts, string where)
+    private static List<ChatPart> Parts(JsonElement parts, string where)
     {
-        var sb = new StringBuilder();
+        var list = new List<ChatPart>();
         foreach (var part in parts.EnumerateArray())
         {
             if (part.ValueKind == JsonValueKind.String)
             {
-                sb.Append(part.GetString());
+                list.Add(new ChatPart(part.GetString()!));
                 continue;
             }
             string type = part.TryGetProperty("type", out var t) ? t.GetString() ?? "" : "";
+            if (type is "image_url" or "input_image" && part.TryGetProperty("image_url", out var image))
+            {
+                // {"image_url": {"url", "detail"}} in chat, {"image_url": url, "detail"} in Responses.
+                var holder = image.ValueKind == JsonValueKind.Object ? image : part;
+                string url = (image.ValueKind == JsonValueKind.Object ? image.TryGetProperty("url", out var u) ? u : default : image) is { ValueKind: JsonValueKind.String } s
+                    ? s.GetString()! : "";
+                string? detail = holder.TryGetProperty("detail", out var d) && d.ValueKind == JsonValueKind.String ? d.GetString() : null;
+                list.Add(new ChatPart(null) { Image = DataUrl(url, where), ImageTokens = DetailTokens(detail, where) });
+                continue;
+            }
             if (type is not ("text" or "input_text" or "output_text") || !part.TryGetProperty("text", out var text))
             {
-                throw new ApiException(400, $"{where}: content part type '{type}' is not supported (text only)", param: where);
+                throw new ApiException(400, $"{where}: content part type '{type}' is not supported (text and images)", param: where);
             }
-            sb.Append(text.GetString());
+            list.Add(new ChatPart(text.GetString() ?? ""));
         }
-        return sb.ToString();
+        return list;
     }
+
+    /// <summary>An image's bytes from its <c>data:</c> URL. The server fetches nothing on a client's behalf.</summary>
+    private static byte[] DataUrl(string url, string where)
+    {
+        int comma = url.IndexOf(',');
+        if (!url.StartsWith("data:", StringComparison.OrdinalIgnoreCase) || comma < 0 || !url[..comma].EndsWith(";base64", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new ApiException(400, $"{where}: an image is sent as a base64 'data:' URL; the server fetches none", param: where);
+        }
+        try
+        {
+            return Convert.FromBase64String(url[(comma + 1)..]);
+        }
+        catch (FormatException)
+        {
+            throw new ApiException(400, $"{where}: the image's 'data:' URL is not base64", param: where);
+        }
+    }
+
+    /// <summary>The tokens an image may take: <c>low</c>, <c>high</c> (the least and most the server
+    /// reads it at), or <c>auto</c>, which leaves it to the model.</summary>
+    private static int? DetailTokens(string? detail, string where) => detail switch
+    {
+        null or "auto" => null,
+        "low" => VisionPlan.Budgets[0],
+        "high" => VisionPlan.Budgets[^1],
+        _ => throw new ApiException(400, $"{where}: an image's 'detail' is low, high or auto, not '{detail}'", param: where),
+    };
 
     /// <summary>Effort for chat completions: <c>reasoning_effort</c>, or <c>reasoning.effort</c>.</summary>
     private static string? ChatEffort(JsonElement body) =>

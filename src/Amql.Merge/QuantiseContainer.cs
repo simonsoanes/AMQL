@@ -41,6 +41,16 @@ public sealed record QuantiseOptions(Fp4Format Format)
     /// <summary>Calibration as token ids, in place of text.</summary>
     public int[]? CalibrationIds { get; init; }
 
+    /// <summary>A container of the same model, usually its own nearest-rounded NVFP4
+    /// copy, that reads the calibration text in place of the source: for a model too
+    /// large for the GPU at full precision. The weights rounded are the source's.</summary>
+    public string? CalibrateWith { get; init; }
+
+    /// <summary>Also the token embedding and the head (one table in a tied model), which
+    /// stay as they are otherwise: with searched scales, whatever the rounding (nearest
+    /// when the rounding is).</summary>
+    public bool Embedding { get; init; }
+
     /// <summary>At most this many calibration tokens.</summary>
     public int CalibrationTokens { get; init; } = 32768;
 
@@ -86,11 +96,14 @@ public sealed record QuantiseReport(string OutDir, Fp4Format Format, int Quantis
 /// <para>How the 4-bit values are found is <see cref="Fp4Rounding"/>: to
 /// nearest, with each block's scale searched, or GPTQ against calibration text
 /// the source model reads on the GPU (each layer's input Gram, one layer at a
-/// time). The stored layout is the same for all three.</para>
+/// time, and each routed expert's over the rows sent to it). A model too large
+/// for the GPU reads it as a 4-bit copy of itself (<see cref="QuantiseOptions.CalibrateWith"/>).
+/// The stored layout is the same for all three.</para>
 /// </summary>
 public static class QuantiseContainer
 {
-    private static readonly string[] Objects = ["target.decoder_stack", "mtp.stack"];
+    private static readonly string[] Objects = ["target.decoder_stack", "mtp.stack", DrafterPlan.Stack];
+    private static readonly string[] Tables = ["target.embedding", "target.output_head"];
 
     public static QuantiseReport Transform(string containerDir, string outDir, Fp4Format format) =>
         Transform(containerDir, outDir, new QuantiseOptions(format));
@@ -107,6 +120,29 @@ public static class QuantiseContainer
         {
             throw new MergeException($"quantise output '{outDir}' already exists and is not empty");
         }
+        if (options.Rounding == Fp4Rounding.Gptq && options.CalibrateWith is null && TooLargeForTheGpu(containerDir, out long stackBytes))
+        {
+            // The whole model has to be on the GPU to read the calibration text: a
+            // nearest-rounded copy of it, made for that and then deleted.
+            string reader = Path.TrimEndingDirectorySeparator(Path.GetFullPath(outDir)) + ".calibration";
+            if (Directory.Exists(reader))
+            {
+                throw new MergeException($"'{reader}' is in the way: the {stackBytes / 1e9:F0} GB stack does not fit the GPU, and its calibration copy goes there");
+            }
+            options.Log?.Invoke($"the {stackBytes / 1e9:F0} GB stack does not fit the GPU: calibrating with a 4-bit copy of it");
+            try
+            {
+                Transform(containerDir, reader, new QuantiseOptions(format) { Rounding = Fp4Rounding.Nearest });
+                return Transform(containerDir, outDir, options with { CalibrateWith = reader });
+            }
+            finally
+            {
+                if (Directory.Exists(reader))
+                {
+                    Directory.Delete(reader, recursive: true);
+                }
+            }
+        }
         using var container = Vindex3Container.Open(containerDir);
         var projections = Projections(container);
         using var calibrator = options.Rounding == Fp4Rounding.Nearest ? null : new Calibrator(container, options);
@@ -118,6 +154,7 @@ public static class QuantiseContainer
 
         var index = JsonNode.Parse(File.ReadAllText(Path.Combine(container.Root, "index.json")))!.AsObject();
         var reps = index["representations"]!.AsObject();
+        var objects = options.Embedding ? [.. Objects, .. Tables] : Objects;
         int quantised = 0, kept = 0;
         long before = 0, after = 0;
         var notes = new List<string>();
@@ -126,7 +163,7 @@ public static class QuantiseContainer
             string from = Path.Combine(container.Root, entry.Segment);
             string to = Path.Combine(outDir, entry.Segment);
             Directory.CreateDirectory(Path.GetDirectoryName(to)!);
-            if (!Objects.Contains(entry.Object))
+            if (!objects.Contains(entry.Object))
             {
                 File.Copy(from, to);
                 continue;
@@ -140,12 +177,17 @@ public static class QuantiseContainer
                 if (Quantisable(entry.Object, t, dtype, segment, projections, out var reads))
                 {
                     int rows = checked((int)t.Shape[0]), cols = checked((int)t.Shape[1]);
-                    var values = BitPattern.WidenToF32(dtype, segment.ReadBytes(t.Name));
-                    var written = calibrator is null
-                        ? Quantise(t.Name, values, rows, cols, format)
-                        : calibrator.Quantise(t.Name, values, rows, cols, reads);
+                    // Quantised as the segment is written, one weight at a time: the whole
+                    // of a large model's 4-bit weights is never held.
+                    var written = Deferred(t.Name, rows, cols, format, () =>
+                    {
+                        var values = BitPattern.WidenToF32(dtype, segment.ReadBytes(t.Name));
+                        return calibrator is null
+                            ? Quantise(t.Name, values, rows, cols, format)
+                            : calibrator.Quantise(t.Name, values, rows, cols, reads);
+                    });
                     tensors.AddRange(written);
-                    after += written.Sum(w => (long)w.Data.Length);
+                    after += written.Sum(w => w.SourceLength);
                     quantised++;
                     continue;
                 }
@@ -188,13 +230,21 @@ public static class QuantiseContainer
                 Fp4Rounding.ScaleSearch => "scale_search",
                 _ => "nearest",
             },
-            ["objects"] = new JsonArray(Objects.Select(o => (JsonNode?)o).ToArray()),
+            ["objects"] = new JsonArray(objects.Select(o => (JsonNode?)o).ToArray()),
             ["quantised_tensors"] = quantised,
         };
         if (calibrator is not null && options.Rounding == Fp4Rounding.Gptq)
         {
             q["calibration_tokens"] = calibrator.Tokens;
             q["damp"] = options.Damp;
+            if (options.CalibrateWith is { } with)
+            {
+                q["calibrated_with"] = Path.GetFileName(Path.TrimEndingDirectorySeparator(Path.GetFullPath(with)));
+            }
+            if (calibrator.Thin > 0)
+            {
+                q["searched_experts"] = calibrator.Thin;
+            }
         }
         index["quantisation"] = q;
         File.WriteAllText(Path.Combine(outDir, "index.json"), index.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = false }));
@@ -202,10 +252,18 @@ public static class QuantiseContainer
         return new QuantiseReport(outDir, format, quantised, kept, before, after, notes);
     }
 
+    private static bool TooLargeForTheGpu(string containerDir, out long stackBytes)
+    {
+        using var container = Vindex3Container.Open(containerDir);
+        stackBytes = container.Index.Representations.Values.Where(r => Objects.Contains(r.Object)).Sum(r => r.PayloadBytes);
+        // Room is needed beside the weights for the Grams and the scratch.
+        return CudaShim.TryMemoryInfo(out _, out long total) && stackBytes > total * 0.75;
+    }
+
     /// <summary>What a projection reads: its layer and which of the layer's
     /// inputs (<see cref="GpuEngine.GramMixerIn"/> and the rest), or layer −1
     /// for weights no calibration reaches (the drafter's).</summary>
-    private readonly record struct Reads(int Layer, int Input);
+    private readonly record struct Reads(int Layer, int Input, int Expert = -1);
 
     /// <summary>The stack's projections as its plan reads them: attention's
     /// q/k/v/o, the Gated DeltaNet's in- and out-projections, the FFN. Not the
@@ -236,10 +294,20 @@ public static class QuantiseContainer
                 Add(g.InProjA, GpuEngine.GramMixerIn); Add(g.InProjB, GpuEngine.GramMixerIn);
                 Add(g.OutProj, GpuEngine.GramMixerOut);
             }
-            if (l.Ffn?.Dense is { } d)
+            if ((l.Ffn?.Dense ?? l.Ffn?.Routed?.Hybrid?.Dense) is { } d)
             {
                 Add(d.Gate, GpuEngine.GramFfnIn); Add(d.Up, GpuEngine.GramFfnIn);
                 Add(d.Down, GpuEngine.GramDownIn);
+            }
+            if (l.Ffn?.Routed is { } moe)
+            {
+                // Each expert reads the rows the router sends it. The router itself stays.
+                for (int e = 0; e < moe.NumExperts; e++)
+                {
+                    names[$"{moe.ExpertGatePrefix}{e}.{moe.ExpertGateStem}"] = new Reads(i, GpuEngine.GramExpertIn, e);
+                    names[$"{moe.ExpertUpPrefix}{e}.{moe.ExpertUpStem}"] = new Reads(i, GpuEngine.GramExpertIn, e);
+                    names[$"{moe.ExpertDownPrefix}{e}.{moe.ExpertDownStem}"] = new Reads(i, GpuEngine.GramExpertDown, e);
+                }
             }
         }
         return names;
@@ -255,12 +323,63 @@ public static class QuantiseContainer
         Dictionary<string, Reads> projections, out Reads reads)
     {
         reads = new Reads(-1, -1);
-        bool projection = objectId == "mtp.stack"
+        bool projection = Tables.Contains(objectId) ? t.Name == "weight" : objectId == DrafterPlan.Stack
+            ? Attach.DrafterMatrix(t.Name) : objectId == "mtp.stack"
             ? t.Name == "fc.weight" || (t.Name.StartsWith("layers.", StringComparison.Ordinal) &&
                                         (t.Name.Contains("_proj.", StringComparison.Ordinal)))
             : projections.TryGetValue(t.Name, out reads);
         return projection && t.Shape.Length == 2 && dtype is Dtype.BF16 or Dtype.F16 or Dtype.F32 &&
                t.Shape[1] % 32 == 0 && !segment.Contains(t.Name + "_scale");
+    }
+
+    /// <summary>The tensors a weight's quantisation writes, quantised when the
+    /// writer first asks for one of them and let go once it has read them all
+    /// (it reads each from its start to its end, once).</summary>
+    private static List<NamedTensorData> Deferred(string name, int rows, int cols, Fp4Format format,
+        Func<List<NamedTensorData>> quantise)
+    {
+        Dictionary<string, byte[]>? held = null;
+        bool ran = false;
+        byte[] Read(string tensor, long offset, int count)
+        {
+            if (held is null)
+            {
+                if (ran)
+                {
+                    throw new MergeException($"'{name}' was quantised and written already");
+                }
+                ran = true;
+                held = quantise().ToDictionary(t => t.Name, t => t.Data, StringComparer.Ordinal);
+            }
+            var data = held[tensor];
+            var slice = data.AsSpan(checked((int)offset), count).ToArray();
+            if (offset + count == data.LongLength)
+            {
+                held.Remove(tensor);
+                if (held.Count == 0)
+                {
+                    held = null;
+                }
+            }
+            return slice;
+        }
+        long elements = (long)rows * cols;
+        NamedTensorData Tensor(string tensor, Dtype dtype, long[] shape, long bytes) => new()
+        {
+            Name = tensor, Dtype = dtype, Shape = shape, Source = (offset, count) => Read(tensor, offset, count), SourceLength = bytes,
+        };
+        return format == Fp4Format.Nvfp4
+            ?
+            [
+                Tensor(name, Dtype.FP4, [rows, cols], elements / 2),
+                Tensor(name + "_scale", Dtype.F8_E4M3, [rows, cols / Nvfp4.BlockElements], elements / Nvfp4.BlockElements),
+                Tensor(name + "_scale_2", Dtype.F32, [1], 4),
+            ]
+            :
+            [
+                Tensor(name, Dtype.FP4, [rows, cols], elements / 2),
+                Tensor(name + "_scale", Dtype.U8, [rows, cols / Mxfp4.BlockElements], elements / Mxfp4.BlockElements),
+            ];
     }
 
     /// <summary>The tensor and its scale companions, as the operand store reads them.</summary>
@@ -303,8 +422,9 @@ public static class QuantiseContainer
     private sealed class Calibrator : IDisposable
     {
         private readonly QuantiseOptions _options;
-        private readonly OperandStore _store;
-        private readonly DecodeSession _session;
+        private readonly Vindex3Container? _reader;
+        private readonly OperandStore? _store;
+        private readonly DecodeSession? _session;
         private readonly GpuEngine _engine;
         private readonly int[][] _sequences = [];
         private int _gramLayer = -1;
@@ -313,19 +433,35 @@ public static class QuantiseContainer
         public Calibrator(Vindex3Container container, QuantiseOptions options)
         {
             _options = options;
-            _store = container.CreateOperandStore();
+            if (options.Rounding != Fp4Rounding.Gptq)
+            {
+                // Searched scales need the weights and a GPU, not the model on it.
+                _engine = GpuEngine.ForRounding()
+                    ?? throw new MergeException("searched rounding runs on the GPU, which is not available");
+                return;
+            }
             try
             {
-                var plan = Planner.Plan(container, "target", _store);
+                if (options.CalibrateWith is { } with)
+                {
+                    _reader = Vindex3Container.Open(with);
+                    if (_reader.Index.Model != container.Index.Model)
+                    {
+                        throw new MergeException($"'{with}' is a copy of '{_reader.Index.Model}', not of '{container.Index.Model}'");
+                    }
+                }
+                var reader = _reader ?? container;
+                _store = reader.CreateOperandStore();
+                var plan = Planner.Plan(reader, "target", _store);
                 _session = new DecodeSession(plan, _store);
                 _session.Prefill([0]);
                 _engine = _session.DeviceEngine()
-                    ?? throw new MergeException($"searched and GPTQ rounding run on the GPU, which is not available ({_session.GpuRefusal})");
-                if (_engine.Fp4Matrices > 0)
+                    ?? throw new MergeException($"GPTQ rounding runs on the GPU, which is not available ({_session.GpuRefusal}); " +
+                                                "a model too large for it calibrates with a 4-bit copy of itself (--calibrate-with)");
+                if (_engine.Fp4Matrices > 0 && _reader is null)
                 {
-                    throw new MergeException("the source must be at full precision (unset AMQL_GPU_FORMAT)");
+                    throw new MergeException("the source must be at full precision (unset AMQL_GPU_FORMAT), or name the copy to calibrate with");
                 }
-                if (options.Rounding == Fp4Rounding.Gptq)
                 {
                     var ids = (options.CalibrationIds ?? HfTokenizer.FromModelDir(container.Root).EncodeToIds(options.CalibrationText!).ToArray())
                         .Take(options.CalibrationTokens).ToArray();
@@ -342,16 +478,22 @@ public static class QuantiseContainer
             {
                 // Nothing calibrated: let go of the model before the error leaves.
                 _session?.Dispose();
-                _store.Dispose();
+                _store?.Dispose();
+                _reader?.Dispose();
                 throw;
             }
         }
 
         public int Tokens { get; }
 
+        /// <summary>Expert projections that saw too little calibration for a Gram.</summary>
+        public int Thin => _thin;
+        private int _thin;
+
         public List<NamedTensorData> Quantise(string name, float[] values, int rows, int cols, Reads reads)
         {
             float[]? h = null;
+            string? key = null;
             if (_options.Rounding == Fp4Rounding.Gptq && reads.Layer >= 0)
             {
                 if (reads.Layer != _gramLayer)
@@ -359,9 +501,25 @@ public static class QuantiseContainer
                     _grams = Grams(reads.Layer);
                     _gramLayer = reads.Layer;
                 }
-                h = _grams[reads.Input]
-                    ?? throw new MergeException($"no calibration input reached {name}");
-                if (h.LongLength != (long)cols * cols)
+                if (reads.Expert >= 0)
+                {
+                    h = _engine.ExpertGram(reads.Input, reads.Expert, out long seen);
+                    if (seen < cols / 8)
+                    {
+                        h = null;   // too few rows to weigh columns by: its scales are searched
+                        _thin++;
+                    }
+                    else
+                    {
+                        key = $"{reads.Layer}/{reads.Input}/{reads.Expert}";
+                    }
+                }
+                else
+                {
+                    h = _grams[reads.Input]
+                        ?? throw new MergeException($"no calibration input reached {name}");
+                }
+                if (h is not null && h.LongLength != (long)cols * cols)
                 {
                     throw new MergeException($"{name} reads {cols} columns, its layer's input has {Math.Sqrt(h.LongLength)}");
                 }
@@ -377,7 +535,7 @@ public static class QuantiseContainer
                 }
                 global = amax > 0 ? amax / (BitPattern.Fp4MaxValue * 448f) : 1f;
             }
-            var (codes, scales) = _engine.QuantiseFp4(values, rows, cols, h, mx, global, _options.Damp);
+            var (codes, scales) = _engine.QuantiseFp4(values, rows, cols, h, mx, global, _options.Damp, key);
             return Written(name, rows, cols, _options.Format, codes, scales, global);
         }
 
@@ -404,8 +562,13 @@ public static class QuantiseContainer
 
         public void Dispose()
         {
-            _session.Dispose();
-            _store.Dispose();
+            if (_session is null)
+            {
+                _engine.Dispose();
+            }
+            _session?.Dispose();
+            _store?.Dispose();
+            _reader?.Dispose();
         }
     }
 

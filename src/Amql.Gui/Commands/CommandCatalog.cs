@@ -208,6 +208,16 @@ public static class CommandCatalog
                 Help: "Where the Hugging Face download goes (default: a folder per model under %LOCALAPPDATA%\\AMQL\\hf, or AMQL_HF_CACHE). Kept, so encoding again does not download again."),
             new("allFiles", "--all-files", ParamKind.Switch, EditorKind.Text, Flag: "--all-files",
                 Help: "Download every file in the repository, including weights in formats the encoder does not read."),
+            new("noVision", "--no-vision", ParamKind.Switch, EditorKind.Text, Flag: "--no-vision",
+                Help: "Leave a multimodal checkpoint's vision tower out: a smaller container, for text alone."),
+        }),
+        new("attach", CatIngest, "Add a drafter or a vision tower to a container, beside what it holds.", new[]
+        {
+            ContainerParam,
+            Opt("drafter", "--drafter checkpoint", EditorKind.Directory, "", "A drafter's checkpoint (Gemma 4's assistant), or its Hugging Face name."),
+            Opt("vision", "--vision checkpoint", EditorKind.Directory, "", "The model's own checkpoint, for the vision tower a --no-vision encode left out."),
+            Opt("format", "--format", EditorKind.Choice, "", "How the drafter's weights are held. Empty = as the container's.",
+                choices: new[] { "", "nvfp4", "mxfp4", "none" }),
         }),
         new("download", CatIngest, "Download a checkpoint from the Hugging Face Hub (resumable, SHA-256 checked).", new[]
         {
@@ -304,11 +314,13 @@ public static class CommandCatalog
             new ParamDef("seed", "--seed", ParamKind.Option, EditorKind.Int, Flag: "--seed", DefaultValue: "42"),
             new ParamDef("chat", "--chat", ParamKind.Switch, EditorKind.Choice, Flag: "--chat",
                 DefaultValue: "", Choices: new[] { "", "1" },
-                Help: "Wrap the prompt in the model's chat template (ChatML / Llama 3) before "
+                Help: "Wrap the prompt in the model's own chat template before "
                       + "encoding. Requires a tokenizer with a chat_template.jinja or "
                       + "tokenizer_config.json."),
             Opt("system", "--system text", EditorKind.MultiLineText, "",
                 "System message placed in the chat template. Requires --chat."),
+            Opt("image", "--image file", EditorKind.File, "",
+                "PNG or JPEG the prompt is about (';' separates several). Requires --chat, the GPU and a container with a vision tower."),
             new ParamDef("logits", "--logits K", ParamKind.Option, EditorKind.Int, Flag: "--logits",
                 Help: "Show top-K logits per step (leave empty to hide)."),
             Opt("logprobs", "--logprobs K", EditorKind.Int, "",
@@ -358,7 +370,7 @@ public static class CommandCatalog
                 Flag: "--attribute-source", Help: "Prompt row to corrupt. Empty = the last prompt token."),
             new ParamDef("attributeLayers", "--attribute-layers end", ParamKind.Option, EditorKind.Int,
                 Flag: "--attribute-layers", Help: "Trace only layers below this index. Empty = all."),
-            Flag("think", "--think", "Diffusion models: leave the chat template's thinking on."),
+            Flag("think", "--think", "With --chat: turn the chat template's thinking on."),
             Opt("gen", "--gen", EditorKind.Int, "", "Diffusion models: how many tokens to generate (default 128)."),
             Opt("block", "--block", EditorKind.Int, "", "Diffusion models: block length denoised at a time (default 32)."),
             Opt("remasking", "--remasking", EditorKind.Choice, "",
@@ -393,6 +405,8 @@ public static class CommandCatalog
             Flag("profile", "--profile", "Break the time down per operator."),
             Flag("compare", "--compare", "Also check the device's logits against the CPU reference."),
             Opt("batch", "--batch N", EditorKind.Int, "", "Decode N sequences together and report the batched rate."),
+            Opt("draft", "--draft N", EditorKind.Int, "", "Decode with up to N drafts a step from the container's drafter, checked against plain decode."),
+            Opt("chat", "--chat text", EditorKind.Text, "", "With --draft: the message to reply to (text or a file)."),
         }),
         new("context bench", CatBench, "Measure how well a model uses a long context: facts recalled, passages quoted, speed.", new[]
         {
@@ -643,6 +657,9 @@ public static class CommandCatalog
                 choices: new[] { "gptq", "search", "nearest" }),
             Opt("calibration", "--calibration file or folder", EditorKind.File, "",
                 "Calibration text for GPTQ. Empty = a built-in text."),
+            Flag("embedding", "--embedding", "Also the token embedding and the head. Smaller and faster, at some cost in quality."),
+            Opt("calibrateWith", "--calibrate-with container", EditorKind.Directory, "",
+                "For a model too large for the GPU at full precision: a 4-bit copy of it (its own nearest-rounded one, say) that reads the calibration text. Empty = the model itself."),
             Opt("calibrationTokens", "--calibration-tokens", EditorKind.Int, "32768"),
             Opt("sequenceTokens", "--sequence-tokens", EditorKind.Int, "1024"),
             Opt("damp", "--damp", EditorKind.Float, "0.01", "GPTQ dampening, as a fraction of the mean diagonal."),

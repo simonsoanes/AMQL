@@ -156,9 +156,38 @@ public sealed class RoutedFfnOp
     /// mixture (Qwen2-MoE); null when the layer has none.</summary>
     public DenseFfnOp? SharedExpert { get; init; }
 
+    /// <summary>The router reads its input RMS-normalised without a weight (null:
+    /// as it is), then scaled by <see cref="RouterScale"/> / √hidden when the layer
+    /// carries that tensor.</summary>
+    public double? RouterInputNormEps { get; init; }
+    public OperandRef? RouterScale { get; init; }
+
+    /// <summary>[experts]: what each selected expert's weight is multiplied by.</summary>
+    public OperandRef? ExpertScale { get; init; }
+
+    /// <summary>The dense FFN the experts run beside; null when they are the FFN.</summary>
+    public HybridFfn? Hybrid { get; init; }
+
     /// <summary>[1, hidden]: the shared expert's output is scaled by
     /// <c>sigmoid(gate·x)</c>; null adds it unscaled.</summary>
     public OperandRef? SharedExpertGate { get; init; }
+}
+
+/// <summary>
+/// A dense FFN beside routed experts in one layer (Gemma 4's MoE). With x the
+/// residual after attention:
+/// <code>
+/// d   = DenseOut(Dense(pre_ffn_norm(x)))
+/// r   = RoutedOut(experts(RoutedIn(x)))      routed by the router's read of x
+/// out = post_ffn_norm(d + r)
+/// </code>
+/// </summary>
+public sealed class HybridFfn
+{
+    public required DenseFfnOp Dense { get; init; }
+    public NormOp? DenseOut { get; init; }
+    public NormOp? RoutedIn { get; init; }
+    public NormOp? RoutedOut { get; init; }
 }
 
 public sealed class LayerFfn
@@ -256,6 +285,9 @@ public sealed class LayerPlan
     /// the mixer reads them.</summary>
     public NgramEmbeddingOp? Ngram { get; init; }
 
+    /// <summary>[1]: what the residual is multiplied by as it leaves the layer.</summary>
+    public OperandRef? OutputScale { get; init; }
+
     /// <summary>The FFN reads the attention's input (the pre-attention norm
     /// output) and both branches add to the residual together.</summary>
     public bool ParallelResidual { get; init; }
@@ -305,10 +337,19 @@ public sealed class ComponentOpPlan
     /// plain add every other family uses.</summary>
     public double ResidualScale { get; init; } = 1.0;
 
+    /// <summary>The container's drafter over this component's caches, when it has one.</summary>
+    public DrafterPlan? Drafter { get; init; }
+
     /// <summary>Set for a masked diffusion LM: the stack is bidirectional and
     /// generation unmasks <see cref="MaskedDiffusionOp.MaskTokenId"/> runs
     /// rather than stepping one token at a time.</summary>
     public MaskedDiffusionOp? Diffusion { get; init; }
+
+    internal ComponentOpPlan With(DrafterPlan drafter) => new()
+    {
+        ComponentId = ComponentId, Embedding = Embedding, Layers = Layers, FinalNorm = FinalNorm, FinalMixer = FinalMixer,
+        Output = Output, ResidualScale = ResidualScale, Diffusion = Diffusion, Drafter = drafter,
+    };
 
     public int HiddenSize => FinalMixer?.HiddenSize ?? FinalNorm!.Width;
 

@@ -42,7 +42,38 @@ public static class InferenceRunner
         int AttributeCorruptTokenId = -1,
         int AttributeLayerEnd = -1,
         bool LogitLens = false,
-        bool TraceAttention = false);
+        bool TraceAttention = false,
+        IReadOnlyList<string>? Images = null);
+
+    /// <summary>The prompt with each image's mark replaced by the tokens the image takes, and the
+    /// images given to the engine that reads it.</summary>
+    private static int[] WithImages(Vindex3Container container, OperandStore store, DecodeSession session, int[] tokens, IReadOnlyList<string> files)
+    {
+        var vision = VisionPlan.Build(container, store, out string? reason) ?? throw new CliException($"--image: {reason}");
+        var engine = session.DeviceEngine() ?? throw new CliException($"--image needs the GPU engine ({session.GpuRefusal})");
+        if (tokens.Count(t => t == vision.ImageToken) != files.Count)
+        {
+            throw new CliException("the prompt's text holds the mark that stands for an image");
+        }
+        engine.UseVision(vision, store);
+        var prompt = new List<int>();
+        var spans = new List<ImageSpan>();
+        foreach (int token in tokens)
+        {
+            if (token != vision.ImageToken)
+            {
+                prompt.Add(token);
+                continue;
+            }
+            var image = vision.Prepare(File.ReadAllBytes(files[spans.Count]));
+            prompt.Add(vision.BeginToken);
+            spans.Add(new ImageSpan(prompt.Count, image.Tokens, engine.EncodeImage(image)));
+            prompt.AddRange(image.Ids());
+            prompt.Add(vision.EndToken);
+        }
+        engine.Images = spans;
+        return prompt.ToArray();
+    }
 
     /// <summary>How many top candidates a traced step records.</summary>
     private const int TraceTopK = 10;
@@ -82,7 +113,7 @@ public static class InferenceRunner
                 onTensorLoad(new TensorTraceLine(objId, tensor, shape, hit));
         }
 
-        session.Prefill(tokens);
+        session.Prefill(options?.Images is { Count: > 0 } images ? WithImages(container, store, session, tokens, images) : tokens);
 
         // Recorded once and reused, so the stream header and the finished
         // document cannot drift apart.

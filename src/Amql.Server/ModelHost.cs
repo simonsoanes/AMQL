@@ -234,7 +234,16 @@ public sealed class ModelHost : IDisposable
                 notes.Add("the plan has no output head, so it cannot generate");
                 return new ModelHost(id, path, container, store, null, null, null, null, notes);
             }
-            string? template = ChatTemplate.Load(path);
+            ChatTemplate? template;
+            try
+            {
+                template = ChatTemplate.Load(path);
+            }
+            catch (ChatTemplateException e)
+            {
+                notes.Add(e.Message);
+                return new ModelHost(id, path, container, store, null, null, null, null, notes);
+            }
             if (template is null)
             {
                 notes.Add("no chat template (chat_template.jinja / tokenizer_config.json): chat endpoints need one");
@@ -242,7 +251,7 @@ public sealed class ModelHost : IDisposable
             }
             try
             {
-                ChatTemplate.ApplyMessages(template, new[] { new ChatMessage("user", "probe") });
+                template.Apply("probe");
             }
             catch (ChatTemplateException e)
             {
@@ -260,6 +269,18 @@ public sealed class ModelHost : IDisposable
                 : null;
             var generator = new TextGenerator(new DecodeSession(plan, store), loaded, prior, tokenizer, template,
                 StopTokens.Resolve(path, tokenizer, template), (int)(surface?.ContextLength ?? int.MaxValue));
+            if (VisionPlan.Build(container, store, out string? noVision) is { } vision)
+            {
+                notes.Add(generator.UseVision(vision, store)
+                    ? $"images: up to {vision.SoftTokens} tokens each"
+                    : "images are not read: the vision tower runs on the GPU engine, without adapters");
+            }
+            else if (container.Graph?.Components.Any(c => c.Role == ComponentRole.Perception) == true)
+            {
+                notes.Add($"images are not read: {noVision}");
+            }
+            notes.Add(generator.RendersTools ? "tools: calls are read as the chat template writes them"
+                : $"no tools: {template.Dialect.CallsRefusal ?? "the chat template does not render tools or their results"}");
             notes.Add(generator.BatchRefusal is null
                 ? $"continuous batching: up to {generator.Concurrency} requests generate together on the GPU"
                 : $"one request at a time: {generator.BatchRefusal}");
@@ -302,7 +323,7 @@ public sealed class ModelHost : IDisposable
 /// template's end-of-turn marker.</summary>
 public static class StopTokens
 {
-    public static IReadOnlySet<int> Resolve(string dir, HfTokenizer tokenizer, string template)
+    public static IReadOnlySet<int> Resolve(string dir, HfTokenizer tokenizer, ChatTemplate template)
     {
         var ids = new HashSet<int>();
         void AddContent(string? content)
@@ -342,13 +363,14 @@ public static class StopTokens
                     : eos.ValueKind == JsonValueKind.Object && eos.TryGetProperty("content", out var c) ? c.GetString() : null);
             }
         }
-        if (template.Contains("<|im_end|>"))
+        // What the template ends a turn with, after words and after calls.
+        var dialect = template.Dialect;
+        foreach (string end in dialect.Calls is null ? new[] { dialect.AfterReply } : [dialect.AfterReply, dialect.BeforeResult])
         {
-            AddContent("<|im_end|>");
-        }
-        if (template.Contains("<|eot_id|>"))
-        {
-            AddContent("<|eot_id|>");
+            if (TurnMarks.First(tokenizer, end) is { } id)
+            {
+                ids.Add(id);
+            }
         }
         return ids;
     }
@@ -394,8 +416,12 @@ public sealed record GenerationParams(
     /// <c>tool_choice</c> required or a named function is enforced.</summary>
     public string? Forced { get; init; }
 
-    /// <summary>The prompt ended inside an open think block.</summary>
+    /// <summary>The reply thinks first: the prompt ended inside an open think block, or the
+    /// model opens one itself.</summary>
     public bool Thinking { get; init; }
+
+    /// <summary>The prompt ended inside an open think block.</summary>
+    public bool ThinkOpened { get; init; }
 
     /// <summary>Thinking tokens after which the block is closed and the reply
     /// goes on to its answer (0: never). See <see cref="ThinkingLimit"/>.</summary>
@@ -427,8 +453,55 @@ public sealed record GenerationParams(
     /// reply for the rules that read it, though not repeated in the output.</summary>
     public string? Prefill { get; init; }
 
+    /// <summary>The prompt's images, where they stand in it.</summary>
+    public IReadOnlyList<PromptImage>? Images { get; init; }
+
     /// <summary>N-gram packs blended into the logits outside thinking (null: none).</summary>
     public Amql.Inference.NGram.NGramPrior? NGram { get; init; }
+}
+
+/// <summary>An image made ready, and what the tower made of it once it has been read.</summary>
+public sealed class ServedImage(PreparedImage image)
+{
+    public PreparedImage Image { get; } = image;
+
+    /// <summary>Its tokens, once a request has needed them (written by the batch's thread alone).</summary>
+    public float[]? Features { get; set; }
+}
+
+/// <summary>An image's place in a prompt.</summary>
+public sealed record PromptImage(int Start, ServedImage Image);
+
+/// <summary>The images lately sent, by file and token limit, so that a conversation about a picture reads it once.</summary>
+public sealed class ImageCache
+{
+    private const int Most = 32;
+
+    private readonly Dictionary<string, (ServedImage Image, long Used)> _images = new(StringComparer.Ordinal);
+    private long _clock;
+
+    public ServedImage Get(VisionPlan vision, byte[] file, int? tokens)
+    {
+        string key = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(file)) + ":" + tokens;
+        lock (_images)
+        {
+            if (_images.TryGetValue(key, out var known))
+            {
+                _images[key] = (known.Image, ++_clock);
+                return known.Image;
+            }
+        }
+        var image = new ServedImage(vision.Prepare(file, tokens));
+        lock (_images)
+        {
+            if (_images.Count >= Most)
+            {
+                _images.Remove(_images.MinBy(p => p.Value.Used).Key);
+            }
+            _images[key] = (image, ++_clock);
+        }
+        return image;
+    }
 }
 
 public sealed record GenerationResult(string Text, string FinishReason, int PromptTokens, int CompletionTokens)
@@ -547,9 +620,113 @@ public sealed class TextGenerator : IDisposable
         Environment.GetEnvironmentVariable("AMQL_SERVER_BATCH")?.Trim() is not ("0" or "off" or "false");
 
     public HfTokenizer Tokenizer { get; }
-    public string Template { get; }
+    public ChatTemplate Template { get; }
+
+    /// <summary>What the template does.</summary>
+    internal ChatDialect Dialect => Template.Dialect;
+
     public int ContextLength { get; }
+
+    /// <summary>The tokens that close and open a thinking block (the first of each mark), where they
+    /// are tokens of their own.</summary>
     internal int? ThinkClose { get; }
+
+    internal int? ThinkOpen { get; }
+
+    /// <summary>What opens a thinking block that is written for the model.</summary>
+    internal string OpenThinking => Dialect.ThinkOpen ?? "";
+
+    /// <summary>What closes a thinking block from outside, after a line's end or within one.</summary>
+    internal string CloseThinking(bool lineEnded) => Dialect.ThinkClose is not { } close ? ""
+        : lineEnded ? close.TrimStart('\n') : close;
+
+    /// <summary>Between a closed thinking block and a call that is written for the model.</summary>
+    internal string AfterThinking => Dialect.ThinkClose is { } close ? close[close.TrimEnd().Length..] : "";
+
+    /// <summary>A reply's text as a prompt would carry it: what <see cref="DecodeReply"/> undoes.</summary>
+    internal string AsWritten(string reply) => _thinkMarks.Count == 0 ? reply
+        : reply.Replace("<think>\n", OpenThinking).Replace("<think>", OpenThinking).Replace("</think>", Dialect.ThinkCloseMark);
+
+    /// <summary>How the model writes its calls; null when the template's calls cannot be read.</summary>
+    internal CallSyntax? Calls { get; }
+
+    /// <summary>The model's marks around thinking, as tokens, and the marks every reply is read by;
+    /// empty when the model writes those itself.</summary>
+    private readonly List<(int[] Ids, string Text)> _thinkMarks = new();
+
+    /// <summary>The special tokens that are part of a call's text.</summary>
+    private readonly Dictionary<int, string> _callMarks = new();
+
+    /// <summary>A token's text as it stands in a reply: <see cref="TokenText"/>, and a call's marks.</summary>
+    internal string ReplyPiece(int id, int vocab) => _callMarks.TryGetValue(id, out var mark) ? mark : TokenText(id, vocab);
+
+    /// <summary>A reply's tokens as text: special tokens dropped, but for a model that
+    /// marks its thinking or its calls with special tokens, those as the marks every reply
+    /// is read by.</summary>
+    internal string DecodeReply(IReadOnlyList<int> ids)
+    {
+        if (_thinkMarks.Count == 0 && _callMarks.Count == 0)
+        {
+            return Tokenizer.DecodeText(ids);
+        }
+        var sb = new StringBuilder();
+        int from = 0;
+        void Plain(int to)
+        {
+            if (to > from)
+            {
+                sb.Append(Tokenizer.DecodeText(ids.Skip(from).Take(to - from).ToList()));
+            }
+        }
+        for (int i = 0; i < ids.Count; i++)
+        {
+            var think = _thinkMarks.FirstOrDefault(m => Holds(ids, i, m.Ids));
+            string? mark = think.Text ?? _callMarks.GetValueOrDefault(ids[i]);
+            if (mark is not null)
+            {
+                Plain(i);
+                sb.Append(mark);
+                i += (think.Ids?.Length ?? 1) - 1;
+                from = i + 1;
+            }
+        }
+        Plain(ids.Count);
+        return sb.ToString();
+
+        static bool Holds(IReadOnlyList<int> ids, int at, int[] mark)
+        {
+            for (int k = 0; k < mark.Length; k++)
+            {
+                if (at + k >= ids.Count || ids[at + k] != mark[k])
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+    }
+
+    /// <summary>The tokens end inside a thinking mark of several, so what they say is not settled yet.</summary>
+    internal bool EndsInsideMark(IReadOnlyList<int> ids)
+    {
+        foreach (var (mark, _) in _thinkMarks)
+        {
+            for (int n = Math.Min(mark.Length - 1, ids.Count); n > 0; n--)
+            {
+                bool same = true;
+                for (int k = 0; k < n && same; k++)
+                {
+                    same = ids[ids.Count - n + k] == mark[k];
+                }
+                if (same)
+                {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     internal IReadOnlySet<int> StopTokenIds => _stopTokens;
 
     private string?[]? _tokenTexts;
@@ -605,10 +782,10 @@ public sealed class TextGenerator : IDisposable
     public IReadOnlyList<IEntailAdapter> Adapters { get; }
 
     /// <summary>Whether the template renders tools, calls and tool results.</summary>
-    public bool RendersTools => ChatTemplate.RendersTools(Template);
+    public bool RendersTools => Dialect is { WritesTools: true, WritesCalls: true, WritesResults: true } && Calls is not null;
 
     /// <summary>Whether the template has a thinking switch.</summary>
-    public bool Thinks => Template.Contains("enable_thinking", StringComparison.Ordinal);
+    public bool Thinks => Dialect.ThinkSwitch && Dialect.ThinkOpen is not null;
 
     /// <summary>Requests that can generate at once: the batch size on the GPU engine, else 1.</summary>
     public int Concurrency => _batch is null ? 1 : GpuEngine.MaxBatch;
@@ -616,16 +793,65 @@ public sealed class TextGenerator : IDisposable
     /// <summary>The batch scheduler, when requests are batched on the GPU engine.</summary>
     internal BatchScheduler? Batch => _batch;
 
+    /// <summary>How the model reads images, when it does.</summary>
+    public VisionPlan? Vision { get; private set; }
+
+    internal ImageCache Images { get; } = new();
+
+    /// <summary>Lets requests carry images: the container's tower runs on the GPU engine.</summary>
+    internal bool UseVision(VisionPlan plan, OperandStore store)
+    {
+        if (_batch is null || Adapters.Count > 0)
+        {
+            return false;
+        }
+        _batch.UseVision(plan, store);
+        Vision = plan;
+        return true;
+    }
+
+    /// <summary>A rendered prompt as tokens, each image's mark replaced by the tokens it takes.</summary>
+    internal (int[] Prompt, IReadOnlyList<PromptImage>? Images) EncodeWithImages(string rendered, IReadOnlyList<ChatPart> images)
+    {
+        var ids = Tokenizer.EncodeToIds(rendered);
+        if (images.Count == 0)
+        {
+            return (ids.ToArray(), null);
+        }
+        var vision = Vision!;
+        if (ids.Count(i => i == vision.ImageToken) != images.Count)
+        {
+            throw new ArgumentException("the text of a message holds the mark that stands for an image");
+        }
+        var prompt = new List<int>(ids.Count + images.Count * vision.SoftTokens);
+        var placed = new List<PromptImage>();
+        foreach (int id in ids)
+        {
+            if (id != vision.ImageToken)
+            {
+                prompt.Add(id);
+                continue;
+            }
+            var part = images[placed.Count];
+            var image = Images.Get(vision, part.Image!, part.ImageTokens);
+            prompt.Add(vision.BeginToken);
+            placed.Add(new PromptImage(prompt.Count, image));
+            prompt.AddRange(image.Image.Ids());
+            prompt.Add(vision.EndToken);
+        }
+        return (prompt.ToArray(), placed);
+    }
+
     /// <summary>Why requests are not batched, when they are not.</summary>
     public string? BatchRefusal { get; }
 
-    public TextGenerator(DecodeSession session, HfTokenizer tokenizer, string template, IReadOnlySet<int> stopTokens, int contextLength)
+    public TextGenerator(DecodeSession session, HfTokenizer tokenizer, ChatTemplate template, IReadOnlySet<int> stopTokens, int contextLength)
         : this(session, Array.Empty<IEntailAdapter>(), null, tokenizer, template, stopTokens, contextLength)
     {
     }
 
     public TextGenerator(DecodeSession partner, IReadOnlyList<IEntailAdapter> adapters, Func<int[], int[]?>? priorPrompt,
-        HfTokenizer tokenizer, string template, IReadOnlySet<int> stopTokens, int contextLength)
+        HfTokenizer tokenizer, ChatTemplate template, IReadOnlySet<int> stopTokens, int contextLength)
     {
         _session = new SideBySideSession(partner, adapters) { PriorPrompt = priorPrompt };
         Adapters = adapters;
@@ -633,7 +859,32 @@ public sealed class TextGenerator : IDisposable
         Template = template;
         _stopTokens = stopTokens;
         ContextLength = contextLength;
-        ThinkClose = tokenizer.AddedTokenId("</think>");
+        var dialect = template.Dialect;
+        if (dialect.ThinkOpenMark.Length > 0)
+        {
+            foreach (var (mark, text) in new[] { (dialect.ThinkOpenMark, "<think>"), (dialect.ThinkCloseMark, "</think>") })
+            {
+                var ids = tokenizer.EncodeToIds(mark).ToArray();
+                int? token = ids.Length > 0 && TurnMarks.First(tokenizer, mark) == ids[0] ? ids[0] : null;
+                if (text == "<think>")
+                {
+                    ThinkOpen = token;
+                }
+                else
+                {
+                    ThinkClose = token;
+                }
+                if (token is not null && (mark != text || ids.Any(tokenizer.IsSpecial)))
+                {
+                    _thinkMarks.Add((ids, text));
+                }
+            }
+        }
+        Calls = dialect.Calls is { } shape ? new CallSyntax(shape) : null;
+        foreach (int id in (Calls?.Pieces ?? []).SelectMany(piece => TurnMarks.All(tokenizer, piece)).Where(tokenizer.IsSpecial))
+        {
+            _callMarks[id] = tokenizer.DecodeText(new[] { id }, skipSpecialTokens: false);
+        }
 
         if (!BatchingEnabled)
         {
@@ -668,7 +919,7 @@ public sealed class TextGenerator : IDisposable
     /// every special token it needs, so no post-processor template is added —
     /// HF tokenises chat prompts with <c>add_special_tokens=False</c>.</summary>
     public int[] EncodePrompt(IReadOnlyList<ChatMessage> messages, bool enableThinking, IReadOnlyList<System.Text.Json.JsonElement>? tools = null) =>
-        Tokenizer.EncodeToIds(ChatTemplate.ApplyMessages(Template, messages, enableThinking, tools)).ToArray();
+        Tokenizer.EncodeToIds(Template.Apply(messages, enableThinking, tools)).ToArray();
 
     public void Warm()
     {
@@ -798,8 +1049,9 @@ internal sealed class GenerationRun
     private string _emitted = string.Empty;
     private readonly JsonConstraint? _json;
     private readonly ToolGrammar? _toolGrammar;
-    private ToolCallConstraint? _call;
-    private int _openMatch;   // how much of "<tool_call>" the reply's text ends with
+    private ICallConstraint? _call;
+    private bool _said;   // something but blank space, thinking aside
+    private int _openMatch;   // how much of a call's opening the reply's text ends with
     private bool _thinkClosed;
     private int _loopFrom;   // the loop guard looks only at tokens from here on
     private float[]? _masked;
@@ -810,6 +1062,9 @@ internal sealed class GenerationRun
     private IReadOnlyList<double>? _prior;
 
     public int[] Prompt { get; }
+
+    /// <summary>The prompt's images.</summary>
+    public IReadOnlyList<PromptImage> Images => _p.Images ?? [];
 
     /// <summary>The finished reply, once <see cref="Next"/> has returned null.</summary>
     public GenerationResult? Result { get; private set; }
@@ -837,7 +1092,7 @@ internal sealed class GenerationRun
         _logprobs = logprobsTopK is > 0 ? new List<LogprobsResult>() : null;
         _holdBack = p.Stop.Count == 0 ? 0 : p.Stop.Max(s => s.Length) - 1;
         _json = p.Json is null ? null : new JsonConstraint(p.Json);
-        if (p.Tools is { Count: > 0 } tools && TextGenerator.ToolGrammarEnabled)
+        if (p.Tools is { Count: > 0 } tools && TextGenerator.ToolGrammarEnabled && g.Calls is not null)
         {
             _toolGrammar = ToolGrammar.Compile(tools);
             if (p.Prefill is { Length: > 0 } started && !p.Thinking)
@@ -850,6 +1105,14 @@ internal sealed class GenerationRun
         if (_forcePending && !p.Thinking)
         {
             Enqueue(p.Forced!);
+        }
+        else if (_forcePending && !p.ThinkOpened)
+        {
+            // The call follows the block, so there must be one.
+            foreach (int id in g.Tokenizer.EncodeToIds(g.OpenThinking))
+            {
+                _forced.Enqueue(id);
+            }
         }
     }
 
@@ -905,9 +1168,9 @@ internal sealed class GenerationRun
         {
             token = Constrained(announced);
         }
-        else if (_p.NoCalls && (!_p.Thinking || _thinkClosed))
+        else if (_p.NoCalls && _g.Calls is { } calls && (!_p.Thinking || _thinkClosed))
         {
-            token = Constrained(NoCallOpen.After((_p.Prefill ?? "") + _stableText));
+            token = Constrained(NoCallOpen.After(calls, (_p.Prefill ?? "") + _stableText));
         }
         else if (_verdict.Silent)
         {
@@ -931,7 +1194,12 @@ internal sealed class GenerationRun
         {
             return Finish("stop");
         }
-        string piece = _g.TokenText(token, _logits().Length);
+        if (_generated.Count == 0 && _p.Thinking && !_p.ThinkOpened && _forced.Count == 0 &&
+            (_g.ThinkOpen is { } opens ? token != opens : !_g.Dialect.ThinkOpenMark.StartsWith(_g.TokenPiece(token).Trim(), StringComparison.Ordinal)))
+        {
+            _thinkClosed = true;   // it chose not to think
+        }
+        string piece = _g.ReplyPiece(token, _logits().Length);
         _json?.Advance(piece);
         if (_call is not null)
         {
@@ -953,7 +1221,7 @@ internal sealed class GenerationRun
         }
         if (_forcePending && _p.Thinking && token == _g.ThinkClose)
         {
-            Enqueue("\n\n" + _p.Forced);
+            Enqueue(_g.AfterThinking + _p.Forced);
         }
 
         if (_p.ThinkingBudget > 0 && _p.Thinking && !_thinkClosed && _g.ThinkClose is not null && _json is null && _call is null && _forced.Count == 0
@@ -961,7 +1229,7 @@ internal sealed class GenerationRun
             && (piece.EndsWith('\n') || _generated.Count >= limit + ThinkingLimit.LineWait))
         {
             // Out of thinking budget: close the block, at the end of a line when one comes soon.
-            foreach (int id in _g.Tokenizer.EncodeToIds(piece.EndsWith('\n') ? "</think>\n\n" : "\n</think>\n\n"))
+            foreach (int id in _g.Tokenizer.EncodeToIds(_g.CloseThinking(piece.EndsWith('\n'))))
             {
                 _forced.Enqueue(id);
             }
@@ -993,7 +1261,7 @@ internal sealed class GenerationRun
             {
                 // Thinking that circles is closed, and the answer goes on from there.
                 Console.Error.WriteLine($"{DateTime.Now:HH:mm:ss.fff} loop guard: thinking repeats a {loop.Period}-token stretch {loop.Repeats} times; closing it");
-                foreach (int id in _g.Tokenizer.EncodeToIds("\n</think>\n\n"))
+                foreach (int id in _g.Tokenizer.EncodeToIds(_g.CloseThinking(lineEnded: false)))
                 {
                     _forced.Enqueue(id);
                 }
@@ -1004,7 +1272,7 @@ internal sealed class GenerationRun
                 Console.Error.WriteLine($"{DateTime.Now:HH:mm:ss.fff} loop guard: the reply repeats a {loop.Period}-token stretch {loop.Repeats} times; " +
                                         $"stopped at {_generated.Count} tokens");
                 int keep = _generated.Count - loop.Period * (loop.Repeats - 1);
-                string once = _g.Tokenizer.DecodeText(_generated.GetRange(0, keep)).TrimEnd('�');
+                string once = _g.DecodeReply(_generated.GetRange(0, keep)).TrimEnd('�');
                 Finish("length");
                 Result = Result! with { Looped = once };
                 return null;
@@ -1023,10 +1291,10 @@ internal sealed class GenerationRun
     private string Text()
     {
         var tail = _generated.GetRange(_stableTokens, _generated.Count - _stableTokens);
-        string text = _stableText + _g.Tokenizer.DecodeText(tail);
+        string text = _stableText + _g.DecodeReply(tail);
         // A tail ending mid-character waits for its next token; one that never
         // completes (invalid bytes) is kept as decoded after 64 tokens.
-        if (tail.Count > 0 && (text.Length == 0 || text[^1] != '�' || tail.Count > 64))
+        if (tail.Count > 0 && !_g.EndsInsideMark(tail) && (text.Length == 0 || text[^1] != '�' || tail.Count > 64))
         {
             _stableText = text;
             _stableTokens = _generated.Count;
@@ -1034,7 +1302,7 @@ internal sealed class GenerationRun
         return text;
     }
 
-    private const string CallOpen = "<tool_call>";
+    private string CallOpen => _g.Calls!.Open;
 
     /// <summary>Set false (<c>--no-announce-rule</c>) to let a reply end on "…let me build it:".</summary>
     internal static bool AnnounceRuleEnabled = true;
@@ -1049,7 +1317,7 @@ internal sealed class GenerationRun
     /// </summary>
     private ITokenConstraint? AnnouncedCall()
     {
-        if (!AnnounceRuleEnabled || _toolGrammar is null || _json is not null || (_p.Thinking && !_thinkClosed))
+        if (!AnnounceRuleEnabled || _toolGrammar is null || _g.Calls!.AtStartOnly || _json is not null || (_p.Thinking && !_thinkClosed))
         {
             return null;
         }
@@ -1097,7 +1365,7 @@ internal sealed class GenerationRun
         {
             double e = Math.Exp(row[id] - max);
             sum += e;
-            if (e > 1e-12 && !_g.StopTokenIds.Contains(id) && _g.TokenText(id, row.Length) is { Length: > 0 } t && way.Accepts(t) && t.Trim().Length > 0)
+            if (e > 1e-12 && !_g.StopTokenIds.Contains(id) && _g.ReplyPiece(id, row.Length) is { Length: > 0 } t && way.Accepts(t) && t.Trim().Length > 0)
             {
                 on += e;
             }
@@ -1111,17 +1379,16 @@ internal sealed class GenerationRun
 
     /// <summary>Anything but a call's markup, whole or written a piece at a time (a reply that must
     /// answer from what it has would otherwise write the call out as text).</summary>
-    private sealed class NoCallOpen(string tail) : ITokenConstraint
+    private sealed class NoCallOpen(CallSyntax calls, string tail) : ITokenConstraint
     {
-        private static readonly string[] Markup =
-            [CallOpen, "</tool_call>", "<function=", "</function>", "<parameter=", "</parameter>"];
+        public static NoCallOpen After(CallSyntax calls, string text) => new(calls, text.Length > Longest ? text[^Longest..] : text);
 
-        public static NoCallOpen After(string text) => new(text.Length > 16 ? text[^16..] : text);
+        private const int Longest = 40;   // longer than any markup
 
         public bool Accepts(string t)
         {
             string s = tail + t;
-            return !Markup.Any(m => s.IndexOf(m, StringComparison.Ordinal) is var i && i >= 0 && i + m.Length > tail.Length);
+            return !calls.Markup.Any(m => s.IndexOf(m, StringComparison.Ordinal) is var i && i >= 0 && i + m.Length > tail.Length);
         }
 
         public void Advance(string text)
@@ -1145,7 +1412,7 @@ internal sealed class GenerationRun
         public bool CanEnd => false;
     }
 
-    /// <summary>The rest of the way to "&lt;tool_call&gt;" (whitespace first, if the opening has not
+    /// <summary>The rest of the way to a call's opening (whitespace first, if the opening has not
     /// begun); never the end of the reply.</summary>
     private sealed class OpensCall(string remaining, bool spaceFirst) : ITokenConstraint
     {
@@ -1163,21 +1430,26 @@ internal sealed class GenerationRun
         public bool CanEnd => false;
     }
 
-    /// <summary>The reply opens a call when its text, outside thinking, reaches "&lt;tool_call&gt;":
-    /// from there to "&lt;/tool_call&gt;" it is held to the tools. What the same token says after
+    /// <summary>The reply opens a call when its text, outside thinking, reaches a call's opening:
+    /// from there to its close it is held to the tools. What the same token says after
     /// the opening goes to the call; if that already breaks it, the call is left unheld.</summary>
     private void WatchForCall(string piece)
     {
+        if (_g.Calls!.AtStartOnly && _openMatch == 0 && _said)
+        {
+            return;
+        }
         for (int i = 0; i < piece.Length; i++)
         {
             char c = piece[i];
+            _said |= !char.IsWhiteSpace(c);
             _openMatch = c == CallOpen[_openMatch] ? _openMatch + 1 : c == CallOpen[0] ? 1 : 0;
             if (_openMatch < CallOpen.Length)
             {
                 continue;
             }
             _openMatch = 0;
-            var call = new ToolCallConstraint(_toolGrammar!);
+            var call = _g.Calls!.Constraint(_toolGrammar!);
             string rest = piece[(i + 1)..];
             if (rest.Length == 0 || call.Accepts(rest))
             {
@@ -1203,10 +1475,11 @@ internal sealed class GenerationRun
         int n = row.Length;
         _masked ??= new float[n];
         Array.Fill(_masked, float.NegativeInfinity);
-        Func<string, bool>? onPath = grammar is ToolCallConstraint call ? MentionedPath(call) : null;
+        Func<string, bool>? onPath = grammar is ICallConstraint call ? MentionedPath(call) : null;
+        // A call's marks are its text; in JSON they would be no one's.
         bool Valid(int id) => _g.StopTokenIds.Contains(id)
             ? grammar.CanEnd && onPath is null
-            : _g.TokenText(id, n) is { Length: > 0 } t && grammar.Accepts(t) && (onPath is null || onPath(t));
+            : (grammar is JsonConstraint ? _g.TokenText(id, n) : _g.ReplyPiece(id, n)) is { Length: > 0 } t && grammar.Accepts(t) && (onPath is null || onPath(t));
 
         bool any = false;
         foreach (int id in TopIndices(row, 256))
@@ -1249,7 +1522,7 @@ internal sealed class GenerationRun
     /// Its value is the model's own, under the grammar. Returns a filter for the tokens on that
     /// way, or null when the rule does not act here.
     /// </summary>
-    private Func<string, bool>? MentionedPath(ToolCallConstraint call)
+    private Func<string, bool>? MentionedPath(ICallConstraint call)
     {
         if (!TextGenerator.MentionRuleEnabled)
         {
@@ -1288,7 +1561,7 @@ internal sealed class GenerationRun
             {
                 double e = Math.Exp(row[id] - max);
                 sum += e;
-                if (e > 1e-12 && !_g.StopTokenIds.Contains(id) && _g.TokenText(id, row.Length) is { Length: > 0 } t && OnPath(t) && t.Trim().Length > 0)
+                if (e > 1e-12 && !_g.StopTokenIds.Contains(id) && _g.ReplyPiece(id, row.Length) is { Length: > 0 } t && OnPath(t) && t.Trim().Length > 0)
                 {
                     on += e;
                 }
@@ -1309,7 +1582,7 @@ internal sealed class GenerationRun
     /// to), the call names the first of them, provided the model gives it at least
     /// <see cref="MentionFloor"/>. A request whose message names no tool is untouched.
     /// </summary>
-    private Func<string, bool>? MentionedToolPath(ToolCallConstraint call)
+    private Func<string, bool>? MentionedToolPath(ICallConstraint call)
     {
         // Only the first call after the message: later, the model is working from results, and a
         // redirect there turned a reply that meant to read the file it had to fix into a third build.
@@ -1346,7 +1619,7 @@ internal sealed class GenerationRun
         {
             double e = Math.Exp(row[id] - max);
             sum += e;
-            if (e > 1e-12 && !_g.StopTokenIds.Contains(id) && _g.TokenText(id, row.Length) is { Length: > 0 } t && t.Trim().Length > 0 && on(t))
+            if (e > 1e-12 && !_g.StopTokenIds.Contains(id) && _g.ReplyPiece(id, row.Length) is { Length: > 0 } t && t.Trim().Length > 0 && on(t))
             {
                 share += e;
             }
@@ -1480,12 +1753,20 @@ public static class PromptMark
     /// The last opens the reply's own turn, and the message before it is the
     /// newest, which an agent may not keep in the next call's history (Hydra
     /// sends its notes as a user message after the newest one, and moves it on
-    /// every call). Everything before stays the same from one call to the next.</summary>
-    public static int At(int[] prompt, int? turnStart)
+    /// every call). Everything before stays the same from one call to the next. Where a call's
+    /// results stay in the reply's own turn (<paramref name="resultStart"/>), a prompt
+    /// that ends on one is saved before it. <paramref name="replyStart"/> opens the reply's turn where
+    /// that is another token.</summary>
+    public static int At(int[] prompt, int? turnStart, int? resultStart = null, int? replyStart = null)
     {
+        if (resultStart is { } result && Array.LastIndexOf(prompt, result) is var at and > 0 &&
+            (turnStart is not { } t || at > Array.LastIndexOf(prompt, t)))
+        {
+            return at;
+        }
         if (turnStart is { } start)
         {
-            int last = Array.LastIndexOf(prompt, start);
+            int last = Math.Max(Array.LastIndexOf(prompt, start), replyStart is { } reply ? Array.LastIndexOf(prompt, reply) : -1);
             int before = last > 0 ? Array.LastIndexOf(prompt, start, last - 1) : -1;
             if (before > 0)
             {
@@ -1550,6 +1831,7 @@ internal sealed class BatchScheduler : IDisposable
         public IEntailAdapter[] Adapters = Array.Empty<IEntailAdapter>();
         public int Token;
         public int Row;     // its row in the last step
+        public DraftPace? Pace;   // how many drafts its next step asks for
         public int? Pending;   // a token already chosen (a verify's first miss), run next
         public List<int>? Context;   // the prompt and every token run since, for suffix drafts
         public (int Mark, ChunkedBuffer State)? Paged;   // a state taken from disk for its prompt
@@ -1570,7 +1852,7 @@ internal sealed class BatchScheduler : IDisposable
     private readonly List<GpuSequence> _free = new();
     private readonly Dictionary<GpuSequence, int[]> _held = new();
     private readonly Dictionary<GpuSequence, DateTime> _usedAt = new();
-    private readonly int? _turnStart, _userRole;
+    private readonly int? _turnStart, _userRole, _resultStart, _replyStart;
     private GpuSequence? _priorSeq;
     private KvPaging _paging = KvPaging.Defaults;
     private KvPageStore? _store;
@@ -1607,8 +1889,10 @@ internal sealed class BatchScheduler : IDisposable
 
     /// <summary>Drafts per step when one reply runs alone on a model with an
     /// MTP drafter (<c>AMQL_MTP_DRAFTS</c>, default 3; 0 turns speculation off).</summary>
-    internal static int Drafts =
-        int.TryParse(Environment.GetEnvironmentVariable("AMQL_MTP_DRAFTS"), out int d) ? Math.Clamp(d, 0, GpuEngine.MaxDrafts) : 3;
+    internal static int? DraftsSet =
+        int.TryParse(Environment.GetEnvironmentVariable("AMQL_MTP_DRAFTS"), out int d) ? Math.Clamp(d, 0, GpuEngine.MaxDrafts) : null;
+
+    private int Drafts => DraftsSet ?? _engine.DraftsThatPay;
     /// <summary>Suffix drafts: when the last <c>AMQL_SUFFIX_DRAFT</c> tokens
     /// (default 8; 0 turns it off) appeared earlier in the prompt or the reply,
     /// what followed them there is drafted instead of asking the drafter. An
@@ -1626,10 +1910,32 @@ internal sealed class BatchScheduler : IDisposable
         _g = g;
         _adapters = adapters;
         _priorPrompt = priorPrompt;
-        _turnStart = g.Tokenizer.AddedTokenId("<|im_start|>");
-        _userRole = g.Tokenizer.EncodeToIds("user").ToArray() is [var user] ? user : null;
+        // The tokens turns open with, as the template writes them.
+        (_turnStart, _userRole, _replyStart, _resultStart) = TurnMarks.Openers(g.Tokenizer, g.Dialect);
         _thread = new Thread(Loop) { IsBackground = true, Name = "amql batch" };
         _thread.Start();
+    }
+
+    /// <summary>Gives the engine the container's vision tower.</summary>
+    public void UseVision(VisionPlan plan, OperandStore store) => Device(() =>
+    {
+        _engine.UseVision(plan, store);
+        return 0;
+    });
+
+    /// <summary>What the tower made of the images that are still to be read, from <paramref name="reused"/> on.</summary>
+    private IReadOnlyList<ImageSpan>? Spans(GenerationRun run, int reused)
+    {
+        List<ImageSpan>? spans = null;
+        foreach (var image in run.Images)
+        {
+            if (image.Start + image.Image.Image.Tokens > reused)
+            {
+                var features = image.Image.Features ??= Device(() => _engine.EncodeImage(image.Image.Image));
+                (spans ??= new()).Add(new ImageSpan(image.Start, image.Image.Image.Tokens, features));
+            }
+        }
+        return spans;
     }
 
     /// <summary>Queues a reply and waits for it.</summary>
@@ -1829,12 +2135,17 @@ internal sealed class BatchScheduler : IDisposable
             return false;
         }
         var seq = job.Seq!;
+        job.Pace ??= new DraftPace(Drafts);
         job.Context ??= new List<int>(job.Run.Prompt);
         job.Context.Add(token);
         var suffix = SuffixDraft.Find(job.Context, SuffixMatch, GpuEngine.MaxDrafts);
         int[] rows = Device(() =>
         {
-            var drafts = suffix ?? _engine.Draft(seq, token, Drafts);
+            var drafts = suffix ?? _engine.Draft(seq, token, DraftsSet ?? job.Pace!.Next);
+            if (suffix is null && DraftsSet is null && drafts.Length > 0)
+            {
+                drafts = drafts[..Math.Min(drafts.Length, _engine.WorthVerifying(DraftPace.Floor))];
+            }
             var all = new int[drafts.Length + 1];
             all[0] = token;
             drafts.CopyTo(all, 1);
@@ -1876,7 +2187,11 @@ internal sealed class BatchScheduler : IDisposable
         _specDrafted += rows.Length - 1;
         _specKept += kept - 1;
         _specTokens += kept;
-        if (suffix is not null)
+        if (suffix is null)
+        {
+            job.Pace.Saw(rows.Length - 1, kept - 1);
+        }
+        else
         {
             _suffixCycles++;
             _suffixDrafted += rows.Length - 1;
@@ -1982,6 +2297,7 @@ internal sealed class BatchScheduler : IDisposable
             long a0 = System.Diagnostics.Stopwatch.GetTimestamp();
             var seqNow = job.Seq;
             Reserve(seqNow, prompt.Length + 1, plannedLength);
+            seqNow.Images = Spans(job.Run, reused);
             // Up to the mark, save the state there, then the rest of the prompt.
             if (PrefixReuse && mark > reused)
             {
@@ -1993,6 +2309,7 @@ internal sealed class BatchScheduler : IDisposable
                 });
             }
             var logits = Read(job, seqNow, prompt, prompt.Length, active);
+            seqNow.Images = null;
             _held[seqNow] = prompt;
             ReusedTokens += reused;
             PrefilledTokens += prompt.Length - reused;
@@ -2041,8 +2358,12 @@ internal sealed class BatchScheduler : IDisposable
         while (true)
         {
             int at = seq.Position;
-            // Slices end where the chunks of one read of the whole would.
+            // Slices end where the chunks of one read of the whole would, and cut no image.
             int n = to - at <= ReadSlice ? to - at : ReadSlice;
+            if (seq.Images?.FirstOrDefault(i => i.Start > at && i.Start < at + n && i.Start + i.Tokens > at + n) is { } cut)
+            {
+                n = cut.Start - at;
+            }
             var logits = Device(() => _engine.Prefill(seq, prompt.AsSpan(at, n)));
             if (seq.Position >= to)
             {
@@ -2091,7 +2412,7 @@ internal sealed class BatchScheduler : IDisposable
         }
     }
 
-    private int MarkFor(int[] prompt) => PromptMark.At(prompt, _turnStart);
+    private int MarkFor(int[] prompt) => PromptMark.At(prompt, _turnStart, _resultStart, _replyStart);
 
     /// <summary>How many of a new conversation's first positions stay f32 in an NVFP4 cache.</summary>
     private int ExactFor(int[] prompt) => PromptMark.Exact(prompt, _paging.ExactPrefix, _turnStart, _userRole);

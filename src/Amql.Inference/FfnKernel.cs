@@ -158,7 +158,9 @@ public static class FfnKernel
         ExpertRoutingPolicy routingPolicy,
         Activation activation,
         Action<int, IReadOnlyList<int>>? onExpertsRouted = null,
-        Action<(Tensor2D Gate, Tensor2D Up, Tensor2D Down)>? release = null)
+        Action<(Tensor2D Gate, Tensor2D Up, Tensor2D Down)>? release = null,
+        Tensor2D? routerInput = null,
+        float[]? expertScale = null)
     {
         if (topK > numExperts)
         {
@@ -167,7 +169,7 @@ public static class FfnKernel
         }
 
         // Router scores: [rows, numExperts].
-        var scores = TensorOps.MatMulTransposedB(x, router);
+        var scores = TensorOps.MatMulTransposedB(routerInput ?? x, router);
         var output = Tensor2D.Zeros(x.Rows, outputWidth);
         var selected = new int[x.Rows * topK];
         var weights = new float[x.Rows * topK];
@@ -239,7 +241,7 @@ public static class FfnKernel
             for (int k = 0; k < topK; k++)
             {
                 selected[r * topK + k] = picked[k];
-                weights[r * topK + k] = row[picked[k]];
+                weights[r * topK + k] = row[picked[k]] * (expertScale is null ? 1f : expertScale[picked[k]]);
             }
         }
 

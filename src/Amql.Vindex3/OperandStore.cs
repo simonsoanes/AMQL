@@ -272,6 +272,41 @@ public sealed class OperandStore : IDisposable
             grid.Scales, grid.Rows, grid.Cols, grid.Global);
     }
 
+    /// <summary>An FP4 operand's elements and block scales exactly as stored, with
+    /// its tensor scale: NVFP4 (an E4M3 byte per 16 elements) or MXFP4 (an E8M0
+    /// exponent byte per 32). Null for any other form. Nothing is decoded and
+    /// nothing is kept, so a model larger than memory streams through.</summary>
+    public (byte[] Elements, byte[] Scales, float Global, bool Mxfp4, int Rows, int Cols)? ResolveRawFp4(string objectId, string tensorName)
+    {
+        var (_, segment, tensor) = Locate(objectId, tensorName);
+        if (DtypeExtensions.FromLabel(tensor.Dtype) != Dtype.FP4 || tensor.Shape.Length != 2 || !segment.Contains(tensorName + "_scale"))
+        {
+            return null;
+        }
+        var scale = segment.GetTensor(tensorName + "_scale");
+        var scaleType = DtypeExtensions.FromLabel(scale.Dtype);
+        int rows = checked((int)tensor.Shape[0]), cols = checked((int)tensor.Shape[1]);
+        bool nv = scaleType == Dtype.F8_E4M3 && cols % 16 == 0 && scale.Shape.Length == 2 && scale.Shape[0] == rows && scale.Shape[1] * 16 == cols;
+        bool mx = scaleType is Dtype.U8 or Dtype.F8_E8M0 && cols % 32 == 0 && scale.Shape.Length == 2 && scale.Shape[0] == rows && scale.Shape[1] * 32 == cols;
+        if (!nv && !mx)
+        {
+            return null;
+        }
+        float global = 1f;
+        if (segment.Contains(tensorName + "_scale_2"))
+        {
+            var second = ReadSmallWidened(segment, segment.GetTensor(tensorName + "_scale_2"));
+            if (second.Length != 1)
+            {
+                throw new ContainerException($"'{tensorName}_scale_2' should hold one value, not {second.Length}");
+            }
+            global = second[0];
+        }
+        _touched.Add(objectId);
+        Loads++;
+        return (segment.ReadBytes(tensorName), segment.ReadBytes(tensorName + "_scale"), global, mx, rows, cols);
+    }
+
     public ScaledMatrix? ResolveScaled(OperandRef operand) => ResolveScaled(operand.ObjectId, operand.TensorName);
 
     private (string Path, SegmentFile Segment, SegmentTensor Tensor) Locate(string objectId, string tensorName)

@@ -41,7 +41,7 @@ internal static partial class Program
         string tokenizerDir = ResolveTokenizerDir(containerDir, args);
         var tokenizer = Tokenizer(tokenizerDir);
         var stop = ResolveStopTokens(tokenizerDir, tokenizer);
-        string? template = ChatTemplate.Load(tokenizerDir);
+        var template = ChatTemplate.Load(tokenizerDir);
         int every = IntOption(args, "--every", 64);
         int agree = IntOption(args, "--agree", 0);          // 0: probe and record, never close
         int least = IntOption(args, "--least", 0);          // thinking tokens before the first probe counts

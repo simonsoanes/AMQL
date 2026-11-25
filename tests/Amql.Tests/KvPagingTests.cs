@@ -38,6 +38,8 @@ public class KvPagingTests
     [InlineData("qwen3", false)]
     [InlineData("qwen3_5-gdn", false)]
     [InlineData("qwen3_5-gdn", true)]
+    [InlineData("gemma3_text", false)]
+    [InlineData("gemma4-moe", false)]
     public void A_Restored_Mark_Carries_On_As_The_Saved_Sequence(string family, bool mtp)
     {
         CudaShim.Reset();
@@ -87,12 +89,24 @@ public class KvPagingTests
         var restored = engine.RestoreMark(state);
         Assert.Equal(mark, restored.Position);
         Assert.Equal(mark, restored.MarkedAt);
+        // A windowed cache comes back with its first row at another position, so a
+        // step's attention sums its slices in other groups: equal to f32 rounding.
+        bool windowed = plan.Layers.Any(l => l.Attention?.Window is not null);
+        void Same(float[] a, float[] b)
+        {
+            if (windowed)
+            {
+                Assert.True(a.Zip(b).All(p => Math.Abs(p.First - p.Second) < 1e-3));
+                return;
+            }
+            Assert.Equal(a, b);
+        }
         var again = engine.Prefill(restored, prompt.AsSpan(mark));
-        Assert.Equal(first, again);
+        Same(first, again);
         var againSteps = Steps(restored, again, 6);
         for (int i = 0; i < firstSteps.Length; i++)
         {
-            Assert.Equal(firstSteps[i], againSteps[i]);
+            Same(firstSteps[i], againSteps[i]);
         }
         if (firstDrafts is not null)
         {
@@ -101,9 +115,74 @@ public class KvPagingTests
 
         // The restored sequence keeps its mark: it rewinds there as the saved one would.
         engine.Rewind(restored);
-        Assert.Equal(first, engine.Prefill(restored, prompt.AsSpan(mark)));
+        Same(first, engine.Prefill(restored, prompt.AsSpan(mark)));
         Assert.True(engine.DeviceBytes(restored) > engine.MarkBytes(restored) / 2);
         engine.Release(restored);
+    }
+
+    /// <summary>A windowed layer's cache stops growing and slides. A sequence that has
+    /// slid before its mark, and again after it, rewinds and comes back from disk to
+    /// the same logits (to rounding: see above), agrees with the managed path, and holds no more
+    /// than the window needs.</summary>
+    [Theory]
+    [InlineData("fp16")]
+    [InlineData("nvfp4")]
+    [InlineData("f32")]
+    public void A_Windowed_Cache_Slides_Past_A_Mark_And_Back(string kv)
+    {
+        CudaShim.Reset();
+        if (!CudaShim.Enabled)
+        {
+            return;
+        }
+        string saved = GpuEngine.RequestedKvFormat;
+        GpuEngine.RequestedKvFormat = kv;
+        try
+        {
+            using var dir = new TempDir();
+            using var container = Vindex3Container.Open(Encode(dir, "gemma3_text", mtp: false));
+            using var store = container.CreateOperandStore();
+            var plan = Planner.Plan(container, "target", store);
+            var (ids, _) = ArchZooTests.Golden("gemma3_text");
+            var prompt = Enumerable.Range(0, 3000).Select(i => ids[(i * 7 + i / 50) % ids.Length]).ToArray();
+            const int mark = 1700;
+            using var host = new DecodeSession(plan, store);
+            host.Prefill(new[] { ids[0] });
+            var engine = host.DeviceEngine()!;
+            engine.ExactPrefill = true;
+
+            var seq = engine.NewSequence();
+            engine.Prefill(seq, prompt.AsSpan(0, mark));
+            engine.Mark(seq);
+            var first = engine.Prefill(seq, prompt.AsSpan(mark));
+            var step = engine.Step(new[] { seq }, new[] { prompt[5] })[0];
+            var state = new ChunkedBuffer();
+            engine.SaveMark(seq, state);
+            Assert.Equal(engine.MarkBytes(seq), state.Length);
+            engine.Rewind(seq);
+            void Close(float[] a, float[] b) => Assert.True(a.Zip(b).All(p => Math.Abs(p.First - p.Second) < 1e-3));
+            Close(first, engine.Prefill(seq, prompt.AsSpan(mark)));
+            Close(step, engine.Step(new[] { seq }, new[] { prompt[5] })[0]);
+
+            state.Position = 0;
+            var restored = engine.RestoreMark(state);
+            Close(first, engine.Prefill(restored, prompt.AsSpan(mark)));
+            Close(step, engine.Step(new[] { restored }, new[] { prompt[5] })[0]);
+
+            if (kv == "f32")
+            {
+                using var cpu = new DecodeSession(plan, store) { AllowGpuEngine = false };
+                var expected = cpu.Prefill(prompt).FirstRow().ToArray();
+                Assert.True(expected.Zip(first).All(p => Math.Abs(p.First - p.Second) < 1e-3));
+            }
+            // Three of the four layers are windowed: far less than 3,000 rows of each.
+            long row = 2L * Enumerable.Range(0, plan.Layers.Count).Sum(i => engine.KvRowBytes(i));
+            Assert.True(engine.DeviceBytes(seq) < row * 4096 * 0.6, $"{engine.DeviceBytes(seq)} bytes held");
+        }
+        finally
+        {
+            GpuEngine.RequestedKvFormat = saved;
+        }
     }
 
     private static ChunkedBuffer Bytes(int n, byte fill)

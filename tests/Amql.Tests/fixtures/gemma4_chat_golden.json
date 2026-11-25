@@ -1,0 +1,296 @@
+[
+{
+"messages": [
+{
+"role": "user",
+"content": "hi",
+"reasoning": null
+}
+],
+"thinking": false,
+"text": "<bos><|turn>user\nhi<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+},
+{
+"messages": [
+{
+"role": "user",
+"content": "hi",
+"reasoning": null
+}
+],
+"thinking": true,
+"text": "<bos><|turn>system\n<|think|>\n<turn|>\n<|turn>user\nhi<turn|>\n<|turn>model\n"
+},
+{
+"messages": [
+{
+"role": "system",
+"content": " Be brief. ",
+"reasoning": null
+},
+{
+"role": "user",
+"content": "  What is 2+2?\n",
+"reasoning": null
+}
+],
+"thinking": false,
+"text": "<bos><|turn>system\nBe brief.<turn|>\n<|turn>user\nWhat is 2+2?<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+},
+{
+"messages": [
+{
+"role": "system",
+"content": " Be brief. ",
+"reasoning": null
+},
+{
+"role": "user",
+"content": "  What is 2+2?\n",
+"reasoning": null
+}
+],
+"thinking": true,
+"text": "<bos><|turn>system\n<|think|>\nBe brief.<turn|>\n<|turn>user\nWhat is 2+2?<turn|>\n<|turn>model\n"
+},
+{
+"messages": [
+{
+"role": "user",
+"content": "a",
+"reasoning": null
+},
+{
+"role": "assistant",
+"content": "b",
+"reasoning": null
+},
+{
+"role": "user",
+"content": "c",
+"reasoning": null
+}
+],
+"thinking": false,
+"text": "<bos><|turn>user\na<turn|>\n<|turn>model\nb<turn|>\n<|turn>user\nc<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+},
+{
+"messages": [
+{
+"role": "user",
+"content": "a",
+"reasoning": null
+},
+{
+"role": "assistant",
+"content": "b",
+"reasoning": null
+},
+{
+"role": "user",
+"content": "c",
+"reasoning": null
+}
+],
+"thinking": true,
+"text": "<bos><|turn>system\n<|think|>\n<turn|>\n<|turn>user\na<turn|>\n<|turn>model\nb<turn|>\n<|turn>user\nc<turn|>\n<|turn>model\n"
+},
+{
+"messages": [
+{
+"role": "system",
+"content": "s",
+"reasoning": null
+},
+{
+"role": "user",
+"content": "a",
+"reasoning": null
+},
+{
+"role": "assistant",
+"content": "<|channel>thought\nhmm\n<channel|>b ",
+"reasoning": null
+},
+{
+"role": "user",
+"content": "c",
+"reasoning": null
+},
+{
+"role": "assistant",
+"content": "d",
+"reasoning": null
+},
+{
+"role": "user",
+"content": "e",
+"reasoning": null
+}
+],
+"thinking": false,
+"text": "<bos><|turn>system\ns<turn|>\n<|turn>user\na<turn|>\n<|turn>model\nb<turn|>\n<|turn>user\nc<turn|>\n<|turn>model\nd<turn|>\n<|turn>user\ne<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+},
+{
+"messages": [
+{
+"role": "system",
+"content": "s",
+"reasoning": null
+},
+{
+"role": "user",
+"content": "a",
+"reasoning": null
+},
+{
+"role": "assistant",
+"content": "<|channel>thought\nhmm\n<channel|>b ",
+"reasoning": null
+},
+{
+"role": "user",
+"content": "c",
+"reasoning": null
+},
+{
+"role": "assistant",
+"content": "d",
+"reasoning": null
+},
+{
+"role": "user",
+"content": "e",
+"reasoning": null
+}
+],
+"thinking": true,
+"text": "<bos><|turn>system\n<|think|>\ns<turn|>\n<|turn>user\na<turn|>\n<|turn>model\nb<turn|>\n<|turn>user\nc<turn|>\n<|turn>model\nd<turn|>\n<|turn>user\ne<turn|>\n<|turn>model\n"
+},
+{
+"messages": [
+{
+"role": "user",
+"content": "a",
+"reasoning": null
+},
+{
+"role": "assistant",
+"content": "b",
+"reasoning": "because"
+},
+{
+"role": "user",
+"content": "c",
+"reasoning": null
+}
+],
+"thinking": false,
+"text": "<bos><|turn>user\na<turn|>\n<|turn>model\nb<turn|>\n<|turn>user\nc<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+},
+{
+"messages": [
+{
+"role": "user",
+"content": "a",
+"reasoning": null
+},
+{
+"role": "assistant",
+"content": "b",
+"reasoning": "because"
+},
+{
+"role": "user",
+"content": "c",
+"reasoning": null
+}
+],
+"thinking": true,
+"text": "<bos><|turn>system\n<|think|>\n<turn|>\n<|turn>user\na<turn|>\n<|turn>model\nb<turn|>\n<|turn>user\nc<turn|>\n<|turn>model\n"
+},
+{
+"messages": [
+{
+"role": "user",
+"content": "a",
+"reasoning": null
+},
+{
+"role": "assistant",
+"content": "b",
+"reasoning": "because"
+}
+],
+"thinking": false,
+"text": "<bos><|turn>user\na<turn|>\n<|turn>model\n<|channel>thought\nbecause\n<channel|>b<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+},
+{
+"messages": [
+{
+"role": "user",
+"content": "a",
+"reasoning": null
+},
+{
+"role": "assistant",
+"content": "b",
+"reasoning": "because"
+}
+],
+"thinking": true,
+"text": "<bos><|turn>system\n<|think|>\n<turn|>\n<|turn>user\na<turn|>\n<|turn>model\n<|channel>thought\nbecause\n<channel|>b<turn|>\n<|turn>model\n"
+},
+{
+"messages": [
+{
+"role": "user",
+"content": "a",
+"reasoning": null
+},
+{
+"role": "assistant",
+"content": "b",
+"reasoning": null
+},
+{
+"role": "assistant",
+"content": "c",
+"reasoning": null
+},
+{
+"role": "user",
+"content": "d",
+"reasoning": null
+}
+],
+"thinking": false,
+"text": "<bos><|turn>user\na<turn|>\n<|turn>model\nbc<turn|>\n<|turn>user\nd<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+},
+{
+"messages": [
+{
+"role": "user",
+"content": "a",
+"reasoning": null
+},
+{
+"role": "assistant",
+"content": "b",
+"reasoning": null
+},
+{
+"role": "assistant",
+"content": "c",
+"reasoning": null
+},
+{
+"role": "user",
+"content": "d",
+"reasoning": null
+}
+],
+"thinking": true,
+"text": "<bos><|turn>system\n<|think|>\n<turn|>\n<|turn>user\na<turn|>\n<|turn>model\nbc<turn|>\n<|turn>user\nd<turn|>\n<|turn>model\n"
+}
+]

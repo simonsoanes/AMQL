@@ -46,7 +46,11 @@ public static class SuffixDraft
         {
             return null;
         }
-        int count = Math.Min(max, n - 1 - bestAt);
+        int count = 0;
+        while (count < Math.Min(max, n - 1 - bestAt) && context[bestAt + 1 + count] >= 0)   // an image's ids are no tokens
+        {
+            count++;
+        }
         return count < 1 ? null : Enumerable.Range(bestAt + 1, count).Select(i => context[i]).ToArray();
     }
 }

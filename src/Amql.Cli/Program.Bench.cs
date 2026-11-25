@@ -9,7 +9,7 @@ namespace Amql.Cli;
 internal static partial class Program
 {
     /// <summary>
-    /// <c>bench &lt;container&gt; [--prompt-tokens N] [--steps M] [--repeat R] [--weights mode] [--profile] [--compare] [--batch N]</c>.
+    /// <c>bench &lt;container&gt; [--prompt-tokens N] [--steps M] [--repeat R] [--weights mode] [--profile] [--compare] [--batch N] [--draft N [--chat text]]</c>.
     /// Loads the model, runs one untimed warm-up request (so weights are
     /// resident and the kernels compiled — "once loaded"), then R timed
     /// requests of an N-token prefill followed by M greedy decode steps.
@@ -71,9 +71,19 @@ internal static partial class Program
 
         if (HasOption(args, "--profile"))
         {
-            Profile(session, prompt, steps);
+            Profile(session, prompt, steps, IntOption(args, "--profile-rows", 1));
         }
 
+        if (OptionValue(args, "--draft") is { } draftText)
+        {
+            if (OptionValue(args, "--chat") is { } chat)
+            {
+                var tokenizer = Amql.Hf.HfTokenizer.FromTokenizerFile(Path.Combine(containerDir, "tokenizer.json"));
+                string text = File.Exists(chat) ? File.ReadAllText(chat) : chat;
+                prompt = tokenizer.EncodeToIds(ChatTemplate.Load(containerDir) is { } template ? template.Apply(text) : text).ToArray();
+            }
+            return DraftBench(session, prompt, steps, Math.Clamp(int.Parse(draftText), 1, GpuEngine.MaxDrafts), args);
+        }
         if (OptionValue(args, "--batch") is { } batchText)
         {
             BatchBench(session, prompt, steps, int.Parse(batchText));
@@ -140,8 +150,27 @@ internal static partial class Program
     /// <summary>One prefill and one decode run with each layer operator's
     /// time split into time inside <see cref="KernelPool"/> loops (parallel)
     /// and the rest (serial) — where a single request still runs on one core.</summary>
-    private static void Profile(DecodeSession session, int[] prompt, int steps)
+    private static void Profile(DecodeSession session, int[] prompt, int steps, int decodeRows)
     {
+        if (session.DeviceEngine() is { } engine)
+        {
+            var decode = engine.ProfileDecode(prompt, 40, Math.Clamp(decodeRows, 1, 8));
+            Console.WriteLine($"a decode step{(decodeRows > 1 ? $" of {decodeRows} rows" : "")}, call by call ({decode.Sum(t => t.Microseconds) / 1000:F2} ms):");
+            foreach (var (op, us) in decode)
+            {
+                Console.WriteLine($"  {op,-20} {us / 1000,9:F3} ms");
+            }
+            foreach (int rows in new[] { Math.Min(prompt.Length, GpuEngine.ChunkRows) })
+            {
+                var times = engine.Profile(prompt.AsSpan(0, rows), 10);
+                Console.WriteLine($"device calls over {rows} row{(rows == 1 ? "" : "s")}, each waited for ({times.Sum(t => t.Microseconds) / 1000:F2} ms in all):");
+                foreach (var (op, us) in times)
+                {
+                    Console.WriteLine($"  {op,-20} {us / 1000,9:F3} ms");
+                }
+            }
+            return;
+        }
         var perOp = new Dictionary<string, double>();
         var perOpPool = new Dictionary<string, double>();
         long lastPool = 0;

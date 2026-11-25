@@ -147,7 +147,7 @@ public class LineDecorationTests
         var d = LineDecoration.Learn([ReadResult(Code)]);
         string reply = "<tool_call>\n<function=create_file>\n<parameter=path>\nProgram.cs\n</parameter>\n<parameter=content>\n"
             + $"# {Code.Length} lines · LF · final-newline\n" + Decorated(Code) + "\n</parameter>\n</function>\n</tool_call>";
-        var parser = new ReplyParser(false, tools, d);
+        var parser = new ReplyParser(false, tools, d, Templates.QwenCalls);
         parser.Feed(reply);
         parser.Finish();
         var args = JsonDocument.Parse(Assert.Single(parser.ToolCalls).Arguments).RootElement;

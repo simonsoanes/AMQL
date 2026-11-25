@@ -141,7 +141,7 @@ nothing is lost on export; ONNX and GGUF exports carry text positions only.
 Experts are judged from their tensors: `<block>.experts.N.<stem>` with the
 projections named by role (`gate_proj`/`up_proj`/`down_proj`, Mixtral's
 `w1`/`w3`/`w2`), the router (`mlp.gate`, `block_sparse_moe.gate`,
-`mlp.router`), and an always-on shared expert with its optional sigmoid gate
+`mlp.router`, `router.proj`), and an always-on shared expert with its optional sigmoid gate
 (`mlp.shared_expert`, `mlp.shared_expert_gate`). The count and top-k come from
 the config (`num_experts` / `num_local_experts`, `num_experts_per_tok`). The
 routing rule comes from `norm_topk_prob`: renormalise the softmax over the
@@ -151,14 +151,25 @@ with dense layers (Qwen3-MoE's `mlp_only_layers`) runs each layer as it is.
 The expert width is read from the expert tensors. HF export keeps the
 checkpoint's own MoE keys and expert names.
 
+Gemma 4's layers have both a dense FFN and routed experts, each with its own
+norms (`post_feedforward_layernorm_1`, `pre_feedforward_layernorm_2`,
+`post_feedforward_layernorm_2`), a router that scales what it reads
+(`router.scale`) and weighs each expert (`router.per_expert_scale`), and a
+multiplier on the layer's output (`layer_scalar`). All of it is judged from those
+tensors. A layer's heads are read from its own projections, since its full and
+sliding layers differ. The GPU engine runs routed layers with or without the
+dense FFN ([gemma-4.md](gemma-4.md)); a shared expert stays on the managed path.
+
 Refused by name: sigmoid router scores, grouped selection (`n_group` /
 `topk_group`) and `routed_scaling_factor` (DeepSeek-V3, GLM-4.5), a router
 bias (gpt-oss), and experts packed into one 3-D tensor (GraniteMoE,
-Llama 4), whose axis order differs between families.
+Llama 4), whose axis order differs between families. (Qwen 3.5 MoE, Qwen4 and
+Gemma 4 pack theirs in one known order and are split on import.)
 
 | Check | Result |
 |---|---|
 | Zoo: Mixtral (renormalised top-2), Qwen2-MoE (shared expert behind its gate), Qwen3-MoE (a dense first layer), OLMoE (not renormalised) | import, HF round trip and transformers reload all match |
+| Zoo: Gemma 4 MoE, dense and wide-headed | import, HF round trip and the GPU engine all match transformers |
 | ONNX, GGUF | refused: neither generic exporter writes routed FFNs yet |
 
 ## Fixes made on the way

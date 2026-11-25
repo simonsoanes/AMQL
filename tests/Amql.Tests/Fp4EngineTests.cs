@@ -308,6 +308,44 @@ public class Fp4EngineTests : IDisposable
         Assert.True(eGptq < 0.7 * eNear, $"GPTQ output error {eGptq} vs nearest {eNear}");
     }
 
+    /// <summary>Each routed expert is rounded against the rows sent to it, read by a
+    /// 4-bit copy of the model as a model too large for the GPU would be.</summary>
+    [Fact]
+    public void Experts_Are_Calibrated_On_What_The_Router_Sends_Them()
+    {
+        CudaShim.Reset();
+        if (!CudaShim.Enabled)
+        {
+            return;
+        }
+        const string family = "gemma4-moe";
+        using var dir = new TempDir();
+        string source = Encode(dir, family), nearest = Path.Combine(dir.Path, "near"), gptq = Path.Combine(dir.Path, "gptq");
+        var (ids, _) = ArchZooTests.Golden(family);
+        var calibration = Enumerable.Range(0, 2048).Select(i => ids[(i * 7 + i / 5) % ids.Length]).ToArray();
+        QuantiseContainer.Transform(source, nearest, Nearest(Fp4Format.Nvfp4));
+        var report = QuantiseContainer.Transform(source, gptq, new QuantiseOptions(Fp4Format.Nvfp4)
+        {
+            Rounding = Fp4Rounding.Gptq,
+            CalibrationIds = calibration,
+            SequenceTokens = 128,
+            CalibrateWith = nearest,
+        });
+        // 6 layers of 8 experts, three projections each, and the dense and attention ones.
+        Assert.True(report.Quantised >= 6 * 8 * 3 + 6 * 6, $"{report.Quantised} projections");
+        Assert.Contains("\"calibrated_with\":\"near\"", File.ReadAllText(Path.Combine(gptq, "index.json")));
+
+        var prompt = Enumerable.Range(0, 200).Select(i => ids[(i * 5 + i / 3) % ids.Length]).ToArray();
+        float[] Logits(string path, bool gpu)
+        {
+            using var container = Vindex3Container.Open(path);
+            using var store = container.CreateOperandStore();
+            using var session = new DecodeSession(Planner.Plan(container, "target", store), store) { AllowGpuEngine = gpu, ExactGpuPrefill = true };
+            return session.Prefill(prompt).FirstRow().ToArray();
+        }
+        AssertClose(Logits(gptq, gpu: false), Logits(gptq, gpu: true), "gptq experts on both paths", 1e-3);
+    }
+
     [Theory]
     [InlineData(Fp4Format.Nvfp4)]
     [InlineData(Fp4Format.Mxfp4)]

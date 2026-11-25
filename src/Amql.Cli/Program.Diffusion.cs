@@ -34,15 +34,10 @@ internal static partial class Program
         {
             if (HasOption(args, "--chat"))
             {
-                string template = ChatTemplate.Load(tokenizerDir) ?? throw new CliException(
+                var template = ChatTemplate.Load(tokenizerDir) ?? throw new CliException(
                     "--chat requires a chat template, but none was found in chat_template.jinja or tokenizer_config.json");
-                prompt = ChatTemplate.Apply(template, prompt, OptionValue(args, "--system"));
-                // The A2D checkpoints are tuned with thinking off: the template's
-                // enable_thinking=false branch pre-fills an empty think block.
-                if (template.Contains("enable_thinking") && !HasOption(args, "--think"))
-                {
-                    prompt += "<think>\n\n</think>\n\n";
-                }
+                // The A2D checkpoints are tuned with thinking off.
+                prompt = template.Apply(prompt, OptionValue(args, "--system"), HasOption(args, "--think"));
                 Console.WriteLine("chat:      prompt formatted via chat template" +
                                   (HasOption(args, "--think") ? "" : " (thinking off)"));
             }

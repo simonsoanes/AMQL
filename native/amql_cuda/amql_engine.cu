@@ -18,54 +18,13 @@
 // with the managed path to rounding (reduction order differs), not bit for
 // bit.
 
-#include <cuda_runtime.h>
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cuda_fp8.h>
-#include <cuda_fp4.h>
-#include <cublas_v2.h>
-#include <cusolverDn.h>
-#include <math.h>
-#include <stdint.h>
-#include <stdlib.h>
-#include <utility>
-#include <type_traits>
+#include "amql_engine.h"
 
-#if defined(_WIN32)
-  #define AMQE_EXPORT extern "C" __declspec(dllexport)
-#else
-  #define AMQE_EXPORT extern "C" __attribute__((visibility("default")))
-#endif
+int gPdlWanted = 1;
 
-// ── engine context ─────────────────────────────────────────────────────────
-
-struct Engine
-{
-    cudaStream_t stream = nullptr;
-    cublasHandle_t blas = nullptr;
-    cudaGraph_t graph = nullptr;
-    cudaGraphExec_t exec = nullptr;
-    float* widen = nullptr;     // f32 scratch a BF16 weight widens into for a GEMM
-    size_t widenElems = 0;
-    __nv_bfloat16* xb = nullptr; // BF16 copy of a GEMM's activations
-    size_t xbElems = 0;
-    int prefillF32 = 0;          // 1: batched rows use FP32 SGEMM over widened weights
-    float* scores = nullptr;     // prompt attention's [group x rows x keys] scores
-    size_t scoresElems = 0;
-    float* chunk = nullptr;      // chunked Gated DeltaNet's W, U, G and P
-    size_t chunkElems = 0;
-    int rowInvariant = 0;        // 1: a decode GEMV computes each row the same for 1 to 8 rows
-    int kvFp4 = 0;               // 1: KV caches hold NVFP4 rows (see kv4_row_bytes), else f32
-    float* kvWiden = nullptr;    // prompt attention's f32 copy of an NVFP4 key/value span
-    size_t kvWidenElems = 0;
-    // Where one-row attention lands: when set, each decode-path attention adds the
-    // share every SPLIT_KEYS-key window takes, summed over heads (amqe_set_attention_mass).
-    float* massOut = nullptr;       // [massSplits]
-    float* massScratch = nullptr;   // [heads x (2 x massSplits + 2)]
-    int massSplits = 0;
-};
-
-static int ok(cudaError_t e) { return e == cudaSuccess ? 0 : -(int)e; }
+/// Whether the kernels launched from now on take part in dependent launch (a
+/// captured graph keeps what it was captured with).
+AMQE_EXPORT void amqe_set_pdl(int on) { gPdlWanted = on ? 1 : 0; }
 
 AMQE_EXPORT int amqe_create(Engine** out)
 {
@@ -90,6 +49,7 @@ AMQE_EXPORT void amqe_destroy(Engine* e)
     if (e->scores) cudaFree(e->scores);
     if (e->kvWiden) cudaFree(e->kvWiden);
     if (e->chunk) cudaFree(e->chunk);
+    moe_prompt_free(e);
     if (e->blas) cublasDestroy(e->blas);
     if (e->stream) cudaStreamDestroy(e->stream);
     delete e;
@@ -143,50 +103,6 @@ AMQE_EXPORT int amqe_sync(Engine* e) { return ok(cudaStreamSynchronize(e->stream
 
 AMQE_EXPORT int amqe_last_error(void) { return (int)cudaGetLastError(); }
 
-// ── programmatic dependent launch ─────────────────────────────────────────
-//
-// Every kernel here is launched with programmatic stream serialisation: the
-// next kernel in the stream may start as soon as every block of this one
-// has started, and waits (griddepcontrol.wait) for this one to finish before
-// it touches anything this one writes. What a kernel may do before its wait
-// is read data no kernel writes — the weights — so a projection streams its
-// weights into L2 while the norm, attention or recurrence before it runs,
-// and DRAM stays busy across kernel boundaries. A kernel's wait returns
-// only once its predecessor has completed, and that one waited on its own,
-// so the ordering is the stream's, transitively.
-
-static bool pdl_enabled()
-{
-    static int on = -1;
-    if (on < 0)
-    {
-        const char* v = getenv("AMQE_PDL");
-        on = (v && v[0] == '0') ? 0 : 1;
-    }
-    return on == 1;
-}
-
-template <typename... KArgs, typename... Args>
-static void launch(void (*kernel)(KArgs...), dim3 grid, dim3 block, size_t smem, cudaStream_t stream, Args&&... args)
-{
-    cudaLaunchConfig_t cfg = {};
-    cfg.gridDim = grid;
-    cfg.blockDim = block;
-    cfg.dynamicSmemBytes = smem;
-    cfg.stream = stream;
-    cudaLaunchAttribute attr[1];
-    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attr[0].val.programmaticStreamSerializationAllowed = 1;
-    cfg.attrs = attr;
-    cfg.numAttrs = pdl_enabled() ? 1 : 0;
-    cudaLaunchKernelEx(&cfg, kernel, std::forward<Args>(args)...);
-}
-
-// Let the next kernel launch, then wait for the previous one's results.
-__device__ __forceinline__ void pdl_trigger() { asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); }
-__device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
-__device__ __forceinline__ void pdl_enter() { pdl_trigger(); pdl_wait(); }
-
 // ── graph capture ──────────────────────────────────────────────────────────
 
 AMQE_EXPORT int amqe_capture_begin(Engine* e)
@@ -222,155 +138,6 @@ AMQE_EXPORT int amqe_graph_launch_async(Engine* e)
 {
     if (!e->exec) return -1;
     return ok(cudaGraphLaunch(e->exec, e->stream));
-}
-
-// ── helpers ────────────────────────────────────────────────────────────────
-
-__device__ __forceinline__ float bf16_lo(uint32_t w) { return __uint_as_float(w << 16); }
-__device__ __forceinline__ float bf16_hi(uint32_t w) { return __uint_as_float(w & 0xffff0000u); }
-
-__device__ __forceinline__ float warp_sum(float v)
-{
-    #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
-    return v;
-}
-
-// Block-wide sum; every thread gets the total. `shared` holds ≥ 32 floats.
-__device__ __forceinline__ float block_sum(float v, float* shared)
-{
-    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    int warps = (blockDim.x + 31) >> 5;
-    v = warp_sum(v);
-    __syncthreads();
-    if (lane == 0) shared[warp] = v;
-    __syncthreads();
-    float t = 0.f;
-    if (threadIdx.x < 32)
-    {
-        t = threadIdx.x < warps ? shared[threadIdx.x] : 0.f;
-        t = warp_sum(t);
-        if (threadIdx.x == 0) shared[0] = t;
-    }
-    __syncthreads();
-    return shared[0];
-}
-
-__device__ __forceinline__ float silu(float x) { return x / (1.f + expf(-x)); }
-__device__ __forceinline__ float sigmoidf_(float x) { return 1.f / (1.f + expf(-x)); }
-__device__ __forceinline__ float gelu_tanh(float x)
-{
-    return 0.5f * x * (1.f + tanhf(0.7978845608028654f * (x + 0.044715f * x * x * x)));
-}
-
-// Activation codes shared with the managed side.
-enum { ACT_NONE = 0, ACT_SILU = 1, ACT_GELU = 2, ACT_RELU = 3 };
-
-__device__ __forceinline__ float activate(float x, int act)
-{
-    switch (act)
-    {
-        case ACT_SILU: return silu(x);
-        case ACT_GELU: return gelu_tanh(x);
-        case ACT_RELU: return x > 0.f ? x : 0.f;
-        default: return x;
-    }
-}
-
-// Eight weights of row `row` starting at column c (c % 8 == 0, row 16-byte aligned).
-__device__ __forceinline__ void load8(const __nv_bfloat16* w, long long idx, float* o)
-{
-    uint4 v = __ldg(reinterpret_cast<const uint4*>(w + idx));
-    o[0] = bf16_lo(v.x); o[1] = bf16_hi(v.x);
-    o[2] = bf16_lo(v.y); o[3] = bf16_hi(v.y);
-    o[4] = bf16_lo(v.z); o[5] = bf16_hi(v.z);
-    o[6] = bf16_lo(v.w); o[7] = bf16_hi(v.w);
-}
-__device__ __forceinline__ void load8(const float* w, long long idx, float* o)
-{
-    float4 a = __ldg(reinterpret_cast<const float4*>(w + idx));
-    float4 b = __ldg(reinterpret_cast<const float4*>(w + idx + 4));
-    o[0] = a.x; o[1] = a.y; o[2] = a.z; o[3] = a.w;
-    o[4] = b.x; o[5] = b.y; o[6] = b.z; o[7] = b.w;
-}
-__device__ __forceinline__ float load1(const __nv_bfloat16* w, long long idx) { return __bfloat162float(w[idx]); }
-__device__ __forceinline__ float load1(const float* w, long long idx) { return w[idx]; }
-
-// ── 4-bit weights ──────────────────────────────────────────────────────────
-//
-// FP4 E2M1 elements two to a byte (low nibble first), row-major [rows × k],
-// then a block scale per 16 elements (NVFP4: an E4M3 byte) or per 32 (MXFP4:
-// an E8M0 exponent byte), row-major [rows × k/block]. A tensor scale (NVFP4's
-// weight_scale_2) is not folded in: it is one f32 per output row, applied to
-// the dot product (rows of stacked weights keep their own tensor's). Element
-// times block scale is exact in f32 (and in BF16): at most 6 significant bits.
-#ifndef FP4_UNROLL
-#define FP4_UNROLL 1   // past one activation row the 4-bit step loop is long already: unrolling it thrashed the instruction cache
-#endif
-struct Fp4Nv { unsigned char b; };   // tags: the pointer type picks the reader
-struct Fp4Mx { unsigned char b; };
-
-template <typename WT> struct WTraits
-{
-    static constexpr bool fp4 = false;
-    static constexpr int block = 1;
-    __host__ __device__ static long long rowBytes(int k) { return (long long)k * sizeof(WT); }
-};
-template <> struct WTraits<Fp4Nv>
-{
-    static constexpr bool fp4 = true;
-    static constexpr int block = 16;
-    __host__ __device__ static long long rowBytes(int k) { return k / 2; }
-};
-template <> struct WTraits<Fp4Mx>
-{
-    static constexpr bool fp4 = true;
-    static constexpr int block = 32;
-    __host__ __device__ static long long rowBytes(int k) { return k / 2; }
-};
-
-__device__ __forceinline__ float e4m3_value(unsigned char b)
-{
-    __half_raw h = __nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t)b, __NV_E4M3);
-    return __half2float(*reinterpret_cast<__half*>(&h));
-}
-
-__device__ __forceinline__ float e8m0_value(unsigned char b)
-{
-    // 2^(b − 127); b = 0 is 2^−127, below f32's normals.
-    return b == 0 ? __int_as_float(0x00400000) : __int_as_float((int)b << 23);
-}
-
-__device__ __forceinline__ float fp4_block_scale(const Fp4Nv*, const unsigned char* scales, long long idx)
-{
-    return e4m3_value(__ldg(scales + (idx >> 4)));
-}
-__device__ __forceinline__ float fp4_block_scale(const Fp4Mx*, const unsigned char* scales, long long idx)
-{
-    return e8m0_value(__ldg(scales + (idx >> 5)));
-}
-
-__device__ __forceinline__ float2 e2m1x2_value(unsigned char pair)
-{
-    __half2_raw raw = __nv_cvt_fp4x2_to_halfraw2((__nv_fp4x2_storage_t)pair, __NV_E2M1);
-    return __half22float2(*reinterpret_cast<__half2*>(&raw));
-}
-
-/// The E2M1 code nearest to x (ties to the smaller magnitude, as the managed
-/// encoder rounds).
-__device__ __forceinline__ unsigned int e2m1_code(float x)
-{
-    float a = fabsf(x);
-    unsigned int m = a <= 0.25f ? 0u : a < 0.75f ? 1u : a <= 1.25f ? 2u : a < 1.75f ? 3u
-                   : a <= 2.5f ? 4u : a < 3.5f ? 5u : a <= 5.f ? 6u : 7u;
-    return m | (x < 0.f ? 8u : 0u);
-}
-
-__device__ __forceinline__ float e2m1_of(unsigned int code)
-{
-    unsigned int m = code & 7u;
-    float v = m < 4 ? 0.5f * m : m == 4 ? 2.f : m == 5 ? 3.f : m == 6 ? 4.f : 6.f;
-    return (code & 8u) ? -v : v;
 }
 
 // ── NVFP4 KV rows ──────────────────────────────────────────────────────────
@@ -429,72 +196,6 @@ AMQE_EXPORT long long amqe_kv_row_bytes(int hkv, int d, int fmt)
     int kvDim = hkv * d;
     return fmt ? kv4_row_bytes(kvDim, hkv) : (long long)kvDim * 4;
 }
-
-// Eight E2M1 elements packed in one word, as f32, unscaled. Integer work
-// only (conversion instructions run at a fraction of the integer rate): the
-// magnitudes 0, ½, 1, 1½, 2, 3, 4, 6 are f32s whose low two bytes are zero,
-// so a byte permute looks up their top two bytes for four elements at once,
-// and the element's sign bit moves to bit 31.
-__device__ __forceinline__ void decode8_e2m1(unsigned int word, float* o)
-{
-    const unsigned int topLo = 0x3F3F3F00u, topHi = 0x40404040u;   // byte 3, magnitudes 0..3 and 4..7
-    const unsigned int midLo = 0xC0800000u, midHi = 0xC0804000u;   // byte 2
-    #pragma unroll
-    for (int half = 0; half < 2; half++)
-    {
-        unsigned int nib = word >> (16 * half);
-        unsigned int sel = nib & 0x7777u;
-        unsigned int top = __byte_perm(topLo, topHi, sel);
-        unsigned int mid = __byte_perm(midLo, midHi, sel);
-        #pragma unroll
-        for (int j = 0; j < 4; j++)
-        {
-            unsigned int bits = __byte_perm(mid, top, j | ((4 + j) << 4)) << 16;
-            bits |= (nib << (28 - 4 * j)) & 0x80000000u;
-            o[4 * half + j] = __uint_as_float(bits);
-        }
-    }
-}
-
-// Eight elements packed in one word, times their block scale.
-__device__ __forceinline__ void decode8_fp4(unsigned int word, float s, float* o)
-{
-    decode8_e2m1(word, o);
-    #pragma unroll
-    for (int i = 0; i < 8; i++) o[i] *= s;
-}
-
-// Eight elements from idx (a multiple of 8, so one block scale covers them).
-template <typename F>
-__device__ __forceinline__ void load8_fp4(const F* w, const unsigned char* scales, long long idx, float* o)
-{
-    unsigned int word = __ldg(reinterpret_cast<const unsigned int*>(reinterpret_cast<const unsigned char*>(w) + (idx >> 1)));
-    float s = fp4_block_scale(w, scales, idx);
-    #pragma unroll
-    for (int i = 0; i < 4; i++)
-    {
-        float2 p = e2m1x2_value((unsigned char)(word >> (8 * i)));
-        o[2 * i] = p.x * s;
-        o[2 * i + 1] = p.y * s;
-    }
-}
-
-template <typename F>
-__device__ __forceinline__ float load1_fp4(const F* w, const unsigned char* scales, long long idx)
-{
-    unsigned char pair = __ldg(reinterpret_cast<const unsigned char*>(w) + (idx >> 1));
-    float2 p = e2m1x2_value(pair);
-    return ((idx & 1) ? p.y : p.x) * fp4_block_scale(w, scales, idx);
-}
-
-__device__ __forceinline__ void loadw(const __nv_bfloat16* w, const unsigned char*, long long idx, float* o) { load8(w, idx, o); }
-__device__ __forceinline__ void loadw(const float* w, const unsigned char*, long long idx, float* o) { load8(w, idx, o); }
-__device__ __forceinline__ void loadw(const Fp4Nv* w, const unsigned char* sc, long long idx, float* o) { load8_fp4(w, sc, idx, o); }
-__device__ __forceinline__ void loadw(const Fp4Mx* w, const unsigned char* sc, long long idx, float* o) { load8_fp4(w, sc, idx, o); }
-__device__ __forceinline__ float loadw1(const __nv_bfloat16* w, const unsigned char*, long long idx) { return load1(w, idx); }
-__device__ __forceinline__ float loadw1(const float* w, const unsigned char*, long long idx) { return load1(w, idx); }
-__device__ __forceinline__ float loadw1(const Fp4Nv* w, const unsigned char* sc, long long idx) { return load1_fp4(w, sc, idx); }
-__device__ __forceinline__ float loadw1(const Fp4Mx* w, const unsigned char* sc, long long idx) { return load1_fp4(w, sc, idx); }
 
 // ── GEMV: y[r, j] = epilogue(Σ_c W[j, c] · x[r, c]) for R ≤ 8 rows ─────────
 //
@@ -804,7 +505,6 @@ __global__ void __launch_bounds__(256) gemv_kernel(GemvArgs a)
     }
 }
 
-static int gSms = 0;
 
 // RW output rows per warp: each activation load then serves RW weight rows.
 template <typename WT, int SPLIT, int RW, bool RMS>
@@ -915,6 +615,8 @@ static int launch_gemv(Engine* e, const GemvArgs& a, int rows)
     if (rwDecode < 0) { const char* v = getenv("AMQE_GEMV_RW_DECODE"); rwDecode = v ? atoi(v) : 0; }
     // Output rows per warp do not change any output's sum: 4 for 4-bit rows under 4096 wide.
     int rwDefault = fp4w && a.k < 4096 ? 4 : 2;
+    // A gated matrix so narrow that four rows a warp leave half the SMs idle: two.
+    if (rwDefault == 4 && a.glu && a.n < 32 * gSms) rwDefault = 2;
     int rw = rows <= 2 ? (rwDecode == 2 || rwDecode == 4 || rwDecode == 8 ? rwDecode : rwDefault)
                        : (fp4w && !getenv("AMQE_GEMV_RW") ? 4 : gemv_rw(rows));
     int perGroup = (8 / split) * rw;
@@ -1211,25 +913,32 @@ AMQE_EXPORT int amqe_set_kv_format(Engine* e, int fmt)
 // ── embedding ──────────────────────────────────────────────────────────────
 
 template <typename WT>
-__global__ void embed_kernel(const WT* table, const int* tokens, int hidden, float scale, int hasScale, float* out)
+__global__ void embed_kernel(const WT* table, const unsigned char* scales, const float* rowScale, const int* tokens, int hidden,
+    float scale, int hasScale, float* out)
 {
     pdl_enter();
     int r = blockIdx.x;
     long long base = (long long)tokens[r] * hidden;
+    const float rs = rowScale ? rowScale[tokens[r]] : 1.f;   // a 4-bit table's tensor scale
     for (int c = threadIdx.x; c < hidden; c += blockDim.x)
     {
-        float v = load1(table, base + c);
+        float v = loadw1(table, scales, base + c) * rs;
         out[(long long)r * hidden + c] = hasScale ? v * scale : v;
     }
 }
 
-AMQE_EXPORT int amqe_embed(Engine* e, const void* table, int wType, const int* tokens, int rows, int hidden,
-    float scale, int hasScale, float* out)
+/// wType as amqe_linear's; scales and rowScale are a 4-bit table's, null otherwise.
+AMQE_EXPORT int amqe_embed(Engine* e, const void* table, int wType, const unsigned char* scales, const float* rowScale,
+    const int* tokens, int rows, int hidden, float scale, int hasScale, float* out)
 {
-    if (wType == 0)
-        launch(embed_kernel<__nv_bfloat16>, rows, 256, 0, e->stream, static_cast<const __nv_bfloat16*>(table), tokens, hidden, scale, hasScale, out);
-    else
-        launch(embed_kernel<float>, rows, 256, 0, e->stream, static_cast<const float*>(table), tokens, hidden, scale, hasScale, out);
+    switch (wType)
+    {
+        case 0: launch(embed_kernel<__nv_bfloat16>, rows, 256, 0, e->stream, static_cast<const __nv_bfloat16*>(table), scales, rowScale, tokens, hidden, scale, hasScale, out); break;
+        case 1: launch(embed_kernel<float>, rows, 256, 0, e->stream, static_cast<const float*>(table), scales, rowScale, tokens, hidden, scale, hasScale, out); break;
+        case 2: launch(embed_kernel<Fp4Nv>, rows, 256, 0, e->stream, static_cast<const Fp4Nv*>(table), scales, rowScale, tokens, hidden, scale, hasScale, out); break;
+        case 3: launch(embed_kernel<Fp4Mx>, rows, 256, 0, e->stream, static_cast<const Fp4Mx*>(table), scales, rowScale, tokens, hidden, scale, hasScale, out); break;
+        default: return -100;
+    }
     return ok(cudaGetLastError());
 }
 
@@ -1287,31 +996,6 @@ AMQE_EXPORT int amqe_add_scaled(Engine* e, float* y, const float* b, float scale
 }
 
 // ── softmax attention: q/k prep (norm, rope, cache append) ────────────────
-
-__device__ __forceinline__ float warp_max(float v)
-{
-    #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
-    return v;
-}
-
-__device__ __forceinline__ float block_max(float v, float* shared)
-{
-    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    int warps = (blockDim.x + 31) >> 5;
-    v = warp_max(v);
-    __syncthreads();
-    if (lane == 0) shared[warp] = v;
-    __syncthreads();
-    if (threadIdx.x < 32)
-    {
-        float t = threadIdx.x < warps ? shared[threadIdx.x] : -INFINITY;
-        t = warp_max(t);
-        if (threadIdx.x == 0) shared[0] = t;
-    }
-    __syncthreads();
-    return shared[0];
-}
 
 /// Writes one head's d key and value values into NVFP4 cache rows (all the
 /// block's threads take part). k and v are in shared memory.
@@ -1373,6 +1057,7 @@ struct AttnPrepArgs
     // A batch (null otherwise): row r is its own sequence, with its own caches and position.
     float* const* kCaches; float* const* vCaches; const int* const* poss;
     const float* const* invFreqs;    // a batch: row r's own rotary frequencies
+    float vNormEps;                  // > 0: each head's value is RMS-normalised (no weight)
 };
 
 template <bool FP4>
@@ -1390,7 +1075,10 @@ __global__ void attn_prep_kernel(AttnPrepArgs a)
     int qw = a.hq * d * (a.gated ? 2 : 1);
     int kvDim = a.hkv * d;
     const float* src = isQ ? row + (long long)h * d * (a.gated ? 2 : 1) : row + qw + (long long)h * d;
+    // The cache row, and the position it stands for: a windowed cache holds only
+    // the rows its window can reach, from pos[2] on.
     int position = a.poss ? *a.poss[r] : *a.pos + r;
+    int rowBase = a.poss ? a.poss[r][2] : a.pos[2];
     float* kCache = a.kCaches ? a.kCaches[r] : a.kCache;
     float* vCache = a.vCaches ? a.vCaches[r] : a.vCache;
 
@@ -1417,7 +1105,7 @@ __global__ void attn_prep_kernel(AttnPrepArgs a)
         {
             int ia = a.interleaved ? 2 * i : i;
             int ib = a.interleaved ? ia + 1 : i + a.pairs;
-            double angle = (double)position * invFreq[i];
+            double angle = (double)(position + rowBase) * invFreq[i];
             double s, c;
             sincos(angle, &s, &c);
             c *= a.ropeScale; s *= a.ropeScale;
@@ -1428,6 +1116,14 @@ __global__ void attn_prep_kernel(AttnPrepArgs a)
         __syncthreads();
     }
 
+    float vInv = 1.f;
+    if (!isQ && a.vNormEps > 0.f)
+    {
+        const float* vr = row + qw + kvDim + (long long)h * d;
+        float ss = 0.f;
+        for (int c = threadIdx.x; c < d; c += blockDim.x) ss += vr[c] * vr[c];
+        vInv = rsqrtf(block_sum(ss, red) / d + a.vNormEps);
+    }
     if (isQ)
     {
         for (int c = threadIdx.x; c < d; c += blockDim.x) a.q[(long long)r * a.hq * d + h * d + c] = buf[c];
@@ -1447,7 +1143,7 @@ __global__ void attn_prep_kernel(AttnPrepArgs a)
                 for (int c = threadIdx.x; c < d; c += blockDim.x)
                 {
                     kh[dst + c] = __float2half_rn(buf[c]);
-                    vh[dst + c] = __float2half_rn(vsrc[c]);
+                    vh[dst + c] = __float2half_rn(vsrc[c] * vInv);
                 }
             }
             else
@@ -1455,13 +1151,13 @@ __global__ void attn_prep_kernel(AttnPrepArgs a)
                 for (int c = threadIdx.x; c < d; c += blockDim.x)
                 {
                     kCache[dst + c] = buf[c];
-                    vCache[dst + c] = vsrc[c];
+                    vCache[dst + c] = vsrc[c] * vInv;
                 }
             }
             return;
         }
         float* vb = buf + d;
-        for (int c = threadIdx.x; c < d; c += blockDim.x) vb[c] = vsrc[c];
+        for (int c = threadIdx.x; c < d; c += blockDim.x) vb[c] = vsrc[c] * vInv;
         __syncthreads();
         long long at = kv4_row_at(position, exact, kvDim, a.hkv);
         kv4_write_head(buf, vb, reinterpret_cast<unsigned char*>(kCache) + at,
@@ -1474,7 +1170,7 @@ __global__ void attn_prep_kernel(AttnPrepArgs a)
         for (int c = threadIdx.x; c < d; c += blockDim.x)
         {
             kCache[dst + c] = buf[c];
-            vCache[dst + c] = vsrc[c];
+            vCache[dst + c] = vsrc[c] * vInv;
         }
     }
 }
@@ -1498,12 +1194,24 @@ AMQE_EXPORT int amqe_attn_prep(Engine* e, const float* qkv, int ldqkv, int rows,
     float* q, float* gate, float* kCache, float* vCache, const int* pos,
     const float* qNormW, float qNormOff, float qNormEps,
     const float* kNormW, float kNormOff, float kNormEps,
-    const float* invFreq, int pairs, double ropeScale, int interleaved, int rope)
+    const float* invFreq, int pairs, double ropeScale, int interleaved, int rope, float vNormEps)
 {
     AttnPrepArgs a{ qkv, ldqkv, rows, hq, hkv, d, gated, q, gate, kCache, vCache, pos,
         qNormW, qNormOff, qNormEps, kNormW, kNormOff, kNormEps, invFreq, pairs, ropeScale, interleaved, rope,
-        nullptr, nullptr, nullptr, nullptr };
+        nullptr, nullptr, nullptr, nullptr, vNormEps };
     return launch_attn_prep(e, dim3(rows, hq + hkv), d, a);
+}
+
+// One row's queries alone (norm and rotary at *pos), for attention over another layer's caches.
+AMQE_EXPORT int amqe_attn_query(Engine* e, const float* proj, int hq, int d, float* q, const int* pos,
+    const float* qNormW, float qNormOff, float qNormEps,
+    const float* invFreq, int pairs, double ropeScale, int interleaved, int rope)
+{
+    AttnPrepArgs a{ proj, hq * d, 1, hq, 0, d, 0, q, nullptr, nullptr, nullptr, pos,
+        qNormW, qNormOff, qNormEps, nullptr, 0.f, 0.f, invFreq, pairs, ropeScale, interleaved, rope,
+        nullptr, nullptr, nullptr, nullptr, 0.f };
+    launch(attn_prep_kernel<false>, dim3(1, hq), d >= 128 ? 128 : 64, d * sizeof(float), e->stream, a);
+    return ok(cudaGetLastError());
 }
 
 // One decode row for each of `batch` sequences: row r appends to kCaches[r] and
@@ -1512,11 +1220,11 @@ AMQE_EXPORT int amqe_attn_prep_batch(Engine* e, const float* qkv, int ldqkv, int
     float* q, float* gate, float* const* kCaches, float* const* vCaches, const int* const* poss,
     const float* qNormW, float qNormOff, float qNormEps,
     const float* kNormW, float kNormOff, float kNormEps,
-    const float* const* invFreqs, int pairs, double ropeScale, int interleaved, int rope)
+    const float* const* invFreqs, int pairs, double ropeScale, int interleaved, int rope, float vNormEps)
 {
     AttnPrepArgs a{ qkv, ldqkv, batch, hq, hkv, d, gated, q, gate, nullptr, nullptr, nullptr,
         qNormW, qNormOff, qNormEps, kNormW, kNormOff, kNormEps, nullptr, pairs, ropeScale, interleaved, rope,
-        kCaches, vCaches, poss, rope ? invFreqs : nullptr };
+        kCaches, vCaches, poss, rope ? invFreqs : nullptr, vNormEps };
     return launch_attn_prep(e, dim3(batch, hq + hkv), d, a);
 }
 
@@ -1649,9 +1357,10 @@ __device__ __forceinline__ float kv4_load(const unsigned char* row, int col0, in
 {
     float s = e4m3_value(row[kvDim / 2 + (col0 >> 4)]) * reinterpret_cast<const float*>(row + headOff)[head];
     const unsigned char* codes = row + (col0 >> 1);
-    if constexpr (DPL == 8)
+    if constexpr (DPL >= 8)
     {
         decode8_e2m1(*reinterpret_cast<const unsigned int*>(codes), v);
+        if constexpr (DPL == 16) decode8_e2m1(reinterpret_cast<const unsigned int*>(codes)[1], v + 8);
     }
     else
     {
@@ -1668,7 +1377,7 @@ __device__ __forceinline__ float kv4_load(const unsigned char* row, int col0, in
 
 // Decode attention over NVFP4 caches for heads of 32·DPL (DPL 2, 4 or 8): each
 // lane owns DPL contiguous dimensions, so a key costs a lane one code load, one
-// block scale and one head scale. Scores as attention_split_kernel; values are
+// block scale and one head scale (DPL 16 too: 512-wide heads). Scores as attention_split_kernel; values are
 // summed per warp over every WARPS-th key, then across warps.
 template <int DPL>
 __global__ void __launch_bounds__(SPLIT_THREADS) attention_split_fp4_kernel(const float* q, const float* kCache,
@@ -1769,8 +1478,8 @@ __global__ void __launch_bounds__(SPLIT_THREADS) attention_split_fp4_kernel(cons
     if (threadIdx.x == 0) { out[0] = m; out[1] = l; }
 }
 
-// The same for the G query heads that share one KV head: their rows are loaded
-// and decoded once. Each head's arithmetic is that of the kernel above, in the
+// The same for G query heads of those that share one KV head: their rows are
+// loaded and decoded once for the G. Each head's arithmetic is that of the kernel above, in the
 // same order, so its result is the same to the bit.
 template <int DPL, int G>
 __global__ void __launch_bounds__(SPLIT_THREADS) attention_split_group_fp4_kernel(const float* q, const float* kCache,
@@ -1784,7 +1493,8 @@ __global__ void __launch_bounds__(SPLIT_THREADS) attention_split_group_fp4_kerne
     __shared__ float sp[G][SPLIT_KEYS];
     __shared__ float red[32];
     __shared__ float accs[WARPS][G][D];
-    int kvh = blockIdx.x, r = blockIdx.y, split = split0 + (int)blockIdx.z;
+    int h0 = blockIdx.x * G, r = blockIdx.y, split = split0 + (int)blockIdx.z;
+    int kvh = h0 / (hq / hkv);
     int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     if (kCaches) { kCache = kCaches[r]; vCache = vCaches[r]; }
     int qPos = poss ? *poss[r] : *pos + r;
@@ -1794,7 +1504,7 @@ __global__ void __launch_bounds__(SPLIT_THREADS) attention_split_group_fp4_kerne
     float* outs[G];
     #pragma unroll
     for (int g = 0; g < G; g++)
-        outs[g] = part + (((long long)r * hq + kvh * G + g) * nsplit + (int)blockIdx.z) * (D + 2);
+        outs[g] = part + (((long long)r * hq + h0 + g) * nsplit + (int)blockIdx.z) * (D + 2);
     if (k0 >= k1)
     {
         if (threadIdx.x < G) { outs[threadIdx.x][0] = -INFINITY; outs[threadIdx.x][1] = 0.f; }
@@ -1812,7 +1522,7 @@ __global__ void __launch_bounds__(SPLIT_THREADS) attention_split_group_fp4_kerne
     #pragma unroll
     for (int g = 0; g < G; g++)
     {
-        const float* qr = q + ((long long)r * hq + kvh * G + g) * D;
+        const float* qr = q + ((long long)r * hq + h0 + g) * D;
         #pragma unroll
         for (int i = 0; i < DPL; i++) qv[g][i] = qr[dim0 + i];
     }
@@ -1888,17 +1598,28 @@ static void launch_split_fp4(Engine* e, dim3 grid, const float* q, const float* 
     const int* pos, int hq, int hkv, int nsplit, float scale, float softcap, int window, int d,
     const float* const* kCaches, const float* const* vCaches, const int* const* poss, int split0)
 {
+    if constexpr (DPL == 16)
+    {
+        // Two heads a group: four would not fit a block's shared memory.
+        if (d == 32 * DPL && (hq / hkv) % 2 == 0)
+            launch(attention_split_group_fp4_kernel<DPL, 2>, dim3(hq / 2, grid.y, grid.z), SPLIT_THREADS, 0, e->stream, q, kCache, vCache, part, pos,
+                hq, hkv, nsplit, scale, softcap, window, kCaches, vCaches, poss, split0);
+        else
+            launch(attention_split_fp4_kernel<DPL>, grid, SPLIT_THREADS, 0, e->stream, q, kCache, vCache, part, pos, hq, hkv, nsplit,
+                scale, softcap, window, kCaches, vCaches, poss, split0);
+        return;
+    }
     if constexpr (DPL == 2 || DPL == 4 || DPL == 8)
     {
-        if (d == 32 * DPL && hq == 4 * hkv)
+        if (d == 32 * DPL && (hq / hkv) % 4 == 0)
         {
-            launch(attention_split_group_fp4_kernel<DPL, 4>, dim3(hkv, grid.y, grid.z), SPLIT_THREADS, 0, e->stream, q, kCache, vCache, part, pos,
+            launch(attention_split_group_fp4_kernel<DPL, 4>, dim3(hq / 4, grid.y, grid.z), SPLIT_THREADS, 0, e->stream, q, kCache, vCache, part, pos,
                 hq, hkv, nsplit, scale, softcap, window, kCaches, vCaches, poss, split0);
             return;
         }
-        if (d == 32 * DPL && hq == 2 * hkv)
+        if (d == 32 * DPL && (hq / hkv) % 2 == 0)
         {
-            launch(attention_split_group_fp4_kernel<DPL, 2>, dim3(hkv, grid.y, grid.z), SPLIT_THREADS, 0, e->stream, q, kCache, vCache, part, pos,
+            launch(attention_split_group_fp4_kernel<DPL, 2>, dim3(hq / 2, grid.y, grid.z), SPLIT_THREADS, 0, e->stream, q, kCache, vCache, part, pos,
                 hq, hkv, nsplit, scale, softcap, window, kCaches, vCaches, poss, split0);
             return;
         }
@@ -2157,6 +1878,12 @@ static int launch_attention_as(Engine* e, const float* q, const float* kCache, c
             (const float* const*)nullptr, (const float* const*)nullptr, (const int* const*)nullptr);
     }
     size_t smem = (size_t)(PF_KT * (D + 1) + PF_KT * D + PF_QT * D) * sizeof(float);
+    if constexpr (DPL > 8)
+    {
+        return -200;   // its tiles pass a block's shared memory: prompts of these heads go through cuBLAS
+    }
+    else
+    {
     static bool configured[9] = {};
     if (!configured[DPL])
     {
@@ -2168,6 +1895,7 @@ static int launch_attention_as(Engine* e, const float* q, const float* kCache, c
     dim3 grid(hq, (rows + PF_QT - 1) / PF_QT);
     launch(attention_prefill_kernel<DPL, FP4>, grid, 128, smem, e->stream, q, kCache, vCache, gate, out, pos, rows, hq, hkv, scale, softcap, window, d);
     return ok(cudaGetLastError());
+    }
 }
 
 template <int DPL>
@@ -2199,18 +1927,19 @@ __global__ void kv4_widen_kernel(const float* cache, float* out, int kStart, int
 // One block per (row, head in group): scale, softcap, causal and window
 // mask, softmax, written back in place as probabilities.
 __global__ void attn_softmax_rows_kernel(float* scores, int rows, int keys, int kStart, int pos0,
-    float scale, float softcap, int window)
+    float scale, float softcap, int window, const int* reach)
 {
     pdl_enter();
     __shared__ float red[32];
     int r = blockIdx.x;
     float* row = scores + ((long long)blockIdx.y * rows + r) * keys;
     int qPos = pos0 + r;
+    int ahead = qPos + (reach ? reach[r] : 0);   // the last key this row sees
     float m = -INFINITY;
     for (int j = threadIdx.x; j < keys; j += blockDim.x)
     {
         int key = kStart + j;
-        bool masked = key > qPos || (window > 0 && qPos - key >= window);
+        bool masked = key > ahead || (window > 0 && qPos - key >= window);
         float v = masked ? -INFINITY : softcapped(row[j] * scale, softcap);
         row[j] = v;
         m = fmaxf(m, v);
@@ -2238,18 +1967,19 @@ __global__ void attn_gate_kernel(float* out, const float* gate, long long count)
 // One segment's part of a score row: masked, softmaxed against the segment's
 // own maximum, and its maximum and sum kept for the merge.
 __global__ void attn_seg_softmax_kernel(float* scores, float* segM, float* segS, int rows, int keys, int kStart, int pos0,
-    float scale, float softcap, int window, int hq, int head0)
+    float scale, float softcap, int window, int hq, int head0, const int* reach)
 {
     pdl_enter();
     __shared__ float red[32];
     int r = blockIdx.x;
     float* row = scores + ((long long)blockIdx.y * rows + r) * keys;
     int qPos = pos0 + r;
+    int ahead = qPos + (reach ? reach[r] : 0);   // the last key this row sees
     float m = -INFINITY;
     for (int j = threadIdx.x; j < keys; j += blockDim.x)
     {
         int key = kStart + j;
-        bool masked = key > qPos || (window > 0 && qPos - key >= window);
+        bool masked = key > ahead || (window > 0 && qPos - key >= window);
         float v = masked ? -INFINITY : softcapped(row[j] * scale, softcap);
         row[j] = v;
         m = fmaxf(m, v);
@@ -2300,7 +2030,7 @@ __global__ void attn_seg_merge_kernel(float* out, const float* seg, float* runM,
 constexpr int SEG_KEYS_MAX = 32768;
 constexpr int SEG_KEYS_DEFAULT = 8192;   // measured: reading 60K-190K on Qwen 3.5 4B is 12% faster than with 32,768
 static int SEG_KEYS = SEG_KEYS_DEFAULT;   // amqe_set_attention_segments, for tests
-static size_t ROWS_BUDGET = (size_t)1 << 30;
+static size_t ROWS_BUDGET = (size_t)1 << 28;   // 1 << 30 read 128K tokens on Qwen 3.5 4B 1.7x slower, and held 1.5 GB more
 
 // amqe_attention_rows for a span of keys too long to hold its scores at once:
 // SEG_KEYS keys at a time, each segment softmaxed against its own maximum and
@@ -2359,7 +2089,7 @@ static int attention_rows_segmented(Engine* e, const float* q, const float* kCac
                 &zero, e->scores, CUDA_R_32F, n, strideS, g, ct, CUBLAS_GEMM_DEFAULT);
             if (st != CUBLAS_STATUS_SUCCESS) return -(1000 + (int)st);
             launch(attn_seg_softmax_kernel, dim3(rows, g), 256, 0, e->stream, e->scores, segM, segS, rows, n, from, pos0,
-                scale, softcap, window, hq, kh * g);
+                scale, softcap, window, hq, kh * g, e->reach);
             st = cublasGemmStridedBatchedEx(e->blas, CUBLAS_OP_N, CUBLAS_OP_N, d, rows, n,
                 &one, vSpan + kh * d, CUDA_R_32F, kvDim, 0, e->scores, CUDA_R_32F, n, strideS,
                 &zero, tmp + (long long)kh * g * d, CUDA_R_32F, hq * d, d, g, ct, CUBLAS_GEMM_DEFAULT);
@@ -2391,7 +2121,7 @@ AMQE_EXPORT int amqe_attention_rows(Engine* e, const float* q, const float* kCac
     int kStart = window > 0 ? max(0, pos0 - window + 1) : 0;
     int keys = last + 1 - kStart;
     size_t need = (size_t)g * rows * keys;
-    // Past a budget (128K keys for a group of 4 heads, or for a widened
+    // Past a budget (32K keys for a group of 4 heads, or for a widened
     // 1,024-wide cache) the span runs in segments.
     size_t widened = e->kvFp4 ? (size_t)2 * keys * kvDim : 0;
     size_t largest = need > widened ? need : widened;
@@ -2440,7 +2170,7 @@ AMQE_EXPORT int amqe_attention_rows(Engine* e, const float* q, const float* kCac
             &zero, e->scores, CUDA_R_32F, keys, strideS, g, ct, CUBLAS_GEMM_DEFAULT);
         if (st != CUBLAS_STATUS_SUCCESS) return -(1000 + (int)st);
         launch(attn_softmax_rows_kernel, dim3(rows, g), 256, 0, e->stream, e->scores, rows, keys, kStart, pos0,
-            scale, softcap, window);
+            scale, softcap, window, e->reach);
         // O[d x rows] = V . P.
         st = cublasGemmStridedBatchedEx(e->blas, CUBLAS_OP_N, CUBLAS_OP_N, d, rows, keys,
             &one, V, CUDA_R_32F, kvDim, 0, e->scores, CUDA_R_32F, keys, strideS,
@@ -2455,6 +2185,10 @@ AMQE_EXPORT int amqe_attention_rows(Engine* e, const float* q, const float* kCac
     return ok(cudaGetLastError());
 }
 
+/// Until it is set to null: how far past its own position each row of amqe_attention_rows
+/// sees ([rows]; the keys of the rows ahead are in the cache, being the same chunk's).
+AMQE_EXPORT int amqe_set_reach(Engine* e, const int* reach) { e->reach = reach; return 0; }
+
 /// For tests: how many splits (decode) and keys (prompts) a segment takes, and
 /// the scratch bytes past which a prompt runs in segments. 0 is the default.
 /// Set before any sequence grows its cache: the scratch is sized by it.
@@ -2462,7 +2196,7 @@ AMQE_EXPORT int amqe_set_attention_segments(int splits, int keys, long long budg
 {
     SEG_SPLITS = splits > 0 ? min(splits, SEG_SPLITS_MAX) : SEG_SPLITS_MAX;
     SEG_KEYS = keys > 0 ? min(keys, SEG_KEYS_MAX) : SEG_KEYS_DEFAULT;
-    ROWS_BUDGET = budget > 0 ? (size_t)budget : (size_t)1 << 30;
+    ROWS_BUDGET = budget > 0 ? (size_t)budget : (size_t)1 << 28;
     return 0;
 }
 
@@ -2490,11 +2224,11 @@ AMQE_EXPORT int amqe_attention(Engine* e, const float* q, const float* kCache, c
     const float* gate, float* out, const int* pos, int rows, int hq, int hkv, int d,
     float scale, float softcap, int window, float* part, int nsplit)
 {
-    if (d < 1 || d > 256) return -100;
+    if (d < 1 || (d > 256 && d != 512)) return -100;
     switch ((d + 31) / 32)
     {
 #define ATTN_CASE(n) case n: return launch_attention<n>(e, q, kCache, vCache, gate, out, pos, rows, hq, hkv, scale, softcap, window, part, nsplit, d);
-        ATTN_CASE(1) ATTN_CASE(2) ATTN_CASE(3) ATTN_CASE(4) ATTN_CASE(5) ATTN_CASE(6) ATTN_CASE(7) ATTN_CASE(8)
+        ATTN_CASE(1) ATTN_CASE(2) ATTN_CASE(3) ATTN_CASE(4) ATTN_CASE(5) ATTN_CASE(6) ATTN_CASE(7) ATTN_CASE(8) ATTN_CASE(16)
 #undef ATTN_CASE
         default: return -100;
     }
@@ -2519,11 +2253,11 @@ AMQE_EXPORT int amqe_attention_batch(Engine* e, const float* q, const float* con
     const float* gate, float* out, const int* const* poss, int batch, int hq, int hkv, int d,
     float scale, float softcap, int window, float* part, int nsplit)
 {
-    if (d < 1 || d > 256 || batch < 1 || batch > 8) return -100;
+    if (d < 1 || (d > 256 && d != 512) || batch < 1 || batch > 8) return -100;
     switch ((d + 31) / 32)
     {
 #define ATTN_CASE(n) case n: return launch_attention_batch<n>(e, q, kCaches, vCaches, gate, out, poss, batch, hq, hkv, scale, softcap, window, part, nsplit, d);
-        ATTN_CASE(1) ATTN_CASE(2) ATTN_CASE(3) ATTN_CASE(4) ATTN_CASE(5) ATTN_CASE(6) ATTN_CASE(7) ATTN_CASE(8)
+        ATTN_CASE(1) ATTN_CASE(2) ATTN_CASE(3) ATTN_CASE(4) ATTN_CASE(5) ATTN_CASE(6) ATTN_CASE(7) ATTN_CASE(8) ATTN_CASE(16)
 #undef ATTN_CASE
         default: return -100;
     }

@@ -1,0 +1,561 @@
+{
+ "vars": {
+  "name": "World",
+  "n": 7,
+  "x": 2.5,
+  "yes": true,
+  "no": false,
+  "nothing": null,
+  "empty": "",
+  "words": [
+   "b",
+   "A",
+   "c",
+   "a"
+  ],
+  "nums": [
+   3,
+   1,
+   2
+  ],
+  "nested": [
+   [
+    1,
+    2
+   ],
+   [
+    3,
+    [
+     4,
+     5
+    ]
+   ]
+  ],
+  "text": "  some text\nwith lines \n",
+  "emoji": "a😀bé",
+  "quotes": "it's \"so\" \\ \t",
+  "d": {
+   "b": 1,
+   "a": "x",
+   "C": [
+    true,
+    null
+   ],
+   "items": "shadow"
+  },
+  "people": [
+   {
+    "name": "Zed",
+    "age": 30,
+    "tags": [
+     "p"
+    ]
+   },
+   {
+    "name": "amy",
+    "age": 25
+   },
+   {
+    "name": "Bob",
+    "age": 30,
+    "tags": []
+   }
+  ],
+  "big": 12345678901234,
+  "tiny": 1e-07,
+  "huge": 1e+22,
+  "whole": 3.0,
+  "tool": {
+   "type": "function",
+   "function": {
+    "name": "f",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "q": {
+       "type": "string",
+       "description": "ü <b>"
+      }
+     },
+     "required": [
+      "q"
+     ]
+    }
+   }
+  }
+ },
+ "cases": [
+  {
+   "template": "Hello {{ name }}!",
+   "text": "Hello World!"
+  },
+  {
+   "template": "{{ n }} {{ x }} {{ yes }} {{ nothing }} {{ missing }}|",
+   "text": "7 2.5 True None |"
+  },
+  {
+   "template": "{{ words }} {{ d }} {{ (1, 'a') }} {{ (1,) }} {{ () }}",
+   "text": "['b', 'A', 'c', 'a'] {'b': 1, 'a': 'x', 'C': [True, None], 'items': 'shadow'} (1, 'a') (1,) ()"
+  },
+  {
+   "template": "{{ big }} {{ tiny }} {{ huge }} {{ whole }} {{ 1/3 }} {{ 10/5 }}",
+   "text": "12345678901234 1e-07 1e+22 3.0 0.3333333333333333 2.0"
+  },
+  {
+   "template": "{{ quotes }} {{ [quotes] }} {{ [emoji] }}",
+   "text": "it's \"so\" \\ \t ['it\\'s \"so\" \\\\ \\t'] ['a😀bé']"
+  },
+  {
+   "template": "a\n{% if yes %}\nb\n{% endif %}\nc\n",
+   "text": "a\nb\nc"
+  },
+  {
+   "template": "a\n  {% if yes %}\n  b\n  {% endif %}\nc",
+   "text": "a\n  b\nc"
+  },
+  {
+   "template": "a  {% if yes %}  b  {% endif %}  c",
+   "text": "a    b    c"
+  },
+  {
+   "template": "a  {%- if yes -%}  b  {%- endif -%}  c",
+   "text": "abc"
+  },
+  {
+   "template": "a\n\n{%- if yes %}\n\nb{% endif -%}\n\n c",
+   "text": "a\nbc"
+  },
+  {
+   "template": "x {{- name -}} y",
+   "text": "xWorldy"
+  },
+  {
+   "template": "x {{- ' ' + name }} y\n\n",
+   "text": "x World y\n"
+  },
+  {
+   "template": "a {# comment #} b",
+   "text": "a  b"
+  },
+  {
+   "template": "a\n{# comment #}\nb",
+   "text": "a\nb"
+  },
+  {
+   "template": "a\n  {#- comment -#}\n  b",
+   "text": "ab"
+  },
+  {
+   "template": "  {%+ if yes %}keep{% endif %}",
+   "text": "  keep"
+  },
+  {
+   "template": "a\n{% if yes +%}\nb{% endif %}",
+   "text": "a\n\nb"
+  },
+  {
+   "template": "{% raw %}{{ not }} {% this %}{% endraw %}!",
+   "text": "{{ not }} {% this %}!"
+  },
+  {
+   "template": "a\n{%- raw -%}\n {{x}} \n{%- endraw -%}\n b",
+   "text": "a{{x}}b"
+  },
+  {
+   "template": "line one\r\nline two\r\n{{ n }}\r\n",
+   "text": "line one\nline two\n7"
+  },
+  {
+   "template": "{{ '\\n' }}|{{ '\\t\\x41\\u00e9\\\\' }}|{{ 'a\\'b' }}|{{ \"q\\\"q\" }}|{{ '\\d' }}",
+   "text": "\n|\tAé\\|a'b|q\"q|\\d"
+  },
+  {
+   "template": "{{ 'a' 'b' \"c\" }}",
+   "text": "abc"
+  },
+  {
+   "template": "{{ '{{ x }}' }} {{ '%}' }}",
+   "text": "{{ x }} %}"
+  },
+  {
+   "template": "\n\n{% set a = 1 %}\n\n{{ a }}\n\n",
+   "text": "\n\n\n1\n"
+  },
+  {
+   "template": "\t{% set a = 1 %}\t{{ a }}",
+   "text": "\t1"
+  },
+  {
+   "template": "{% for i in nums %}\n  {{ i }}\n{% endfor %}\nend",
+   "text": "  3\n  1\n  2\nend"
+  },
+  {
+   "template": "{%- for i in nums -%}\n  {{ i }},\n{%- endfor -%}\n end",
+   "text": "3,1,2,end"
+  },
+  {
+   "template": "{{\n name\n}}",
+   "text": "World"
+  },
+  {
+   "template": "{{ 1 + 2 * 3 - 4 // 3 % 2 ** 2 }} {{ 7 // 2 }} {{ -7 // 2 }} {{ -7 % 3 }} {{ 7.5 // 2 }} {{ 2 ** 10 }} {{ 2 ** -1 }}",
+   "text": "6 3 -4 2 3.0 1024 0.5"
+  },
+  {
+   "template": "{{ 'a' ~ 1 ~ none ~ true }}",
+   "text": "a1NoneTrue"
+  },
+  {
+   "template": "{{ 'ab' * 3 }} {{ [1] * 2 }} {{ [1] + [2, 3] }}",
+   "text": "ababab [1, 1] [1, 2, 3]"
+  },
+  {
+   "template": "{{ 1 < 2 < 3 }} {{ 1 < 3 < 2 }} {{ 'a' < 'b' }} {{ 1 == 1.0 }} {{ true == 1 }} {{ 'a' != 'b' }}",
+   "text": "True False True True True True"
+  },
+  {
+   "template": "{{ 'b' in words }} {{ 'z' not in words }} {{ 'or' in 'World' }} {{ 'a' in d }} {{ 2 in nums }}",
+   "text": "True True True True True"
+  },
+  {
+   "template": "{{ not yes }} {{ not no and yes }} {{ no or 'other' }} {{ empty or none or 0 or 'last' }} {{ yes and 'then' }}",
+   "text": "False True other last then"
+  },
+  {
+   "template": "{{ 'yes' if n > 5 else 'no' }} {{ 'x' if no }}|{{ 'a' if no else 'b' if no else 'c' }}",
+   "text": "yes |c"
+  },
+  {
+   "template": "{{ -n }} {{ +n }} {{ -n|abs }} {{ (-n)|abs }} {{ -2.5 }}",
+   "text": "-7 7 7 7 -2.5"
+  },
+  {
+   "template": "{{ words[0] }} {{ words[-1] }} {{ words[1:3] }} {{ words[::-1] }} {{ words[:-1] }} {{ words[10] }}| {{ words[5:] }}",
+   "text": "b a ['A', 'c'] ['a', 'c', 'A', 'b'] ['b', 'A', 'c'] | []"
+  },
+  {
+   "template": "{{ name[0] }} {{ name[1:3] }} {{ name[::-1] }} {{ name[-2:] }} {{ emoji[1] }} {{ emoji[1:] }} {{ emoji|length }}",
+   "text": "W or dlroW ld 😀 😀bé 4"
+  },
+  {
+   "template": "{{ d.b }} {{ d['a'] }} {{ d.missing }}| {{ d['missing'] }}| {{ d.C[0] }} {{ d['items'] }} {{ d.get('b') }} {{ d.get('z', 'dflt') }} {{ d.get('z') }}",
+   "text": "1 x | | True shadow 1 dflt None"
+  },
+  {
+   "template": "{{ {'a': 1, 'b': [1, 2]} }} {{ {'a': 1}.a }} {{ {1: 'one'}[1] }} {{ {} }}",
+   "text": "{'a': 1, 'b': [1, 2]} 1 one {}"
+  },
+  {
+   "template": "{{ 1_000 }} {{ 1.5e3 }} {{ 0x1F }} {{ 5 .__class__ if no else 'ok' }}",
+   "text": "1000 1500.0 31 ok"
+  },
+  {
+   "template": "{{ (1, 2, 3)[1] }} {{ [1, 2, 3][-1] }}",
+   "text": "2 3"
+  },
+  {
+   "template": "{{ '%s is %d, %.2f%%' % ('a', 3, 2.5) }} {{ '%s' % 'x' }}",
+   "text": "a is 3, 2.50% x"
+  },
+  {
+   "template": "{{ '{} and {}'.format(1, 'b') }} {{ '{0}{1}{0}'.format('x', 'y') }} {{ '{k}'.format(k=3) }}",
+   "text": "1 and b xyx 3"
+  },
+  {
+   "template": "{{ none is none }} {{ 1 is number and yes }}",
+   "text": "True True"
+  },
+  {
+   "template": "{{ name is defined }} {{ missing is defined }} {{ missing is undefined }} {{ missing is not defined }} {{ nothing is none }} {{ nothing is not none }}",
+   "text": "True False True True True False"
+  },
+  {
+   "template": "{{ name is string }} {{ n is string }} {{ d is mapping }} {{ words is sequence }} {{ d is sequence }} {{ name is iterable }} {{ n is iterable }} {{ missing is iterable }}",
+   "text": "True False True True True True False True"
+  },
+  {
+   "template": "{{ n is number }} {{ x is float }} {{ n is integer }} {{ yes is boolean }} {{ yes is integer }} {{ yes is true }} {{ n is true }} {{ no is false }} {{ yes is number }}",
+   "text": "True True True True False True False True True"
+  },
+  {
+   "template": "{{ n is odd }} {{ n is even }} {{ n is divisibleby 7 }} {{ n is divisibleby(2) }} {{ 3 is in nums }} {{ n is eq 7 }} {{ n is gt(5) }} {{ n is lt 5 }} {{ 'abc' is lower }} {{ 'ABC' is upper }} {{ none is sameas none }}",
+   "text": "True False True False True True True False True True True"
+  },
+  {
+   "template": "{% if words is iterable and words is not mapping and words is not string %}list{% endif %}",
+   "text": "list"
+  },
+  {
+   "template": "{% if missing is defined and missing.x %}a{% else %}b{% endif %}",
+   "text": "b"
+  },
+  {
+   "template": "{{ text|trim }}| {{ '--a--'|trim('-') }} {{ name|upper }} {{ name|lower }} {{ 'hello wOrld'|capitalize }} {{ 'hello wOrld-foo (bar)'|title }}",
+   "text": "some text\nwith lines| a WORLD world Hello world Hello World-Foo (Bar)"
+  },
+  {
+   "template": "{{ words|length }} {{ words|count }} {{ name|length }} {{ d|length }} {{ missing|length }}",
+   "text": "4 4 5 4 0"
+  },
+  {
+   "template": "{{ words|join }} {{ words|join(', ') }} {{ people|join('/', attribute='name') }} {{ nums|join('-') }}",
+   "text": "bAca b, A, c, a Zed/amy/Bob 3-1-2"
+  },
+  {
+   "template": "{{ words|first }} {{ words|last }} {{ []|first }}| {{ 'abc'|first }} {{ 'abc'|last }} {{ words|reverse|list }} {{ 'abc'|reverse }} {{ 'abc'|list }}",
+   "text": "b a | a c ['a', 'c', 'A', 'b'] cba ['a', 'b', 'c']"
+  },
+  {
+   "template": "{{ missing|default('d') }} {{ empty|default('d') }}| {{ empty|default('d', true) }} {{ nothing|default('d') }} {{ nothing|d('d', boolean=true) }}",
+   "text": "d | d None d"
+  },
+  {
+   "template": "{{ words|sort }} {{ words|sort(case_sensitive=true) }} {{ nums|sort(reverse=true) }} {{ people|sort(attribute='name')|map(attribute='name')|list }}",
+   "text": "['A', 'a', 'b', 'c'] ['A', 'a', 'b', 'c'] [3, 2, 1] ['amy', 'Bob', 'Zed']"
+  },
+  {
+   "template": "{{ d|dictsort }} {{ {'b': 1, 'A': 3, 'c': 2}|dictsort }} {{ {'b': 1, 'A': 3, 'c': 2}|dictsort(true) }} {{ {'b': 1, 'A': 3, 'c': 2}|dictsort(by='value') }} {{ {'b': 1, 'a': 3}|dictsort(reverse=true) }}",
+   "text": "[('a', 'x'), ('b', 1), ('C', [True, None]), ('items', 'shadow')] [('A', 3), ('b', 1), ('c', 2)] [('A', 3), ('b', 1), ('c', 2)] [('b', 1), ('c', 2), ('A', 3)] [('b', 1), ('a', 3)]"
+  },
+  {
+   "template": "{{ words|map('upper')|list }} {{ people|map(attribute='age')|list }} {{ people|map(attribute='tags', default='-')|list }} {{ ['1', 'x']|map('int', 5)|list }}",
+   "text": "['B', 'A', 'C', 'A'] [30, 25, 30] [['p'], '-', []] [1, 5]"
+  },
+  {
+   "template": "{{ nums|select('gt', 1)|list }} {{ nums|reject('odd')|list }} {{ [0, 1, '', 'a']|select|list }} {{ people|selectattr('age', 'equalto', 30)|map(attribute='name')|list }} {{ people|selectattr('tags')|list|length }} {{ people|rejectattr('tags', 'defined')|map(attribute='name')|join }}",
+   "text": "[3, 2] [2] [1, 'a'] ['Zed', 'Bob'] 1 amy"
+  },
+  {
+   "template": "{{ [1, 2, 1, 'a', 'A']|unique|list }} {{ nums|max }} {{ nums|min }} {{ nums|sum }} {{ people|sum(attribute='age') }} {{ words|max }} {{ [1, 2.5]|sum }}",
+   "text": "[1, 2, 'a'] 3 1 6 85 c 3.5"
+  },
+  {
+   "template": "{{ '3'|int }} {{ 'x'|int }} {{ 'x'|int(9) }} {{ 3.9|int }} {{ '2.5'|float }} {{ 2.567|round(2) }} {{ 2.5|round }} {{ 2.4|round(0, 'ceil') }} {{ n|string + '!' }} {{ 3|float }}",
+   "text": "3 0 9 3 2.5 2.57 2.0 3.0 7! 3.0"
+  },
+  {
+   "template": "{{ 'aXbXc'|replace('X', '-') }} {{ 'aXbXc'|replace('X', '-', 1) }} {{ 'a b'|replace(' ', '') }}",
+   "text": "a-b-c a-bXc ab"
+  },
+  {
+   "template": "{{ tool|tojson }}",
+   "text": "{\"type\": \"function\", \"function\": {\"name\": \"f\", \"parameters\": {\"type\": \"object\", \"properties\": {\"q\": {\"type\": \"string\", \"description\": \"ü <b>\"}}, \"required\": [\"q\"]}}}"
+  },
+  {
+   "template": "{{ tool|tojson(indent=2) }}",
+   "text": "{\n  \"type\": \"function\",\n  \"function\": {\n    \"name\": \"f\",\n    \"parameters\": {\n      \"type\": \"object\",\n      \"properties\": {\n        \"q\": {\n          \"type\": \"string\",\n          \"description\": \"ü <b>\"\n        }\n      },\n      \"required\": [\n        \"q\"\n      ]\n    }\n  }\n}"
+  },
+  {
+   "template": "{{ d|tojson }} {{ [1, 2.0, 'é', none, true]|tojson }} {{ []|tojson }} {{ {}|tojson(indent=4) }} {{ 'a\"b\\\\c\\n'|tojson }}",
+   "text": "{\"b\": 1, \"a\": \"x\", \"C\": [true, null], \"items\": \"shadow\"} [1, 2.0, \"é\", null, true] [] {} \"a\\\"b\\\\c\\n\""
+  },
+  {
+   "template": "{{ d|tojson(sort_keys=true) }} {{ {'a': 1, 'b': [1]}|tojson(separators=(',', ':')) }} {{ 'é😀'|tojson(ensure_ascii=true) }} {{ [[1], []]|tojson(indent=1) }}",
+   "text": "{\"C\": [true, null], \"a\": \"x\", \"b\": 1, \"items\": \"shadow\"} {\"a\":1,\"b\":[1]} \"\\u00e9\\ud83d\\ude00\" [\n [\n  1\n ],\n []\n]"
+  },
+  {
+   "template": "{{ text|indent }}|{{ 'a\\nb\\n\\nc'|indent(2, true) }}|{{ 'a\\nb'|indent('>>') }}",
+   "text": "  some text\n    with lines \n|  a\n  b\n\n  c|a\n>>b"
+  },
+  {
+   "template": "{{ d|items|list }} {{ '<a & \"b\">'|e }} {{ 'x'|safe }} {{ 'one two three'|wordcount }} {{ 'abc'|center(9) }}| {{ 'a long sentence here'|truncate(10) }}",
+   "text": "[('b', 1), ('a', 'x'), ('C', [True, None]), ('items', 'shadow')] &lt;a &amp; &#34;b&#34;&gt; x 3    abc   | a long..."
+  },
+  {
+   "template": "{% for a, g in people|groupby('age') %}{{ a }}:{{ g|map(attribute='name')|join(',') }};{% endfor %} {{ nums|batch(2)|list }} {{ [1,2,3,4,5]|slice(2)|list }} {{ [1,2,3]|batch(2, 'x')|list }}",
+   "text": "25:amy;30:Zed,Bob; [[3, 1], [2]] [[1, 2, 3], [4, 5]] [[1, 2], [3, 'x']]"
+  },
+  {
+   "template": "{{ '  a '.strip() }}|{{ 'xxaxx'.strip('x') }}|{{ '\\n\\na\\n'.lstrip('\\n') }}|{{ 'a\\n\\n'.rstrip('\\n') }}|",
+   "text": "a|a|a\n|a|"
+  },
+  {
+   "template": "{{ 'a,b,c'.split(',') }} {{ 'a b  c'.split() }} {{ 'a,b,c'.split(',', 1) }} {{ 'a,b,c'.rsplit(',', 1) }} {{ 'x</think>y</think>z'.split('</think>')[-1] }} {{ ''.split(',') }} {{ ''.split() }} {{ 'a--b'.split('--')[0] }}",
+   "text": "['a', 'b', 'c'] ['a', 'b', 'c'] ['a', 'b,c'] ['a,b', 'c'] z [''] [] a"
+  },
+  {
+   "template": "{{ 'abc'.startswith('ab') }} {{ 'abc'.endswith('bc') }} {{ 'abc'.startswith(('x', 'a')) }} {{ 'abc'.upper() }} {{ 'a-b'.replace('-', '+') }} {{ 'hello'.find('l') }} {{ 'hello'.count('l') }} {{ 'ab'.join(['1', '2']) }} {{ 'a\\nb\\r\\nc'.splitlines() }} {{ 'they\\'re here'.title() }} {{ 'aBc'.capitalize() }} {{ '42'.isdigit() }} {{ 'prefix-x'.removeprefix('prefix-') }} {{ 'a=b=c'.partition('=') }} {{ '7'.zfill(3) }}",
+   "text": "True True True ABC a+b 2 2 1ab2 ['a', 'b', 'c'] They'Re Here Abc True x ('a', '=', 'b=c') 007"
+  },
+  {
+   "template": "{% for k, v in d.items() %}{{ k }}={{ v }};{% endfor %} {{ d.keys()|list }} {{ d.values()|list }} {{ words.index('c') }} {{ words.count('a') }}",
+   "text": "b=1;a=x;C=[True, None];items=shadow; ['b', 'a', 'C', 'items'] [1, 'x', [True, None], 'shadow'] 2 1"
+  },
+  {
+   "template": "{% for w in words %}{{ loop.index }}{{ loop.index0 }}{{ loop.revindex }}{{ loop.first }}{{ loop.last }}{{ loop.length }}{{ loop.previtem }}{{ loop.nextitem }} {% endfor %}",
+   "text": "104TrueFalse4A 213FalseFalse4bc 322FalseFalse4Aa 431FalseTrue4c "
+  },
+  {
+   "template": "{% for w in words if w != 'A' %}{{ loop.index }}{{ w }}{% else %}none{% endfor %} {% for w in [] %}x{% else %}none{% endfor %} {% for w in missing %}x{% else %}undefined{% endfor %}",
+   "text": "1b2c3a none undefined"
+  },
+  {
+   "template": "{% for p in people recursive %}{{ p.name }}{% if loop.first and loop.depth == 1 %}[{{ loop([{'name': 'inner'}]) }}]{% endif %}{% endfor %}",
+   "text": "Zed[inner]amyBob"
+  },
+  {
+   "template": "{% for i in range(5) %}{% if i == 1 %}{% continue %}{% endif %}{% if i == 4 %}{% break %}{% endif %}{{ i }}{% endfor %} {{ range(3)|list }} {{ range(1, 10, 3)|list }} {{ range(3, 0, -1)|list }}",
+   "text": "023 [0, 1, 2] [1, 4, 7] [3, 2, 1]"
+  },
+  {
+   "template": "{% for a, b in [(1, 2), (3, 4)] %}{{ a }}{{ b }}{% endfor %} {% for a, (b, c) in [(1, (2, 3))] %}{{ a }}{{ b }}{{ c }}{% endfor %}",
+   "text": "1234 123"
+  },
+  {
+   "template": "{% for i in 'abc' %}{{ loop.cycle('x', 'y') }}{{ i }}{% endfor %} {% for k in d %}{{ k }}{% endfor %} {% for i in nums %}{{ loop.changed(i > 1) }}{% endfor %}",
+   "text": "xaybxc baCitems TrueTrueTrue"
+  },
+  {
+   "template": "{% set a = 1 %}{% for i in nums %}{% set a = a + i %}{{ a }}{% endfor %}{{ a }}",
+   "text": "4231"
+  },
+  {
+   "template": "{% set ns = namespace(a=1, b='x') %}{% for i in nums %}{% set ns.a = ns.a + i %}{% endfor %}{{ ns.a }}{{ ns.b }}{{ ns.zz }}",
+   "text": "7x"
+  },
+  {
+   "template": "{% if yes %}{% set inside = 5 %}{% endif %}{{ inside }}",
+   "text": "5"
+  },
+  {
+   "template": "{% set a, b = 1, 2 %}{{ a }}{{ b }} {% set (c, d2) = (3, 4) %}{{ c }}{{ d2 }} {% set l = 1, 2 %}{{ l }}",
+   "text": "12 34 (1, 2)"
+  },
+  {
+   "template": "{% set block %}some {{ name }}{% endset %}[{{ block }}] {% set up | upper %}loud {{ name }}{% endset %}{{ up }}",
+   "text": "[some World] LOUD WORLD"
+  },
+  {
+   "template": "{% macro m(a, b=2, c='z') %}{{ a }}-{{ b }}-{{ c }}{% endmacro %}{{ m(1) }} {{ m(1, 3) }} {{ m(c=9, a=0) }} {{ m() }}",
+   "text": "1-2-z 1-3-z 0-2-9 -2-z"
+  },
+  {
+   "template": "{% macro rec(n) %}{{ n }}{% if n > 0 %},{{ rec(n - 1) }}{% endif %}{% endmacro %}{{ rec(3) }}",
+   "text": "3,2,1,0"
+  },
+  {
+   "template": "{% macro wrap(tag) %}<{{ tag }}>{{ caller() }}</{{ tag }}>{% endmacro %}{% call wrap('b') %}bold {{ name }}{% endcall %} {% macro each(l) %}{% for x in l %}{{ caller(x) }}{% endfor %}{% endmacro %}{% call(v) each(nums) %}[{{ v }}]{% endcall %}",
+   "text": "<b>bold World</b> [3][1][2]"
+  },
+  {
+   "template": "{% macro outer() %}{{ later }}{% endmacro %}{% set later = 'seen' %}{{ outer() }}",
+   "text": "seen"
+  },
+  {
+   "template": "{% macro va() %}{{ varargs }} {{ kwargs }}{% endmacro %}{{ va(1, 2, k=3) }}",
+   "text": "(1, 2) {'k': 3}"
+  },
+  {
+   "template": "{% filter upper %}shout {{ name }}{% endfilter %} {% filter trim|lower %}  ABC {% endfilter %}",
+   "text": "SHOUT WORLD abc"
+  },
+  {
+   "template": "{% with a = 1, b = 2 %}{{ a }}{{ b }}{% endwith %}{{ a }}",
+   "text": "12"
+  },
+  {
+   "template": "{% if n > 10 %}a{% elif n > 5 %}b{% elif yes %}c{% else %}d{% endif %}",
+   "text": "b"
+  },
+  {
+   "template": "{% generation %}gen {{ name }}{% endgeneration %}!",
+   "text": "gen World!"
+  },
+  {
+   "template": "{% block thing %}in {{ name }}{% endblock thing %}",
+   "text": "in World"
+  },
+  {
+   "template": "{% set messages = [{'role': 'user', 'content': 'a'}, {'role': 'assistant', 'content': 'b'}] %}{% for m in messages[::-1] %}{% set index = (messages|length - 1) - loop.index0 %}{{ index }}{{ m.role }}{% endfor %}",
+   "text": "1assistant0user"
+  },
+  {
+   "template": "{{ dict(a=1, b=2) }} {{ namespace(a=1).a }} {% set c = cycler('a', 'b') %}{{ c.next() }}{{ c.next() }}{{ c.next() }} {% set j = joiner('|') %}{{ j() }}a{{ j() }}b{{ j() }}c",
+   "text": "{'a': 1, 'b': 2} 1 aba a|b|c"
+  },
+  {
+   "template": "{{ strftime_now('%Y') is string }}",
+   "text": "True"
+  },
+  {
+   "template": "{{ missing.x }}",
+   "text": null
+  },
+  {
+   "template": "{{ missing['x'] }}",
+   "text": null
+  },
+  {
+   "template": "{{ raise_exception('no ' ~ name) }}",
+   "text": null
+  },
+  {
+   "template": "{{ 'a' + 1 }}",
+   "text": null
+  },
+  {
+   "template": "{{ 1 / 0 }}",
+   "text": null
+  },
+  {
+   "template": "{% for i in n %}{% endfor %}",
+   "text": null
+  },
+  {
+   "template": "{{ name() }}",
+   "text": null
+  },
+  {
+   "template": "{{ words.append('x') }}",
+   "text": null
+  },
+  {
+   "template": "{{ missing + 'a' }}",
+   "text": null
+  },
+  {
+   "template": "{{ 1 < 'a' }}",
+   "text": null
+  },
+  {
+   "template": "{% if %}",
+   "text": null
+  },
+  {
+   "template": "{% for x in %}",
+   "text": null
+  },
+  {
+   "template": "{{ 'open }}",
+   "text": null
+  },
+  {
+   "template": "{% endif %}",
+   "text": null
+  },
+  {
+   "template": "{% if yes %}",
+   "text": null
+  },
+  {
+   "template": "{{ x | nofilter }}",
+   "text": null
+  },
+  {
+   "template": "{{ x is notest }}",
+   "text": null
+  },
+  {
+   "template": "{% unknown %}",
+   "text": null
+  },
+  {
+   "template": "{{ a b }}",
+   "text": null
+  },
+  {
+   "template": "{% set name.x = 1 %}",
+   "text": null
+  }
+ ]
+}

@@ -10,12 +10,17 @@
     "  embed_scale         'sqrt_hidden' when embeddings are multiplied by sqrt(hidden_size).",
     "  rope_interleaved    true when rotary pairs are adjacent dims (2i, 2i+1), the GPT-J layout.",
     "  partial_rotary      'zero_tail' when a partial rotary keeps the full head dim's frequency progression and zeroes the tail.",
-    "  rope_on_full_layers false when, in a stack with sliding layers, the full-attention layers use no position encoding."
+    "  rope_on_full_layers false when, in a stack with sliding layers, the full-attention layers use no position encoding.",
+    "  attention_scale     the factor on q·k when the config states none (the default is 1/sqrt(head_dim)).",
+    "  value_norm          'rms' when each head's value is RMS-normalised without a weight.",
+    "  router_input_norm   'rms' when the expert router reads its input RMS-normalised without a weight."
   ],
   "gemma": { "norm_weight_offset": 1, "embed_scale": "sqrt_hidden" },
   "gemma2": { "norm_weight_offset": 1, "embed_scale": "sqrt_hidden" },
   "gemma3": { "norm_weight_offset": 1, "embed_scale": "sqrt_hidden" },
   "gemma3_text": { "norm_weight_offset": 1, "embed_scale": "sqrt_hidden" },
+  "gemma4": { "embed_scale": "sqrt_hidden", "attention_scale": 1.0, "value_norm": "rms", "router_input_norm": "rms" },
+  "gemma4_text": { "embed_scale": "sqrt_hidden", "attention_scale": 1.0, "value_norm": "rms", "router_input_norm": "rms" },
   "qwen3_5": { "norm_weight_offset": 1 },
   "qwen3_5_text": { "norm_weight_offset": 1 },
   "qwen3_5_moe": { "norm_weight_offset": 1 },

@@ -36,6 +36,22 @@ public sealed class JsonSchemaNode
     /// <summary>Per property: a bit set of the properties it may not stand beside ("never both").</summary>
     public List<long>? Excludes;
 
+    /// <summary>The properties may come in any order, rather than as declared.</summary>
+    public bool AnyOrder;
+
+    /// <summary>Lets this and everything in it take its properties in any order, and strings
+    /// without a <c>maxLength</c> up to <paramref name="longest"/> characters.</summary>
+    public void Relax(int longest)
+    {
+        AnyOrder = Properties is null or { Count: <= 64 };
+        MaxLength ??= longest;
+        foreach (var (_, node, _) in Properties ?? new())
+        {
+            node.Relax(longest);
+        }
+        Items?.Relax(longest);
+    }
+
     /// <summary>Any JSON value at all.</summary>
     public static JsonSchemaNode Any() => new() { Obj = true, Arr = true, Str = true, Num = true, Bool = true, Null = true };
 
@@ -349,7 +365,9 @@ public sealed class JsonConstraint : ITokenConstraint
         private bool Free => node.Properties is null;
 
         // A required property still to come.
-        private bool Owed => node.Properties is { } props && props.Skip(next).Any(p => p.Required);
+        private bool Owed => node.Properties is { } props && (node.AnyOrder
+            ? props.Where((p, i) => p.Required && (used >> i & 1) == 0 && Allowed(i)).Any()
+            : props.Skip(next).Any(p => p.Required));
 
         private bool MoreToCome => Free || Candidates().Any();
 
@@ -398,13 +416,13 @@ public sealed class JsonConstraint : ITokenConstraint
                 yield break;
             }
             var props = node.Properties!;
-            for (int i = next; i < props.Count; i++)
+            for (int i = node.AnyOrder ? 0 : next; i < props.Count; i++)
             {
-                if (Allowed(i))
+                if (Allowed(i) && !(node.AnyOrder && (used >> i & 1) != 0))
                 {
                     yield return (i, props[i].Name);
                 }
-                if (props[i].Required)
+                if (props[i].Required && !node.AnyOrder)
                 {
                     yield break;   // a required property cannot be skipped
                 }

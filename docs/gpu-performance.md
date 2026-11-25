@@ -256,7 +256,11 @@ speculation, greedy and seeded sampling alike. A 400-token essay runs 1.38–1.4
 faster and a 600-token sampled reply to a real 23k-token Hydra request 1.65×. Prose
 under sampling keeps about half the drafts.
 
-`AMQL_MTP_DRAFTS` (default 3, 0 off), `AMQL_SUFFIX_DRAFT` (default 8, 0 off),
+Since then verifies are captured as graphs and the number of drafts follows the reply, for this drafter and for
+those that read the model's caches ([gemma-4.md](gemma-4.md#the-drafter)): 365 tok/s on prose and 380 on code
+at NVFP4, against 332 and 339 with three drafts every step. `bench --draft N` measures it.
+
+`AMQL_MTP_DRAFTS` (a fixed number, 0 off), `AMQL_SUFFIX_DRAFT` (default 8, 0 off),
 `AMQL_MTP=0` (no drafter, and no row invariance). Speculation runs while one reply
 runs alone. A batch step passes the drafter by, and that sequence drafts again only
 after a reset or a rewind.
@@ -386,8 +390,8 @@ costs show.
 
 ## Routed experts: grouped launches
 
-Routed (MoE) layers do not run on the device engine yet; the managed path
-runs them, with every expert held on the GPU done in one call
+The device engine runs routed (MoE) layers itself where every expert fits the GPU
+([gemma-4.md](gemma-4.md)). What follows is the managed path, which runs the rest, with every expert held on the GPU done in one call
 (`amql_cuda_ffn`). That call used to run expert by expert: six launches each
 (gather, gate, up, SiLU, down, scatter), so a decode token on Flash-Next's
 geometry (10 experts routed of 512, 48 layers) took ~2,900 launches, each too

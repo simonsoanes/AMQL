@@ -99,6 +99,7 @@ public static partial class ArchMapper
         DiffusionSurface? diffusion = JudgeDiffusion(facts);
         PositionPolicy position = JudgePosition(facts, conventions);
         bool anySliding = false;
+        var shapes = stackTensors.ToDictionary(t => t.Name, t => t.Shape, StringComparer.Ordinal);
         var policies = new List<AttentionLayerPolicy>(facts.NumLayers);
         for (int l = 0; l < facts.NumLayers; l++)
         {
@@ -117,7 +118,8 @@ public static partial class ArchMapper
             anySliding |= sliding;
             HeadGeometry geometry = linear && facts.LinearAttention is { } lin
                 ? new HeadGeometry { HeadDim = lin.KeyHeadDim, NumKvHeads = lin.KeyHeads }
-                : new HeadGeometry { HeadDim = facts.HeadDim, NumKvHeads = facts.NumKvHeads };
+                : SoftmaxGeometry(facts, roles, shapes, l, qwen4 is not null);
+            bool sharedKv = !linear && SharesKvProjection(facts, roles, shapes, l);
             policies.Add(new AttentionLayerPolicy
             {
                 Operator = layerType switch
@@ -136,6 +138,7 @@ public static partial class ArchMapper
                 Window = sliding ? facts.SlidingWindow : null,
                 Position = LayerPosition(facts, conventions, l, layerType, position),
                 Geometry = geometry,
+                SharedKvProjection = sharedKv,
             });
         }
         if (!conventions.RopeOnFullLayers && anySliding)
@@ -152,6 +155,7 @@ public static partial class ArchMapper
                         Window = policies[l].Window,
                         Position = PositionPolicy.None,
                         Geometry = policies[l].Geometry,
+                        SharedKvProjection = policies[l].SharedKvProjection,
                     };
                 }
             }
@@ -184,7 +188,10 @@ public static partial class ArchMapper
                 // attention_multiplier; Gemma scales by query_pre_attn_scalar;
                 // everything else gets the standard scale.
                 ScoreScale = facts.AttentionMultiplier
-                             ?? (facts.QueryPreAttnScalar is { } qpas ? 1.0 / Math.Sqrt(qpas) : 1.0 / Math.Sqrt(facts.HeadDim)),
+                             ?? (facts.QueryPreAttnScalar is { } qpas
+                                 ? 1.0 / Math.Sqrt(qpas)
+                                 : conventions.AttentionScale ?? 1.0 / Math.Sqrt(facts.HeadDim)),
+                ParameterFreeQkNorm = new ParameterFreeQkNorm { V = conventions.ValueRmsNorm },
                 LogitSoftcapping = facts.AttnLogitSoftcapping is { } attnCap ? (float)attnCap : null,
                 QkNormScope = QkNormScope.PerHead,
                 QkNormWeightOffset = conventions.NormWeightOffset,
@@ -212,6 +219,8 @@ public static partial class ArchMapper
                         TopK = moe.TopK,
                         ExpertIntermediateSize = moe.ExpertIntermediateSize,
                         RoutingPolicy = moe.RoutingPolicy,
+                        Hybrid = roles.Name(TensorRoles.DenseOut) is not null && roles.Name(TensorRoles.Down) is not null,
+                        RouterInputNorm = conventions.RouterInputRmsNorm,
                     }
                     : null,
             },
@@ -442,7 +451,7 @@ public static partial class ArchMapper
         // ── multi-modal projector (LFM2.5-VL, Qwen-VL, etc.) ────────────
         if (options.IncludeVision)
         {
-            const string projectorPrefix = "model.multi_modal_projector";
+            string projectorPrefix = ProjectorPrefix(inventory);
             int projectorTensors = inventory.CountUnder(projectorPrefix + ".");
             if (projectorTensors > 0)
             {
@@ -542,9 +551,9 @@ public static partial class ArchMapper
         {
             reps.Add(Rep("vision.perception_tower", encoding, BindUnder(inventory, visionPrefix + ".")));
         }
-        if (options.IncludeVision && inventory.CountUnder("model.multi_modal_projector.") > 0)
+        if (options.IncludeVision && inventory.CountUnder(ProjectorPrefix(inventory) + ".") > 0)
         {
-            reps.Add(Rep("vision.projector", encoding, BindUnder(inventory, "model.multi_modal_projector.")));
+            reps.Add(Rep("vision.projector", encoding, BindUnder(inventory, ProjectorPrefix(inventory) + ".")));
         }
 
         // Stored-precision policy: the canonical encoding is the stack
@@ -621,6 +630,48 @@ public static partial class ArchMapper
     private static bool HasPerHeadGate(HfInventory inventory) =>
         inventory.TensorNames.Any(n => n.EndsWith(".self_attn.gate_proj.weight", StringComparison.Ordinal));
 
+    /// <summary>A softmax layer's heads, read from its own projections (a stack's
+    /// full and sliding layers may differ: Gemma 4's do); the config's where the
+    /// layer's projections do not divide into heads.</summary>
+    private static HeadGeometry SoftmaxGeometry(TextArchitectureFacts facts, LayerRoleMap roles,
+        Dictionary<string, long[]> shapes, int layer, bool gatedQ)
+    {
+        var stated = new HeadGeometry { HeadDim = facts.HeadDim, NumKvHeads = facts.NumKvHeads };
+        if (roles.Name(TensorRoles.Q) is not { } q || roles.Name(TensorRoles.K) is not { } k ||
+            !shapes.TryGetValue($"{layer}.{q}", out var qShape) || !shapes.TryGetValue($"{layer}.{k}", out var kShape) ||
+            qShape.Length != 2 || kShape.Length != 2 || qShape[1] != facts.HiddenSize || kShape[1] != facts.HiddenSize)
+        {
+            return stated;
+        }
+        long qWidth = facts.AttentionOutputGate || gatedQ ? qShape[0] / 2 : qShape[0];
+        long headDim = qWidth / facts.NumQueryHeads;
+        if (headDim == 0 || qWidth % facts.NumQueryHeads != 0 || kShape[0] % headDim != 0)
+        {
+            return stated;
+        }
+        long kvHeads = kShape[0] / headDim;
+        return kvHeads > 0 && facts.NumQueryHeads % kvHeads == 0
+            ? new HeadGeometry { HeadDim = (int)headDim, NumKvHeads = (int)kvHeads }
+            : stated;
+    }
+
+    /// <summary>Whether this layer's keys and values come from one projection: the
+    /// config says the stack has such layers, and this one carries no V.</summary>
+    private static bool SharesKvProjection(TextArchitectureFacts facts, LayerRoleMap roles, Dictionary<string, long[]> shapes, int layer)
+    {
+        if ((roles.Name(TensorRoles.V) is { } v && shapes.ContainsKey($"{layer}.{v}")) ||
+            roles.Name(TensorRoles.K) is not { } k || !shapes.ContainsKey($"{layer}.{k}") || facts.SourceConfig is null)
+        {
+            return false;
+        }
+        return TextConfig(facts).TryGetProperty("attention_k_eq_v", out var shared) && shared.ValueKind == JsonValueKind.True;
+    }
+
+    private static string ProjectorPrefix(HfInventory inventory) =>
+        inventory.CountUnder("model.embed_vision.") > 0 && inventory.CountUnder("model.multi_modal_projector.") == 0
+            ? "model.embed_vision"
+            : "model.multi_modal_projector";
+
     /// <summary>One layer's position policy. Conv layers carry none; SmolLM3's
     /// <c>no_rope_layers</c> switches individual layers to NoPE; a rope block
     /// keyed by the layer's own type (Gemma 3, LFM3: <c>rope_parameters.sliding_attention</c>)
@@ -659,6 +710,19 @@ public static partial class ArchMapper
         }
         var mrope = RopeMultimodal.FromRopeBlock(block);
         RopeScaling? scaling = null;
+        if (ropeType == "proportional")
+        {
+            // Gemma 4: the full head's frequency progression, the first `factor`
+            // of it kept and the rest zero. An overall divisor is not served.
+            double proportionalTheta = block.TryGetProperty("rope_theta", out var pt) ? pt.GetDouble() : 10_000.0;
+            if (mrope is not null || (block.TryGetProperty("factor", out var pf) && pf.ValueKind == JsonValueKind.Number && pf.GetDouble() != 1.0))
+            {
+                return new PositionUnresolved { Kind = "rope_scaling(proportional)", Payload = block.Clone() };
+            }
+            return factor < 1.0
+                ? new PositionZeroTailRope { Theta = proportionalTheta, RotaryFactor = factor }
+                : new PositionRope { Theta = proportionalTheta };
+        }
         if (ropeType != "default")
         {
             // linear, llama3, yarn, longrope and dynamic are served; any other
@@ -824,6 +888,10 @@ public static partial class ArchMapper
         int dot = relative.IndexOf('.');
         string suffix = relative[(dot + 1)..];
         int lastDot = suffix.LastIndexOf('.');
+        if (lastDot < 0)
+        {
+            return null;   // a bare parameter (Gemma 4's layer_scalar) is not a fusion
+        }
         string stem = suffix[..lastDot], part = suffix[(lastDot + 1)..];
         if (!TensorRoles.ContiguousFusions.TryGetValue(stem, out var partStems))
         {

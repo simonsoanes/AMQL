@@ -254,7 +254,7 @@ internal static partial class Program
         }
     }
 
-    private static string EntailPrompt(string prompt, string? template, bool chat, bool think)
+    private static string EntailPrompt(string prompt, ChatTemplate? template, bool chat, bool think)
     {
         if (!chat)
         {
@@ -264,12 +264,7 @@ internal static partial class Program
         {
             throw new CliException("this model has no chat template");
         }
-        string rendered = ChatTemplate.Apply(template, prompt, null);
-        if (template.Contains("<think>", StringComparison.Ordinal))
-        {
-            rendered += think ? "<think>\n" : "<think>\n\n</think>\n\n";
-        }
-        return rendered;
+        return template.Apply(prompt, null, think);
     }
 
     /// <summary>Decodes one prompt with a partner and its adapters, marking
@@ -281,7 +276,7 @@ internal static partial class Program
         string tokenizerDir = ResolveTokenizerDir(containerDir, args);
         var tokenizer = Tokenizer(tokenizerDir);
         var stop = ResolveStopTokens(tokenizerDir, tokenizer);
-        string? template = ChatTemplate.Load(tokenizerDir);
+        var template = ChatTemplate.Load(tokenizerDir);
 
         using var container = Vindex3Container.Open(containerDir);
         using var store = container.CreateOperandStore();
@@ -403,7 +398,7 @@ internal static partial class Program
         string tokenizerDir = ResolveTokenizerDir(containerDir, args);
         var tokenizer = Tokenizer(tokenizerDir);
         var stop = ResolveStopTokens(tokenizerDir, tokenizer);
-        string? template = ChatTemplate.Load(tokenizerDir);
+        var template = ChatTemplate.Load(tokenizerDir);
         int maxTokens = IntOption(args, "--max-tokens", 24);
         string? reportPath = OptionValue(args, "--report");
 

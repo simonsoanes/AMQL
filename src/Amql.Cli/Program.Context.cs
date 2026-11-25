@@ -52,11 +52,11 @@ internal static partial class Program
 
         var tokenizer = Tokenizer(containerDir);
         var stop = ResolveStopTokens(containerDir, tokenizer);
-        string template = ChatTemplate.Load(containerDir) ?? (plain ? "" : throw new CliException("the container has no chat template; use --plain"));
+        var template = ChatTemplate.Load(containerDir) ?? (plain ? null : throw new CliException("the container has no chat template; use --plain"));
 
         // The prompt around the document: rendered once, cut where the document goes.
         const string Cut = "DOC", Ask = "ASK";
-        string frame = plain ? Cut + Ask : ChatTemplate.ApplyMessages(template, new[]
+        string frame = plain ? Cut + Ask : template!.Apply(new[]
         {
             new ChatMessage("user", $"Read the document, then answer the question after it.\n\n<document>\n{Cut}\n</document>\n\n{Ask}"),
         }, enableThinking: false);

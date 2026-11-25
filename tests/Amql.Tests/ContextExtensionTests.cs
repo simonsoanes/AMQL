@@ -201,6 +201,9 @@ public class SegmentedAttentionTests
     [InlineData("gemma2", "f32")]
     [InlineData("olmo3", "fp16")]
     [InlineData("gemma3_text", "f32")]
+    [InlineData("gemma4-wide", "fp16")]
+    [InlineData("gemma4-wide", "nvfp4")]
+    [InlineData("gemma4-moe", "f32")]
     public void Segments_Agree_With_One_Pass(string family, string kv)
     {
         CudaShim.Reset();

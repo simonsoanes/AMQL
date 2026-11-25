@@ -123,7 +123,7 @@ Import and export these checkpoint formats:
 |--------|-------------|-------|
 | Qwen 3.5–3.8 | `qwen3_5_text` | Hybrid: GDN (linear attention) + softmax, MoE, vision |
 | Qwen Flash-Next | `qwen4_exp_text` | `--arch qwen4-next` export with HC placeholders |
-| Gemma 4 | `gemma4_text` | GeGLU activation, QK norms, nested `text_config` |
+| Gemma 4 | `gemma4_text` | Dense and MoE (26B A4B) models on the GPU engine, with images, drafter and tool calls ([docs](docs/gemma-4.md)); E2B and E4B are refused by name |
 | LFM 2.5 | `lfm2` | Short-convolution layers + GQA, SwiGLU MLP |
 | LFM3 / LFM3-VL | `lfm3` | Gated short conv (width 7) + full and sliding-window GQA, per-head output gate, sandwich norms, zero-tail partial rope; `to-gguf` writes llama.cpp's `lfm3` arch |
 | Masked diffusion (dLLM A2D) | `a2d-qwen3` | Qwen3 with bidirectional attention, MDLM objective; `generate` runs the block-wise low-confidence unmasking sampler; `to-gguf` writes llama.cpp's `rnd1` arch (dense FFN as one expert) for `llama-diffusion-cli` |
@@ -334,7 +334,7 @@ model's URL (or `owner/name`), and it is downloaded (resumable, SHA-256 checked)
 ready to serve.
 
 The **Playground** streams a chat with any loaded model, showing speed and token counts under each reply. It
-can also send raw requests to any endpoint. **Tools** puts every `amql-cli` command (61, subcommands included)
+can also send raw requests to any endpoint. **Tools** puts every `amql-cli` command (62, subcommands included)
 behind a searchable form, with required fields first, the rest under Advanced, memory sliders for the CLI's
 `--max-ram` / `--gpu-memory`, and a run history.
 
@@ -348,7 +348,7 @@ decoder stack, final norm, output head, vision tower, MTP drafter). Tensors open
 
 `amql-server --model <container> [--model …]` serves containers over HTTP: TypeSafe `/v1/decisions` for Von
 decision models, and OpenAI-compatible `/v1/embeddings`, `/v1/chat/completions`, `/v1/responses`
-(streaming included; tools, reasoning and `previous_response_id` for Qwen3.5-family models), and
+(streaming included, with the model's own chat template, tools, reasoning and `previous_response_id`), and
 `/v1/classify` for classifier containers — each endpoint only where the container can serve it.
 `--adapter` runs Entail adapters beside a chat model, so an agent harness can use the model with, for
 example, `stop-circling`. See [Server](docs/server.md).

@@ -29,5 +29,8 @@ public class PrefixReuseTests
         Assert.Equal(4, PromptMark.At([1, 2, 3, 4, 5], Turn));
         Assert.Equal(4, PromptMark.At([1, 2, 3, 4, 5], null));
         Assert.Equal(2, PromptMark.At([Turn, 1, 2], Turn));
+        // A call's result in the reply's own turn: saved before it, so a loop of calls reads only what is new.
+        Assert.Equal(6, PromptMark.At([Turn, 1, Turn, 2, 99, 3, 99, 4], Turn, 99));
+        Assert.Equal(2, PromptMark.At([1, 99, Turn, 3, Turn, 4], Turn, 99));
     }
 }

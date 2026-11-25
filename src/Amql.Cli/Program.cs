@@ -220,6 +220,7 @@ internal static partial class Program
                 "export-mtp" => ExportMtp(args[1..]),
                 "generate-mtp" => GenerateMtp(args[1..]),
                 "quantise" or "quantize" => Quantise(args[1..]),
+                "attach" => AttachPart(args[1..]),
                 "collect-mtp" => CollectMtp(args[1..]),
                 "fit-mtp" => FitMtp(args[1..]),
                 "layers" => Layers(args[1..]),
@@ -319,7 +320,8 @@ internal static partial class Program
 
         Console.WriteLine($"encoding '{modelDir}' → '{outDir}'");
         CliProgress.Phase("encode");
-        var report = ModelToContainer.Encode(modelDir, outDir, modelId);
+        var report = ModelToContainer.Encode(modelDir, outDir, modelId,
+            new ArchMapper.EncodeOptions { IncludeVision = !HasOption(args, "--no-vision") });
         CliProgress.Complete($"{report.Tensors} tensors, {report.PayloadBytes} bytes");
 
         Console.WriteLine();
@@ -698,14 +700,17 @@ internal static partial class Program
                 }
             }
         }
-        // Always common in the Llama family: the end-of-turn markers these
-        // templates emit.
-        foreach (var marker in new[] { "<|im_end|>", "<|eot_id|>" })
+        // What the chat template ends an assistant's turn with.
+        try
         {
-            if (tokenizer.AddedTokenId(marker) is { } id)
+            if (ChatTemplate.Load(dir) is { } template && TurnMarks.First(tokenizer, template.Dialect.AfterReply) is { } end)
             {
-                ids.Add(id);
+                ids.Add(end);
             }
+        }
+        catch (ChatTemplateException)
+        {
+            // A template that cannot be read ends no turn; --chat says what is wrong with it.
         }
         return ids;
     }
@@ -870,6 +875,11 @@ internal static partial class Program
         HfTokenizer? tokenizer = null;
         string? tokenizerSource = null;
         int[] tokens;
+        var images = OptionValue(args, "--image")?.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries) ?? [];
+        if (images.Length > 0 && (prompt is null || !useChat))
+        {
+            throw new CliException("--image goes with --prompt and --chat");
+        }
         if (prompt is not null)
         {
             tokenizerSource = ResolveTokenizerDir(containerDir, args);
@@ -877,12 +887,21 @@ internal static partial class Program
 
             if (useChat)
             {
-                string? chatTmpl = ChatTemplate.Load(tokenizerSource);
+                var chatTmpl = ChatTemplate.Load(tokenizerSource);
                 if (chatTmpl is null)
                     throw new CliException("--chat requires a chat template, but none was found in " +
                         "chat_template.jinja or tokenizer_config.json at the tokenizer directory");
                 string? system = OptionValue(args, "--system");
-                prompt = ChatTemplate.Apply(chatTmpl, prompt, system);
+                if (images.Length > 0)
+                {
+                    // The images first, as the models that read them are trained.
+                    var turn = new ChatMessage("user", prompt) { Parts = [.. images.Select(_ => new ChatPart(null)), new ChatPart(prompt)] };
+                    prompt = chatTmpl.Apply(system is null ? [turn] : [new ChatMessage("system", system), turn], HasOption(args, "--think"));
+                }
+                else
+                {
+                    prompt = chatTmpl.Apply(prompt, system, HasOption(args, "--think"));
+                }
                 Console.WriteLine("chat:      prompt formatted via chat template");
             }
 
@@ -1027,7 +1046,7 @@ internal static partial class Program
 
         var tensorLoads = traceTensors ? new List<TensorTraceLine>() : null;
         var genOpts = (trace || traceTensors || traceJson is not null || traceStream is not null
-                       || workingSet is not null || attribute)
+                       || workingSet is not null || attribute || images.Length > 0)
             ? new InferenceRunner.GenerateOptions(Trace: trace, TraceTensors: traceTensors,
                 WeightWorkingSet: workingSet, TraceJsonPath: traceJson, TraceStreamPath: traceStream,
                 // Resolve token text at capture time so a saved trace reads as
@@ -1040,7 +1059,8 @@ internal static partial class Program
                 AttributeCorruptTokenId: corruptId,
                 AttributeLayerEnd: attributeLayerEnd,
                 LogitLens: logitLens,
-                TraceAttention: HasOption(args, "--trace-attention"))
+                TraceAttention: HasOption(args, "--trace-attention"),
+                Images: images)
             : null;
 
         var (prefill, steps2) = InferenceRunner.Generate(
@@ -2020,6 +2040,8 @@ internal static partial class Program
         {
             Rounding = rounding,
             CalibrationText = calibration is null ? null : ReadText(calibration),
+            CalibrateWith = OptionValue(args, "--calibrate-with"),
+            Embedding = HasOption(args, "--embedding"),
             CalibrationTokens = IntOption(args, "--calibration-tokens", 32768),
             SequenceTokens = IntOption(args, "--sequence-tokens", 1024),
             Damp = DoubleOption(args, "--damp", 0.01),
@@ -2956,10 +2978,12 @@ internal static partial class Program
               amql-cli --version | -V
 
             Commands:
-              amql-cli encode <model-dir | hf-url | owner/name> --out <container-dir>   map + materialise
+              amql-cli encode <model-dir | hf-url | owner/name> --out <container-dir> [--no-vision]   map + materialise
                               [--dtype Q4_0|Q8_0|FP4|BF16|FP32]   single-encoding slim import
                               [--revision main] [--download-dir <dir>] [--all-files]
                               a Hugging Face URL or owner/name is downloaded first (HF_TOKEN for gated models)
+              amql-cli attach <container-dir> [--drafter <checkpoint | hf-url>] [--vision <checkpoint | hf-url>] [--format nvfp4|mxfp4|none]
+                              adds a drafter (Gemma 4's assistant) or a checkpoint's vision tower to a container
               amql-cli download <hf-url | owner/name> [--out <dir>] [--revision main] [--all-files]
                               fetch a checkpoint from the Hugging Face Hub (resumable, SHA-256 checked)
               amql-cli strip <container-dir> --keep <encoding> [--out <slim-dir>]   slim copy
@@ -3000,6 +3024,7 @@ internal static partial class Program
                               [--attribute-source <row>] [--attribute-layers <end>]
                               [--logit-lens] [--trace-attention]
                               [--trace-stream <trace.jsonl>]
+                              [--chat [--system "text"] [--image <file>;…] [--think]]
                             masked diffusion containers (a2d-qwen3) take instead:
                               [--chat] [--think] [--gen 128] [--steps <gen>] [--block 32]
                               [--remasking low_confidence|random] [--temperature 0]

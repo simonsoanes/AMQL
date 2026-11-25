@@ -28,11 +28,11 @@ public static partial class ArchMapper
     /// pack differently and stay refused.</summary>
     private static readonly HashSet<string> GateThenUpPackedExperts = new(StringComparer.Ordinal)
     {
-        "qwen3_5_moe", "qwen3_5_moe_text", "qwen4_exp", "qwen4_exp_text",
+        "qwen3_5_moe", "qwen3_5_moe_text", "qwen4_exp", "qwen4_exp_text", "gemma4", "gemma4_text",
     };
 
-    private const string PackedGateUp = "mlp.experts.gate_up_proj";
-    private const string PackedDown = "mlp.experts.down_proj";
+    private const string PackedGateUp = "experts.gate_up_proj";
+    private const string PackedDown = "experts.down_proj";
 
     /// <summary>Splits a packed expert tensor (<c>3.mlp.experts.gate_up_proj</c>)
     /// into per-expert tensors, each a byte range of it, or returns null when
@@ -42,7 +42,17 @@ public static partial class ArchMapper
     {
         int dot = relative.IndexOf('.');
         string suffix = relative[(dot + 1)..];
-        if (suffix is not (PackedGateUp or PackedDown))
+        // The module the experts sit in: "mlp.", or "" where they are beside the
+        // FFN rather than in it (Gemma 4).
+        string? module = null;
+        foreach (var packed in new[] { PackedGateUp, PackedDown })
+        {
+            if (suffix == packed || suffix.EndsWith("." + packed, StringComparison.Ordinal))
+            {
+                module = suffix[..^packed.Length];
+            }
+        }
+        if (module is null)
         {
             return null;
         }
@@ -60,7 +70,7 @@ public static partial class ArchMapper
         {
             throw new ModelConfigException($"'{fullName}' packs {experts} experts but the config states {moe.Experts}");
         }
-        bool gateUp = suffix == PackedGateUp;
+        bool gateUp = suffix == module + PackedGateUp;
         if (gateUp && rows % 2 != 0)
         {
             throw new ModelConfigException($"'{fullName}' has {rows} rows per expert — a gate/up pair needs an even count");
@@ -73,8 +83,8 @@ public static partial class ArchMapper
         for (long e = 0; e < experts; e++)
         {
             var stems = gateUp
-                ? new[] { ($"mlp.experts.{e}.gate_proj.weight", 0L, rows / 2), ($"mlp.experts.{e}.up_proj.weight", rows / 2, rows / 2) }
-                : new[] { ($"mlp.experts.{e}.down_proj.weight", 0L, rows) };
+                ? new[] { ($"{module}experts.{e}.gate_proj.weight", 0L, rows / 2), ($"{module}experts.{e}.up_proj.weight", rows / 2, rows / 2) }
+                : new[] { ($"{module}experts.{e}.down_proj.weight", 0L, rows) };
             foreach (var (stem, rowStart, partRows) in stems)
             {
                 long byteStart = e * bytesPerExpert + rowStart * bytesPerRow;

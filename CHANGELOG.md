@@ -8,6 +8,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- **gemma 4:** Gemma 4's dense and mixture-of-experts text models import, quantise and run ([docs](docs/gemma-4.md)). Gemma 4 26B A4B takes 14.2 GB on disk and 18.1 GB of GPU memory with its whole 256K context, and decodes at 266 tok/s on an RTX 5090 (Qwen 3.5 4B: 275).
+  - The GPU engine runs routed experts, alone (Mixtral, OLMoE, Qwen3-MoE) or beside a dense FFN. Prompts gather each expert's rows for tensor-core GEMMs; a prompt gives the same bits every run.
+  - A sliding-window layer's KV cache holds about two windows and slides, at any context: 0.6 GB for Gemma 4's 25 windowed layers at 256K instead of 50 GB. Marks, rewinds and paging follow it.
+  - `quantise` rounds each expert against the rows the router sends it, calibrates a model larger than the GPU with a 4-bit copy of itself (`--calibrate-with` names one), and writes weights as it goes. `--embedding` takes the embedding and head too. `encode --no-vision` leaves a vision tower out.
+  - SentencePiece-style tokenizers (marked spaces, byte fallback).
+  - Its drafter (`amql-cli attach <container> --drafter`): 331 tok/s on prose and 391 on code against 250, token for token the same replies.
+  - Images (`attach --vision`, or encoded with the model): in chat, Responses and tool results, and `generate --image`. PNG and JPEG are read bit for bit as Pillow reads them, with no package added.
+  - Tool calls in the server, written and read in the model's own notation and held to the request's tools.
+  - All of it, with 256K tokens of context, in 18.4 GiB of GPU memory.
+- **chat templates:** AMQL runs a model's own chat template and learns from it how the model thinks, ends its turns and writes calls, so tools work for any family whose template marks its calls ([docs](docs/server.md#chat-templates)). Templates other than Qwen's, ChatML's, Llama 3's and Gemma 4's were refused before, and tools worked for two families.
+  - A Jinja interpreter with no package added. On 23 models' templates, 966 conversations render exactly as transformers renders them.
+  - Calls are learned in four forms: a JSON object, parameters one by one (Qwen 3.5, Nemotron, MiniCPM, GLM), a Python call (LFM 2.5), and an object with marked strings (Gemma 4). They are read, streamed and held to the request's tools in the model's own form.
+  - `chat_template_kwargs` and `reasoning_effort` reach the template.
+  - `generate --chat` renders the model's own prompt with thinking off; `--think` turns it on. Before, a Qwen model was left to think whether it was asked to or not.
+- **speculation:** verifies and draft runs are captured as graphs, and the number of drafts follows the reply instead of being three. Qwen 3.5 4B: 365 to 380 tok/s.
+- **perf:** 4-bit weights load as stored, without a trip through floats: 70 s to 13 s and 6 GB less host memory on the 26B. Dependent launch is chosen by weight format (Qwen 3.5 4B NVFP4 decode +9%). Prompt attention's scratch is 256 MB rather than 1 GB: less memory, and Qwen 3.5 4B reads 128K tokens in 20 s rather than 35.
+- **studio:** *Context length* offers the model's own (the default), 512K, 1M or any other, and *Prompt state (KV) format* is a server setting.
 - **context:** any model can run at a context length other than its trained one: `--max-context 1M` on amql-server and amql-cli, `"max_context"` per model in `--config`, *Context length* in AMQL Studio ([docs](docs/context-extension.md)). `--rope-extend auto|none|yarn|ntk|linear` picks the method.
   - The default, `auto`, leaves a conversation that fits the trained length at the trained frequencies, to the bit, and runs NTK-aware frequencies for one that will go past it. Both kinds batch together.
   - Qwen 3.5 4B (trained to 256K, NVFP4 weights and KV) reads 1M tokens in about 32 minutes on an RTX 5090. At 520K it recalled 41 of 64 facts planted among 254 of the same form, against 28 with the trained frequencies and 30 with YaRN; at 1.04M, 9 of 24 against 3. Recall among look-alikes falls off well before the context ends, inside the trained length too.

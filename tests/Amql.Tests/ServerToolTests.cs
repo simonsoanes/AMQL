@@ -111,11 +111,11 @@ public sealed class ServerToolTests : IClassFixture<ServerToolTests.ToolHost>
     public void Tool_Conversations_Render_As_Transformers_Renders_Them(string name)
     {
         var c = Golden.GetProperty("cases").EnumerateArray().Single(x => x.GetProperty("name").GetString() == name);
-        string template = File.ReadAllText(Path.Combine(ServerTests.Hosts.Fixtures, "qwen35_chat_template.jinja"));
+        var template = Templates.Qwen;
         var tools = c.GetProperty("tools").ValueKind == JsonValueKind.Array
             ? c.GetProperty("tools").EnumerateArray().Select(t => t.Clone()).ToList()
             : null;
-        string rendered = ChatTemplate.ApplyMessages(template, Messages(c.GetProperty("messages")),
+        string rendered = template.Apply(Messages(c.GetProperty("messages")),
             c.GetProperty("thinking").GetBoolean(), tools);
         Assert.Equal(c.GetProperty("rendered").GetString(), rendered);
     }
@@ -123,12 +123,12 @@ public sealed class ServerToolTests : IClassFixture<ServerToolTests.ToolHost>
     [Fact]
     public void Tools_Are_Refused_For_A_Template_That_Cannot_Render_Them()
     {
-        const string chatMl = "{% for m in messages %}<|im_start|>{{ m.role }}{% endfor %}";
+        var chatMl = ChatTemplate.Parse("{% for m in messages %}<|im_start|>{{ m.role }}{% endfor %}");
         var tool = JsonDocument.Parse("""{"type":"function","function":{"name":"x"}}""").RootElement;
         Assert.Throws<ChatTemplateException>(() =>
-            ChatTemplate.ApplyMessages(chatMl, new[] { new ChatMessage("user", "q") }, tools: new[] { tool }));
+            chatMl.Apply(new[] { new ChatMessage("user", "q") }, tools: new[] { tool }));
         Assert.Throws<ChatTemplateException>(() =>
-            ChatTemplate.ApplyMessages(chatMl, new[] { new ChatMessage("user", "q"), new ChatMessage("tool", "r") }));
+            chatMl.Apply(new[] { new ChatMessage("user", "q"), new ChatMessage("tool", "r") }));
     }
 
     // ── reading replies ─────────────────────────────────────────────────
@@ -150,7 +150,7 @@ public sealed class ServerToolTests : IClassFixture<ServerToolTests.ToolHost>
     [Fact]
     public void A_Reply_Splits_Into_Reasoning_Content_And_Typed_Calls()
     {
-        var reply = ReplyParser.Parse(AgentReply, promptOpenedThink: true, Tools);
+        var reply = ReplyParser.Parse(AgentReply, promptOpenedThink: true, Tools, syntax: Templates.QwenCalls);
         Assert.True(reply.Thought);
         Assert.Equal("Let me think.\nThe file needs 2 lines.", reply.Reasoning);
         Assert.Equal("I'll write it now.", reply.Content);
@@ -171,8 +171,8 @@ public sealed class ServerToolTests : IClassFixture<ServerToolTests.ToolHost>
     [Fact]
     public void Streaming_A_Character_At_A_Time_Reads_The_Same_And_Never_Leaks_Markup()
     {
-        var whole = ReplyParser.Parse(AgentReply, promptOpenedThink: true, Tools);
-        var parser = new ReplyParser(true, Tools);
+        var whole = ReplyParser.Parse(AgentReply, promptOpenedThink: true, Tools, syntax: Templates.QwenCalls);
+        var parser = new ReplyParser(true, Tools, null, Templates.QwenCalls);
         var events = new List<ReplyEvent>();
         foreach (char c in AgentReply)
         {
@@ -197,7 +197,7 @@ public sealed class ServerToolTests : IClassFixture<ServerToolTests.ToolHost>
     [Fact]
     public void A_Call_Cut_Off_By_The_Token_Limit_Is_Shown_Not_Run()
     {
-        var reply = ReplyParser.Parse("Writing.\n<tool_call>\n<function=create_file>\n<parameter=content>\nwhile True:", false, Tools);
+        var reply = ReplyParser.Parse("Writing.\n<tool_call>\n<function=create_file>\n<parameter=content>\nwhile True:", false, Tools, syntax: Templates.QwenCalls);
         Assert.Empty(reply.ToolCalls);
         Assert.StartsWith("Writing.\n\n<tool_call>", reply.Content);
     }
@@ -209,7 +209,7 @@ public sealed class ServerToolTests : IClassFixture<ServerToolTests.ToolHost>
         Assert.Equal("Use <tool_call> tags.", plain.Content);
         Assert.False(plain.Thought);
 
-        var cut = ReplyParser.Parse("still thinking about it", true, Tools);
+        var cut = ReplyParser.Parse("still thinking about it", true, Tools, syntax: Templates.QwenCalls);
         Assert.Equal("still thinking about it", cut.Reasoning);
         Assert.Equal("", cut.Content);
 
@@ -593,7 +593,7 @@ public sealed class ServerToolTests : IClassFixture<ServerToolTests.ToolHost>
         var g = _h.Models.Single(m => m.Id == "lm").Generator!;
         // The prompt is the conversation's generation prompt plus the started reply, token for token.
         string started = "The capital of france is";
-        string rendered = ChatTemplate.ApplyMessages(g.Template, new[] { new ChatMessage("user", "hello") }, false) + started;
+        string rendered = g.Template.Apply(new[] { new ChatMessage("user", "hello") }, false) + started;
         int expected = g.Tokenizer.EncodeToIds(rendered).Count;
         var (status, body) = await Post("/v1/chat/completions", $$$"""
             {"model":"lm","max_tokens":4,"temperature":0,"continue_final_message":true,

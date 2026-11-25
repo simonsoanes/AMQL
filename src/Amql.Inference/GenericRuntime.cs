@@ -138,7 +138,7 @@ public sealed partial class GenericRuntime
         // FFN.
         if (layerPlan.Ffn is { IsPresent: true } ffn)
         {
-            Tensor2D ffnOut = RunFfn(hf, layer, ffn);
+            Tensor2D ffnOut = RunFfn(hf, layer, ffn, x);
 
             if (layerPlan.PostFfnNorm is { } postFfnNorm)
             {
@@ -161,6 +161,14 @@ public sealed partial class GenericRuntime
             AddResidualInPlace(x, mixerOut);
         }
 
+        if (layerPlan.OutputScale is { } outputScale)
+        {
+            float s = _weights.Vector(outputScale, 1)[0];
+            for (int i = 0; i < x.Data.Length; i++)
+            {
+                x.Data[i] *= s;
+            }
+        }
         ApplyPatches(x, layer, queryPositions);
         // started 0 means "no timing" — the residual is the layer's result, not
         // an operation with a duration of its own.
@@ -197,7 +205,9 @@ public sealed partial class GenericRuntime
 
     /// <summary>The layer's FFN over its (normalised) input, with any adapter's
     /// contribution added.</summary>
-    private Tensor2D RunFfn(Tensor2D hf, int layer, LayerFfn ffn)
+    /// <param name="residual">The residual the FFN's norm read: what experts beside
+    /// a dense FFN (<see cref="HybridFfn"/>) read themselves.</param>
+    private Tensor2D RunFfn(Tensor2D hf, int layer, LayerFfn ffn, Tensor2D? residual = null)
     {
         int hidden = _plan.HiddenSize;
         FfnInputCapture?.Invoke(layer, hf);
@@ -219,7 +229,9 @@ public sealed partial class GenericRuntime
         else
         {
             var routed = ffn.Routed!;
-            ffnOut = RunRoutedFfn(hf, layer, routed);
+            ffnOut = routed.Hybrid is { } hybrid
+                ? RunHybridFfn(hf, residual ?? throw new InvalidOperationException("experts beside a dense FFN read the residual"), layer, routed, hybrid)
+                : RunRoutedFfn(hf, layer, routed);
             Report(layer, "ffn_routed", routed.Router, ffnOut, t);
         }
         if (FfnAdapter?.Invoke(layer, hf) is { } extra)
@@ -785,7 +797,67 @@ public sealed partial class GenericRuntime
         return new Tensor2D(result, heads.Rows, srcHeads * ratio * headDim);
     }
 
-    private Tensor2D RunRoutedFfn(Tensor2D h, int layer, RoutedFfnOp routed)
+    private Tensor2D RunHybridFfn(Tensor2D normed, Tensor2D residual, int layer, RoutedFfnOp routed, HybridFfn hybrid)
+    {
+        int hidden = routed.HiddenSize;
+        var d = hybrid.Dense;
+        var dense = FfnKernel.Dense(normed,
+            d.Gate is null ? null : _weights.Matrix(d.Gate, d.IntermediateSize, hidden),
+            _weights.Matrix(d.Up, d.IntermediateSize, hidden),
+            _weights.Matrix(d.Down, hidden, d.IntermediateSize), d.Activation, d.IsGated,
+            OptionalVector(d.GateBias, d.IntermediateSize), OptionalVector(d.UpBias, d.IntermediateSize), OptionalVector(d.DownBias, hidden));
+        if (hybrid.DenseOut is { } denseOut)
+        {
+            ApplyNorm(dense, denseOut, hidden);
+        }
+        var routedIn = residual.Clone();
+        if (hybrid.RoutedIn is { } inNorm)
+        {
+            ApplyNorm(routedIn, inNorm, hidden);
+        }
+        var experts = RunRoutedFfn(routedIn, layer, routed, residual);
+        if (hybrid.RoutedOut is { } outNorm)
+        {
+            ApplyNorm(experts, outNorm, hidden);
+        }
+        AddInPlace(dense, experts);
+        return dense;
+    }
+
+    /// <summary>What the router scores: its input, normalised and scaled where the
+    /// layer says so.</summary>
+    private Tensor2D RouterInput(Tensor2D h, RoutedFfnOp routed)
+    {
+        if (routed.RouterInputNormEps is null && routed.RouterScale is null)
+        {
+            return h;
+        }
+        var input = h.Clone();
+        int hidden = routed.HiddenSize;
+        if (routed.RouterInputNormEps is { } normEps)
+        {
+            var ones = new float[hidden];
+            Array.Fill(ones, 1f);
+            Norms.ApplyInPlace(input, NormType.RmsNorm, normEps, ones, 0f);
+        }
+        if (routed.RouterScale is { } scaleOperand)
+        {
+            var scale = _weights.Vector(scaleOperand, hidden);
+            float root = (float)(1.0 / Math.Sqrt(hidden));
+            for (int r = 0; r < input.Rows; r++)
+            {
+                var row = input.Row(r);
+                for (int c = 0; c < row.Length; c++)
+                {
+                    row[c] *= scale[c] * root;
+                }
+            }
+        }
+        return input;
+    }
+
+    /// <param name="routeBy">What the router reads, when it is not what the experts read.</param>
+    private Tensor2D RunRoutedFfn(Tensor2D h, int layer, RoutedFfnOp routed, Tensor2D? routeBy = null)
     {
         int hidden = routed.HiddenSize;
         var router = _weights.Matrix(routed.Router, routed.NumExperts, hidden);
@@ -804,6 +876,7 @@ public sealed partial class GenericRuntime
         // — it is the row that decides the next token, and capturing every
         // prefill row would dwarf the rest of the trace.
         int lastRow = h.Rows - 1;
+        var routerInput = RouterInput(routeBy ?? h, routed);
         var mixture = FfnKernel.Routed(h, router, routed.NumExperts, hidden, Expert,
             routed.TopK, routed.RoutingPolicy, routed.Activation,
             onExpertsRouted: ExpertRoutingTrace is null
@@ -820,7 +893,9 @@ public sealed partial class GenericRuntime
                 _weights.Release(w.Gate);
                 _weights.Release(w.Up);
                 _weights.Release(w.Down);
-            });
+            },
+            routerInput: ReferenceEquals(routerInput, h) ? null : routerInput,
+            expertScale: OptionalVector(routed.ExpertScale, routed.NumExperts));
         if (routed.SharedExpert is { } shared)
         {
             // Every token also passes through the shared expert, scaled by

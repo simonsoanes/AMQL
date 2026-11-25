@@ -34,9 +34,11 @@ public sealed record TokenizationResult(IReadOnlyList<TokenPiece> Pieces, IReadO
 /// An HF <c>tokenizer.json</c> reader for the byte-level BPE family: NFC
 /// normalisation, the configured regex pre-tokenizer (the GPT-2-style
 /// split), added/special-token carving, greedy BPE over the byte-level
-/// characters, and ByteLevel decoding. Unsupported pipeline stages refuse
-/// the file by name — the tokenizer is only trusted when every stage is
-/// one it has judged.
+/// characters, and ByteLevel decoding. Also the SentencePiece-style BPE family
+/// (Gemma): spaces replaced by "▁", no split, BPE over characters with a byte
+/// fallback (<c>&lt;0x0A&gt;</c>) for those the vocabulary lacks, and the matching
+/// decoder. Unsupported pipeline stages refuse the file by name — the
+/// tokenizer is only trusted when every stage is one it has judged.
 /// </summary>
 public sealed class HfTokenizer
 {
@@ -50,6 +52,9 @@ public sealed class HfTokenizer
     private readonly (int[] Prefix, int[] Suffix)? _singleTemplate;
     private readonly Dictionary<int, AddedToken> _addedById;
 
+    /// <summary>SentencePiece-style: what a space is written as ("▁"); null for byte-level BPE.</summary>
+    private readonly string? _spaceMark;
+
     private HfTokenizer(
         Dictionary<string, int> vocab,
         Dictionary<(string, string), int> mergeRanks,
@@ -58,8 +63,10 @@ public sealed class HfTokenizer
         Regex splitRegex,
         string[] tokensById,
         HashSet<int> specialIds,
-        (int[] Prefix, int[] Suffix)? singleTemplate)
+        (int[] Prefix, int[] Suffix)? singleTemplate,
+        string? spaceMark)
     {
+        _spaceMark = spaceMark;
         _singleTemplate = singleTemplate;
         _addedById = new Dictionary<int, AddedToken>();
         foreach (var t in addedTokens)
@@ -172,8 +179,12 @@ public sealed class HfTokenizer
                 }
             }
 
+            // SentencePiece-style BPE: every stage must be the one that goes with
+            // the others, or the file is refused below by the stage that is not.
+            string? spaceMark = ReadSpaceMark(root, model, path);
+
             // Normalizer: only NFC is judged.
-            if (root.TryGetProperty("normalizer", out var normalizer) &&
+            if (spaceMark is null && root.TryGetProperty("normalizer", out var normalizer) &&
                 normalizer.ValueKind == JsonValueKind.Object &&
                 normalizer.GetProperty("type").GetString() is { } normType &&
                 normType != "NFC")
@@ -182,10 +193,10 @@ public sealed class HfTokenizer
             }
 
             // Pre-tokenizer: Sequence(Split(regex), ByteLevel) or bare ByteLevel.
-            var splitRegex = BuildSplitRegex(root);
+            var splitRegex = spaceMark is null ? BuildSplitRegex(root) : NoSplit;
 
             // Decoder: only ByteLevel is judged.
-            if (root.TryGetProperty("decoder", out var decoder) &&
+            if (spaceMark is null && root.TryGetProperty("decoder", out var decoder) &&
                 decoder.GetProperty("type").GetString() is { } decoderType &&
                 decoderType != "ByteLevel")
             {
@@ -206,8 +217,58 @@ public sealed class HfTokenizer
             var specialIds = new HashSet<int>(addedTokens.Where(a => a.IsSpecial).Select(a => a.Id));
 
             return new HfTokenizer(vocab, mergeRanks, addedByContent, addedTokens, splitRegex, tokensById, specialIds,
-                ReadSingleTemplate(root, path));
+                ReadSingleTemplate(root, path), spaceMark);
         }
+    }
+
+    private static readonly Regex NoSplit = new(".+", RegexOptions.Singleline | RegexOptions.CultureInvariant);
+
+    /// <summary>The space mark of a SentencePiece-style file: normalizer
+    /// <c>Replace " " → mark</c>, a pre-tokenizer that splits only on spaces (there
+    /// are none left) or none, byte fallback, and the decoder that reverses it.
+    /// Null when the normalizer is not that one.</summary>
+    private static string? ReadSpaceMark(JsonElement root, JsonElement model, string path)
+    {
+        static string? Type(JsonElement e) => e.ValueKind == JsonValueKind.Object ? e.GetProperty("type").GetString() : null;
+        static string? Literal(JsonElement e) =>
+            e.TryGetProperty("pattern", out var p) && p.TryGetProperty("String", out var s) ? s.GetString() : null;
+
+        if (!root.TryGetProperty("normalizer", out var normalizer) || Type(normalizer) != "Replace" || Literal(normalizer) != " ")
+        {
+            return null;
+        }
+        string mark = normalizer.GetProperty("content").GetString() ?? "";
+        if (mark.Length == 0)
+        {
+            throw new TokenizerException($"'{path}': the normalizer deletes spaces, which is not served by this build");
+        }
+        if (root.TryGetProperty("pre_tokenizer", out var pre) && pre.ValueKind != JsonValueKind.Null &&
+            (Type(pre) != "Split" || Literal(pre) != " "))
+        {
+            throw new TokenizerException($"'{path}': pre-tokenizer '{Type(pre)}' over a '{mark}' normalizer is not served by this build");
+        }
+        if (!model.TryGetProperty("byte_fallback", out var fallback) || fallback.ValueKind != JsonValueKind.True)
+        {
+            throw new TokenizerException($"'{path}': a '{mark}' normalizer without byte fallback is not served by this build");
+        }
+        foreach (var key in new[] { "continuing_subword_prefix", "end_of_word_suffix", "dropout" })
+        {
+            if (model.TryGetProperty(key, out var v) && v.ValueKind != JsonValueKind.Null &&
+                !(v.ValueKind == JsonValueKind.String && v.GetString() == ""))
+            {
+                throw new TokenizerException($"'{path}': BPE with {key} is not served by this build");
+            }
+        }
+        bool reversed = root.TryGetProperty("decoder", out var decoder) && Type(decoder) == "Sequence";
+        if (reversed)
+        {
+            var stages = decoder.GetProperty("decoders").EnumerateArray().ToList();
+            reversed = stages.Count == 3 && Type(stages[0]) == "Replace" && Literal(stages[0]) == mark &&
+                       stages[0].GetProperty("content").GetString() == " " && Type(stages[1]) == "ByteFallback" && Type(stages[2]) == "Fuse";
+        }
+        return reversed
+            ? mark
+            : throw new TokenizerException($"'{path}': the decoder is not Replace, ByteFallback, Fuse, which is the one that goes with a '{mark}' normalizer");
     }
 
     /// <summary>Reads a <c>TemplateProcessing</c> post-processor's single-sequence
@@ -356,6 +417,10 @@ public sealed class HfTokenizer
 
     public TokenizationResult Encode(string text)
     {
+        if (_spaceMark is not null)
+        {
+            return EncodeMarked(text);
+        }
         // Stage 1: NF C normalisation (the "NFC" normalizer).
         string normalized = text.Normalize(NormalizationForm.FormC);
 
@@ -385,6 +450,103 @@ public sealed class HfTokenizer
     }
 
     public IReadOnlyList<int> EncodeToIds(string text) => Encode(text).Ids;
+
+    /// <summary>SentencePiece-style: added tokens are carved from the text as it is,
+    /// and each run between them is one word of the BPE, its spaces marked.</summary>
+    private TokenizationResult EncodeMarked(string text)
+    {
+        var pieces = new List<TokenPiece>();
+        foreach (var (start, end, token) in Scatter(text))
+        {
+            if (token is not null)
+            {
+                pieces.Add(PieceFor(token, token.Content));
+                continue;
+            }
+            foreach (int id in BpeRun(text.Substring(start, end - start).Replace(" ", _spaceMark)))
+            {
+                pieces.Add(PieceFor(id));
+            }
+        }
+        return new TokenizationResult(pieces, pieces.Select(p => p.Id).ToArray());
+    }
+
+    /// <summary>BPE over a run of any length: the lowest-ranked merge first, the
+    /// leftmost of equals, from a queue rather than a scan (a document is one run).</summary>
+    private List<int> BpeRun(string run)
+    {
+        var tokens = new List<string>(run.Length);
+        foreach (var rune in run.EnumerateRunes())
+        {
+            string ch = rune.ToString();
+            if (_vocab.ContainsKey(ch))
+            {
+                tokens.Add(ch);
+                continue;
+            }
+            foreach (byte b in Encoding.UTF8.GetBytes(ch))
+            {
+                tokens.Add($"<0x{b:X2}>");
+            }
+        }
+        int n = tokens.Count;
+        var next = new int[n];
+        var previous = new int[n];
+        var alive = new bool[n];
+        for (int i = 0; i < n; i++)
+        {
+            next[i] = i + 1;
+            previous[i] = i - 1;
+            alive[i] = true;
+        }
+        // Each entry keeps the very strings it was queued for, so one whose tokens
+        // have since merged is told apart.
+        var queue = new PriorityQueue<(int At, string Left, string Right), (int Rank, int At)>();
+        void Offer(int at)
+        {
+            if (at >= 0 && next[at] < n && _mergeRanks.TryGetValue((tokens[at], tokens[next[at]]), out int rank))
+            {
+                queue.Enqueue((at, tokens[at], tokens[next[at]]), (rank, at));
+            }
+        }
+        for (int i = 0; i < n; i++)
+        {
+            Offer(i);
+        }
+        while (queue.TryDequeue(out var entry, out _))
+        {
+            int at = entry.At;
+            if (!alive[at] || next[at] >= n || !ReferenceEquals(tokens[at], entry.Left) || !ReferenceEquals(tokens[next[at]], entry.Right))
+            {
+                continue;
+            }
+            int gone = next[at];
+            tokens[at] = entry.Left + entry.Right;
+            alive[gone] = false;
+            next[at] = next[gone];
+            if (next[at] < n)
+            {
+                previous[next[at]] = at;
+            }
+            Offer(previous[at]);
+            Offer(at);
+        }
+        var ids = new List<int>();
+        for (int i = 0; i < n; i = next[i])
+        {
+            ids.Add(_vocab.TryGetValue(tokens[i], out int id)
+                ? id
+                : throw new TokenizerException($"piece '{tokens[i]}' is not in the vocabulary"));
+        }
+        return ids;
+    }
+
+    /// <summary>The bytes a SentencePiece-style token stands for.</summary>
+    private byte[] MarkedBytes(string token) =>
+        token.Length == 6 && token.StartsWith("<0x", StringComparison.Ordinal) && token[5] == '>' &&
+        byte.TryParse(token.AsSpan(3, 2), System.Globalization.NumberStyles.AllowHexSpecifier, System.Globalization.CultureInfo.InvariantCulture, out byte b)
+            ? [b]
+            : Encoding.UTF8.GetBytes(token.Replace(_spaceMark!, " "));
 
     /// <summary>
     /// Walks the string once, carving added tokens leftmost-longest the way
@@ -528,6 +690,10 @@ public sealed class HfTokenizer
             throw new TokenizerException($"cannot decode unknown id {id}");
         }
         string token = _tokensById[id];
+        if (_spaceMark is not null)
+        {
+            return new TokenPiece(id, token, Encoding.UTF8.GetString(MarkedBytes(token)), false);
+        }
         ByteLevel.TryDecodeWord(token, out var word);
         return new TokenPiece(id, token, word, false);
     }
@@ -552,6 +718,11 @@ public sealed class HfTokenizer
                 {
                     bytes.AddRange(Encoding.UTF8.GetBytes(added.Content));
                 }
+                continue;
+            }
+            if (_spaceMark is not null && id >= 0 && id < _tokensById.Length && _tokensById[id] is { } marked)
+            {
+                bytes.AddRange(MarkedBytes(marked));
                 continue;
             }
             if (id < 0 || id >= _tokensById.Length || _tokensById[id] is null ||

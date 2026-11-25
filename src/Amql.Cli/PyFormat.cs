@@ -353,7 +353,7 @@ internal static class PyFormat
         }
     }
 
-    private static void AppendJsonString(StringBuilder sb, string s, bool ensureAscii)
+    internal static void AppendJsonString(StringBuilder sb, string s, bool ensureAscii)
     {
         sb.Append('"');
         foreach (char c in s)

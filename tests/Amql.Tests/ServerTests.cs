@@ -82,10 +82,10 @@ public sealed class ServerTests : IClassFixture<ServerTests.Hosts>
     [Fact]
     public void Chat_Rendering_Matches_Hf_Apply_Chat_Template_On_Qwen35()
     {
-        string template = File.ReadAllText(Path.Combine(Hosts.Fixtures, "qwen35_chat_template.jinja"));
+        var template = Templates.Qwen;
         foreach (var c in _h.LmGolden.GetProperty("chat").EnumerateArray())
         {
-            string rendered = ChatTemplate.ApplyMessages(template, Messages(c.GetProperty("messages")),
+            string rendered = template.Apply(Messages(c.GetProperty("messages")),
                 c.GetProperty("enable_thinking").GetBoolean());
             Assert.Equal(c.GetProperty("text").GetString(), rendered);
         }

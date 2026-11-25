@@ -243,6 +243,8 @@ public static class ModelConfig
                 }
             }
 
+            RefuseUnservedFacts(text);
+
             JsonElement rope = text.TryGetProperty("rope_parameters", out var rp) && rp.ValueKind == JsonValueKind.Object
                 ? rp.Clone()
                 : LegacyRopeParameters(text);
@@ -489,7 +491,7 @@ public static class ModelConfig
             return null;
         }
         if (Int("num_experts", "num_local_experts", "n_routed_experts") is not { } experts || experts <= 0 ||
-            Int("num_experts_per_tok", "num_experts_per_token", "moe_top_k") is not { } topK || topK <= 0)
+            Int("num_experts_per_tok", "num_experts_per_token", "moe_top_k", "top_k_experts") is not { } topK || topK <= 0)
         {
             return null;
         }
@@ -546,6 +548,29 @@ public static class ModelConfig
             return JsonDocument.Parse(perType.ToJsonString()).RootElement.Clone();
         }
         return JsonDocument.Parse(node.ToJsonString()).RootElement.Clone();
+    }
+
+    /// <summary>Config facts that change the arithmetic and have no operator here:
+    /// refused by name rather than run as if they were absent.</summary>
+    private static void RefuseUnservedFacts(JsonElement text)
+    {
+        foreach (var (key, what) in new[]
+                 {
+                     ("hidden_size_per_layer_input", "per-layer input embeddings"),
+                     ("num_kv_shared_layers", "layers that reuse another layer's keys and values"),
+                 })
+        {
+            if (text.TryGetProperty(key, out var v) && v.ValueKind == JsonValueKind.Number && v.GetInt64() > 0)
+            {
+                throw new ModelConfigException($"{key} = {v.GetInt64()}: {what} are not served");
+            }
+        }
+        if (text.TryGetProperty("use_bidirectional_attention", out var bidirectional) &&
+            (bidirectional.ValueKind == JsonValueKind.True ||
+             bidirectional.ValueKind == JsonValueKind.String && bidirectional.GetString() == "all"))
+        {
+            throw new ModelConfigException("use_bidirectional_attention: a decoder whose text attends both ways is not served");
+        }
     }
 
     private static JsonElement WithoutTextConfig(JsonElement root)

@@ -26,6 +26,93 @@ public class SpeculativeDecodingTests
         return containerDir;
     }
 
+    /// <summary>A drafter that reads the model's caches (Gemma 4's assistant) gives what transformers
+    /// gives, and a reply drafted with it is the reply without it.</summary>
+    [Theory]
+    [InlineData(null)]
+    [InlineData(Fp4Format.Nvfp4)]
+    public void A_Drafter_Over_The_Models_Caches_Matches_Transformers(Fp4Format? format)
+    {
+        CudaShim.Reset();
+        if (!CudaShim.Enabled)
+        {
+            return;
+        }
+        string kv = GpuEngine.RequestedKvFormat;
+        using var restore = new Restore(() => GpuEngine.RequestedKvFormat = kv);
+        GpuEngine.RequestedKvFormat = format is null ? "f32" : "fp16";   // random routers make much of a cache's rounding
+        using var dir = new TempDir();
+        string containerDir = Encode(dir, "gemma4-moe");
+        string assistant = Path.Combine(AppContext.BaseDirectory, "fixtures", "gemma4-assistant");
+        var report = Attach.Drafter(containerDir, assistant, format);
+        Assert.Equal(["drafter.stack"], report.Objects);
+        Attach.Drafter(containerDir, assistant, format);   // again: replaced
+        using var golden = System.Text.Json.JsonDocument.Parse(File.ReadAllBytes(Path.Combine(assistant, "golden.json")));
+        var root = golden.RootElement;
+        var ids = root.GetProperty("ids").EnumerateArray().Select(e => e.GetInt32()).ToArray();
+        using var container = Vindex3Container.Open(containerDir);
+        using var store = container.CreateOperandStore();
+        var plan = Planner.Plan(container, "target", store);
+        using var host = new DecodeSession(plan, store);
+        host.Prefill(new[] { ids[0] });
+        var engine = host.DeviceEngine()!;
+        Assert.True(engine.HasDrafter);
+        engine.ExactPrefill = true;
+        var seq = engine.NewSequence();
+        var last = engine.Prefill(seq, ids);
+        int token = root.GetProperty("token").GetInt32();
+        Assert.Equal(token, Sampler.ArgMax(last));
+        var expected = root.GetProperty("logits").EnumerateArray().Select(r => r.EnumerateArray().Select(v => v.GetSingle()).ToArray()).ToArray();
+        var (drafts, logits) = engine.DraftLogits(seq, token, expected.Length);
+        if (format is null)
+        {
+            double scale = expected.Max(r => r.Max(Math.Abs));
+            for (int i = 0; i < expected.Length; i++)
+            {
+                double apart = expected[i].Zip(logits[i]).Max(p => Math.Abs(p.First - p.Second)) / scale;
+                Assert.True(apart < 2e-3, $"draft {i}: {apart:P3}");
+            }
+            Assert.Equal(root.GetProperty("drafts").EnumerateArray().Select(e => e.GetInt32()).ToArray(), drafts);
+        }
+        engine.ExactPrefill = false;
+
+        // Drafted and plain greedy replies, past the window and through slides of it.
+        var plain = engine.NewSequence();
+        var reply = new List<int> { Sampler.ArgMax(engine.Prefill(plain, ids)) };
+        while (reply.Count < 60)
+        {
+            reply.Add(Sampler.ArgMax(engine.Step(new[] { plain }, new[] { reply[^1] })[0]));
+        }
+        engine.Reset(seq);
+        var drafted = new List<int> { Sampler.ArgMax(engine.Prefill(seq, ids)) };
+        while (drafted.Count < 60)
+        {
+            var proposal = engine.Draft(seq, drafted[^1], 3);
+            Assert.Equal(3, proposal.Length);
+            engine.Verify(seq, [drafted[^1], .. proposal]);
+            int rows = 0;
+            do
+            {
+                drafted.Add(Sampler.ArgMax(engine.HostLogits(rows++)));
+            }
+            while (rows <= proposal.Length && proposal[rows - 1] == drafted[^1]);
+            engine.Accept(seq, rows);
+        }
+        Assert.Equal(reply, drafted.Take(60));
+
+        // A plain step passes the drafter by; the next verify brings it back.
+        engine.Step(new[] { seq }, new[] { 5 });
+        Assert.Empty(engine.Draft(seq, 6, 3));
+        engine.Verify(seq, [6]);
+        engine.Accept(seq, 1);
+        Assert.Equal(3, engine.Draft(seq, 7, 3).Length);
+    }
+
+    private sealed class Restore(Action undo) : IDisposable
+    {
+        public void Dispose() => undo();
+    }
+
     [Theory]
     [InlineData("qwen3")]
     [InlineData("qwen3_5-gdn")]

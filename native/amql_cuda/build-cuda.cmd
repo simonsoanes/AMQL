@@ -66,13 +66,13 @@ if errorlevel 1 (
 
 echo [amql-cuda] nvcc:
 "%CUDA_ROOT%\bin\nvcc.exe" --version | findstr /i release
-echo [amql-cuda] compiling amql_cuda.cu -arch=%CUDA_ARCH% ...
+echo [amql-cuda] compiling -arch=%CUDA_ARCH% (amql_engine.cu takes several minutes) ...
 
 "%CUDA_ROOT%\bin\nvcc.exe" -arch=%CUDA_ARCH% -O3 -std=c++17 ^
     -Xcompiler /MT ^
     --shared ^
     -o bin\amql_cuda.dll ^
-    amql_cuda.cu amql_engine.cu ^
+    amql_cuda.cu amql_engine.cu amql_moe.cu amql_vision.cu amql_graph.cu ^
     -lcublasLt -lcublas -lcusolver -lcudart
 if errorlevel 1 (
     echo [amql-cuda] nvcc build FAILED for -arch=%CUDA_ARCH%.

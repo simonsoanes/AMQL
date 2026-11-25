@@ -33,9 +33,9 @@ internal static partial class Program
         var questions = conv["questions"]!.AsArray().Select(q => (string)q!).ToList();
         var tokenizer = Tokenizer(containerDir);
         var stop = ResolveStopTokens(containerDir, tokenizer);
-        string template = ChatTemplate.Load(containerDir) ?? throw new CliException("the container has no chat template");
+        var template = ChatTemplate.Load(containerDir) ?? throw new CliException("the container has no chat template");
         int turn = tokenizer.AddedTokenId("<|im_start|>") ?? throw new CliException("kv-probe needs <|im_start|> turns");
-        int[] PromptFor(string q) => tokenizer.EncodeToIds(ChatTemplate.ApplyMessages(template,
+        int[] PromptFor(string q) => tokenizer.EncodeToIds(template.Apply(
             messages.Append(new ChatMessage("user", q)).ToList(), enableThinking: false)).ToArray();
         var prompts = questions.Select(PromptFor).ToList();
         // The prefix: everything before the question's own turn (as the server marks a prompt).

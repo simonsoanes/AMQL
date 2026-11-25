@@ -222,8 +222,15 @@ public sealed class MoeSurface
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public int? DensePrefixLayers { get; init; }
 
+    /// <summary>The routed experts run beside a dense FFN in the same layer:
+    /// <c>out(dense_out(dense(in(x))) + routed_out(experts(routed_in(x))))</c>, the
+    /// router reading x itself.</summary>
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
     public bool Hybrid { get; init; }
+
+    /// <summary>The router reads its input RMS-normalised without a weight.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool RouterInputNorm { get; init; }
 }
 
 public sealed class FfnSurface

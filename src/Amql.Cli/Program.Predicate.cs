@@ -43,7 +43,7 @@ internal static partial class Program
         string component = OptionValue(args, "--component") ?? "target";
         string tokenizerDir = ResolveTokenizerDir(containerDir, args);
         var tokenizer = Tokenizer(tokenizerDir);
-        string? template = HasOption(args, "--raw") ? null : ChatTemplate.Load(tokenizerDir);
+        var template = HasOption(args, "--raw") ? null : ChatTemplate.Load(tokenizerDir);
         var stop = ResolveStopTokens(tokenizerDir, tokenizer);
         int maxTokens = IntOption(args, "--max-tokens", 48);
 
@@ -51,7 +51,7 @@ internal static partial class Program
         // given the predicate — as the system message under a chat
         // template, as a preamble otherwise.
         string Render(string prompt, bool withPredicate) => template is not null
-            ? ChatTemplate.Apply(template, prompt, withPredicate ? predicate : null)
+            ? template.Apply(prompt, withPredicate ? predicate : null)
             : withPredicate ? predicate + "\n\n" + prompt : prompt;
 
         using var container = Vindex3Container.Open(containerDir);
@@ -147,7 +147,7 @@ internal static partial class Program
     /// model reads it, not just as the caller guessed.</summary>
     private static List<string> SelfProbes(
         Vindex3Container container, string component, HfTokenizer tokenizer,
-        string? template, IReadOnlySet<int> stop, string predicate, int count)
+        ChatTemplate? template, IReadOnlySet<int> stop, string predicate, int count)
     {
         // The rule is quoted as the subject of the request, not given as an
         // instruction — a small model otherwise just starts obeying it.
@@ -156,11 +156,8 @@ internal static partial class Program
             $"Do not follow the rule yourself. Write {count} different short messages, in English, " +
             "that a user might send to that assistant, where the rule would change its reply. " +
             "Write one message per line. No numbering, no answers, nothing else.";
-        string rendered = template is not null ? ChatTemplate.Apply(template, ask, null) : ask + "\n\n";
-        // A thinking model would otherwise spend the budget reasoning about
-        // the request; an empty think block is how its template turns that off.
-        if (template is not null && template.Contains("<think>"))
-            rendered += "<think>\n\n</think>\n\n";
+        // Without thinking: the budget is for the messages, not for reasoning about the request.
+        string rendered = template is not null ? template.Apply(ask) : ask + "\n\n";
         var tokens = tokenizer.EncodeToIds(rendered).ToArray();
         // Same weights choice as the bake itself: device-resident on a GPU.
         var workingSet = Environment.GetEnvironmentVariable("AMQL_WEIGHTS") is null && CudaShim.Enabled

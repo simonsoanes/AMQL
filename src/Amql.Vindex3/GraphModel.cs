@@ -151,6 +151,12 @@ public sealed class AttentionLayerPolicy
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
     public bool VFromK { get; init; }
 
+    /// <summary>The layer has one projection for keys and values: each is the
+    /// same K projection of the input, normalised (and, for keys, rotated) its
+    /// own way. Not <see cref="VFromK"/>, which reuses the finished keys.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool SharedKvProjection { get; init; }
+
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? DeclaredSpan { get; init; }
 }

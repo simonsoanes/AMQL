@@ -23,11 +23,11 @@ public class GpuEngineTests : IDisposable
     public void Dispose() => GpuEngine.RequestedKvFormat = _kvFormat;
 
     /// <summary>Families whose plans need an operator the engine leaves to the
-    /// managed path (routed experts, length-dependent rope, Qwen4's gated
+    /// managed path (a shared expert, length-dependent rope, Qwen4's gated
     /// residual, QSA and n-gram embedding).</summary>
     private static readonly HashSet<string> Refused = new(StringComparer.Ordinal)
     {
-        "mixtral", "olmoe", "qwen2_moe", "qwen3_moe", "llama-dynamic", "phi3-longrope-long", "phi3-longrope-short",
+        "qwen2_moe", "llama-dynamic", "phi3-longrope-long", "phi3-longrope-short",
         "qwen4_exp-tiny", "qwen4_exp-nvfp4-tiny",
     };
 
@@ -67,7 +67,10 @@ public class GpuEngineTests : IDisposable
         // 3-token prompt takes the GEMV path, f32 either way). 800 tokens run
         // as 512 + 288 rows, so a Gated DeltaNet takes its chunked form in
         // both, with a partial last chunk and the state carried between them.
-        foreach (bool exact in new[] { true, false })
+        // A random router scores its experts close together, so a BF16-rounded prompt
+        // can send a token to another expert and that token's logits move by whole
+        // units (and only that token's): those are held to exact prompts.
+        foreach (bool exact in family == "gemma4-moe" ? new[] { true } : new[] { true, false })
         foreach (int length in new[] { 3, 21, 800 })
         {
             var prompt = Enumerable.Range(0, length).Select(i => ids[i % ids.Length]).ToArray();

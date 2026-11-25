@@ -22,6 +22,8 @@ public class GpuBatchTests
     [InlineData("qwen3_5-gdn")]
     [InlineData("gemma2")]
     [InlineData("cohere")]
+    [InlineData("gemma4-moe")]
+    [InlineData("mixtral")]
     public void Batched_Steps_Equal_Each_Sequence_Alone(string family)
     {
         CudaShim.Reset();
@@ -103,6 +105,8 @@ public class GpuBatchTests
     [Theory]
     [InlineData("qwen3")]
     [InlineData("qwen3_5-gdn")]
+    [InlineData("gemma3_text")]
+    [InlineData("gemma4-moe")]
     public void A_Rewound_Sequence_Picks_Up_At_Its_Mark(string family)
     {
         CudaShim.Reset();

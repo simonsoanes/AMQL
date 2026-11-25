@@ -210,8 +210,8 @@ for (int i = 0; i < args.Length; i++)
                   all                         GET  /v1/models, /v1/models/{id}, /health
                 The API key may also come from AMQL_API_KEY; without one, requests are not authenticated.
 
-                Chat serves tools (OpenAI function calling) for Qwen3.5-family templates, returns thinking
-                as reasoning_content (chat) or reasoning items (responses), and keeps responses for
+                Chat runs the model's own chat template and serves tools (OpenAI function calling) in the
+                form it writes calls, learned from it. It returns thinking as reasoning_content (chat) or reasoning items (responses), and keeps responses for
                 previous_response_id.
                   --adapter     Entail adapters to run beside a chat model (id= picks the model; bare: all)
                   --gpu-format  nvfp4 or mxfp4 serves each container's GPTQ-rounded 4-bit copy, built beside it

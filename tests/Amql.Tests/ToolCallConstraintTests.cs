@@ -26,7 +26,7 @@ public sealed class ToolCallConstraintTests
 
     private static bool Valid(string call, int piece = 1)
     {
-        var c = new ToolCallConstraint(Grammar);
+        var c = Templates.QwenCalls.Constraint(Grammar);
         for (int i = 0; i < call.Length; i += piece)
         {
             string part = call.Substring(i, Math.Min(piece, call.Length - i));
@@ -66,13 +66,13 @@ public sealed class ToolCallConstraintTests
     [InlineData("\n<function=edit_file>\n<parameter=edits>\n[{\"op\": \"replace\", \"anchor\": \"L4\"},]")]      // a trailing comma
     [InlineData("\n<function=edit_file>\n<parameter=edits>\n[{\"op\": \"rename\"")]                              // op outside its enum
     [InlineData("\n<function=edit_file>\n<parameter=edits>\n'L42:a3f9c1'")]                                     // not an array
-    [InlineData("\n<function=edit_file>\n<parameter=force>\nTrue")]                                              // JSON booleans are lower case
+    [InlineData("\n<function=edit_file>\n<parameter=force>\nyes")]                                               // not a boolean
     [InlineData("\n<function=run_build>\n<parameter=mode>\nfast")]                                               // a string enum, bare
     [InlineData("\n<function=run_build>\n<parameter=jobs>\n2.5")]                                                // an integer
     [InlineData("\n<function=run_build>\n<parameter=jobs>\n9 9")]                                                // nothing but its close after a value
     public void Calls_The_Tools_Do_Not_Declare_Are_Refused(string prefix)
     {
-        var c = new ToolCallConstraint(Grammar);
+        var c = Templates.QwenCalls.Constraint(Grammar);
         bool all = true;
         foreach (char ch in prefix)
         {
@@ -90,7 +90,7 @@ public sealed class ToolCallConstraintTests
     [Fact]
     public void A_Call_Cannot_End_The_Reply_And_Is_Done_Only_At_Its_Close()
     {
-        var c = new ToolCallConstraint(Grammar);
+        var c = Templates.QwenCalls.Constraint(Grammar);
         c.Advance(Create[..^"</tool_call>".Length]);
         Assert.False(c.Done);
         Assert.False(c.CanEnd);
@@ -103,7 +103,7 @@ public sealed class ToolCallConstraintTests
     {
         var tools = JsonDocument.Parse("""[{"type":"function","function":{"name":"edit_file","parameters":{"type":"object","properties":{"path":{"type":"string"},"edits":{"type":"array"}}}}}]""")
             .RootElement.EnumerateArray().Select(t => t.Clone()).ToList();
-        var reply = ReplyParser.Parse("<tool_call>" + Edit, false, tools);
+        var reply = ReplyParser.Parse("<tool_call>" + Edit, false, tools, syntax: Templates.QwenCalls);
         var args = JsonDocument.Parse(reply.ToolCalls.Single().Arguments).RootElement;
         Assert.Equal("Program.cs", args.GetProperty("path").GetString());
         Assert.Equal("replace", args.GetProperty("edits")[0].GetProperty("op").GetString());
@@ -112,7 +112,7 @@ public sealed class ToolCallConstraintTests
     [Fact]
     public void The_Way_To_An_Optional_Parameter_Is_Known_Wherever_One_Can_Open()
     {
-        var c = new ToolCallConstraint(Grammar);
+        var c = Templates.QwenCalls.Constraint(Grammar);
         c.Advance("\n<function=create_file>\n");
         Assert.Equal(new[] { "overwrite" }, c.OptionalLeft());
         Assert.Equal("<parameter=overwrite>", c.PathTo("overwrite"));

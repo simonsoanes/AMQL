@@ -14,6 +14,15 @@ public static class Planner
 {
     public static ComponentOpPlan Plan(Vindex3Container container, string componentId, OperandStore store)
     {
+        var plan = PlanStack(container, componentId, store);
+        return container.Graph is { } graph && graph.Component(componentId).Role == ComponentRole.PrimaryText &&
+               DrafterPlan.Build(graph, store, plan) is { } drafter
+            ? plan.With(drafter)
+            : plan;
+    }
+
+    private static ComponentOpPlan PlanStack(Vindex3Container container, string componentId, OperandStore store)
+    {
         var graph = container.Graph
             ?? throw new ContainerException("container records no system graph — cannot plan execution");
         var component = graph.Component(componentId);
@@ -195,7 +204,8 @@ public static class Planner
             PostAttentionNorm = postAttention,
             PreFfnNorm = preFfn,
             PostFfnNorm = postFfn,
-            Ffn = BuildFfn(store, stackId, layer, ffnSurface, roles, hiddenSize),
+            Ffn = BuildFfn(store, stackId, layer, ffnSurface, roles, hiddenSize, normSurface),
+            OutputScale = RoleOperand(store, stackId, layer, roles, TensorRoles.LayerScale),
             ParallelResidual = surface.ParallelResidual,
         };
     }
@@ -245,6 +255,8 @@ public static class Planner
                 $"layer {layer}: a sliding window over bidirectional attention has no managed implementation");
         }
 
+        var geometry = LayerHeads(store, stackId, layer, policy, attnSurface, roles);
+
         bool perHeadGate = attnSurface.OutputGate is { ValueKind: System.Text.Json.JsonValueKind.Object } gateFacts &&
                            gateFacts.TryGetProperty("per_head_gate", out var phg) && phg.ValueKind == System.Text.Json.JsonValueKind.True;
         OperandRef? headGate = null;
@@ -264,8 +276,8 @@ public static class Planner
         return new AttentionOp
         {
             NumQHeads = attnSurface.NumQHeads,
-            NumKvHeads = attnSurface.NumKvHeads,
-            HeadDim = attnSurface.HeadDim,
+            NumKvHeads = geometry.NumKvHeads,
+            HeadDim = geometry.HeadDim,
             ScoreScale = attnSurface.ScoreScale,
             LogitSoftcapping = attnSurface.LogitSoftcapping,
             Window = policy.Window,
@@ -282,17 +294,40 @@ public static class Planner
             Indexer = surface.SparseAttention is { } sparse
                 ? BindIndexer(store, stackId, layer, sparse, policy.Position, attnSurface, normSurface)
                 : null,
-            QNorm = BindOptionalQkNorm(store, stackId, layer, roles, TensorRoles.QNorm, attnSurface, normSurface),
-            KNorm = BindOptionalQkNorm(store, stackId, layer, roles, TensorRoles.KNorm, attnSurface, normSurface),
+            QNorm = BindOptionalQkNorm(store, stackId, layer, roles, TensorRoles.QNorm, attnSurface, normSurface, geometry),
+            KNorm = BindOptionalQkNorm(store, stackId, layer, roles, TensorRoles.KNorm, attnSurface, normSurface, geometry),
             QProj = Projection(TensorRoles.Q),
             KProj = Projection(TensorRoles.K),
-            VProj = Projection(TensorRoles.V),
+            VProj = Projection(policy.SharedKvProjection ? TensorRoles.K : TensorRoles.V),
             OProj = Projection(TensorRoles.O),
             QBias = RoleOperand(store, stackId, layer, roles, TensorRoles.Q, "bias"),
             KBias = RoleOperand(store, stackId, layer, roles, TensorRoles.K, "bias"),
-            VBias = RoleOperand(store, stackId, layer, roles, TensorRoles.V, "bias"),
+            VBias = RoleOperand(store, stackId, layer, roles, policy.SharedKvProjection ? TensorRoles.K : TensorRoles.V, "bias"),
             OBias = RoleOperand(store, stackId, layer, roles, TensorRoles.O, "bias"),
         };
+    }
+
+    /// <summary>The layer's heads: the stack's, unless the layer's own projections
+    /// are not those heads' and are its policy row's (Gemma 4's full layers differ
+    /// from its sliding ones). The tensors decide, because a row that was never
+    /// updated with a reshaped stack says nothing about it.</summary>
+    private static HeadGeometry LayerHeads(OperandStore store, string stackId, int layer, AttentionLayerPolicy policy,
+        AttentionSurface attnSurface, LayerRoleMap roles)
+    {
+        var stack = new HeadGeometry { HeadDim = attnSurface.HeadDim, NumKvHeads = attnSurface.NumKvHeads };
+        if (policy.Geometry is not { } own || (own.HeadDim == stack.HeadDim && own.NumKvHeads == stack.NumKvHeads) ||
+            RoleTensor(store, stackId, layer, roles, TensorRoles.Q) is not { } q ||
+            RoleTensor(store, stackId, layer, roles, TensorRoles.K) is not { } k)
+        {
+            return stack;
+        }
+        long qRows = store.ShapeOf(stackId, q)[0], kRows = store.ShapeOf(stackId, k)[0];
+        bool Fits(HeadGeometry g)
+        {
+            long qDim = (long)attnSurface.NumQHeads * g.HeadDim;
+            return kRows == (long)g.NumKvHeads * g.HeadDim && (qRows == qDim || (attnSurface.OutputGate is not null && qRows == 2 * qDim));
+        }
+        return !Fits(stack) && Fits(own) ? own : stack;
     }
 
     /// <summary>Binds a weighted QK norm operand when the learned tensor
@@ -301,7 +336,7 @@ public static class Planner
     /// whole projection (OLMo 2) — is read from the tensor's shape.</summary>
     private static NormOp? BindOptionalQkNorm(
         OperandStore store, string stackId, int layer, LayerRoleMap roles, string role,
-        AttentionSurface attnSurface, NormSurface normSurface)
+        AttentionSurface attnSurface, NormSurface normSurface, HeadGeometry geometry)
     {
         string otherRole = role == TensorRoles.QNorm ? TensorRoles.KNorm : TensorRoles.QNorm;
         string? name = RoleTensor(store, stackId, layer, roles, role);
@@ -317,11 +352,11 @@ public static class Planner
             return null;
         }
         int width = checked((int)store.ShapeOf(stackId, name)[0]);
-        int heads = role == TensorRoles.QNorm ? attnSurface.NumQHeads : attnSurface.NumKvHeads;
-        if (width != attnSurface.HeadDim && width != heads * attnSurface.HeadDim)
+        int heads = role == TensorRoles.QNorm ? attnSurface.NumQHeads : geometry.NumKvHeads;
+        if (width != geometry.HeadDim && width != heads * geometry.HeadDim)
         {
             throw new ContainerException(
-                $"layer {layer}: '{name}' has width {width} — neither one head ({attnSurface.HeadDim}) nor the projection ({heads * attnSurface.HeadDim})");
+                $"layer {layer}: '{name}' has width {width} — neither one head ({geometry.HeadDim}) nor the projection ({heads * geometry.HeadDim})");
         }
         return new NormOp
         {
@@ -451,7 +486,7 @@ public static class Planner
         };
     }
 
-    private static LayerFfn? BuildFfn(OperandStore store, string stackId, int layer, FfnSurface ffnSurface, LayerRoleMap roles, int hiddenSize)
+    private static LayerFfn? BuildFfn(OperandStore store, string stackId, int layer, FfnSurface ffnSurface, LayerRoleMap roles, int hiddenSize, NormSurface normSurface)
     {
         if (ffnSurface.Moe is { } routedMoe && roles.Experts is { } experts)
         {
@@ -506,6 +541,19 @@ public static class Planner
                         ExpertGateStem = experts.Gate,
                         ExpertUpStem = experts.Up,
                         ExpertDownStem = experts.Down,
+                        RouterInputNormEps = routedMoe.RouterInputNorm ? normSurface.Pre.Eps : null,
+                        RouterScale = RoleOperand(store, stackId, layer, roles, TensorRoles.RouterScale),
+                        ExpertScale = RoleOperand(store, stackId, layer, roles, TensorRoles.ExpertScale),
+                        Hybrid = routedMoe.Hybrid
+                            ? new HybridFfn
+                            {
+                                Dense = BuildDenseFfn(store, stackId, layer, ffnSurface, roles, hiddenSize)
+                                        ?? throw new ContainerException($"layer {layer}: experts beside a dense FFN, but the layer carries none"),
+                                DenseOut = BindRoleNorm(store, stackId, layer, roles, TensorRoles.DenseOut, normSurface.Post!, hiddenSize),
+                                RoutedIn = BindRoleNorm(store, stackId, layer, roles, TensorRoles.RoutedIn, normSurface.Post!, hiddenSize),
+                                RoutedOut = BindRoleNorm(store, stackId, layer, roles, TensorRoles.RoutedOut, normSurface.Post!, hiddenSize),
+                            }
+                            : null,
                         SharedExpert = shared,
                         SharedExpertGate = shared is null ? null : RoleOperand(store, stackId, layer, roles, TensorRoles.SharedExpertGate),
                     },
@@ -541,6 +589,11 @@ public static class Planner
             return new LayerFfn { Routed = routed };
         }
 
+        return BuildDenseFfn(store, stackId, layer, ffnSurface, roles, hiddenSize) is { } dense ? new LayerFfn { Dense = dense } : null;
+    }
+
+    private static DenseFfnOp? BuildDenseFfn(OperandStore store, string stackId, int layer, FfnSurface ffnSurface, LayerRoleMap roles, int hiddenSize)
+    {
         // Gated or plain is the checkpoint's shape: a gate projection exists or not.
         var gate = RoleOperand(store, stackId, layer, roles, TensorRoles.Gate);
         var up = RoleOperand(store, stackId, layer, roles, TensorRoles.Up);
@@ -554,20 +607,17 @@ public static class Planner
             throw new UnsupportedOperatorException(
                 $"layer {layer}: the FFN is incomplete (up: {up is not null}, down: {down is not null})");
         }
-        return new LayerFfn
+        return new DenseFfnOp
         {
-            Dense = new DenseFfnOp
-            {
-                Gate = gate,
-                Up = up,
-                Down = down,
-                GateBias = RoleOperand(store, stackId, layer, roles, TensorRoles.Gate, "bias"),
-                UpBias = RoleOperand(store, stackId, layer, roles, TensorRoles.Up, "bias"),
-                DownBias = RoleOperand(store, stackId, layer, roles, TensorRoles.Down, "bias"),
-                Activation = ffnSurface.Activation,
-                IntermediateSize = ffnSurface.IntermediateSize,
-                HiddenSize = hiddenSize,
-            },
+            Gate = gate,
+            Up = up,
+            Down = down,
+            GateBias = RoleOperand(store, stackId, layer, roles, TensorRoles.Gate, "bias"),
+            UpBias = RoleOperand(store, stackId, layer, roles, TensorRoles.Up, "bias"),
+            DownBias = RoleOperand(store, stackId, layer, roles, TensorRoles.Down, "bias"),
+            Activation = ffnSurface.Activation,
+            IntermediateSize = ffnSurface.IntermediateSize,
+            HiddenSize = hiddenSize,
         };
     }
 
@@ -647,7 +697,7 @@ public static class Planner
                 throw new ContainerException($"layer {layer}: '{stray}' is a layer norm, but a gated-residual layer has none");
             }
         }
-        var ffn = BuildFfn(store, stackId, layer, ffnSurface, roles, hiddenSize)
+        var ffn = BuildFfn(store, stackId, layer, ffnSurface, roles, hiddenSize, normSurface)
             ?? throw new ContainerException($"layer {layer}: a gated-residual layer implies an FFN, and the segment carries none");
 
         NgramEmbeddingOp? ngram = null;
