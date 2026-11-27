@@ -63,12 +63,12 @@ public static class ToolLocator
     /// <summary>The tool, or an exception that says how to make it available.</summary>
     public static ToolLocation Require(string tool) =>
         Find(tool) ?? throw new FileNotFoundException(
-            $"{tool}.exe was not found beside AMQL Studio, in the repository's bin folders or on PATH. " +
+            $"{ExecutableName(tool)} was not found beside AMQL Studio, in the repository's bin folders or on PATH. " +
             $"Build it (dotnet build src/{ProjectFor(tool)}) or put it on PATH.");
 
     private static ToolLocation? Discover(string tool)
     {
-        string exe = tool + ".exe";
+        string exe = ExecutableName(tool);
         var candidates = new List<(string Path, string Source)>();
         string baseDir = AppContext.BaseDirectory;
         candidates.Add((Path.Combine(baseDir, exe), "beside AMQL Studio"));
@@ -78,7 +78,7 @@ public static class ToolLocator
         }
         if (RepoRoot is { } repo)
         {
-            foreach (var sub in new[] { "bin/Release", "bin/Debug", "bin", "bin-dev", "bin/Release/win-x64/publish" })
+            foreach (var sub in BuildFolders())
             {
                 candidates.Add((Path.Combine(repo, sub, exe), "repository build"));
             }
@@ -186,6 +186,32 @@ public static class ToolLocator
     }
 
     private static string ProjectFor(string tool) => tool == Server ? "Amql.Server" : "Amql.Cli";
+
+    /// <summary>The file name of a tool on this operating system: amql-cli.exe on Windows, amql-cli elsewhere.</summary>
+    public static string ExecutableName(string tool) => OperatingSystem.IsWindows() ? tool + ".exe" : tool;
+
+    /// <summary>
+    /// The repository's output folders, for this machine. On Windows the shared
+    /// bin/&lt;Configuration&gt; folders; on Linux also the per-runtime folders a
+    /// cross-build from Windows writes (bin/Release/linux-arm64 for the DGX Spark)
+    /// and their publish folders, since a checkout may be shared between the two.
+    /// </summary>
+    private static IEnumerable<string> BuildFolders()
+    {
+        yield return "bin/Release";
+        yield return "bin/Debug";
+        yield return "bin";
+        yield return "bin-dev";
+        if (OperatingSystem.IsWindows())
+        {
+            yield return "bin/Release/win-x64/publish";
+            yield break;
+        }
+        string rid = System.Runtime.InteropServices.RuntimeInformation.RuntimeIdentifier;   // linux-arm64 on the Spark
+        yield return $"bin/Release/{rid}";
+        yield return $"bin/Release/{rid}/publish";
+        yield return $"bin/{rid}";
+    }
 
     /// <summary>Walks up from a directory to the folder holding AMQL.slnx.</summary>
     public static string? FindRepoRoot(string startDir)

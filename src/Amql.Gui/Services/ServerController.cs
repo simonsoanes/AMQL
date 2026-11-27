@@ -7,7 +7,6 @@ using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
-using System.Windows;
 
 namespace Amql.Gui.Services;
 
@@ -456,18 +455,7 @@ public sealed class ServerController : INotifyPropertyChanged
 
     private static string Quote(string a) => a.Length == 0 || a.Any(char.IsWhiteSpace) ? $"\"{a}\"" : a;
 
-    private static void Dispatch(Action action)
-    {
-        var dispatcher = Application.Current?.Dispatcher;
-        if (dispatcher is null || dispatcher.CheckAccess())
-        {
-            action();
-        }
-        else
-        {
-            dispatcher.BeginInvoke(action);
-        }
-    }
+    private static void Dispatch(Action action) => UiThread.Run(action);
 
     private bool Set<T>(ref T field, T value, [CallerMemberName] string? name = null)
     {

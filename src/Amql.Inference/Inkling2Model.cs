@@ -37,7 +37,7 @@ namespace Amql.Inference;
 /// vision tower. A tensor stored F32 is read as F32, as before.
 /// </para>
 /// </summary>
-public sealed class Inkling2Model
+public sealed class Inkling2Model : ITokenModel
 {
     /// <summary>A 2-D weight held as f32, or as BF16/F16 bits widened as each
     /// row is read (which is exact, so it changes nothing but memory).</summary>
@@ -317,6 +317,10 @@ public sealed class Inkling2Model
     /// state), in the order transformers records <c>hidden_states</c>.</summary>
     public Action<int, float[]>? OnVisit { get; set; }
 
+    /// <summary>Called with each layer visit's output (visit index, hidden
+    /// state): what a forward hook on the decoder layer sees.</summary>
+    public Action<int, float[]>? OnVisitOutput { get; set; }
+
     private Inkling2Model(Inkling2Surface facts, int hidden, Mat embed, float[] embedNorm, float[] finalNorm,
         float[] outputQuery, Mat unembed, float[] messageQueries, Layer[] layers, long context)
     {
@@ -500,6 +504,14 @@ public sealed class Inkling2Model
             messages, layers, component.Execution!.ContextLength ?? long.MaxValue);
     }
 
+    string ITokenModel.Backend => "cpu";
+
+    float[] ITokenModel.Prefill(IReadOnlyList<int> tokens) => Prefill(tokens)[^1];
+
+    void IDisposable.Dispose()
+    {
+    }
+
     public void Reset()
     {
         _slots = NewSlots();
@@ -525,8 +537,10 @@ public sealed class Inkling2Model
 
         for (int l = 0; l < _f.LoopStart; l++)
         {
-            OnVisit?.Invoke(visit++, h);
+            OnVisit?.Invoke(visit, h);
+            visit++;
             h = RunLayer(l, _slots[l], h, blocks, null);
+            OnVisitOutput?.Invoke(visit - 1, h);
         }
         var prelude = h;
         var preludeBlocks = blocks.ToList();
@@ -545,15 +559,19 @@ public sealed class Inkling2Model
             for (int ip = _f.LoopStart; ip < _f.LoopEnd; ip++)
             {
                 int slot = pass == 0 ? ip : _layers.Length + (pass - 1) * core + (ip - _f.LoopStart);
-                OnVisit?.Invoke(visit++, h);
+                OnVisit?.Invoke(visit, h);
+                visit++;
                 float[][]? messages = pass == 0 ? null : Messages(bank!, bankOut!, ip - _f.LoopStart);
                 h = RunLayer(ip, _slots[slot], h, blocks, messages);
+                OnVisitOutput?.Invoke(visit - 1, h);
             }
         }
         for (int l = _f.LoopEnd; l < _layers.Length; l++)
         {
-            OnVisit?.Invoke(visit++, h);
+            OnVisit?.Invoke(visit, h);
+            visit++;
             h = RunLayer(l, _slots[l], h, blocks, null);
+            OnVisitOutput?.Invoke(visit - 1, h);
         }
 
         h = RmsNorm(Mix(_outputQuery, 1, blocks, h)[0], _finalNorm);

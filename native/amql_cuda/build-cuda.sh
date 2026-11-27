@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # build-cuda.sh — build the optional amql_cuda native backend (Linux).
 # Requires: CUDA Toolkit (nvcc), GCC toolchain.
-# Produces: native/amql_cuda/bin/libamql_cuda.so
+# Produces: native/amql_cuda/bin/libamql_cuda.so (and libamql_inkling.so,
+#           Inkling 2 looped's GPU path, when amql_inkling.cu is present)
 # Exit code 0 on success, 1 on any failure.
 #
 # Environment overrides:
 #   CUDA_ROOT  — path to the CUDA Toolkit (default: /usr/local/cuda)
-#   CUDA_ARCH  — target SM architecture (default: sm_120; e.g. sm_121)
-#   CLI_OUT    — optional deployment directory
+#   CUDA_ARCH  — target SM architecture (default: the installed GPU's, from
+#                nvidia-smi — sm_121 on a DGX Spark's GB10 — else sm_120)
+#   CLI_OUT    — optional deployment directory (one or more, space-separated):
+#                the libraries are copied there, e.g. the folder
+#                scripts/publish-linux.sh writes
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -27,7 +31,16 @@ if [ ! -x "$CUDA_ROOT/bin/nvcc" ]; then
 fi
 
 # ── Architecture ─────────────────────────────────────────────────────
-CUDA_ARCH="${CUDA_ARCH:-sm_120}"
+if [ -z "${CUDA_ARCH:-}" ]; then
+    # compute_cap is "12.1" on GB10 (DGX Spark), "12.0" on RTX 50-series.
+    cap="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n1 | tr -d ' .' || true)"
+    if [[ "$cap" =~ ^[0-9]+$ ]]; then
+        CUDA_ARCH="sm_${cap}"
+    else
+        CUDA_ARCH="sm_120"
+    fi
+fi
+echo "[amql-cuda] target: $CUDA_ARCH ($(uname -m))"
 
 # ── Build ────────────────────────────────────────────────────────────
 mkdir -p bin
@@ -46,8 +59,16 @@ echo "[amql-cuda] compiling amql_cuda.cu -arch=$CUDA_ARCH ..."
 
 echo "[amql-cuda] built bin/libamql_cuda.so"
 
-# ── Stage next to the CLI / server ───────────────────────────────────
-if [ -n "${CLI_OUT:-}" ] && [ -d "$CLI_OUT" ]; then
-    cp bin/libamql_cuda.so "$CLI_OUT/"
-    echo "[amql-cuda] staged libamql_cuda.so into $CLI_OUT"
+if [ -f amql_inkling.cu ]; then
+    echo "[amql-cuda] compiling amql_inkling.cu -arch=$CUDA_ARCH ..."
+    "$CUDA_ROOT/bin/nvcc"         -arch="$CUDA_ARCH"         -O3 -std=c++17         -Xcompiler -fPIC         --shared         -o bin/libamql_inkling.so         amql_inkling.cu         -lcudart
+    echo "[amql-cuda] built bin/libamql_inkling.so"
 fi
+
+# ── Stage next to the CLI / server ───────────────────────────────────
+for out in ${CLI_OUT:-}; do
+    if [ -d "$out" ]; then
+        cp bin/libamql_*.so "$out/"
+        echo "[amql-cuda] staged $(cd bin && echo libamql_*.so) into $out"
+    fi
+done

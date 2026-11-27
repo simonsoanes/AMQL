@@ -43,10 +43,21 @@
 
 ## What to do on the DGX Spark
 
+The short way, with AMQL Studio's text UI to choose models, start the server and chat
+([docs](amql-studio.md#text-ui-linux-dgx-spark)):
+
+```bash
+scripts/publish-linux.sh                              # or scripts\publish-linux.ps1 on Windows, then copy bin/linux-arm64
+CLI_OUT=bin/linux-arm64 bash native/amql_cuda/build-cuda.sh   # sm_121 is read from nvidia-smi
+tmux new -s amql bin/linux-arm64/amql-gui
+```
+
+The steps below do the same by hand.
+
 ### Step 1: Build the native library
 ```bash
 cd native/amql_cuda
-CUDA_ARCH=sm_121 ./build-cuda.sh
+bash build-cuda.sh            # CUDA_ARCH defaults to the GPU's own (sm_121 on GB10)
 ```
 This produces `bin/libamql_cuda.so`.
 

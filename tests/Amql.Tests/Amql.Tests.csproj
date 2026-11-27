@@ -27,6 +27,7 @@
     <ProjectReference Include="..\..\src\Amql.Hf\Amql.Hf.csproj" />
     <ProjectReference Include="..\..\src\Amql.Cli\Amql.Cli.csproj" />
     <ProjectReference Include="..\..\src\Amql.Server\Amql.Server.csproj" />
+    <ProjectReference Include="..\..\src\Amql.Manager\Amql.Manager.csproj" />
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
   </ItemGroup>
 
@@ -65,6 +66,10 @@
        skipping. Absent on CPU-only machines; those tests then fall back. -->
   <ItemGroup Condition="Exists('..\..\native\amql_cuda\bin\amql_cuda.dll')">
     <None Include="..\..\native\amql_cuda\bin\amql_cuda.dll" Link="amql_cuda.dll"
+          CopyToOutputDirectory="PreserveNewest" Visible="false" />
+  </ItemGroup>
+  <ItemGroup Condition="Exists('..\..\native\amql_cuda\bin\amql_inkling.dll')">
+    <None Include="..\..\native\amql_cuda\bin\amql_inkling.dll" Link="amql_inkling.dll"
           CopyToOutputDirectory="PreserveNewest" Visible="false" />
   </ItemGroup>
 

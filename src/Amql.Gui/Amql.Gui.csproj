@@ -7,17 +7,57 @@
     <ProjectReference Include="..\Amql.Hf\Amql.Hf.csproj" />
   </ItemGroup>
 
+  <!--
+    One project, two builds of the same app:
+      • on Windows: net11.0-windows with WPF. The desktop window opens by
+        default; the tui switch (amql-gui, then two dashes and tui) runs the
+        text UI instead.
+      • for Linux (built on Linux, or published with -r linux-x64 / linux-arm64
+        from Windows): net11.0 with no WPF, and the text UI is the only one.
+    Both builds compile the shared services, models and command catalogue and
+    the Tui folder, so the two front ends show the same screens and options.
+  -->
   <PropertyGroup>
-    <OutputType>WinExe</OutputType>
-    <TargetFramework>net11.0-windows</TargetFramework>
-    <UseWPF>true</UseWPF>
+    <AmqlDesktop Condition="'$(OS)' == 'Windows_NT' and !$(RuntimeIdentifier.StartsWith('linux')) and !$(RuntimeIdentifier.StartsWith('osx'))">true</AmqlDesktop>
+    <AmqlDesktop Condition="'$(AmqlDesktop)' == ''">false</AmqlDesktop>
+  </PropertyGroup>
+
+  <PropertyGroup>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AssemblyName>amql-gui</AssemblyName>
     <RootNamespace>Amql.Gui</RootNamespace>
+    <StartupObject>Amql.Gui.Program</StartupObject>
+    <Description>AMQL Studio: start and watch the inference server, chat with models, run every amql-cli command from a form, explore containers and visualise inference. A WPF window on Windows and a text UI (Terminal.Gui) everywhere, from one project. References Vindex3 and Safetensors for direct container inspection and Inference for its operator-trace model; the CLI child process handles transforms.</Description>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(AmqlDesktop)' == 'true'">
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net11.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <DefineConstants>$(DefineConstants);AMQL_DESKTOP</DefineConstants>
     <!-- The Fluent theme (Application.ThemeMode) is still marked for evaluation. -->
     <NoWarn>$(NoWarn);WPF0001</NoWarn>
-    <Description>AMQL Studio: start and watch the inference server, chat with models, run every amql-cli command from a form, explore containers and visualise inference. References Vindex3 and Safetensors for direct container inspection and Inference for its operator-trace model; the CLI child process handles transforms.</Description>
   </PropertyGroup>
+
+  <PropertyGroup Condition="'$(AmqlDesktop)' != 'true'">
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net11.0</TargetFramework>
+    <!-- Published as one folder with its own runtime, so a Linux box (the DGX
+         Spark, say) needs no .NET install to run it. -->
+    <SelfContained Condition="'$(RuntimeIdentifier)' != ''">true</SelfContained>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Terminal.Gui" Version="2.6.0" />
+  </ItemGroup>
+
+  <!-- The text-UI build leaves out everything that is WPF. -->
+  <ItemGroup Condition="'$(AmqlDesktop)' != 'true'">
+    <Compile Remove="App.xaml.cs;MainWindow.xaml.cs;Pages/**;Windows/**;Dialogs/**;Visualiser/**;Services/WheelScrolling.cs;Explorer/ContainerExplorer.xaml.cs;Explorer/TensorGridDialog.xaml.cs" />
+    <None Remove="**/*.xaml" />
+    <Page Remove="**/*.xaml" />
+    <ApplicationDefinition Remove="App.xaml" />
+  </ItemGroup>
 
 </Project>

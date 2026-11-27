@@ -20,11 +20,23 @@ dotnet run --project src/Amql.Gui
 | `Commands/CommandCatalog.cs` | One record per CLI command and parameter. It drives both the forms and the argv builder. |
 | `Run/CliRunner.cs` | Runs one CLI command as a child process and reads its `--progress` protocol. |
 | `Explorer/`, `Visualiser/` | The container explorer and the inference visualiser. |
+| `Program.cs` | The entry point: the WPF window, or the text UI (`--tui`; always on Linux). |
+| `Tui/` | The text UI (Terminal.Gui): `Shell` (page list, server box, status bar), a page per desktop page plus `MonitorPageTui` and `VisualiserPageTui`, `FieldList` (forms as a list of settings) and `TuiKit` (prompts, path picker, chooser, OSC 52 copy, sparklines). |
+| `Services/ServerOptions.cs`, `Commands/CommandForms.cs`, `Model/ProjectSession.cs` | What both front ends offer and how forms, runs and projects behave, without UI, so the two cannot drift. `UiThread` is where services hand events back to whichever UI runs. |
 
 The app uses WPF's Fluent theme (`Application.ThemeMode="System"`), so it follows Windows' light or dark
 setting. Page colours come from the theme's brushes, and no standard control is restyled implicitly. The
 explorer's tensor grid and the visualiser were drawn for a light background, so they keep
 `ThemeMode="Light"`.
+
+## Two builds, one project
+
+On Windows the project builds `net11.0-windows` with WPF, and `amql-gui.exe` opens the window (or the text UI
+with `--tui`, in a console of its own). Built on Linux, or published with `-r linux-arm64` / `-r linux-x64`, it
+builds `net11.0` without the WPF files and is the text UI only (`AmqlDesktop` in the project file chooses).
+`scripts/publish-linux.sh` (or `.ps1` from Windows) publishes it with `amql-server` and `amql-cli` as one
+self-contained folder. A cross-build goes to `bin/<Configuration>/<rid>/` so it does not overwrite the Windows
+build.
 
 ## Finding the executables
 

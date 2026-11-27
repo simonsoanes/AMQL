@@ -17,6 +17,9 @@ dotnet build src/Amql.Gui
 
 (The output folder follows `src/Directory.Build.props`. `dotnet run --project src/Amql.Gui` also works.)
 
+The same app runs as a text UI in a terminal: on Linux, where there is no desktop window to open (a DGX Spark
+reached over SSH, say), and on Windows with `--tui`. See [Text UI](#text-ui-linux-dgx-spark).
+
 ## Home
 
 ![Home](../screenshots/AMQL%20Studio%20-%20Home.png)
@@ -166,16 +169,73 @@ The container explorer shows index facts, components, per-layer attention polici
 tensors open in a value grid. **Run and display inference…** runs a prompt and fills in the
 [inference visualiser](inference-visualiser.md) live. **Open a saved trace…** opens a `--trace-json` capture.
 
+## Text UI (Linux, DGX Spark)
+
+`amql-gui` built for Linux has no WPF window, so it always opens the text UI. It has the same pages and options,
+on the same settings and project files: Home, Server, Playground, Tools and Explorer, plus the Monitor and the
+inference Visualiser, which are windows of their own on the desktop and pages here. On Windows, `amql-gui --tui`
+(or `AMQL_STUDIO_UI=tui`) opens it in a console window of its own.
+
+Build it for the Spark (linux-arm64), on the Spark or from Windows, as one self-contained folder with
+`amql-server` and `amql-cli` beside it:
+
+```bash
+scripts/publish-linux.sh                    # → bin/linux-arm64   (RID=linux-x64 for x86-64 Linux or WSL)
+```
+
+```powershell
+scripts\publish-linux.ps1                   # the same from Windows; copy bin\linux-arm64 to the Spark
+```
+
+On the Spark, build the CUDA library and put it beside the server (it picks `sm_121` from the GPU itself):
+
+```bash
+CLI_OUT=bin/linux-arm64 bash native/amql_cuda/build-cuda.sh
+bin/linux-arm64/amql-gui                     # in a terminal: ssh -t, tmux, a console
+```
+
+The folder needs no .NET install. Run it inside `tmux` to keep the server running when the SSH session drops:
+the server is a child of the app, so it ends with the session otherwise (or when the app quits, unless
+**Stop the server when AMQL Studio closes** is off under Server ▸ Advanced).
+
+What changes in a terminal:
+
+| On the desktop | In the text UI |
+|---|---|
+| Navigation rail | The page list on the left, or Alt+1 … Alt+7. The server's state and Start/Stop stay in view below it. |
+| Forms of text boxes, check boxes and combo boxes | A list of settings: Enter changes the selected one (a prompt, a choice, a path), Space flips a switch or steps a choice, and the selected setting's help is shown underneath. |
+| Expanders (Advanced, Run settings) | Tabs (Ctrl+PgUp / Ctrl+PgDn, or click), or sections of the settings list. |
+| Folder and file dialogs | A path prompt: type or paste it (`~` is your home folder), or Browse… for the file dialog. |
+| Right-click menus | Enter on the selected item opens the same choices. |
+| Sliders | A number of GB, checked against the same range. |
+| Chat bubbles | A transcript; thinking is shown with a `┊` margin. |
+| Monitor charts | Sparklines of block characters, five minutes wide when the terminal is. |
+| Visualiser's zoomable map | A grid: one row per kind of operator, one column per layer, coloured on the same ramps. Arrows move, `[` `]` step, Enter offers the edit commands. |
+| Copy to clipboard | The terminal's clipboard through OSC 52, so it works over SSH in terminals that allow it. Text boxes show the command as well. |
+
+Keys: F1 help, F2 start or stop the server, F5 run the Tools command, F7 the Monitor, Ctrl+Q quit. In a
+multi-line prompt Enter adds a line and Ctrl+S accepts.
+
+On the GB10 the GPU shares the system's memory and `nvidia-smi` reports no memory of its own. The Server page
+and the Monitor show the machine's memory for it, marked *shared*.
+
+`amql-gui --tui-snapshot <dir>` draws every page off-screen into `<dir>/<page>.txt` and exits: a check that the
+text UI starts and lays out on a new machine (on Linux it still needs a terminal; `script -qec` provides one).
+`AMQL_TUI_TRACE=1` writes key and focus changes to stderr.
+
 ## How it finds amql-cli and amql-server
 
 There is no setting for where the executables are. AMQL Studio looks beside itself, in the folder above it, in
 the repository's `bin`, `bin/Debug`, `bin/Release`, `bin-dev` and publish folders (found by walking up to
 `AMQL.slnx`), and on `PATH`. It uses the most recently built copy. A copy whose libraries are missing from its
-folder (a partial build output) is skipped. With no build at all but a repository present, it runs the
+folder (a partial build output) is skipped. On Linux it looks for `amql-cli` and `amql-server` without the
+`.exe`, and also in the per-runtime folders a cross-build writes (`bin/Release/linux-arm64` and its `publish`). With no build at all but a repository present, it runs the
 project from source with `dotnet run`. The Home page and the Server page show which build is in use. The Tools
 page's ⋯ menu looks again after a rebuild, and starting the server always looks again.
 
 ## Where settings live
+
+On Linux `%LOCALAPPDATA%` is `~/.local/share`.
 
 | What | Where |
 |---|---|

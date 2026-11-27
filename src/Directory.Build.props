@@ -25,4 +25,17 @@
     <AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
   </PropertyGroup>
 
+  <!--
+    A build for another operating system (dotnet publish -r linux-arm64 from
+    Windows, for the DGX Spark) gets a folder of its own: amql-gui.dll there is
+    the text-UI build, and it must not overwrite the WPF one beside the
+    Windows executables.
+  -->
+  <!-- Appending the runtime also gives obj/ a folder per runtime: with one
+       shared intermediate folder, a linux-x64 build after a linux-arm64 one
+       reuses the arm64 launcher (amql-cli, amql-server) as up to date. -->
+  <PropertyGroup Condition="'$(RuntimeIdentifier)' != '' and !$(RuntimeIdentifier.StartsWith('win'))">
+    <AppendRuntimeIdentifierToOutputPath>true</AppendRuntimeIdentifierToOutputPath>
+  </PropertyGroup>
+
 </Project>

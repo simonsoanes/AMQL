@@ -33,7 +33,7 @@ public sealed class Inkling2Tests
     private static string FormOf(int layer) => (layer % 3) switch { 0 => "plain", 1 => "NVFP4", _ => "MXFP8" };
 
     /// <summary>Writes the quantised checkpoint and its decoded twin.</summary>
-    private static void WriteCheckpoints(string quantised, string decoded)
+    internal static void WriteCheckpoints(string quantised, string decoded)
     {
         Directory.CreateDirectory(quantised);
         Directory.CreateDirectory(decoded);
@@ -184,99 +184,181 @@ public sealed class Inkling2Tests
         Assert.Equal(0.0, ArchZooTests.WorstDiff(ArchZooTests.RunPrefill(again, ids), ArchZooTests.RunPrefill(qc, ids)));
     }
 
-    // ── the real checkpoint against golden.py ─────────────────────────────────
+    // ── the real checkpoint against transformers ──────────────────────────────
 
     /// <summary>
-    /// Inkling-2-Mini against transformers (bf16, CPU), when both are to hand:
+    /// Inkling-2-Mini against transformers, when both are to hand:
     /// <c>AMQL_INKLING_CONTAINER</c> (encoded with <c>--no-vision</c>) and
-    /// <c>AMQL_INKLING_GOLDEN</c> (golden.py's output: per prompt
-    /// <c>{name}.ids.npy</c>, <c>{name}.logits.npy</c>, optionally
-    /// <c>{name}.hidden.npy</c>, and <c>summary.json</c> with the greedy
-    /// continuation). The reference runs in bf16 and this runtime in f32, so
-    /// it is judged on the decisions: the argmax at (nearly) every position,
-    /// the top five at the last, and the start of the greedy continuation.
+    /// <c>AMQL_INKLING_REFERENCE</c>, the output of
+    /// <c>scripts/reference/stream_reference.py</c> (see its README):
+    /// <c>summary.json</c> (per prompt the ids, the top 20 logits, log-sum-exp
+    /// and entropy at every position, and a greedy continuation),
+    /// <c>visits.json</c> (per prompt, layer visit in run order and position:
+    /// the output's RMS, first coordinates and a fingerprint on 16 fixed unit
+    /// directions) and <c>{name}.last.f32</c> (the last position's logits).
+    /// The directions come from torch's generator, so they are read from
+    /// <c>AMQL_INKLING_DIRECTIONS</c> (16 x hidden little-endian f32) when
+    /// given; without them the fingerprints are not compared. Both the managed
+    /// runtime and the GPU path (where it runs) are compared and every number is
+    /// printed. The reference may run in bf16 and these in f32, so the
+    /// assertions are on decisions: the top token at every position but one in
+    /// ten, the last position's top five (four of five), and the greedy
+    /// continuation's first four tokens.
     /// </summary>
     [Fact]
     public void Real_Checkpoint_Matches_Transformers_When_Available()
     {
         if (Environment.GetEnvironmentVariable("AMQL_INKLING_CONTAINER") is not { Length: > 0 } containerDir ||
-            Environment.GetEnvironmentVariable("AMQL_INKLING_GOLDEN") is not { Length: > 0 } goldenDir)
+            Environment.GetEnvironmentVariable("AMQL_INKLING_REFERENCE") is not { Length: > 0 } referenceDir)
         {
             return;
         }
-        int greedySteps = int.TryParse(Environment.GetEnvironmentVariable("AMQL_INKLING_GREEDY"), out var g) ? g : 8;
-        using var summary = JsonDocument.Parse(File.ReadAllBytes(Path.Combine(goldenDir, "summary.json")));
+        using var summary = JsonDocument.Parse(File.ReadAllBytes(Path.Combine(referenceDir, "summary.json")));
+        string visitsPath = Path.Combine(referenceDir, "visits.json");
+        using var visits = File.Exists(visitsPath) ? JsonDocument.Parse(File.ReadAllBytes(visitsPath)) : null;
         using var container = Vindex3Container.Open(containerDir);
         using var store = container.CreateOperandStore();
         var model = Inkling2Model.Load(container, store);
-        _output.WriteLine($"experts: {string.Join(" ", model.ExpertForms)}");
-
-        foreach (var prompt in summary.RootElement.EnumerateObject())
+        int hidden = container.Graph!.Component("target").HiddenSize;
+        float[][]? directions = null;
+        if (Environment.GetEnvironmentVariable("AMQL_INKLING_DIRECTIONS") is { Length: > 0 } dirPath)
         {
-            string name = prompt.Name;
-            var ids = Npy.Read(Path.Combine(goldenDir, $"{name}.ids.npy")).AsInts();
-            var logits = Npy.Read(Path.Combine(goldenDir, $"{name}.logits.npy"));
-            int vocab = logits.Shape[^1];
-            Assert.Equal(model.VocabSize, vocab);
+            var raw = File.ReadAllBytes(dirPath);
+            var flat = new float[raw.Length / 4];
+            Buffer.BlockCopy(raw, 0, flat, 0, raw.Length);
+            directions = Enumerable.Range(0, flat.Length / hidden).Select(i => flat.AsSpan(i * hidden, hidden).ToArray()).ToArray();
+        }
+        using var gpu = Inkling2Gpu.Available ? Inkling2Gpu.TryCreate(container, store, out _) : null;
+        if (gpu is not null)
+        {
+            gpu.KvFormat = "f32";
+        }
+        _output.WriteLine($"reference dtype {Str(summary.RootElement, "dtype")}; experts: {string.Join(" ", model.ExpertForms.Distinct())}; " +
+                          $"gpu {(gpu is null ? "absent" : "compared")}; fingerprints {(directions is null ? "not compared" : "compared")}");
+
+        foreach (var prompt in summary.RootElement.GetProperty("prompts").EnumerateArray())
+        {
+            string name = prompt.GetProperty("name").GetString()!;
+            var ids = prompt.GetProperty("ids").EnumerateArray().Select(e => e.GetInt32()).ToArray();
+            var positions = prompt.GetProperty("positions").EnumerateArray().ToList();
+            var expected = prompt.GetProperty("greedy").EnumerateArray().Select(e => e.GetInt32()).ToArray();
+            Assert.Equal(ids.Length, positions.Count);
+            float[]? last = null;
+            string lastPath = Path.Combine(referenceDir, $"{name}.last.f32");
+            if (File.Exists(lastPath))
+            {
+                var bytes = File.ReadAllBytes(lastPath);
+                last = new float[bytes.Length / 4];
+                Buffer.BlockCopy(bytes, 0, last, 0, bytes.Length);
+            }
+            var records = visits is not null && visits.RootElement.TryGetProperty(name, out var r) ? r.EnumerateArray().ToList() : null;
+
+            void Judge(string who, float[][] logits, float[][][]? outputs, Func<int, float[]> step)
+            {
+                var lines = new StringBuilder();
+                int top1 = 0;
+                for (int t = 0; t < ids.Length; t++)
+                {
+                    var theirs = positions[t].GetProperty("top_ids").EnumerateArray().Select(e => e.GetInt32()).ToArray();
+                    var theirLogits = positions[t].GetProperty("top_logits").EnumerateArray().Select(e => e.GetDouble()).ToArray();
+                    var ours = TopK(logits[t], 5);
+                    bool agree = ours[0] == theirs[0];
+                    top1 += agree ? 1 : 0;
+                    double worstTop = Enumerable.Range(0, theirs.Length).Max(i => Math.Abs(logits[t][theirs[i]] - theirLogits[i]));
+                    double lse = Math.Abs(LogSumExp(logits[t]) - positions[t].GetProperty("logsumexp").GetDouble());
+                    lines.AppendLine($"  {t,3}: argmax {(agree ? "agrees" : $"differs ({ours[0]} vs {theirs[0]})")}, top-5 overlap " +
+                                     $"{ours.Intersect(theirs.Take(5)).Count()}/5, max |diff| on the top-20 {worstTop:G3}, log-sum-exp {lse:G3}");
+                }
+                string full = "";
+                if (last is not null)
+                {
+                    int n = Math.Min(last.Length, logits[^1].Length);
+                    double worst = 0, ab = 0, aa = 0, bb = 0;
+                    for (int v = 0; v < n; v++)
+                    {
+                        double a = logits[^1][v], b = last[v];
+                        worst = Math.Max(worst, Math.Abs(a - b));
+                        ab += a * b; aa += a * a; bb += b * b;
+                    }
+                    full = $"; last position, all {n} logits: max |diff| {worst:G4}, cosine {ab / Math.Sqrt(aa * bb):F6}";
+                }
+                var generated = new List<int>();
+                var next = logits[^1];
+                for (int i = 0; i < expected.Length; i++)
+                {
+                    generated.Add(ArgMax(next));
+                    next = step(generated[^1]);
+                }
+                int same = generated.Zip(expected).TakeWhile(p => p.First == p.Second).Count();
+                _output.WriteLine($"{name} ({ids.Length} tokens), {who}: top-1 agrees at {top1}/{ids.Length}{full}; " +
+                                  $"greedy agrees for {same}/{expected.Length} tokens [{string.Join(",", generated)}] vs [{string.Join(",", expected)}]");
+                _output.WriteLine(lines.ToString().TrimEnd());
+
+                if (outputs is not null && records is not null)
+                {
+                    var visitLines = new StringBuilder();
+                    for (int v = 0; v < Math.Min(records.Count, outputs.Length); v++)
+                    {
+                        var rms = records[v].GetProperty("rms").EnumerateArray().Select(e => e.GetDouble()).ToArray();
+                        var prints = records[v].GetProperty("fingerprint").EnumerateArray()
+                            .Select(p => p.EnumerateArray().Select(e => e.GetDouble()).ToArray()).ToArray();
+                        double ratioLo = double.MaxValue, ratioHi = 0, cosLo = 1;
+                        for (int t = 0; t < ids.Length; t++)
+                        {
+                            var h = outputs[v][t];
+                            double ours = Math.Sqrt(h.Average(x => (double)x * x));
+                            double ratio = ours / Math.Max(rms[t], 1e-12);
+                            ratioLo = Math.Min(ratioLo, ratio);
+                            ratioHi = Math.Max(ratioHi, ratio);
+                            if (directions is not null)
+                            {
+                                var mine = directions.Select(dir => Enumerable.Range(0, hidden).Sum(i => (double)dir[i] * h[i])).ToArray();
+                                double ab = 0, aa = 0, bb = 0;
+                                for (int i = 0; i < mine.Length; i++)
+                                {
+                                    ab += mine[i] * prints[t][i]; aa += mine[i] * mine[i]; bb += prints[t][i] * prints[t][i];
+                                }
+                                cosLo = Math.Min(cosLo, ab / Math.Sqrt(aa * bb + 1e-30));
+                            }
+                        }
+                        visitLines.Append($"  visit {v,2} ({records[v].GetProperty("layer").GetString()}): RMS ratio {ratioLo:F4}..{ratioHi:F4}" +
+                                          (directions is null ? "" : $", fingerprint cosine >= {cosLo:F5}") + Environment.NewLine);
+                    }
+                    _output.WriteLine($"{name}, {who}, per visit over every position:\n{visitLines.ToString().TrimEnd()}");
+                }
+
+                var lastTop = positions[^1].GetProperty("top_ids").EnumerateArray().Select(e => e.GetInt32()).Take(5).ToArray();
+                Assert.Equal(lastTop[0], TopK(logits[^1], 1)[0]);
+                Assert.True(TopK(logits[^1], 5).Intersect(lastTop).Count() >= 4, $"{name} {who}: last-position top-5");
+                Assert.True(top1 >= ids.Length * 0.9, $"{name} {who}: top-1 agrees at {top1}/{ids.Length}");
+                Assert.True(same >= Math.Min(4, expected.Length), $"{name} {who}: greedy agrees for {same} tokens");
+            }
 
             model.Reset();
-            var visits = new List<float[]>();
-            model.OnVisit = (_, h) => visits.Add(h);
+            var outputs = new Dictionary<int, List<float[]>>();
+            model.OnVisitOutput = (v, h) => (outputs.TryGetValue(v, out var list) ? list : outputs[v] = new()).Add(h);
             var mine = model.Prefill(ids);
-            model.OnVisit = null;
+            model.OnVisitOutput = null;
+            var managedVisits = outputs.OrderBy(kv => kv.Key).Select(kv => kv.Value.ToArray()).ToArray();
+            Judge("managed", mine, managedVisits, model.Step);
 
-            int agree = 0;
-            double worst = 0;
-            for (int t = 0; t < ids.Length; t++)
+            if (gpu is not null)
             {
-                var reference = logits.Data.AsSpan(t * vocab, vocab);
-                agree += ArgMax(mine[t]) == ArgMax(reference) ? 1 : 0;
-                for (int v = 0; v < vocab; v++)
-                {
-                    worst = Math.Max(worst, Math.Abs(mine[t][v] - reference[v]));
-                }
+                using var seq = gpu.NewSequence(ids.Length + expected.Length + 16);
+                var logits = seq.PrefillAll(ids);
+                var gpuVisits = ids.Length <= 256 ? seq.VisitOutputs(managedVisits.Length, ids.Length, hidden) : null;
+                Judge("gpu", logits, gpuVisits, seq.Step);
             }
-            var last = logits.Data.AsSpan((ids.Length - 1) * vocab, vocab).ToArray();
-            var top5Mine = TopK(mine[^1], 5);
-            var top5Ref = TopK(last, 5);
-            int overlap = top5Mine.Intersect(top5Ref).Count();
-            _output.WriteLine($"{name}: {ids.Length} tokens, argmax agrees at {agree}/{ids.Length}, worst logit diff {worst:G4}, " +
-                              $"last top-5 mine [{string.Join(",", top5Mine)}] ref [{string.Join(",", top5Ref)}]");
-
-            string hiddenPath = Path.Combine(goldenDir, $"{name}.hidden.npy");
-            if (File.Exists(hiddenPath))
-            {
-                // [states, T, d]; the visits' inputs in the order transformers records them.
-                var hidden = Npy.Read(hiddenPath);
-                int states = hidden.Shape[0], d = hidden.Shape[2];
-                int perToken = visits.Count / ids.Length;
-                var lines = new StringBuilder();
-                for (int s = 0; s < Math.Min(states, perToken); s++)
-                {
-                    var theirs = hidden.Data.AsSpan((s * ids.Length + ids.Length - 1) * d, d);
-                    var ours = visits[(ids.Length - 1) * perToken + s];
-                    lines.Append($"{s}:{Cosine(ours, theirs):F4} ");
-                }
-                _output.WriteLine($"{name}: hidden-state cosine at the last token by visit ({states} recorded, {perToken} visits): {lines}");
-            }
-
-            var expected = prompt.Value.GetProperty("greedy").EnumerateArray().Select(e => e.GetInt32()).Take(greedySteps).ToArray();
-            var generated = new List<int>();
-            var next = mine[^1];
-            for (int i = 0; i < expected.Length; i++)
-            {
-                int token = ArgMax(next);
-                generated.Add(token);
-                next = model.Step(token);
-            }
-            _output.WriteLine($"{name}: greedy mine [{string.Join(",", generated)}] ref [{string.Join(",", expected)}]");
-
-            Assert.Equal(ArgMax(last), ArgMax(mine[^1]));
-            Assert.True(overlap >= 4, $"{name}: last-position top-5 overlap {overlap}/5");
-            Assert.True(agree >= ids.Length * 0.9, $"{name}: argmax agrees at {agree}/{ids.Length}");
-            int prefix = Math.Min(4, expected.Length);
-            Assert.Equal(expected.Take(prefix), generated.Take(prefix));
         }
+    }
+
+    private static string? Str(JsonElement e, string key) =>
+        e.TryGetProperty(key, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
+
+    private static double LogSumExp(float[] x)
+    {
+        double max = x.Max();
+        return max + Math.Log(x.Sum(v => Math.Exp(v - max)));
     }
 
     /// <summary>The real checkpoint without a reference (<c>AMQL_INKLING_CONTAINER</c>
@@ -311,6 +393,130 @@ public sealed class Inkling2Tests
         Assert.Contains("Paris", text);
     }
 
+    /// <summary>
+    /// The real checkpoint on the GPU path against the managed runtime
+    /// (<c>AMQL_INKLING_CONTAINER</c>, a CUDA device and amql_inkling.dll): a
+    /// few prompts, the top five at every position and a greedy continuation,
+    /// then the GPU's decode and prompt speeds. f32 rows, so the two differ only
+    /// in summation order; <c>AMQL_INKLING_STEPS</c> sets the greedy length (12).
+    /// </summary>
+    [Fact]
+    public void Real_Checkpoint_Gpu_Matches_Managed_When_Available()
+    {
+        if (Environment.GetEnvironmentVariable("AMQL_INKLING_CONTAINER") is not { Length: > 0 } containerDir ||
+            !Inkling2Gpu.Available)
+        {
+            return;
+        }
+        int steps = int.TryParse(Environment.GetEnvironmentVariable("AMQL_INKLING_STEPS"), out var n) ? n : 12;
+        var tokenizer = HfTokenizer.FromModelDir(containerDir);
+        using var container = Vindex3Container.Open(containerDir);
+        using var store = container.CreateOperandStore();
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        using var gpu = Inkling2Gpu.TryCreate(container, store, out var reason);
+        Assert.True(gpu is not null, reason);
+        _output.WriteLine($"GPU weights {gpu.WeightBytes / (double)(1 << 30):F2} GiB, uploaded in {clock.Elapsed.TotalSeconds:F0}s");
+        var managed = Inkling2Model.Load(container, store);
+        gpu.KvFormat = "f32";
+
+        string[] prompts =
+        {
+            "The capital of France is",
+            "def fibonacci(n):\n    \"\"\"Return the n-th Fibonacci number.\"\"\"\n",
+            "Water boils at a temperature of",
+            // Past a prompt chunk (256 tokens), so the GPU's chunks meet inside it.
+            string.Concat(Enumerable.Range(1, 24).Select(i =>
+                $"Step {i}: the river carried {i * 7} boats past the old mill, and the miller counted each one. ")) + "In total the miller counted",
+        };
+        int positions = 0, sameTop5 = 0, sameOrder = 0;
+        double worst = 0;
+        foreach (string text in prompts)
+        {
+            var ids = tokenizer.Encode(text).Ids.ToArray();
+            managed.Reset();
+            var reference = managed.Prefill(ids);
+            using var seq = gpu.NewSequence(256);
+            var mine = seq.PrefillAll(ids);
+            for (int t = 0; t < ids.Length; t++)
+            {
+                var a = TopK(mine[t], 5);
+                var b = TopK(reference[t], 5);
+                positions++;
+                sameTop5 += a.ToHashSet().SetEquals(b) ? 1 : 0;
+                sameOrder += a.SequenceEqual(b) ? 1 : 0;
+                for (int v = 0; v < reference[t].Length; v++)
+                {
+                    worst = Math.Max(worst, Math.Abs(mine[t][v] - reference[t][v]));
+                }
+            }
+            var g = new List<int>();
+            var m = new List<int>();
+            float[] gl = mine[^1], ml = reference[^1];
+            for (int i = 0; i < steps; i++)
+            {
+                g.Add(ArgMax(gl));
+                m.Add(ArgMax(ml));
+                gl = seq.Step(g[^1]);
+                ml = managed.Step(m[^1]);
+            }
+            _output.WriteLine($"'{text.Replace("\n", "\\n")}' ({ids.Length} tokens): gpu '{tokenizer.Decode(g).Replace("\n", "\\n")}' " +
+                              $"managed '{tokenizer.Decode(m).Replace("\n", "\\n")}'");
+            Assert.Equal(m, g);
+        }
+        _output.WriteLine($"top-5 at {positions} positions: same set {sameTop5}, same order {sameOrder}; worst logit diff {worst:G4}");
+        Assert.Equal(positions, sameTop5);
+    }
+
+    /// <summary>The GPU path's speeds on the real checkpoint
+    /// (<c>AMQL_INKLING_CONTAINER</c> and <c>AMQL_INKLING_SPEED=1</c>, on a quiet
+    /// machine): a prompt of each length fed in chunks, then 128 greedy steps
+    /// after it, per KV format; and the device memory a sequence takes.</summary>
+    [Fact]
+    public void Real_Checkpoint_Gpu_Speed_When_Available()
+    {
+        if (Environment.GetEnvironmentVariable("AMQL_INKLING_CONTAINER") is not { Length: > 0 } containerDir ||
+            Environment.GetEnvironmentVariable("AMQL_INKLING_SPEED") != "1" || !Inkling2Gpu.Available)
+        {
+            return;
+        }
+        using var container = Vindex3Container.Open(containerDir);
+        using var store = container.CreateOperandStore();
+        using var gpu = Inkling2Gpu.TryCreate(container, store, out var reason);
+        Assert.True(gpu is not null, reason);
+        var (free0, total) = Inkling2Gpu.DeviceMemory();
+        _output.WriteLine($"weights {gpu.WeightBytes / (double)(1 << 30):F2} GiB; device {free0 / (double)(1 << 30):F2} of {total / (double)(1 << 30):F2} GiB free after upload");
+        var clock = new System.Diagnostics.Stopwatch();
+        foreach (var (format, lengths) in new[] { ("fp16", new[] { 512, 4096, 16384, 65536 }), ("nvfp4", new[] { 512, 4096, 16384, 65536 }), ("f32", new[] { 512, 4096 }) })
+        {
+            gpu.KvFormat = format;
+            foreach (int promptLength in lengths)
+            {
+                using var seq = gpu.NewSequence(promptLength + 256);
+                var prompt = Enumerable.Range(0, promptLength).Select(i => 1000 + (i * 7919) % 50000).ToArray();
+                seq.Step(prompt[0]);
+                clock.Restart();
+                seq.Prefill(prompt[1..]);
+                double prefill = (promptLength - 1) / clock.Elapsed.TotalSeconds;
+                int token = 1000;
+                seq.Step(token);
+                clock.Restart();
+                for (int i = 0; i < 128; i++)
+                {
+                    token = ArgMax(seq.Step(token));
+                }
+                double decode = 128 / clock.Elapsed.TotalSeconds;
+                var (free, _) = Inkling2Gpu.DeviceMemory();
+                _output.WriteLine($"{format} rows, {promptLength}-token prompt: prompt {prefill:F0} tok/s, then decode {decode:F1} tok/s; " +
+                                  $"sequence {seq.DeviceBytes / (double)(1 << 20):F0} MiB, device used {(total - free) / (double)(1 << 30):F2} GiB");
+            }
+        }
+        foreach (int context in new[] { 4096, 32768, 131072, 262144, 1048576 })
+        {
+            _output.WriteLine($"KV and histories at {context}: f32 {gpu.SequenceBytes(context, "f32") / (double)(1 << 30):F2} GiB, " +
+                              $"fp16 {gpu.SequenceBytes(context, "fp16") / (double)(1 << 30):F2} GiB, nvfp4 {gpu.SequenceBytes(context, "nvfp4") / (double)(1 << 30):F2} GiB");
+        }
+    }
+
     private static int ArgMax(ReadOnlySpan<float> x)
     {
         int best = 0;
@@ -326,79 +532,4 @@ public sealed class Inkling2Tests
 
     private static int[] TopK(float[] x, int k) =>
         Enumerable.Range(0, x.Length).OrderByDescending(i => x[i]).Take(k).ToArray();
-
-    private static double Cosine(ReadOnlySpan<float> a, ReadOnlySpan<float> b)
-    {
-        double ab = 0, aa = 0, bb = 0;
-        for (int i = 0; i < a.Length; i++)
-        {
-            ab += (double)a[i] * b[i];
-            aa += (double)a[i] * a[i];
-            bb += (double)b[i] * b[i];
-        }
-        return ab / Math.Sqrt(aa * bb + 1e-30);
-    }
-
-    /// <summary>A NumPy <c>.npy</c> file: little-endian f4, f8 or i8 (and i4),
-    /// C order, widened to f32 (ids are small integers).</summary>
-    private sealed record Npy(int[] Shape, float[] Data)
-    {
-        public int[] AsInts() => Data.Select(v => checked((int)v)).ToArray();
-
-        public static Npy Read(string path)
-        {
-            var bytes = File.ReadAllBytes(path);
-            if (bytes.Length < 10 || bytes[0] != 0x93 || Encoding.ASCII.GetString(bytes, 1, 5) != "NUMPY")
-            {
-                throw new InvalidDataException($"{path} is not a .npy file");
-            }
-            int major = bytes[6];
-            int headerLength = major == 1 ? BitConverter.ToUInt16(bytes, 8) : checked((int)BitConverter.ToUInt32(bytes, 8));
-            int start = major == 1 ? 10 : 12;
-            string header = Encoding.Latin1.GetString(bytes, start, headerLength);
-            string descr = Field(header, "descr").Trim('\'', '"', ' ');
-            if (Field(header, "fortran_order").Trim() != "False")
-            {
-                throw new InvalidDataException($"{path}: Fortran order is not read");
-            }
-            string shapeText = Field(header, "shape").Trim('(', ')', ' ');
-            var shape = shapeText.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-                .Select(int.Parse).ToArray();
-            long count = shape.Aggregate(1L, (n, s) => n * s);
-            int offset = start + headerLength;
-            var data = new float[count];
-            switch (descr)
-            {
-                case "<f4":
-                    Buffer.BlockCopy(bytes, offset, data, 0, checked((int)(count * 4)));
-                    break;
-                case "<f8":
-                    for (long i = 0; i < count; i++) data[i] = (float)BitConverter.ToDouble(bytes, (int)(offset + i * 8));
-                    break;
-                case "<i8":
-                    for (long i = 0; i < count; i++) data[i] = BitConverter.ToInt64(bytes, (int)(offset + i * 8));
-                    break;
-                case "<i4":
-                    for (long i = 0; i < count; i++) data[i] = BitConverter.ToInt32(bytes, (int)(offset + i * 4));
-                    break;
-                default:
-                    throw new InvalidDataException($"{path}: dtype '{descr}' is not read");
-            }
-            return new Npy(shape, data);
-        }
-
-        private static string Field(string header, string key)
-        {
-            int at = header.IndexOf($"'{key}'", StringComparison.Ordinal);
-            if (at < 0)
-            {
-                throw new InvalidDataException($".npy header has no '{key}': {header}");
-            }
-            int colon = header.IndexOf(':', at);
-            int end = header[(colon + 1)..].TrimStart().StartsWith('(')
-                ? header.IndexOf(')', colon) + 1
-                : header.IndexOf(',', colon);
-            return header[(colon + 1)..end].Trim();
-        }
-    }
 }

@@ -4,8 +4,10 @@ using System.IO;
 
 namespace Amql.Gui.Services;
 
-/// <summary>One GPU as nvidia-smi reports it.</summary>
-public sealed record GpuSample(string Name, long TotalBytes, long UsedBytes, int UtilisationPercent, int? TemperatureC);
+/// <summary>One GPU as nvidia-smi reports it. <see cref="Unified"/> is set for a GPU
+/// that shares the system's memory (the DGX Spark's GB10), whose memory figures
+/// are the machine's: nvidia-smi reports them as not available.</summary>
+public sealed record GpuSample(string Name, long TotalBytes, long UsedBytes, int UtilisationPercent, int? TemperatureC, bool Unified = false);
 
 /// <summary>Machine facts for the memory sliders and the monitor: physical RAM,
 /// and the GPU through nvidia-smi (so the GUI never loads CUDA itself).</summary>
@@ -37,7 +39,39 @@ public static class SystemInfo
         }
         static long Mib(string s) => long.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out var v) ? v << 20 : 0;
         static int? Int(string s) => int.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out var v) ? v : null;
-        return new GpuSample(f[0], Mib(f[1]), Mib(f[2]), Int(f[3]) ?? 0, Int(f[4]));
+        long total = Mib(f[1]), used = Mib(f[2]);
+        if (total == 0 && ReadMemInfo() is { } mem)
+        {
+            // Unified memory (GB10, Jetson-class parts): "[N/A]" for the GPU's own memory.
+            // The GPU can address the system's memory, so that is what it has.
+            return new GpuSample(f[0], mem.Total, mem.Total - mem.Available, Int(f[3]) ?? 0, Int(f[4]), Unified: true);
+        }
+        return new GpuSample(f[0], total, used, Int(f[3]) ?? 0, Int(f[4]));
+    }
+
+    /// <summary>MemTotal and MemAvailable from /proc/meminfo (Linux), or null elsewhere.</summary>
+    public static (long Total, long Available)? ReadMemInfo()
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            return null;
+        }
+        try
+        {
+            long total = 0, available = 0;
+            foreach (var line in File.ReadLines("/proc/meminfo"))
+            {
+                static long Kib(string l) =>
+                    long.TryParse(l.Split(' ', StringSplitOptions.RemoveEmptyEntries)[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out var v) ? v << 10 : 0;
+                if (line.StartsWith("MemTotal:", StringComparison.Ordinal)) total = Kib(line);
+                else if (line.StartsWith("MemAvailable:", StringComparison.Ordinal)) available = Kib(line);
+            }
+            return total > 0 ? (total, available) : null;
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or IndexOutOfRangeException)
+        {
+            return null;
+        }
     }
 
     /// <summary>GPU memory one process holds, when the driver reports it per process (not under WDDM).</summary>

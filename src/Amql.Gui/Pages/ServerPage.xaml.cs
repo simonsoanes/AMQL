@@ -17,20 +17,7 @@ namespace Amql.Gui.Pages;
 /// </summary>
 public partial class ServerPage : UserControl
 {
-    private static readonly (string Label, string Help, Func<ServerProfile, bool> Get, Action<ServerProfile, bool> Set)[] Behaviours =
-    {
-        ("Don't warm up models", "--no-warm: skip the warm-up pass at start (faster start, slower first request)", p => p.NoWarm, (p, v) => p.NoWarm = v),
-        ("One request at a time", "--no-batch: no continuous batching, even on the GPU", p => p.NoBatch, (p, v) => p.NoBatch = v),
-        ("No prefix reuse", "--no-prefix-reuse: prefill every prompt whole", p => p.NoPrefixReuse, (p, v) => p.NoPrefixReuse = v),
-        ("Page prompt state to disk", "--kv-disk: idle prompt state goes to kv-cache in the model's container (1 GiB, deleted after 30 min) and loads back instead of prefilling", p => p.KvDisk, (p, v) => p.KvDisk = v),
-        ("BF16 batches (faster)", "--batch-bf16: batches of 4+ on tensor cores, ~1.6x throughput; replies depend slightly on their batch", p => p.BatchBf16, (p, v) => p.BatchBf16 = v),
-        ("No loop guard", "--no-loop-guard: let a reply repeat itself to its token limit", p => p.NoLoopGuard, (p, v) => p.NoLoopGuard = v),
-        ("Free tool calls", "--free-tool-calls: do not hold calls to the request's declared tools", p => p.FreeToolCalls, (p, v) => p.FreeToolCalls = v),
-        ("No mention rule", "--no-mention-rule: do not open optional parameters the conversation names", p => p.NoMentionRule, (p, v) => p.NoMentionRule = v),
-        ("No announce rule", "--no-announce-rule: allow a reply to end on a colon without a call", p => p.NoAnnounceRule, (p, v) => p.NoAnnounceRule = v),
-        ("Allow repeated calls", "--allow-repeated-calls: allow a call that already returned the same result twice", p => p.AllowRepeatedCalls, (p, v) => p.AllowRepeatedCalls = v),
-        ("Keep line marks", "--keep-line-marks: show tool results with their line decoration", p => p.KeepLineMarks, (p, v) => p.KeepLineMarks = v),
-    };
+    private static readonly (string Label, string Help, Func<ServerProfile, bool> Get, Action<ServerProfile, bool> Set)[] Behaviours = ServerOptions.Behaviours;
 
     private readonly MainWindow _shell;
     private readonly List<CheckBox> _behaviourChecks = new();
