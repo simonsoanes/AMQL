@@ -191,10 +191,18 @@ prompts run (`amqe_linear`, `amqe_moe_experts_paired`). The kernels mirror
   which is the form the engine's experts take it in.
 - **A step** reads its token and position from device memory, so the whole
   step (48 layer visits, the loop's three passes, the messages between them)
-  is captured once as a CUDA graph and replayed for every token. Projections
-  that share an input run as one launch. Only the 8 chosen experts' rows are
-  read, each decoded in registers (E2M1 pairs and E4M3 by the conversion
-  instructions). The router's top 8 is one warp.
+  is captured once as a CUDA graph and replayed for every token.
+  - **Launches shared:** projections that share an input run as one launch,
+    and so do the q, k and v message gates' three steps, their three norms,
+    and the queries' and relative coefficients' preparation.
+  - **Norms in the mixes:** a norm that follows a block-residual mix is done
+    in the mix's own kernel.
+  - **Experts:** only the 8 chosen experts' rows are read, on the engine's
+    decode kernels (`amqe_moe_experts_paired_step`). The up projection reads
+    each output's gate and up rows together through Inkling's capped SwiGLU.
+    The down projection gives each warp four of a pair's short rows (1,152
+    wide), and the weighted sum is a kernel of its own.
+  - **Router:** its top 8 is one warp.
 - **A prompt** runs in chunks of up to 256 tokens with a token dimension.
   - **Projections:** the engine's BF16 tensor-core GEMMs (cuBLAS), with the
     activations rounded to BF16 and the products summed in f32.
@@ -276,15 +284,15 @@ Measured on the RTX 5090 (32 GB) on 2026-11-27 with nothing else running:
     is also why the top-5 set agrees at only 375 of the 614 positions.
 - **Speed**, with a prompt fed in chunks and then 128 greedy steps after it:
 
-  | KV rows | prompt tokens | prompt tok/s | per-query attention | all f32 kernels | decode tok/s after it |
-  |---|---|---|---|---|---|
-  | f32 | 512 | 1,992 | 1,844 | 630 | 100 |
-  | fp16 | 4,096 | 2,002 | 1,390 | 580 | 98 |
-  | nvfp4 | 4,096 | 1,955 | 1,214 | 522 | 93 |
-  | fp16 | 16,384 | 1,985 | 1,157 | 536 | 95 |
-  | nvfp4 | 16,384 | 1,928 | 710 | 400 | 84 |
-  | fp16 | 65,536 | 1,839 | 654 | 397 | 83 |
-  | nvfp4 | 65,536 | 1,787 | 265 | 208 | 56 |
+  | KV rows | prompt tokens | prompt tok/s | per-query attention | all f32 kernels | decode tok/s after it | decode before |
+  |---|---|---|---|---|---|---|
+  | f32 | 512 | 1,992 | 1,844 | 630 | 116 | 100 |
+  | fp16 | 4,096 | 2,002 | 1,390 | 580 | 113 | 98 |
+  | nvfp4 | 4,096 | 1,955 | 1,214 | 522 | 105 | 93 |
+  | fp16 | 16,384 | 1,985 | 1,157 | 536 | 109 | 95 |
+  | nvfp4 | 16,384 | 1,928 | 710 | 400 | 95 | 84 |
+  | fp16 | 65,536 | 1,839 | 654 | 397 | 93 | 83 |
+  | nvfp4 | 65,536 | 1,787 | 265 | 208 | 60 | 56 |
 
   The columns:
   - **Prompt tok/s:** the default, tensor-core projections, experts and
@@ -292,6 +300,8 @@ Measured on the RTX 5090 (32 GB) on 2026-11-27 with nothing else running:
   - **Per-query attention:** the same run with `AMQL_INK_TILED=0`.
   - **All f32 kernels:** projections, experts and attention all on Inkling's
     own f32 kernels.
+  - **Decode before:** with Inkling's own expert kernels and a launch for
+    every gate, norm and head preparation (see Decode below).
 
   Repeated runs vary by about 8%. The first prompt of a run is slower, at
   about 800 tok/s for 512 tokens, because cuBLAS picks its algorithms on it.
@@ -310,11 +320,19 @@ Measured on the RTX 5090 (32 GB) on 2026-11-27 with nothing else running:
 
   The tail comes from the BF16 projections and experts, not the attention.
 
-  `amql-cli generate` on a 5-token prompt decodes at 110 tok/s. Decode reads
-  about 5.4 GB a token: 2.6 GB of attention projections over 48 visits,
-  1.85 GB of chosen experts and 0.9 GB of head. That puts the bandwidth bound
-  near 330 tok/s, so decode runs at about a third of it. The rest is the many
-  small kernels a visit runs, about 30 each.
+- **Decode.** `amql-cli generate` on a 5-token prompt decodes at about 125
+  tok/s, up from 105.
+  - **Gains:** the engine's expert kernels gave about 8%, and the shared
+    launches and the norms inside the mixes about 10% more.
+  - **Bound:** decode reads about 5.4 GB a token, 2.6 GB of attention
+    projections over 48 visits, 1.85 GB of chosen experts and 0.9 GB of head.
+    That puts the bandwidth bound near 330 tok/s.
+  - **Profile of a step** (about 8 ms on the GPU):
+    - the projections and head, 2.5 ms, at about 77% of bandwidth;
+    - the experts, about 2.4 ms;
+    - the rest, about 900 small kernels at a few microseconds each.
+  - **Ruled out:** programmatic dependent launch, tried for those small
+    kernels, gained nothing inside the graph.
 - **Memory.** The weights take 17.64 GiB. A sequence's KV rows and
   convolution histories (40 sliding rings of 1,280 f32 rows, plus the 8 full
   slots) take:
@@ -335,8 +353,9 @@ Measured on the RTX 5090 (32 GB) on 2026-11-27 with nothing else running:
 Not done yet:
 
 - Batching several requests in one step.
-- Decode: fewer, fused kernels per visit (norms into the mixes, the gates'
-  three steps into one).
+- Decode: the block-residual mixes (about 1 ms a step) and the experts'
+  down projection (about 21 us a layer for 12 MB, short rows) are the next
+  targets. At 64K positions with NVFP4 rows, the step's attention is too.
 - W4A4 prefill, which `hf_quant_config.json` describes (`required_activation_quantization`).
 - KV paging and marks.
 - The vision tower and the drafter.

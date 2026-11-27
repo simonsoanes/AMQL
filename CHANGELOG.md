@@ -317,6 +317,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- **inkling 2:** decode is 10-15% faster: about 125 tok/s from a short prompt (105 before), and 93 at 64K positions with fp16 rows (83).
+  - **Experts:** a step's experts run on the engine's decode kernels (`amqe_moe_experts_paired_step`). The engine gained an MXFP8 reader and a paired mode for interleaved gate and up rows with Inkling's softcaps.
+  - **Fewer launches:** the q, k and v message gates, their norms and the head preparation share launches, and a norm that follows a block-residual mix runs inside the mix.
+  - **Matching:** the real checkpoint still matches the managed runtime exactly with f32 prompts: the same top five at all 614 positions and the same greedy continuations.
 - **inkling 2:** a prompt chunk's attention runs on the tensor cores: FlashAttention-2 with FP16 tiles (`k_attn_tiles`), each tile of 64 keys decoded once from f32, fp16 or NVFP4 rows for 64 queries, with Inkling's relative bias added from a per-chunk table ([docs](docs/inkling-2.md#gpu-path)).
   - **Speed:** on an RTX 5090, prompts now hold about 1,800-2,000 tok/s from 4K to 64K tokens. At 64K that is 1,839 tok/s with fp16 rows (654 with the per-query attention) and 1,787 with NVFP4 rows (265). Decode is unchanged.
   - **Accuracy:** BF16 prompts are as close to f32 with it as with the per-query kernel: on a 2,048-token prompt, the top token agrees at 2,043-2,046 positions and the median KL is 1-2e-5 either way.

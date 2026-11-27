@@ -2,6 +2,40 @@
 
 #include "amql_engine.h"
 
+// ── MXFP8 weights ──────────────────────────────────────────────────────────
+//
+// E4M3 elements, an E8M0 exponent per 32 (Inkling 2's last layers' experts).
+// The tag picks the reader, as Fp4Nv and Fp4Mx do; a row is k bytes.
+
+struct Fp8Mx { unsigned char b; };
+
+__device__ __forceinline__ void loadw(const Fp8Mx* w, const unsigned char* sc, long long idx, float* o)
+{
+    const uint2 q = __ldg(reinterpret_cast<const uint2*>(reinterpret_cast<const unsigned char*>(w) + idx));
+    const float s = e8m0_value(__ldg(sc + (idx >> 5)));
+    const unsigned int words[2] = { q.x, q.y };
+    #pragma unroll
+    for (int k = 0; k < 2; k++)
+    {
+        __half2_raw lo = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)(words[k] & 0xffffu), __NV_E4M3);
+        __half2_raw hi = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)(words[k] >> 16), __NV_E4M3);
+        const float2 a = __half22float2(*reinterpret_cast<__half2*>(&lo)), b = __half22float2(*reinterpret_cast<__half2*>(&hi));
+        o[4 * k] = a.x * s; o[4 * k + 1] = a.y * s; o[4 * k + 2] = b.x * s; o[4 * k + 3] = b.y * s;
+    }
+}
+
+__device__ __forceinline__ float loadw1(const Fp8Mx* w, const unsigned char* sc, long long idx)
+{
+    __half_raw h = __nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t)__ldg(reinterpret_cast<const unsigned char*>(w) + idx), __NV_E4M3);
+    return __half2float(*reinterpret_cast<__half*>(&h)) * e8m0_value(__ldg(sc + (idx >> 5)));
+}
+
+// Inkling 2's gate: capped(g) . sigmoid(g) . capped(u), cap(v) = c . tanh(v / c).
+__device__ __forceinline__ float capped_swiglu(float g, float u, float gateCap, float upCap)
+{
+    return tanhf(g / gateCap) * gateCap / (1.f + expf(-g)) * (tanhf(u / upCap) * upCap);
+}
+
 // ── timing marks ──────────────────────────────────────────────────────────
 //
 // An event after each device call of a captured step: the time between two is
@@ -278,12 +312,14 @@ struct MoeGemvArgs
     const int* idx;
     float* y;                                  // [pairs x n]
     int act; int glu;
+    float gateCap, upCap;                      // PAIR: Inkling 2's caps
 };
 
 // One warp per RW output rows of a group's expert, over the group's R inputs.
 // A GLU takes an output's gate and up rows together, so their loads are in
-// flight at once.
-template <typename WT, int R, int RW, bool GLU>
+// flight at once: rows j and n + j, or with PAIR rows 2j and 2j + 1 (gate and
+// up interleaved) through Inkling 2's capped SwiGLU.
+template <typename WT, int R, int RW, bool GLU, bool PAIR = false>
 __global__ void __launch_bounds__(256) moe_gemv_kernel(MoeGemvArgs a)
 {
     pdl_enter();
@@ -325,7 +361,8 @@ __global__ void __launch_bounds__(256) moe_gemv_kernel(MoeGemvArgs a)
         #pragma unroll
         for (int q = 0; q < RW; q++)
         {
-            base[s][q] = (rowBase0 + (jb + q < a.n ? jb + q : jb) + (s ? a.n : 0)) * k;
+            const int jj = jb + q < a.n ? jb + q : jb;
+            base[s][q] = (rowBase0 + (PAIR ? 2 * jj + s : jj + (s ? a.n : 0))) * k;
             #pragma unroll
             for (int r = 0; r < R; r++) acc[s][q][r] = 0.f;
         }
@@ -401,8 +438,9 @@ __global__ void __launch_bounds__(256) moe_gemv_kernel(MoeGemvArgs a)
             if (lane != 0 || j >= a.n || r >= live) continue;
             if (a.rowScale)
                 #pragma unroll
-                for (int s = 0; s < S; s++) v[s] *= a.rowScale[rowBase0 + (s ? a.n : 0) + j];
-            yr[r][j] = GLU ? activate(v[0], a.act) * v[S - 1] : activate(v[0], a.act);
+                for (int s = 0; s < S; s++) v[s] *= a.rowScale[rowBase0 + (PAIR ? 2 * j + s : (s ? a.n : 0) + j)];
+            if constexpr (PAIR) yr[r][j] = capped_swiglu(v[0], v[S - 1], a.gateCap, a.upCap);
+            else yr[r][j] = GLU ? activate(v[0], a.act) * v[S - 1] : activate(v[0], a.act);
         }
 }
 
@@ -440,6 +478,7 @@ static int moe_gemv(Engine* e, int wType, const MoeGemvArgs& a, int R, int RW, i
         case 1: return launch_moe_gemv<float>(e, a, R, RW, groups);
         case 2: return launch_moe_gemv<Fp4Nv>(e, a, R, RW, groups);
         case 3: return launch_moe_gemv<Fp4Mx>(e, a, R, RW, groups);
+        case 4: return launch_moe_gemv<Fp8Mx>(e, a, R, RW, groups);   // MXFP8: amqe_moe_experts_paired_step only
         default: return -100;
     }
 }
@@ -1034,6 +1073,45 @@ AMQE_EXPORT int amqe_moe_experts_paired(Engine* e,
     if (rc) return rc;
     return moe_experts_prompt(e, gateUp, guType, guScales, guRowScale, down, dType, dScales, dRowScale,
         experts, hidden, inter, ACT_NONE, x, ldx, topK, rows * topK, order, groups, slots, 1, gateCap, upCap);
+}
+
+/// A decode step's experts (rows <= 8) for gate and up rows interleaved and
+/// softcapped (Inkling 2): glu[pair] = the capped SwiGLU of the pair's expert,
+/// then slots[pair] = its down projection, unweighted (the caller weighs and
+/// sums them). A warp takes several short down rows of one pair, which suits
+/// narrow experts (Inkling's 1,152) better than amqe_moe_experts' mix. guType
+/// and dType: 0 BF16, 1 f32, 2 NVFP4, 3 MXFP4, 4 MXFP8; a row scale is
+/// [experts x rows] or null. glu: [rows x topK x inter], slots [rows x topK x hidden].
+AMQE_EXPORT int amqe_moe_experts_paired_step(Engine* e,
+    const void* gateUp, int guType, const unsigned char* guScales, const float* guRowScale,
+    const void* down, int dType, const unsigned char* dScales, const float* dRowScale,
+    int experts, int hidden, int inter, int topK, float gateCap, float upCap,
+    const float* x, int ldx, int rows, const int* idx, float* glu, float* slots)
+{
+    if (rows < 1 || rows > 8 || guType < 0 || guType > 4 || dType < 0 || dType > 4) return -100;
+    if ((guType >= 2 && (hidden % 32 != 0 || !guScales)) || (dType >= 2 && (inter % 32 != 0 || !dScales))) return -100;
+    int R, rw;
+    moe_shape(rows, hidden, 1, &R, &rw);
+    if (R != 1) return -100;
+    MoeGemvArgs a{ gateUp, guScales, guRowScale, inter, hidden, 2 * inter, x, ldx, topK, nullptr, nullptr, idx, glu, ACT_NONE, 1, gateCap, upCap };
+    const dim3 grid((inter + 8 * rw - 1) / (8 * rw), rows * topK);
+    auto up = [&](auto tag) {
+        using WT = decltype(tag);
+        if (rw == 1) launch(moe_gemv_kernel<WT, 1, 1, true, true>, grid, 256, 0, e->stream, a);
+        else launch(moe_gemv_kernel<WT, 1, 4, true, true>, grid, 256, 0, e->stream, a);
+    };
+    switch (guType)
+    {
+        case 0: up(__nv_bfloat16{}); break;
+        case 1: up(float{}); break;
+        case 2: up(Fp4Nv{}); break;
+        case 3: up(Fp4Mx{}); break;
+        default: up(Fp8Mx{}); break;
+    }
+    int rd;
+    moe_shape(rows, inter, 0, &R, &rd);
+    MoeGemvArgs b{ down, dScales, dRowScale, hidden, inter, hidden, glu, inter, 1, nullptr, nullptr, idx, slots, ACT_NONE, 0, 0.f, 0.f };
+    return moe_gemv(e, dType, b, 1, rd, rows * topK);
 }
 
 // y = (y + scale · b) · mul: the residual join of a layer that scales what it passes on.

@@ -62,6 +62,11 @@ extern "C" int amqe_linear(Engine* e, const void* w, int wType, int n, int k,
     const float* bias, const float* residual, int ldr, float resScale, int act, int glu, float* raw,
     const float* normW, float normOff, const float* normBias, float normEps, int normKind,
     const unsigned char* wScales, const float* rowScale);
+extern "C" int amqe_moe_experts_paired_step(Engine* e,
+    const void* gateUp, int guType, const unsigned char* guScales, const float* guRowScale,
+    const void* down, int dType, const unsigned char* dScales, const float* dRowScale,
+    int experts, int hidden, int inter, int topK, float gateCap, float upCap,
+    const float* x, int ldx, int rows, const int* idx, float* glu, float* slots);
 extern "C" int amqe_moe_experts_paired(Engine* e,
     const void* gateUp, int guType, const unsigned char* guScales, const float* guRowScale,
     const void* down, int dType, const unsigned char* dScales, const float* dRowScale,
@@ -690,11 +695,15 @@ __global__ void k_softcap(float* x, int n, float cap)
 }
 
 // out = x / rms(x) (times w when given).
-__global__ void k_rmsnorm(const float* __restrict__ x, const float* __restrict__ w, float* __restrict__ out, int d, float eps)
+// Up to three norms at once: grid (T, n).
+struct Norms { const float* x[3]; const float* w[3]; float* out[3]; };
+
+__global__ void k_rmsnorm(Norms a, int d, float eps)
 {
     __shared__ float sh[32];
-    x += (long long)blockIdx.x * d;
-    out += (long long)blockIdx.x * d;
+    const float* x = a.x[blockIdx.y] + (long long)blockIdx.x * d;
+    const float* w = a.w[blockIdx.y];
+    float* out = a.out[blockIdx.y] + (long long)blockIdx.x * d;
     float s = 0.f;
     for (int i = threadIdx.x; i < d; i += blockDim.x) s += x[i] * x[i];
     float inv = rsqrtf(block_sum(s, sh) / d + eps);
@@ -722,8 +731,11 @@ __global__ void k_embed(Mat embed, const int* __restrict__ token, const float* _
 // Attention over depth (Inkling2Loop{Block,Message}AttentionResidual): each
 // state RMS-normed without a gain, weighted by softmax(query . state / sqrt d).
 struct States { const float* s[10]; int n; };
+// The norm that follows a mix, done in the same block: query i's output is
+// also written RMS-normed with w[i] (null: no gain) into out[i] + row * d.
+struct MixNorm { const float* w[4]; float* out[4]; float eps; };
 
-__global__ void k_mix(States st, const float* __restrict__ queries, float* __restrict__ out, int d)
+__global__ void k_mix(States st, const float* __restrict__ queries, float* __restrict__ out, int d, MixNorm mn)
 {
     __shared__ float sh[32];
     __shared__ float inv[10], w[10];
@@ -766,21 +778,34 @@ __global__ void k_mix(States st, const float* __restrict__ queries, float* __res
     }
     __syncthreads();
     float* o = out + ((long long)blockIdx.x * gridDim.y + blockIdx.y) * d;
+    float sq = 0.f;
     for (int j = threadIdx.x; j < d; j += blockDim.x)
     {
         float acc = 0.f;
         for (int i = 0; i < st.n; i++) acc += w[i] * st.s[i][ro + j];
         o[j] = acc;
+        sq += acc * acc;
     }
+    float* no = mn.out[blockIdx.x];
+    if (no == nullptr) return;
+    // Each thread reads back only what it wrote, so no barrier is needed for o.
+    float rinv = rsqrtf(block_sum(sq, sh) / d + mn.eps);
+    const float* nw = mn.w[blockIdx.x];
+    no += ro;
+    for (int j = threadIdx.x; j < d; j += blockDim.x) no[j] = o[j] * rinv * (nw ? nw[j] : 1.f);
 }
 
 // The message gate's input: [h / rms(h); m / rms(m)].
-__global__ void k_gate_cat(const float* __restrict__ h, const float* __restrict__ m, float* __restrict__ cat, int d, float eps)
+// Up to three gates at once (q, k and v take theirs side by side): grid (T, n).
+struct GateCats { const float* h[3]; const float* m[3]; float* cat[3]; };
+
+__global__ void k_gate_cat(GateCats args, int d, float eps)
 {
     __shared__ float sh[32];
-    h += (long long)blockIdx.x * d;
-    m += (long long)blockIdx.x * d;
-    cat += (long long)blockIdx.x * 2 * d;
+    const int g = blockIdx.y;
+    const float* h = args.h[g] + (long long)blockIdx.x * d;
+    const float* m = args.m[g] + (long long)blockIdx.x * d;
+    float* cat = args.cat[g] + (long long)blockIdx.x * 2 * d;
     float a = 0.f, b = 0.f;
     for (int i = threadIdx.x; i < d; i += blockDim.x) { a += h[i] * h[i]; b += m[i] * m[i]; }
     float ia = rsqrtf(block_sum(a, sh) / d + eps);
@@ -788,28 +813,37 @@ __global__ void k_gate_cat(const float* __restrict__ h, const float* __restrict_
     for (int i = threadIdx.x; i < d; i += blockDim.x) { cat[i] = h[i] * ia; cat[d + i] = m[i] * ib; }
 }
 
-// (1 - tanh(F g)) h + tanh(G g) m.
-__global__ void k_gate_apply(Mat forget, Mat gain, const float* __restrict__ g, const float* __restrict__ h,
-                             const float* __restrict__ m, float* __restrict__ out, int d, int rank)
+// (1 - tanh(F g)) h + tanh(G g) m, up to three gates at once: grid (d / 8, T, n).
+struct GateApplies { Mat forget[3], gain[3]; const float* g[3]; const float* h[3]; const float* m[3]; float* out[3]; };
+
+__global__ void k_gate_apply(GateApplies args, int d, int rank)
 {
     int i = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
     if (i >= d) return;
+    const int z = blockIdx.z;
+    const Mat forget = args.forget[z], gain = args.gain[z];
     long long ro = (long long)blockIdx.y * d;
-    g += (long long)blockIdx.y * rank;
-    h += ro; m += ro; out += ro;
+    const float* g = args.g[z] + (long long)blockIdx.y * rank;
+    const float* h = args.h[z] + ro;
+    const float* m = args.m[z] + ro;
+    float* out = args.out[z] + ro;
     float f = row_dot(forget.w, forget.type, i, rank, g);
     float a = row_dot(gain.w, gain.type, i, rank, g);
     if ((threadIdx.x & 31) == 0) out[i] = (1.f - tanhf(f)) * h[i] + tanhf(a) * m[i];
 }
 
-// Queries or relative-bias coefficients, a head a block: a learned scale per
-// channel, clipped to `clip`, then the full layers' log scaling.
-__global__ void k_head_prep(float* x, const float* __restrict__ scale, int dim, float clip,
-                            int full, const int* __restrict__ pos, int floor, float alpha)
+// Queries and relative-bias coefficients, a head a block (z = 0 queries, 1
+// coefficients): a learned scale per channel, clipped to `clip`, then the full
+// layers' log scaling. Grid (heads, T, 2).
+struct HeadPreps { float* x[2]; const float* scale[2]; int dim[2]; float clip[2]; };
+
+__global__ void k_head_prep(HeadPreps a, int full, const int* __restrict__ pos, int floor, float alpha)
 {
     __shared__ float sh[32];
-    float* hx = x + ((long long)blockIdx.y * gridDim.x + blockIdx.x) * dim;
-    const float* sc = scale + blockIdx.x * dim;
+    const int z = blockIdx.z, dim = a.dim[z];
+    const float clip = a.clip[z];
+    float* hx = a.x[z] + ((long long)blockIdx.y * gridDim.x + blockIdx.x) * dim;
+    const float* sc = a.scale[z] + blockIdx.x * dim;
     float s = 0.f;
     for (int i = threadIdx.x; i < dim; i += blockDim.x) { float v = hx[i] * sc[i]; hx[i] = v; s += v * v; }
     float norm = sqrtf(block_sum(s, sh));
@@ -1570,27 +1604,65 @@ static void proj(Ctx* x, int T, std::initializer_list<std::tuple<Mat, const floa
 
 // The engine's code for an expert stack's format: 0 BF16, 2 NVFP4, 4 MXFP8; -1 none.
 static int engine_type(int type) { return type == W_BF16 ? 0 : type == W_NVFP4 ? 2 : type == W_MXFP8 ? 4 : -1; }
+// The same for a step's experts, whose kernels also read f32 (1).
+static int engine_step_type(int type) { return type == W_F32 ? 1 : engine_type(type); }
 
 static void rmsnorm(Ctx* x, const float* in, const float* w, float* out, int T)
 {
-    k_rmsnorm<<<T, 256, 0, x->stream>>>(in, w, out, x->c.d, x->c.eps);
+    Norms n = {};
+    n.x[0] = in; n.w[0] = w; n.out[0] = out;
+    k_rmsnorm<<<dim3(T, 1), 256, 0, x->stream>>>(n, x->c.d, x->c.eps);
 }
 
-static void mix(Ctx* x, const std::vector<float*>& blocks, const float* partial, const float* queries, int count, float* out, int T)
+// Three norms in one launch.
+static void rmsnorm3(Ctx* x, const float* const in[3], const float* const w[3], float* const out[3], int T)
+{
+    Norms n = {};
+    for (int i = 0; i < 3; i++) { n.x[i] = in[i]; n.w[i] = w[i]; n.out[i] = out[i]; }
+    k_rmsnorm<<<dim3(T, 3), 256, 0, x->stream>>>(n, x->c.d, x->c.eps);
+}
+
+static void mix(Ctx* x, const std::vector<float*>& blocks, const float* partial, const float* queries, int count, float* out, int T,
+                const float* const normW[] = nullptr, float* const normOut[] = nullptr)
 {
     States st = {};
     st.n = (int)blocks.size() + 1;
     for (size_t i = 0; i < blocks.size(); i++) st.s[i] = blocks[i];
     st.s[blocks.size()] = partial;
-    k_mix<<<dim3(count, T), 1024, 0, x->stream>>>(st, queries, out, x->c.d);
+    MixNorm mn = {};
+    mn.eps = x->c.eps;
+    if (normOut)
+        for (int i = 0; i < count; i++) { mn.w[i] = normW[i]; mn.out[i] = normOut[i]; }
+    k_mix<<<dim3(count, T), 1024, 0, x->stream>>>(st, queries, out, x->c.d, mn);
 }
 
-static void message_gate(Ctx* x, Seq* s, const Layer& L, int g, const float* h, const float* m, float* out, int T)
+// Message gates g0 .. g0 + n - 1 (n is 1 or 3): gate g reads h[i] and the
+// message m[i], and writes out[i]. The q, k and v gates are independent, so
+// their three steps (cat, the down projection, apply) each take one launch.
+static void message_gates(Ctx* x, Seq* s, const Layer& L, int g0, int n, const float* const h[3], const float* const m[3],
+                          float* const out[3], int T)
 {
-    int d = x->c.d;
-    k_gate_cat<<<T, 256, 0, x->stream>>>(h, m, s->cat, d, x->c.eps);
-    proj(x, T, { { L.m[M_CTRL + 3 * g], s->cat, s->gvec } });
-    k_gate_apply<<<dim3((d + 7) / 8, T), 256, 0, x->stream>>>(L.m[M_CTRL + 3 * g + 1], L.m[M_CTRL + 3 * g + 2], s->gvec, h, m, out, d, x->c.rank);
+    int d = x->c.d, rank = x->c.rank;
+    GateCats gc = {};
+    GateApplies ga = {};
+    float* cat[3];
+    float* gv[3];
+    for (int i = 0; i < n; i++)
+    {
+        cat[i] = s->cat + (long long)i * kChunk * 2 * d;
+        gv[i] = s->gvec + (long long)i * kChunk * rank;
+        gc.h[i] = h[i]; gc.m[i] = m[i]; gc.cat[i] = cat[i];
+        ga.forget[i] = L.m[M_CTRL + 3 * (g0 + i) + 1];
+        ga.gain[i] = L.m[M_CTRL + 3 * (g0 + i) + 2];
+        ga.g[i] = gv[i]; ga.h[i] = h[i]; ga.m[i] = m[i]; ga.out[i] = out[i];
+    }
+    k_gate_cat<<<dim3(T, n), 256, 0, x->stream>>>(gc, d, x->c.eps);
+    if (n == 3)
+        proj(x, T, { { L.m[M_CTRL + 3 * g0], cat[0], gv[0] }, { L.m[M_CTRL + 3 * (g0 + 1)], cat[1], gv[1] },
+                     { L.m[M_CTRL + 3 * (g0 + 2)], cat[2], gv[2] } });
+    else
+        proj(x, T, { { L.m[M_CTRL + 3 * g0], cat[0], gv[0] } });
+    k_gate_apply<<<dim3((d + 7) / 8, T, n), 256, 0, x->stream>>>(ga, d, rank);
 }
 
 static KvView view_of(const KvSlot& kv) { return KvView{ kv.k, kv.v, kv.ks, kv.vs, kv.kg, kv.vg, kv.cap, kv.ring, kv.format }; }
@@ -1608,40 +1680,57 @@ static float* run_layer(Ctx* x, Seq* s, int l, Slot& slot, float* h, std::vector
     if (L.full)
     {
         const float *xq = h, *xk = h, *xv = h;
+        const float* qkvNorm[3] = { L.v[V_QNORM], L.v[V_KNORM], L.v[V_VNORM] };
+        float* const qkvOut[3] = { s->nq, s->nk, s->nv };
+        bool normed = false;
         if (L.v[V_ATTNQUERY])
         {
-            mix(x, blocks, h, L.v[V_ATTNQUERY], 3, s->mixed, T);
+            mix(x, blocks, h, L.v[V_ATTNQUERY], 3, s->mixed, T, messages ? nullptr : qkvNorm, messages ? nullptr : qkvOut);
+            normed = !messages;
             xq = s->mixed; xk = s->mixed + Td; xv = s->mixed + 2 * Td;
         }
         if (messages)
         {
-            message_gate(x, s, L, 0, xq, messages, s->xq, T);
-            message_gate(x, s, L, 1, xk, messages + Td, s->xk, T);
-            message_gate(x, s, L, 2, xv, messages + 2 * Td, s->xv, T);
+            const float* hs[3] = { xq, xk, xv };
+            const float* ms[3] = { messages, messages + Td, messages + 2 * Td };
+            float* const outs[3] = { s->xq, s->xk, s->xv };
+            message_gates(x, s, L, 0, 3, hs, ms, outs, T);
             xq = s->xq; xk = s->xk; xv = s->xv;
         }
-        rmsnorm(x, xq, L.v[V_QNORM], s->nq, T);
-        rmsnorm(x, xk, L.v[V_KNORM], s->nk, T);
-        rmsnorm(x, xv, L.v[V_VNORM], s->nv, T);
+        if (!normed)
+        {
+            const float* ins[3] = { xq, xk, xv };
+            rmsnorm3(x, ins, qkvNorm, qkvOut, T);
+        }
         qIn = s->nq; kIn = s->nk; vIn = s->nv;
     }
     else
     {
         const float* xx = h;
-        if (L.v[V_ATTNQUERY]) { mix(x, blocks, h, L.v[V_ATTNQUERY], 1, s->mixed, T); xx = s->mixed; }
+        const float* attnNorm[1] = { L.v[V_ATTNNORM] };
+        float* const attnOut[1] = { s->nq };
+        bool normed = false;
+        if (L.v[V_ATTNQUERY])
+        {
+            mix(x, blocks, h, L.v[V_ATTNQUERY], 1, s->mixed, T, messages ? nullptr : attnNorm, messages ? nullptr : attnOut);
+            normed = !messages;
+            xx = s->mixed;
+        }
         if (messages)
         {
-            message_gate(x, s, L, 0, xx, messages, s->xq, T);
-            message_gate(x, s, L, 1, xx, messages + Td, s->xk, T);
-            message_gate(x, s, L, 2, xx, messages + 2 * Td, s->xv, T);
-            rmsnorm(x, s->xq, L.v[V_ATTNNORM], s->nq, T);
-            rmsnorm(x, s->xk, L.v[V_ATTNNORM], s->nk, T);
-            rmsnorm(x, s->xv, L.v[V_ATTNNORM], s->nv, T);
+            const float* hs[3] = { xx, xx, xx };
+            const float* ms[3] = { messages, messages + Td, messages + 2 * Td };
+            float* const outs[3] = { s->xq, s->xk, s->xv };
+            message_gates(x, s, L, 0, 3, hs, ms, outs, T);
+            const float* ins[3] = { s->xq, s->xk, s->xv };
+            const float* ws[3] = { L.v[V_ATTNNORM], L.v[V_ATTNNORM], L.v[V_ATTNNORM] };
+            float* const nouts[3] = { s->nq, s->nk, s->nv };
+            rmsnorm3(x, ins, ws, nouts, T);
             qIn = s->nq; kIn = s->nk; vIn = s->nv;
         }
         else
         {
-            rmsnorm(x, xx, L.v[V_ATTNNORM], s->nq, T);
+            if (!normed) rmsnorm(x, xx, L.v[V_ATTNNORM], s->nq, T);
             qIn = kIn = vIn = s->nq;
         }
     }
@@ -1653,8 +1742,12 @@ static float* run_layer(Ctx* x, Seq* s, int l, Slot& slot, float* h, std::vector
         proj(x, T, { { L.m[M_WK], kIn, s->k }, { L.m[M_WV], vIn, s->v }, { L.m[M_KPROJ], kIn, s->kdyn }, { L.m[M_VPROJ], vIn, s->vdyn } });
     else
         proj(x, T, { { L.m[M_WK], kIn, s->k }, { L.m[M_WV], vIn, s->v } });
-    k_head_prep<<<dim3(heads, T), 128, 0, x->stream>>>(s->q, L.v[V_QSCALE], hd, c.qkClip, L.full, s->dPos, c.logFloor, c.alpha);
-    k_head_prep<<<dim3(heads, T), 32, 0, x->stream>>>(s->r, L.v[V_RELSCALE], c.relDim, c.relClip, L.full, s->dPos, c.logFloor, c.alpha);
+    {
+        HeadPreps hp = {};
+        hp.x[0] = s->q; hp.scale[0] = L.v[V_QSCALE]; hp.dim[0] = hd; hp.clip[0] = c.qkClip;
+        hp.x[1] = s->r; hp.scale[1] = L.v[V_RELSCALE]; hp.dim[1] = c.relDim; hp.clip[1] = c.relClip;
+        k_head_prep<<<dim3(heads, T, 2), 128, 0, x->stream>>>(hp, L.full, s->dPos, c.logFloor, c.alpha);
+    }
     KvPrep kp = {};
     kp.raw[0] = s->k; kp.raw[1] = s->v;
     if (L.full)
@@ -1721,21 +1814,45 @@ static float* run_layer(Ctx* x, Seq* s, int l, Slot& slot, float* h, std::vector
     if (blockStart) blocks.push_back(h);
     k_shortconv<<<(d + 255) / 256, 256, 0, x->stream>>>(s->attn, L.v[V_ATTNCONV], slot.ahist, blockStart ? nullptr : h, s->res, d, K, s->dPos, T);
 
-    mix(x, blocks, s->res, L.v[V_MLPQUERY], 1, s->mlpIn, T);
+    const float* mlpNorm[1] = { L.v[V_MLPNORM] };
+    float* const mlpOut[1] = { s->normed };
+    mix(x, blocks, s->res, L.v[V_MLPQUERY], 1, s->mlpIn, T, messages ? nullptr : mlpNorm, messages ? nullptr : mlpOut);
     const float* mlpIn = s->mlpIn;
     if (messages)
     {
-        message_gate(x, s, L, 3, s->mlpIn, messages + 3 * Td, s->mlpGated, T);
+        const float* hs[3] = { s->mlpIn };
+        const float* ms[3] = { messages + 3 * Td };
+        float* const outs[3] = { s->mlpGated };
+        message_gates(x, s, L, 3, 1, hs, ms, outs, T);
         mlpIn = s->mlpGated;
     }
-    rmsnorm(x, mlpIn, L.v[V_MLPNORM], s->normed, T);
+    if (messages) rmsnorm(x, mlpIn, L.v[V_MLPNORM], s->normed, T);
 
     // The experts (Inkling2LoopTopKRouter, Inkling2LoopExperts): a step reads
     // its chosen experts' rows; a chunk groups its pairs by expert first.
     proj(x, T, { { L.m[M_ROUTER], s->normed, s->rlogits } });
     k_router<<<T, 32, 0, x->stream>>>(s->rlogits, L.v[V_ROUTERBIAS], c.experts, c.topK, c.routeScale, s->idx, s->wt);
     bool grouped = T > 1 && d % 32 == 0 && c.width % 32 == 0 && d % 8 == 0;
-    if (!grouped)
+    bool summed = false;
+    if (!grouped && T <= 8 && engine_step_type(L.w13.type) >= 0 && engine_step_type(L.w2.type) >= 0)
+    {
+        // A step's experts on the engine's decode kernels: the up rows with the
+        // capped SwiGLU, then each pair's down projection; weighed and summed here.
+        int rc = amqe_moe_experts_paired_step(x->eng, L.w13.w, engine_step_type(L.w13.type), L.w13.scales, L.w13.rowScale,
+                                              L.w2.w, engine_step_type(L.w2.type), L.w2.scales, L.w2.rowScale,
+                                              c.experts, d, c.width, c.topK, c.gateCap, c.upCap, s->normed, d, T, s->idx,
+                                              s->act, s->epart);
+        if (rc == 0)
+        {
+            k_expert_wsum<<<dim3((d + 255) / 256, T), 256, 0, x->stream>>>(s->epart, s->wt, c.topK, d, s->ffn);
+            summed = true;
+        }
+        else if (rc != -100 && !x->err) x->err = rc;
+    }
+    if (summed)
+    {
+    }
+    else if (!grouped)
     {
         for (int t = 0; t < T; t++)
         {
@@ -1766,7 +1883,7 @@ static float* run_layer(Ctx* x, Seq* s, int l, Slot& slot, float* h, std::vector
             k_expert_sum<<<dim3((d + 255) / 256, T), 256, 0, x->stream>>>(s->epart, c.topK, d, s->ffn);
         }
     }
-    if (!grouped) k_expert_sum<<<dim3((d + 255) / 256, T), 256, 0, x->stream>>>(s->epart, c.topK, d, s->ffn);
+    if (!grouped && !summed) k_expert_sum<<<dim3((d + 255) / 256, T), 256, 0, x->stream>>>(s->epart, c.topK, d, s->ffn);
     k_shortconv<<<(d + 255) / 256, 256, 0, x->stream>>>(s->ffn, L.v[V_MLPCONV], slot.mhist, s->res, outBuf, d, K, s->dPos, T);
     return outBuf;
 }
@@ -1811,8 +1928,11 @@ static void record(Ctx* x, Seq* s, int T, bool every)
         }
     }
     for (int l = c.loopEnd; l < c.layers; l++) h = run_layer(x, s, l, s->slots[l], h, blocks, nullptr, s->hbuf[buf++], T);
-    mix(x, blocks, h, x->gv[G_OUTPUTQUERY], 1, s->mixed, T);
-    rmsnorm(x, s->mixed, x->gv[G_FINALNORM], s->normed, T);
+    {
+        const float* finalNorm[1] = { x->gv[G_FINALNORM] };
+        float* const finalOut[1] = { s->normed };
+        mix(x, blocks, h, x->gv[G_OUTPUTQUERY], 1, s->mixed, T, finalNorm, finalOut);
+    }
     Mat head = x->g[G_UNEMBED];
     head.rows = c.vocab;   // the padded rows are never read
     if (every)
@@ -1995,8 +2115,8 @@ INK_EXPORT int ink_seq_create(void* ctx, int capacity, int format, void** out)
     if ((rc = alloc_f(s, &s->part, (size_t)max_parts(x, s) * 130))) return fail(rc);
     if ((rc = alloc_f(s, &s->mixed, R * 3 * d))) return fail(rc);
     if ((rc = alloc_f(s, &s->msg, R * 4 * d))) return fail(rc);
-    if ((rc = alloc_f(s, &s->cat, R * 2 * d))) return fail(rc);
-    if ((rc = alloc_f(s, &s->gvec, R * c.rank))) return fail(rc);
+    if ((rc = alloc_f(s, &s->cat, 3 * R * 2 * d))) return fail(rc);      // three gates at once (message_gates)
+    if ((rc = alloc_f(s, &s->gvec, 3 * R * c.rank))) return fail(rc);
     float** rows[] = { &s->attn, &s->xq, &s->xk, &s->xv, &s->nq, &s->nk, &s->nv, &s->res, &s->mlpIn, &s->mlpGated, &s->normed, &s->ffn };
     for (auto p : rows) if ((rc = alloc_f(s, p, R * d))) return fail(rc);
     if ((rc = alloc_f(s, &s->act, R * c.topK * c.width))) return fail(rc);
@@ -2125,9 +2245,11 @@ INK_EXPORT int ink_step(void* ctx, void* seq, int token, float* logits, int grap
     s->hToks[kChunk] = s->pos;
     TRY(cudaMemcpyAsync(s->dToks, s->hToks, sizeof(int), cudaMemcpyHostToDevice, x->stream));
     TRY(cudaMemcpyAsync(s->dPos, s->hToks + kChunk, sizeof(int), cudaMemcpyHostToDevice, x->stream));
+    x->err = 0;
     if (!graphs)
     {
         record(x, s, 1, false);
+        if (x->err) return x->err;
         TRY(cudaGetLastError());
     }
     else
@@ -2138,6 +2260,7 @@ INK_EXPORT int ink_step(void* ctx, void* seq, int token, float* logits, int grap
             record(x, s, 1, false);
             cudaError_t e = cudaStreamEndCapture(x->stream, &s->graph);
             if (e != cudaSuccess) return -(int)e;
+            if (x->err) { cudaGraphDestroy(s->graph); s->graph = nullptr; return x->err; }
             TRY(cudaGraphInstantiate(&s->exec, s->graph, 0));
         }
         TRY(cudaGraphLaunch(s->exec, x->stream));
