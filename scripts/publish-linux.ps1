@@ -28,7 +28,7 @@ foreach ($project in "Amql.Cli", "Amql.Server", "Amql.Gui") {
 # The Windows builds of the native libraries come along with Amql.Inference; they are no use on Linux.
 Remove-Item (Join-Path $Out "amql_cuda.dll"), (Join-Path $Out "amql_inkling.dll") -ErrorAction SilentlyContinue
 
-foreach ($lib in "libamql_cuda.so", "libamql_inkling.so") {
+foreach ($lib in "libamql_cuda.so") {
     $path = Join-Path $root "native\amql_cuda\bin\$lib"
     if (Test-Path $path) { Copy-Item $path $Out }
 }

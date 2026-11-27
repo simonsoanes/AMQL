@@ -3,7 +3,7 @@
 #   amql-gui     AMQL Studio's text UI (the same app as the Windows window)
 #   amql-server  the inference server
 #   amql-cli     every command the Studio's Tools page runs
-#   libamql_cuda.so / libamql_inkling.so, when built (native/amql_cuda/build-cuda.sh)
+#   libamql_cuda.so, when built (native/amql_cuda/build-cuda.sh)
 #
 # Self-contained: the folder carries its own .NET runtime, so the target needs
 # no .NET install. Run it on the Spark itself, or on any machine with the .NET 11
@@ -33,7 +33,7 @@ done
 rm -f "$OUT/amql_cuda.dll" "$OUT/amql_inkling.dll"
 
 staged=0
-for lib in native/amql_cuda/bin/libamql_cuda.so native/amql_cuda/bin/libamql_inkling.so; do
+for lib in native/amql_cuda/bin/libamql_cuda.so; do
     if [ -f "$lib" ]; then
         cp "$lib" "$OUT/"
         staged=1

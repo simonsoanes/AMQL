@@ -640,6 +640,8 @@ AMQE_EXPORT int amqe_moe_finish(Engine* e, const float* slots, const float* wt, 
 // L2, and one batched GEMM runs their blocks.
 
 constexpr int MOE_BLOCK = 32;
+// Expert weights as MXFP8 (E4M3 elements, E8M0 per 32): prompts only (amqe_moe_experts_paired).
+constexpr int WT_MXFP8 = 4;
 
 // x[block][row] = bf16(x of the pair there), zero past the block's last pair.
 __global__ void moe_gather_kernel(const float* x, long long ldx, int xDiv, const int* order, const int* blocks, int k, __nv_bfloat16* out)
@@ -665,6 +667,24 @@ __global__ void moe_glu_kernel(const float* raw, int n, const int* blocks, const
         float g = in[c], u = in[n + c];
         if (rs) { g *= rs[c]; u *= rs[n + c]; }
         o[c] = __float2bfloat16_rn(activate(g, act) * u);
+    }
+}
+
+// The GLU of interleaved rows (gate 2c, up 2c + 1), each softcapped: Inkling 2's
+// capped(g) · sigmoid(g) · capped(u), with cap(v) = c · tanh(v / c).
+__global__ void moe_glu_pairs_kernel(const float* raw, int n, const int* blocks, const float* rowScale, int rowsPerExpert,
+                                     float gateCap, float upCap, __nv_bfloat16* out)
+{
+    pdl_enter();
+    const int b = blockIdx.x, r = blockIdx.y;
+    const float* in = raw + ((long long)b * MOE_BLOCK + r) * 2 * n;
+    __nv_bfloat16* o = out + ((long long)b * MOE_BLOCK + r) * n;
+    const float* rs = rowScale ? rowScale + (long long)blocks[3 * b] * rowsPerExpert : nullptr;
+    for (int c = threadIdx.x; c < n; c += blockDim.x)
+    {
+        float g = in[2 * c], u = in[2 * c + 1];
+        if (rs) { g *= rs[2 * c]; u *= rs[2 * c + 1]; }
+        o[c] = __float2bfloat16_rn(tanhf(g / gateCap) * gateCap / (1.f + expf(-g)) * (tanhf(u / upCap) * upCap));
     }
 }
 
@@ -708,6 +728,37 @@ __global__ void moe_decode_kernel(const WT* w, const unsigned char* scales, cons
     }
 }
 
+// MXFP8 (E4M3 elements, an E8M0 exponent per 32), 32 elements a thread. Element
+// times a power of two is exact in BF16.
+__global__ void moe_decode_mxfp8_kernel(const unsigned char* w, const unsigned char* scales, const int* experts, long long elements, __nv_bfloat16* out)
+{
+    pdl_enter();
+    const long long i = ((long long)blockIdx.x * blockDim.x + threadIdx.x) * 32;
+    if (i >= elements) return;
+    const long long at = (long long)experts[blockIdx.y] * elements + i;
+    const uint4* q = reinterpret_cast<const uint4*>(w + at);
+    const uint4 a = __ldg(q), c = __ldg(q + 1);
+    const unsigned int words[8] = { a.x, a.y, a.z, a.w, c.x, c.y, c.z, c.w };
+    const float s = e8m0_value(__ldg(scales + (at >> 5)));
+    uint4* o = reinterpret_cast<uint4*>(out + (long long)blockIdx.y * elements + i);
+    #pragma unroll
+    for (int t = 0; t < 4; t++)
+    {
+        unsigned int p[4];
+        #pragma unroll
+        for (int h = 0; h < 2; h++)
+        {
+            const unsigned int wd = words[2 * t + h];
+            __half2_raw lo = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)(wd & 0xffffu), __NV_E4M3);
+            __half2_raw hi = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)(wd >> 16), __NV_E4M3);
+            const float2 x0 = __half22float2(*reinterpret_cast<__half2*>(&lo)), x1 = __half22float2(*reinterpret_cast<__half2*>(&hi));
+            p[2 * h] = (__float_as_uint(x0.y * s) & 0xffff0000u) | (__float_as_uint(x0.x * s) >> 16);
+            p[2 * h + 1] = (__float_as_uint(x1.y * s) & 0xffff0000u) | (__float_as_uint(x1.x * s) >> 16);
+        }
+        o[t] = make_uint4(p[0], p[1], p[2], p[3]);
+    }
+}
+
 static int moe_decode(Engine* e, const void* w, int type, const unsigned char* scales, const int* experts, int count, long long elements, __nv_bfloat16* out)
 {
     dim3 grid((unsigned)((elements / 32 + 255) / 256), count);
@@ -715,6 +766,7 @@ static int moe_decode(Engine* e, const void* w, int type, const unsigned char* s
     {
         case 2: launch(moe_decode_kernel<Fp4Nv>, grid, 256, 0, e->stream, (const Fp4Nv*)w, scales, experts, elements, out); break;
         case 3: launch(moe_decode_kernel<Fp4Mx>, grid, 256, 0, e->stream, (const Fp4Mx*)w, scales, experts, elements, out); break;
+        case WT_MXFP8: launch(moe_decode_mxfp8_kernel, grid, 256, 0, e->stream, (const unsigned char*)w, scales, experts, elements, out); break;
         default: return -100;
     }
     return ok(cudaGetLastError());
@@ -765,7 +817,8 @@ static int moe_experts_prompt(Engine* e,
     const void* gateUp, int guType, const unsigned char* guScales, const float* guRowScale,
     const void* down, int dType, const unsigned char* dScales, const float* dRowScale,
     int experts, int hidden, int inter, int act,
-    const float* x, int ldx, int topK, int pairs, int* order, int* groups, float* slots)
+    const float* x, int ldx, int topK, int pairs, int* order, int* groups, float* slots,
+    int paired = 0, float gateCap = 0.f, float upCap = 0.f)
 {
     if (!e->moe) e->moe = new MoePrompt();
     MoePrompt& m = *e->moe;
@@ -847,7 +900,8 @@ static int moe_experts_prompt(Engine* e,
             &zero, (void* const*)(dev + 2 * blocks + f), CUDA_R_32F, 2 * inter, count, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
         if (st != CUBLAS_STATUS_SUCCESS) return -(1000 + (int)st);
     }
-    launch(moe_glu_kernel, grid, 256, 0, e->stream, raw, inter, blk, guRowScale, 2 * inter, act, xb);
+    if (paired) launch(moe_glu_pairs_kernel, grid, 256, 0, e->stream, raw, inter, blk, guRowScale, 2 * inter, gateCap, upCap, xb);
+    else launch(moe_glu_kernel, grid, 256, 0, e->stream, raw, inter, blk, guRowScale, 2 * inter, act, xb);
     for (int u0 = 0; u0 < used; u0 += MOE_DECODE_EXPERTS)
     {
         const int n = used - u0 < MOE_DECODE_EXPERTS ? used - u0 : MOE_DECODE_EXPERTS;
@@ -959,6 +1013,27 @@ AMQE_EXPORT int amqe_moe_experts(Engine* e,
     }
     MoeGemvArgs b{ down, dScales, dRowScale, hidden, inter, hidden, glu, inter, 1, ord, groups, idx, slots, ACT_NONE, 0 };
     return moe_gemv(e, dType, b, R, rwDown, count);
+}
+
+/// A prompt's experts on the tensor cores, for gate and up rows interleaved
+/// (gate 2c, up 2c + 1) and each softcapped (Inkling 2): slots[pair] = the
+/// expert's output for that pair, unweighted. guType and dType: 0 BF16, 2 NVFP4,
+/// 3 MXFP4, 4 MXFP8; a row scale is [experts x rows], or null. Scratch as for
+/// amqe_moe_experts. -100: not a shape or mode this path takes (the caller runs
+/// its own kernels), as with prompts kept at f32.
+AMQE_EXPORT int amqe_moe_experts_paired(Engine* e,
+    const void* gateUp, int guType, const unsigned char* guScales, const float* guRowScale,
+    const void* down, int dType, const unsigned char* dScales, const float* dRowScale,
+    int experts, int hidden, int inter, int topK, float gateCap, float upCap,
+    const float* x, int ldx, int rows, const int* idx, int* order, int* groups, float* slots)
+{
+    auto takes = [](int t) { return t == 0 || t == 2 || t == 3 || t == WT_MXFP8; };
+    if (e->prefillF32 || experts > 4096 || !takes(guType) || !takes(dType) || hidden % 32 != 0 || inter % 32 != 0) return -100;
+    if ((guType != 0 && !guScales) || (dType != 0 && !dScales)) return -100;
+    int rc = launch_moe_group(e, idx, rows, topK, experts, 0, 0, order, groups);
+    if (rc) return rc;
+    return moe_experts_prompt(e, gateUp, guType, guScales, guRowScale, down, dType, dScales, dRowScale,
+        experts, hidden, inter, ACT_NONE, x, ldx, topK, rows * topK, order, groups, slots, 1, gateCap, upCap);
 }
 
 // y = (y + scale · b) · mul: the residual join of a layer that scales what it passes on.

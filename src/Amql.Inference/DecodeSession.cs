@@ -46,7 +46,7 @@ public sealed class DecodeSession : IDisposable
     }
 
     /// <summary>An Inkling 2 looped container's session: its GPU path when a
-    /// device and amql_inkling.dll are present (and <c>AMQL_GPU_ENGINE</c> is
+    /// device and amql_cuda are present (and <c>AMQL_GPU_ENGINE</c> is
     /// not 0), else the managed runtime.</summary>
     public static DecodeSession ForInkling2(Vindex3Container container, OperandStore store)
     {

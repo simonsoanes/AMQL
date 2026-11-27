@@ -68,9 +68,5 @@
     <None Include="..\..\native\amql_cuda\bin\amql_cuda.dll" Link="amql_cuda.dll"
           CopyToOutputDirectory="PreserveNewest" Visible="false" />
   </ItemGroup>
-  <ItemGroup Condition="Exists('..\..\native\amql_cuda\bin\amql_inkling.dll')">
-    <None Include="..\..\native\amql_cuda\bin\amql_inkling.dll" Link="amql_inkling.dll"
-          CopyToOutputDirectory="PreserveNewest" Visible="false" />
-  </ItemGroup>
 
 </Project>

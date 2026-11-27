@@ -72,7 +72,7 @@ echo [amql-cuda] compiling -arch=%CUDA_ARCH% (amql_engine.cu takes several minut
     -Xcompiler /MT ^
     --shared ^
     -o bin\amql_cuda.dll ^
-    amql_cuda.cu amql_engine.cu amql_moe.cu amql_vision.cu amql_graph.cu ^
+    amql_cuda.cu amql_engine.cu amql_moe.cu amql_vision.cu amql_graph.cu amql_inkling.cu ^
     -lcublasLt -lcublas -lcusolver -lcudart
 if errorlevel 1 (
     echo [amql-cuda] nvcc build FAILED for -arch=%CUDA_ARCH%.

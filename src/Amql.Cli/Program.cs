@@ -918,7 +918,7 @@ internal static partial class Program
         using var store = container.CreateOperandStore();
         using var session = DecodeSession.ForInkling2(container, store);
         Console.WriteLine(session.Backend == "gpu"
-            ? $"inkling2:  GPU path (amql_inkling), experts as stored, {GpuEngine.RequestedKvFormat} KV rows; loaded in {clock.Elapsed.TotalSeconds:F1}s"
+            ? $"inkling2:  GPU path (amql_cuda), experts as stored, {GpuEngine.RequestedKvFormat} KV rows; loaded in {clock.Elapsed.TotalSeconds:F1}s"
             : $"inkling2:  managed runtime ({session.GpuRefusal}); loaded in {clock.Elapsed.TotalSeconds:F1}s");
         long limit = container.Graph?.Component("target").Execution?.ContextLength ?? int.MaxValue;
         int budget = steps < 0 ? (int)Math.Min(int.MaxValue, limit - tokens.Length) : steps;

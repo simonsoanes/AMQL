@@ -54,7 +54,7 @@ public class GpuEngineTests : IDisposable
         if (Inkling2Model.Serves(container))
         {
             // Inkling 2's looped stack is not a plan: it has its own GPU path
-            // (amql_inkling), held to its own managed runtime.
+            // (amql_inkling.cu in amql_cuda), held to its own managed runtime.
             Assert.Throws<UnsupportedOperatorException>(() => Planner.Plan(container, "target", store));
             InklingMatchesManaged(container, store, family);
             return;
@@ -105,7 +105,13 @@ public class GpuEngineTests : IDisposable
 
     /// <summary>The tiny Inkling 2 with its experts NVFP4 (amax / denominator),
     /// MXFP8 and plain, mixed inside the loop: the GPU path's expert readers
-    /// against the managed runtime's, f32 rows, to 1e-3 of the largest logit.</summary>
+    /// against the managed runtime's, f32 rows, to 1e-3 of the largest logit with
+    /// prompts at f32. Then the default prompt path, the engine's BF16 tensor cores
+    /// over the same experts decoded once per chunk, against the f32 one visit by
+    /// visit: within 2% through the prelude and the core's first pass (all three
+    /// expert forms). Past that a random router's near ties flip under BF16
+    /// rounding (visit 7 sends four tokens to other experts), and the sliding
+    /// window spreads it, so the logits are the real checkpoint's to judge.</summary>
     [Fact]
     public void Inkling2_Quantised_Experts_Match_Managed_Path()
     {
@@ -123,6 +129,7 @@ public class GpuEngineTests : IDisposable
         using var gpu = Inkling2Gpu.TryCreate(container, store, out var reason);
         Assert.True(gpu is not null, reason);
         gpu.KvFormat = "f32";
+        gpu.ExactPrefill = true;
         var managed = Inkling2Model.Load(container, store);
         Assert.Contains("NVFP4", managed.ExpertForms);
         Assert.Contains("MXFP8", managed.ExpertForms);
@@ -134,6 +141,20 @@ public class GpuEngineTests : IDisposable
         for (int t = 0; t < prompt.Length; t++)
         {
             AssertClose(mine[t], reference[t], $"quantised inkling2, position {t}");
+        }
+
+        int hidden = container.Graph!.Component("target").HiddenSize;
+        const int Visits = 7;   // the prelude (4) and the first pass's first three
+        var exact = seq.VisitOutputs(Visits, prompt.Length, hidden);
+        gpu.ExactPrefill = false;
+        using var tensor = gpu.NewSequence(64);
+        tensor.PrefillAll(prompt);
+        var fast = tensor.VisitOutputs(Visits, prompt.Length, hidden);
+        for (int v = 0; v < Visits; v++)
+        {
+            // Measured against the visit's largest value: a row of small values rounds alike.
+            AssertClose(fast[v].SelectMany(r => r).ToArray(), exact[v].SelectMany(r => r).ToArray(),
+                $"quantised inkling2, BF16 prompt, visit {v}", 2e-2);
         }
     }
 
@@ -152,6 +173,7 @@ public class GpuEngineTests : IDisposable
     {
         using var gpu = Inkling2Gpu.TryCreate(container, store, out var reason);
         Assert.True(gpu is not null, $"{family}: Inkling 2 GPU path refused — {reason}");
+        gpu.ExactPrefill = true;
         var managed = Inkling2Model.Load(container, store);
         var (ids, _) = ArchZooTests.Golden(family);
         foreach (int length in new[] { 3, 21, 200 })

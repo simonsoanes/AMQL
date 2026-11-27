@@ -18,8 +18,9 @@ public interface ITokenModel : IDisposable
 }
 
 /// <summary>
-/// Inkling 2 looped on the GPU (<c>native/amql_cuda/amql_inkling.cu</c>, its
-/// own library). The weights go up as stored: the experts NVFP4 (elements,
+/// Inkling 2 looped on the GPU (<c>native/amql_cuda/amql_inkling.cu</c>, built
+/// into amql_cuda beside the engine, whose GEMMs and grouped experts run a
+/// prompt's chunks). The weights go up as stored: the experts NVFP4 (elements,
 /// E4M3 block scales and the per-expert factor amax / denominator) or MXFP8
 /// (elements and E8M0 exponents) or plain, the large matrices BF16, the small
 /// tensors f32. A step runs as one captured CUDA graph that reads its token
@@ -31,7 +32,7 @@ public sealed class Inkling2Gpu : IDisposable
 {
     private static class Native
     {
-        private const string Lib = "amql_inkling";
+        private const string Lib = "amql_cuda";
         [DllImport(Lib)] public static extern int ink_available();
         [DllImport(Lib)] public static extern int ink_mem_info(out long free, out long total);
         [DllImport(Lib)] public static extern int ink_create(ref Config cfg, out IntPtr ctx);
@@ -54,6 +55,7 @@ public sealed class Inkling2Gpu : IDisposable
         [DllImport(Lib)] public static extern int ink_free(IntPtr ctx);
         [DllImport(Lib)] public static extern int ink_seq_visit(IntPtr ctx, IntPtr seq, int visit, float[] output, int rows);
         [DllImport(Lib)] public static extern IntPtr ink_error_string(int code);
+        [DllImport(Lib)] public static extern int ink_set_prefill_f32(IntPtr ctx, int f32);
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -84,6 +86,23 @@ public sealed class Inkling2Gpu : IDisposable
 
     /// <summary>The KV format new sequences use: <see cref="GpuEngine.RequestedKvFormat"/> unless set.</summary>
     public string KvFormat { get; set; } = GpuEngine.RequestedKvFormat;
+
+    /// <summary>True: a prompt's chunks keep activations at f32 (f32 SGEMMs over
+    /// widened weights, the experts on f32 kernels), which holds them within 1e-3
+    /// of the managed runtime. False (the default): the engine's BF16 tensor
+    /// cores, activations rounded to BF16 and products summed in f32, as
+    /// <see cref="GpuEngine.ExactPrefill"/>. Steps are f32 either way.</summary>
+    public bool ExactPrefill
+    {
+        get => _exactPrefill;
+        set
+        {
+            Check(Native.ink_set_prefill_f32(_ctx, value ? 1 : 0), "prefill precision");
+            _exactPrefill = value;
+        }
+    }
+
+    private bool _exactPrefill;
 
     /// <summary>False runs each step's launches directly instead of replaying the captured graph.</summary>
     public bool UseGraphs { get; set; } = Environment.GetEnvironmentVariable("AMQL_INKLING_GRAPHS")?.Trim() is not "0";
@@ -146,7 +165,7 @@ public sealed class Inkling2Gpu : IDisposable
         }
         if (!Available)
         {
-            reason = "no CUDA device or amql_inkling.dll";
+            reason = "no CUDA device or amql_cuda";
             return null;
         }
         var component = (container.Graph ?? throw new ContainerException("container records no system graph")).Component(componentId);

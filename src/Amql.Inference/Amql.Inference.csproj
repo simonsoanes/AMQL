@@ -26,14 +26,5 @@
     <None Include="..\..\native\amql_cuda\bin\libamql_cuda.so" Link="libamql_cuda.so"
           CopyToOutputDirectory="PreserveNewest" Visible="false" />
   </ItemGroup>
-  <ItemGroup Condition="Exists('..\..\native\amql_cuda\bin\libamql_inkling.so') and !$(RuntimeIdentifier.StartsWith('win'))">
-    <None Include="..\..\native\amql_cuda\bin\libamql_inkling.so" Link="libamql_inkling.so"
-          CopyToOutputDirectory="PreserveNewest" Visible="false" />
-  </ItemGroup>
-  <!-- Inkling 2 looped's GPU path, a library of its own (build-inkling.cmd). -->
-  <ItemGroup Condition="Exists('..\..\native\amql_cuda\bin\amql_inkling.dll') and ('$(RuntimeIdentifier)' == '' or $(RuntimeIdentifier.StartsWith('win')))">
-    <None Include="..\..\native\amql_cuda\bin\amql_inkling.dll" Link="amql_inkling.dll"
-          CopyToOutputDirectory="PreserveNewest" Visible="false" />
-  </ItemGroup>
 
 </Project>

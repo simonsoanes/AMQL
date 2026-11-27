@@ -1,8 +1,11 @@
 // amql_inkling.cu — Inkling 2 looped (inkling2_loop) on the GPU.
 //
-// Its own library (amql_inkling.dll), so nothing the other models' engine
-// runs is touched. It mirrors src/Amql.Inference/Inkling2Model.cs, the managed
-// runtime transcribed from transformers, kernel for step:
+// Built into amql_cuda.dll beside the engine (amql_engine.cu) and run on an
+// engine's stream: a prompt chunk's projections and experts are the engine's
+// (amqe_linear, amqe_moe_experts_paired: BF16 tensor cores), and what is
+// Inkling's own (its attention, the short convolutions, the loop and its
+// messages, a step's GEMVs) is here. It mirrors src/Amql.Inference/Inkling2Model.cs,
+// the managed runtime transcribed from transformers, kernel for step:
 //
 //   h = embed_norm(embed[token]);  blocks = []
 //   layers [0, start), then the core [start, end) three times (passes 1 and 2
@@ -18,10 +21,11 @@
 //
 // A step reads its token and position from device memory, so the whole step is
 // captured once as a CUDA graph and replayed for every token. A prompt runs in
-// chunks of up to kChunk tokens through the same kernels with a token
-// dimension: the projections as GEMMs that read each weight once per 16 tokens,
-// the experts grouped so each chosen expert is read once per chunk, and the
-// convolutions and the cache rows advanced token by token inside their kernels.
+// chunks of up to kChunk tokens with a token dimension: the projections and the
+// experts (grouped, each chosen expert decoded once per chunk) as the engine's
+// tensor-core GEMMs, or, with prompts kept at f32 (ink_set_prefill_f32), the
+// projections as f32 SGEMMs and the experts as the f32 kernels here; the
+// convolutions and the cache rows advance token by token inside their kernels.
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -46,6 +50,24 @@
 static int ok(cudaError_t e) { return e == cudaSuccess ? 0 : -(int)e; }
 #define TRY(x) do { cudaError_t _e = (x); if (_e != cudaSuccess) return -(int)_e; } while (0)
 
+// -- the engine (amql_engine.cu, amql_moe.cu), in the same library --
+
+struct Engine;
+extern "C" int amqe_create(Engine** out);
+extern "C" void amqe_destroy(Engine* e);
+extern "C" cudaStream_t amqe_stream(Engine* e);
+extern "C" int amqe_set_prefill_f32(Engine* e, int f32);
+extern "C" int amqe_linear(Engine* e, const void* w, int wType, int n, int k,
+    const float* x, int ldx, int rows, float* y, int ldy,
+    const float* bias, const float* residual, int ldr, float resScale, int act, int glu, float* raw,
+    const float* normW, float normOff, const float* normBias, float normEps, int normKind,
+    const unsigned char* wScales, const float* rowScale);
+extern "C" int amqe_moe_experts_paired(Engine* e,
+    const void* gateUp, int guType, const unsigned char* guScales, const float* guRowScale,
+    const void* down, int dType, const unsigned char* dScales, const float* dRowScale,
+    int experts, int hidden, int inter, int topK, float gateCap, float upCap,
+    const float* x, int ldx, int rows, const int* idx, int* order, int* groups, float* slots);
+
 // ── types shared with the managed side ───────────────────────────────────────
 
 enum { W_F32 = 0, W_BF16 = 1, W_NVFP4 = 2, W_MXFP8 = 3 };
@@ -69,7 +91,8 @@ struct InkConfig
 
 struct Mat { const void* w = nullptr; int type = 0; int rows = 0; int cols = 0; };
 struct Experts { const void* w = nullptr; const unsigned char* scales = nullptr; const float* factor = nullptr;
-                 int type = 0; int rows = 0; int cols = 0; };
+                 int type = 0; int rows = 0; int cols = 0;
+                 const float* rowScale = nullptr; };   // NVFP4: the factor for every row, [experts x rows], for the engine
 
 struct Layer
 {
@@ -1131,6 +1154,25 @@ __global__ void k_expert_sum(const float* __restrict__ part, int topK, int d, fl
     ffn[(long long)blockIdx.y * d + i] = s;
 }
 
+// The same for the engine's experts, whose outputs are not yet weighted.
+__global__ void k_expert_wsum(const float* __restrict__ part, const float* __restrict__ wt, int topK, int d, float* __restrict__ ffn)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= d) return;
+    part += (long long)blockIdx.y * topK * d;
+    wt += blockIdx.y * topK;
+    float s = 0.f;
+    for (int k = 0; k < topK; k++) s += wt[k] * part[k * d + i];
+    ffn[(long long)blockIdx.y * d + i] = s;
+}
+
+// rowScale[e * rows + r] = factor[e]: the per-expert factor as the engine's row scale.
+__global__ void k_expand_factor(const float* __restrict__ factor, int rows, long long count, float* __restrict__ out)
+{
+    long long i = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+    if (i < count) out[i] = factor[i / rows];
+}
+
 // ── the model and a sequence ─────────────────────────────────────────────────
 
 // Tokens a prompt chunk holds: every per-token buffer has this many rows.
@@ -1146,7 +1188,9 @@ struct Ctx
     const float* gv[G_COUNT] = {};
     std::vector<void*> owned;
     long long bytes = 0;
-    cudaStream_t stream = nullptr;
+    cudaStream_t stream = nullptr;   // the engine's
+    Engine* eng = nullptr;
+    int err = 0;                     // the first engine call of a chunk that failed
 };
 
 struct Slot
@@ -1168,6 +1212,7 @@ struct Seq
           *nq, *nk, *nv, *res, *mlpIn, *mlpGated, *normed, *act, *epart, *ffn, *logits, *wt, *tmp;
     float* every = nullptr;                      // kChunk x vocab, made when a prompt's every position is asked for
     int *idx, *offsets, *order;
+    int *gorder = nullptr, *ggroups = nullptr;   // the engine's grouping: [3 x (pairs + experts)] each
     std::vector<void*> owned;
     long long bytes = 0;
     cudaGraph_t graph = nullptr;
@@ -1264,9 +1309,28 @@ static void proj(Ctx* x, int T, std::initializer_list<std::tuple<Mat, const floa
     }
     else
     {
-        k_gemms<<<(rows + 7) / 8, 256, 0, x->stream>>>(g);
+        // The engine's GEMMs (BF16 tensor cores, or f32 SGEMM with prompts kept at f32).
+        for (int i = 0; i < g.n; i++)
+        {
+            const Mat& m = g.m[i];
+            int wType = m.type == W_BF16 ? 0 : m.type == W_F32 ? 1 : -1;
+            int rc = wType < 0 ? -100
+                : amqe_linear(x->eng, m.w, wType, m.rows, m.cols, g.x[i], m.cols, T, g.y[i], m.rows,
+                              nullptr, nullptr, 0, 1.f, 0, 0, nullptr, nullptr, 0.f, nullptr, 0.f, 0, nullptr, nullptr);
+            if (rc == -100)
+            {
+                Gemms one = {};
+                one.m[0] = m; one.x[0] = g.x[i]; one.y[0] = g.y[i];
+                one.first[1] = m.rows; one.n = 1; one.T = T;
+                k_gemms<<<(m.rows + 7) / 8, 256, 0, x->stream>>>(one);
+            }
+            else if (rc && !x->err) x->err = rc;
+        }
     }
 }
+
+// The engine's code for an expert stack's format: 0 BF16, 2 NVFP4, 4 MXFP8; -1 none.
+static int engine_type(int type) { return type == W_BF16 ? 0 : type == W_NVFP4 ? 2 : type == W_MXFP8 ? 4 : -1; }
 
 static void rmsnorm(Ctx* x, const float* in, const float* w, float* out, int T)
 {
@@ -1416,12 +1480,26 @@ static float* run_layer(Ctx* x, Seq* s, int l, Slot& slot, float* h, std::vector
     }
     else
     {
-        k_group<<<1, 1024, 0, x->stream>>>(s->idx, T * c.topK, c.experts, s->offsets, s->order);
-        k_expert_up_g<<<dim3(c.experts, (c.width + 31) / 32), 256, 0, x->stream>>>(L.w13, s->normed, s->offsets, s->order, c.topK,
-                                                                                s->act, c.width, c.gateCap, c.upCap);
-        k_expert_down_g<<<dim3(c.experts, (d + 63) / 64), 256, 0, x->stream>>>(L.w2, s->act, s->offsets, s->order, s->wt, s->epart, d, c.width);
+        int gu = engine_type(L.w13.type), dn = engine_type(L.w2.type);
+        int rc = gu < 0 || dn < 0 ? -100
+            : amqe_moe_experts_paired(x->eng, L.w13.w, gu, L.w13.scales, L.w13.rowScale, L.w2.w, dn, L.w2.scales, L.w2.rowScale,
+                                      c.experts, d, c.width, c.topK, c.gateCap, c.upCap, s->normed, d, T, s->idx,
+                                      s->gorder, s->ggroups, s->epart);
+        if (rc == 0)
+        {
+            k_expert_wsum<<<dim3((d + 255) / 256, T), 256, 0, x->stream>>>(s->epart, s->wt, c.topK, d, s->ffn);
+        }
+        else
+        {
+            if (rc != -100 && !x->err) x->err = rc;
+            k_group<<<1, 1024, 0, x->stream>>>(s->idx, T * c.topK, c.experts, s->offsets, s->order);
+            k_expert_up_g<<<dim3(c.experts, (c.width + 31) / 32), 256, 0, x->stream>>>(L.w13, s->normed, s->offsets, s->order, c.topK,
+                                                                                    s->act, c.width, c.gateCap, c.upCap);
+            k_expert_down_g<<<dim3(c.experts, (d + 63) / 64), 256, 0, x->stream>>>(L.w2, s->act, s->offsets, s->order, s->wt, s->epart, d, c.width);
+            k_expert_sum<<<dim3((d + 255) / 256, T), 256, 0, x->stream>>>(s->epart, c.topK, d, s->ffn);
+        }
     }
-    k_expert_sum<<<dim3((d + 255) / 256, T), 256, 0, x->stream>>>(s->epart, c.topK, d, s->ffn);
+    if (!grouped) k_expert_sum<<<dim3((d + 255) / 256, T), 256, 0, x->stream>>>(s->epart, c.topK, d, s->ffn);
     k_shortconv<<<(d + 255) / 256, 256, 0, x->stream>>>(s->ffn, L.v[V_MLPCONV], slot.mhist, s->res, outBuf, d, K, s->dPos, T);
     return outBuf;
 }
@@ -1507,8 +1585,8 @@ INK_EXPORT int ink_create(const InkConfig* cfg, void** out)
     Ctx* x = new Ctx();
     x->c = *cfg;
     x->layers.resize(cfg->layers);
-    cudaError_t e = cudaStreamCreateWithFlags(&x->stream, cudaStreamNonBlocking);
-    if (e != cudaSuccess) { delete x; return -(int)e; }
+    if (int rc = amqe_create(&x->eng)) { delete x; return -2100 + (rc < 0 ? rc : 0); }
+    x->stream = amqe_stream(x->eng);
     *out = x;
     return 0;
 }
@@ -1555,6 +1633,18 @@ INK_EXPORT int ink_set_experts(void* ctx, int l, int which, const void* w, const
     if (l < 0 || l >= x->c.layers || type < W_F32 || type > W_MXFP8) return -1004;
     if ((type == W_NVFP4 && cols % 16) || (type == W_MXFP8 && cols % 32)) return -1005;
     Experts e{ w, scales, factor, type, rows, cols };
+    if (type == W_NVFP4 && factor)
+    {
+        long long count = (long long)x->c.experts * rows;
+        float* rs = nullptr;
+        TRY(cudaMalloc((void**)&rs, (size_t)count * sizeof(float)));
+        x->owned.push_back(rs);
+        x->bytes += count * (long long)sizeof(float);
+        k_expand_factor<<<(unsigned)((count + 255) / 256), 256, 0, x->stream>>>(factor, rows, count, rs);
+        TRY(cudaGetLastError());
+        TRY(cudaStreamSynchronize(x->stream));
+        e.rowScale = rs;
+    }
     (which == 0 ? x->layers[l].w13 : x->layers[l].w2) = e;
     return 0;
 }
@@ -1649,6 +1739,8 @@ INK_EXPORT int ink_seq_create(void* ctx, int capacity, int format, void** out)
     if ((rc = alloc_f(s, &s->idx, R * c.topK))) return fail(rc);
     if ((rc = alloc_f(s, &s->order, R * c.topK))) return fail(rc);
     if ((rc = alloc_f(s, &s->offsets, c.experts + 1))) return fail(rc);
+    if ((rc = alloc_f(s, &s->gorder, 3 * (R * c.topK + c.experts)))) return fail(rc);
+    if ((rc = alloc_f(s, &s->ggroups, 3 * (R * c.topK + c.experts)))) return fail(rc);
     if ((rc = alloc_f(s, &s->dToks, R + 1))) return fail(rc);
     s->dPos = s->dToks + R;
     if (cudaHostAlloc((void**)&s->hToks, (R + 1) * sizeof(int), cudaHostAllocDefault) != cudaSuccess) return fail(-2000);
@@ -1819,7 +1911,9 @@ INK_EXPORT int ink_prefill(void* ctx, void* seq, const int* tokens, int count, f
         TRY(cudaMemcpyAsync(s->dToks, s->hToks, (size_t)T * sizeof(int), cudaMemcpyHostToDevice, x->stream));
         TRY(cudaMemcpyAsync(s->dPos, s->hToks + kChunk, sizeof(int), cudaMemcpyHostToDevice, x->stream));
         bool all = every && logits;
+        x->err = 0;
         record(x, s, T, all);
+        if (x->err) return x->err;
         TRY(cudaGetLastError());
         if (all)
         {
@@ -1855,7 +1949,7 @@ INK_EXPORT int ink_free(void* ctx)
     Ctx* x = (Ctx*)ctx;
     cudaDeviceSynchronize();
     for (void* p : x->owned) cudaFree(p);
-    if (x->stream) cudaStreamDestroy(x->stream);
+    amqe_destroy(x->eng);   // and its stream
     delete x;
     return 0;
 }
@@ -1863,4 +1957,12 @@ INK_EXPORT int ink_free(void* ctx)
 INK_EXPORT const char* ink_error_string(int code)
 {
     return code < 0 && code > -1000 ? cudaGetErrorString((cudaError_t)(-code)) : "amql_inkling error";
+}
+
+/// Prompts at f32 (1): projections as f32 SGEMMs and the experts as the f32
+/// kernels here, which keeps a chunk within 1e-3 of the managed runtime.
+/// 0 (the default): the engine's BF16 tensor cores.
+INK_EXPORT int ink_set_prefill_f32(void* ctx, int f32)
+{
+    return amqe_set_prefill_f32(((Ctx*)ctx)->eng, f32);
 }

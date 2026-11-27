@@ -232,6 +232,7 @@ public sealed class Inkling2Tests
         if (gpu is not null)
         {
             gpu.KvFormat = "f32";
+            gpu.ExactPrefill = true;
         }
         _output.WriteLine($"reference dtype {Str(summary.RootElement, "dtype")}; experts: {string.Join(" ", model.ExpertForms.Distinct())}; " +
                           $"gpu {(gpu is null ? "absent" : "compared")}; fingerprints {(directions is null ? "not compared" : "compared")}");
@@ -395,10 +396,11 @@ public sealed class Inkling2Tests
 
     /// <summary>
     /// The real checkpoint on the GPU path against the managed runtime
-    /// (<c>AMQL_INKLING_CONTAINER</c>, a CUDA device and amql_inkling.dll): a
-    /// few prompts, the top five at every position and a greedy continuation,
-    /// then the GPU's decode and prompt speeds. f32 rows, so the two differ only
-    /// in summation order; <c>AMQL_INKLING_STEPS</c> sets the greedy length (12).
+    /// (<c>AMQL_INKLING_CONTAINER</c>, a CUDA device and amql_cuda): a few
+    /// prompts, the top five at every position and a greedy continuation. f32
+    /// rows and f32 prompts, so the two differ only in summation order;
+    /// <c>AMQL_INKLING_STEPS</c> sets the greedy length (12). Then the default
+    /// BF16 prompts, held to the same top token at 95% of positions.
     /// </summary>
     [Fact]
     public void Real_Checkpoint_Gpu_Matches_Managed_When_Available()
@@ -418,6 +420,7 @@ public sealed class Inkling2Tests
         _output.WriteLine($"GPU weights {gpu.WeightBytes / (double)(1 << 30):F2} GiB, uploaded in {clock.Elapsed.TotalSeconds:F0}s");
         var managed = Inkling2Model.Load(container, store);
         gpu.KvFormat = "f32";
+        gpu.ExactPrefill = true;
 
         string[] prompts =
         {
@@ -428,8 +431,8 @@ public sealed class Inkling2Tests
             string.Concat(Enumerable.Range(1, 24).Select(i =>
                 $"Step {i}: the river carried {i * 7} boats past the old mill, and the miller counted each one. ")) + "In total the miller counted",
         };
-        int positions = 0, sameTop5 = 0, sameOrder = 0;
-        double worst = 0;
+        int positions = 0, sameTop5 = 0, sameOrder = 0, fastTop1 = 0, fastTop5 = 0;
+        double worst = 0, worstFast = 0;
         foreach (string text in prompts)
         {
             var ids = tokenizer.Encode(text).Ids.ToArray();
@@ -449,6 +452,23 @@ public sealed class Inkling2Tests
                     worst = Math.Max(worst, Math.Abs(mine[t][v] - reference[t][v]));
                 }
             }
+            // The default prompt path: the engine's BF16 tensor cores.
+            gpu.ExactPrefill = false;
+            using (var tensor = gpu.NewSequence(256))
+            {
+                var fast = tensor.PrefillAll(ids);
+                for (int t = 0; t < ids.Length; t++)
+                {
+                    fastTop1 += ArgMax(fast[t]) == ArgMax(reference[t]) ? 1 : 0;
+                    fastTop5 += TopK(fast[t], 5).ToHashSet().SetEquals(TopK(reference[t], 5)) ? 1 : 0;
+                    for (int v = 0; v < reference[t].Length; v++)
+                    {
+                        worstFast = Math.Max(worstFast, Math.Abs(fast[t][v] - reference[t][v]));
+                    }
+                }
+            }
+            gpu.ExactPrefill = true;
+
             var g = new List<int>();
             var m = new List<int>();
             float[] gl = mine[^1], ml = reference[^1];
@@ -464,7 +484,9 @@ public sealed class Inkling2Tests
             Assert.Equal(m, g);
         }
         _output.WriteLine($"top-5 at {positions} positions: same set {sameTop5}, same order {sameOrder}; worst logit diff {worst:G4}");
+        _output.WriteLine($"BF16 prompts: same top token at {fastTop1}/{positions}, same top-5 set at {fastTop5}; worst logit diff {worstFast:G4}");
         Assert.Equal(positions, sameTop5);
+        Assert.True(fastTop1 >= positions * 0.95, $"BF16 prompts: the top token agrees at {fastTop1}/{positions}");
     }
 
     /// <summary>The GPU path's speeds on the real checkpoint

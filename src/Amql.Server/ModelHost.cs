@@ -278,7 +278,7 @@ public sealed class ModelHost : IDisposable
             if (inkling)
             {
                 notes.Add(session.Backend == "gpu"
-                    ? "Inkling 2 looped on its GPU path (amql_inkling): experts as stored, one request at a time"
+                    ? "Inkling 2 looped on its GPU path (amql_cuda): experts as stored, one request at a time"
                     : $"Inkling 2 looped on the managed runtime: {session.GpuRefusal}");
             }
             var generator = new TextGenerator(session, loaded, prior, tokenizer, template,

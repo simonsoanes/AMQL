@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # build-cuda.sh — build the optional amql_cuda native backend (Linux).
 # Requires: CUDA Toolkit (nvcc), GCC toolchain.
-# Produces: native/amql_cuda/bin/libamql_cuda.so (and libamql_inkling.so,
-#           Inkling 2 looped's GPU path, when amql_inkling.cu is present)
+# Produces: native/amql_cuda/bin/libamql_cuda.so (the engine, and Inkling 2
+#           looped's kernels beside it)
 # Exit code 0 on success, 1 on any failure.
 #
 # Environment overrides:
@@ -54,16 +54,10 @@ echo "[amql-cuda] compiling amql_cuda.cu -arch=$CUDA_ARCH ..."
     -Xcompiler -fPIC \
     --shared \
     -o bin/libamql_cuda.so \
-    amql_cuda.cu amql_engine.cu amql_moe.cu amql_vision.cu amql_graph.cu \
+    amql_cuda.cu amql_engine.cu amql_moe.cu amql_vision.cu amql_graph.cu amql_inkling.cu \
     -lcublas -lcudart
 
 echo "[amql-cuda] built bin/libamql_cuda.so"
-
-if [ -f amql_inkling.cu ]; then
-    echo "[amql-cuda] compiling amql_inkling.cu -arch=$CUDA_ARCH ..."
-    "$CUDA_ROOT/bin/nvcc"         -arch="$CUDA_ARCH"         -O3 -std=c++17         -Xcompiler -fPIC         --shared         -o bin/libamql_inkling.so         amql_inkling.cu         -lcudart
-    echo "[amql-cuda] built bin/libamql_inkling.so"
-fi
 
 # ── Stage next to the CLI / server ───────────────────────────────────
 for out in ${CLI_OUT:-}; do

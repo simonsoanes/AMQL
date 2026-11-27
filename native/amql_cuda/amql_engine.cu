@@ -100,6 +100,8 @@ AMQE_EXPORT int amqe_memset(Engine* e, void* dst, int value, size_t bytes)
 }
 
 AMQE_EXPORT int amqe_sync(Engine* e) { return ok(cudaStreamSynchronize(e->stream)); }
+/// The engine's stream, for a model whose own kernels (amql_inkling.cu) run beside the engine's calls.
+AMQE_EXPORT cudaStream_t amqe_stream(Engine* e) { return e->stream; }
 
 AMQE_EXPORT int amqe_last_error(void) { return (int)cudaGetLastError(); }
 
