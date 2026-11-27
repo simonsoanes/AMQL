@@ -5,20 +5,37 @@ using Amql.Merge;
 
 namespace Amql.Cli;
 
-// ── attach: a drafter or a vision tower, added to a container ─────────────
+// ── attach: a drafter, a vision tower or Entail adapters, added to a container ──
 
 internal static partial class Program
 {
-    /// <summary><c>attach &lt;container&gt; [--drafter &lt;checkpoint&gt;] [--vision &lt;checkpoint&gt;] [--format nvfp4|mxfp4|none]</c>:
-    /// adds the part to the container as it stands. The format is the container's own unless given.</summary>
+    /// <summary><c>attach &lt;container&gt; [--drafter &lt;checkpoint&gt;] [--vision &lt;checkpoint&gt;] [--adapter &lt;dir&gt;,…] [--format nvfp4|mxfp4|none]</c>:
+    /// adds the part to the container as it stands. The format is the container's own unless given.
+    /// Adapters are copied in, to run beside the model wherever it is served.</summary>
     private static int AttachPart(string[] args)
     {
         var containerDir = Arg(args, 0) ?? throw new CliException(
             "attach requires a container directory, e.g. 'amql-cli attach <container> --drafter <checkpoint>'");
-        string? drafter = OptionValue(args, "--drafter"), vision = OptionValue(args, "--vision");
-        if (drafter is null && vision is null)
+        string? drafter = OptionValue(args, "--drafter"), vision = OptionValue(args, "--vision"), adapters = OptionValue(args, "--adapter");
+        if (drafter is null && vision is null && adapters is null)
         {
-            throw new CliException("attach requires '--drafter <checkpoint>' or '--vision <checkpoint>'");
+            throw new CliException("attach requires '--drafter <checkpoint>', '--vision <checkpoint>' or '--adapter <dir>,…'");
+        }
+        if (adapters is not null)
+        {
+            try
+            {
+                var order = Amql.Entail.ShippedAdapters.Attach(containerDir, adapters.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+                Console.WriteLine($"attached:   adapters {string.Join(", ", order)} (run in that order beside the model)");
+            }
+            catch (Amql.Entail.EntailException e)
+            {
+                throw new CliException(e.Message);
+            }
+            if (drafter is null && vision is null)
+            {
+                return 0;
+            }
         }
         Fp4Format? format = (OptionValue(args, "--format") ?? ContainerFormat(containerDir)).ToLowerInvariant() switch
         {

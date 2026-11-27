@@ -16,15 +16,26 @@ public sealed class EntailRepeat
     private readonly int?[] _continuation;
     private readonly List<int> _tokens = new();
 
-    public EntailRepeat(IEnumerable<int> spans)
+    /// <summary>What a push changed, so it can be taken back: each span's table
+    /// entry before it (absent or its old value), and the readings before it.</summary>
+    private sealed record Undo(ulong[] Keys, (int End, int Count)?[] Before, int[] Count, int?[] Continuation);
+
+    private readonly LinkedList<Undo> _undo = new();
+    private readonly int _keep;
+
+    public EntailRepeat(IEnumerable<int> spans, int keep = 0)
     {
         _spans = spans.Distinct().Order().ToArray();
         _seen = _spans.Select(_ => new Dictionary<ulong, (int, int)>()).ToArray();
         _count = new int[_spans.Length];
         _continuation = new int?[_spans.Length];
+        _keep = keep;
     }
 
     public bool Any => _spans.Length > 0;
+
+    /// <summary>How many of the latest pushes <see cref="Rewind"/> can take back.</summary>
+    public int Undoable => Any ? _undo.Count : int.MaxValue;
 
     public void Reset()
     {
@@ -35,11 +46,15 @@ public sealed class EntailRepeat
         }
         Array.Clear(_count);
         Array.Clear(_continuation);
+        _undo.Clear();
     }
 
     /// <summary>Reads one more token.</summary>
     public void Push(int token)
     {
+        Undo? undo = _keep > 0
+            ? new Undo(new ulong[_spans.Length], new (int, int)?[_spans.Length], (int[])_count.Clone(), (int?[])_continuation.Clone())
+            : null;
         _tokens.Add(token);
         int end = _tokens.Count - 1;
         for (int k = 0; k < _spans.Length; k++)
@@ -53,12 +68,63 @@ public sealed class EntailRepeat
             }
             ulong h = Hash(end - span + 1, span);
             // A hash that matches is checked token by token: a collision counts as a new run.
-            if (_seen[k].TryGetValue(h, out var earlier) && Same(earlier.End - span + 1, end - span + 1, span))
+            bool had = _seen[k].TryGetValue(h, out var earlier);
+            if (had && Same(earlier.End - span + 1, end - span + 1, span))
             {
                 _count[k] = earlier.Count;
                 _continuation[k] = _tokens[earlier.End + 1];
             }
+            if (undo is not null)
+            {
+                undo.Keys[k] = h;
+                undo.Before[k] = had ? earlier : null;
+            }
             _seen[k][h] = (end, _count[k] + 1);
+        }
+        if (undo is not null)
+        {
+            _undo.AddLast(undo);
+            if (_undo.Count > _keep)
+            {
+                _undo.RemoveFirst();
+            }
+        }
+    }
+
+    /// <summary>Takes back the latest <paramref name="tokens"/> pushes, newest first.</summary>
+    public void Rewind(int tokens)
+    {
+        if (!Any)
+        {
+            return;
+        }
+        if (tokens > _undo.Count)
+        {
+            throw new ArgumentOutOfRangeException(nameof(tokens), $"can take back {_undo.Count} pushes, not {tokens}");
+        }
+        for (int i = 0; i < tokens; i++)
+        {
+            var undo = _undo.Last!.Value;
+            _undo.RemoveLast();
+            int length = _tokens.Count;
+            for (int k = 0; k < _spans.Length; k++)
+            {
+                if (length < _spans[k])
+                {
+                    continue;
+                }
+                if (undo.Before[k] is { } before)
+                {
+                    _seen[k][undo.Keys[k]] = before;
+                }
+                else
+                {
+                    _seen[k].Remove(undo.Keys[k]);
+                }
+            }
+            _tokens.RemoveAt(length - 1);
+            undo.Count.CopyTo(_count, 0);
+            undo.Continuation.CopyTo(_continuation, 0);
         }
     }
 

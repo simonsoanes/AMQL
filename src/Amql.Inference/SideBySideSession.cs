@@ -129,21 +129,37 @@ public sealed class SideBySideSession
             _partner.Reset();
         }
         _fresh = false;
+        // The adapters read the same tokens and need nothing of the partner's: they run meanwhile.
+        var ruling = _adapters.Count == 0 ? null : Task.Run(() => Rule(_adapters, a => a.Prefill(tokens)));
         Logits = _partner.Prefill(tokens);
         _partnerClock.Stop();
         _adapterClock.Start();
-        Verdict = EntailVerdict.Merge(_adapters.Select(a => a.Prefill(tokens)).ToList());
+        Verdict = ruling?.GetAwaiter().GetResult() ?? EntailVerdict.Silence;
         _adapterClock.Stop();
     }
 
     public void Step(int token)
     {
         _partnerClock.Start();
+        var ruling = _adapters.Count == 0 ? null : Task.Run(() => Rule(_adapters, a => a.Step(token)));
         Logits = _partner.Step(token);
         _partnerClock.Stop();
-        _adapterClock.Start();
-        Verdict = EntailVerdict.Merge(_adapters.Select(a => a.Step(token)).ToList());
+        _adapterClock.Start();   // what is left of the adapters' time once the partner is done
+        Verdict = ruling?.GetAwaiter().GetResult() ?? EntailVerdict.Silence;
         _adapterClock.Stop();
+    }
+
+    /// <summary>Every adapter's verdict on a token, merged in their order. Each holds its own
+    /// state, so more than one runs on cores of their own.</summary>
+    public static EntailVerdict Rule(IReadOnlyList<IEntailAdapter> adapters, Func<IEntailAdapter, EntailVerdict> step)
+    {
+        if (adapters.Count <= 1)
+        {
+            return EntailVerdict.Merge(adapters.Select(step).ToList());
+        }
+        var verdicts = new EntailVerdict[adapters.Count];
+        Parallel.For(0, adapters.Count, i => verdicts[i] = step(adapters[i]));
+        return EntailVerdict.Merge(verdicts);
     }
 
     /// <summary>Chooses the next token greedily, and says who decided it.</summary>

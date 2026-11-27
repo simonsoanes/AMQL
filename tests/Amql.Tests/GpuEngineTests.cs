@@ -51,6 +51,13 @@ public class GpuEngineTests : IDisposable
             new ArchMapper.EncodeOptions { IncludeVision = false, IncludeMtp = false });
         using var container = Vindex3Container.Open(containerDir);
         using var store = container.CreateOperandStore();
+        if (Inkling2Model.Serves(container))
+        {
+            // Inkling 2's looped stack has a managed runtime only so far: the
+            // planner the GPU engine starts from refuses it, naming the runtime.
+            Assert.Throws<UnsupportedOperatorException>(() => Planner.Plan(container, "target", store));
+            return;
+        }
         var plan = Planner.Plan(container, "target", store);
 
         string? refusal = GpuEngine.Unsupported(plan);

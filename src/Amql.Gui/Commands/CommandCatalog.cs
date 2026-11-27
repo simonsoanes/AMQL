@@ -211,11 +211,12 @@ public static class CommandCatalog
             new("noVision", "--no-vision", ParamKind.Switch, EditorKind.Text, Flag: "--no-vision",
                 Help: "Leave a multimodal checkpoint's vision tower out: a smaller container, for text alone."),
         }),
-        new("attach", CatIngest, "Add a drafter or a vision tower to a container, beside what it holds.", new[]
+        new("attach", CatIngest, "Add a drafter, a vision tower or Entail adapters to a container, beside what it holds.", new[]
         {
             ContainerParam,
             Opt("drafter", "--drafter checkpoint", EditorKind.Directory, "", "A drafter's checkpoint (Gemma 4's assistant), or its Hugging Face name."),
             Opt("vision", "--vision checkpoint", EditorKind.Directory, "", "The model's own checkpoint, for the vision tower a --no-vision encode left out."),
+            Opt("adapter", "--adapter dir,…", EditorKind.Text, "", "Entail adapters built for this model ('entail adapter --tokenizer <container>'), copied in. A server runs them beside the model, in this order, unless its config names others."),
             Opt("format", "--format", EditorKind.Choice, "", "How the drafter's weights are held. Empty = as the container's.",
                 choices: new[] { "", "nvfp4", "mxfp4", "none" }),
         }),
@@ -229,6 +230,15 @@ public static class CommandCatalog
                 Help: "Branch, tag or commit (default main)."),
             new("allFiles", "--all-files", ParamKind.Switch, EditorKind.Text, Flag: "--all-files",
                 Help: "Download every file, including weights in formats the encoder does not read."),
+        }),
+        new("upload", CatIngest, "Publish a folder (a container, its adapters and card) as a Hugging Face model, in one commit.", new[]
+        {
+            Pos("dir", "folder", EditorKind.Directory, "What to publish: every file but hidden ones."),
+            Pos("repo", "Hub model id", EditorKind.Text, "owner/name. Made if it is not there."),
+            Flag("public", "--public", "Make a new repository public. Without it, a new one is private."),
+            Opt("revision", "--revision", EditorKind.Text, "main", "The branch to commit to."),
+            Opt("message", "--message", EditorKind.Text, "", "The commit's summary."),
+            Flag("dry-run", "--dry-run", "List what would be sent, and send nothing."),
         }),
         new("verify", CatIngest, "Integrity + runtime readiness of a container.", new[]
         {

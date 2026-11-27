@@ -4,6 +4,10 @@
 
 A tokenizer merges symbols, so ((p is two brackets and a letter in two tokens. Each token
 that is made only of logic is listed with the events it stands for, last event first.
+
+A tokenizer also cuts operators: Gemma 4 writes <-> as < and ->, and xor as x and or. Where
+an operator is cut into a lead that is not logic and a tail that is (-> is an operator of its
+own), the lead stands for the whole operator and the tail just after it for nothing.
 """
 import json
 import re
@@ -75,8 +79,9 @@ const K_TABLE = 5
 #
 # isx: this token can stand in an expression. cnt: how many events it holds.
 # l1, l2, l3: those events, last first. an: an answer can hold it.
+# n, e1, e2, e3: what it adds, which is nothing for the tail of a cut operator (section 1b).
 
-state isx, cnt, l1, l2, l3, an, kind
+state isx, cnt, l1, l2, l3, an, kind, n, e1, e2, e3
 
 token " is" means kind = K_IS
 token " =", "=" means kind = K_EQ
@@ -90,16 +95,20 @@ token " table" means kind = K_TABLE
 token " " means isx = 1, an = 1
 @TOKENS@
 
+# ─── 1b. Operators the tokenizer cuts ───────────────────────────────────────
+
+@CUTS@
+
 # ─── 2. Sight ───────────────────────────────────────────────────────────────
 
 state wx[W + 2], wc[W + 2], w1[W + 2], w2[W + 2], w3[W + 2], wk[W + 3], wa_[S]
 for k in 1 to W + 1
     attend back k
         wx[k] <- isx
-        wc[k] <- cnt
-        w1[k] <- l1
-        w2[k] <- l2
-        w3[k] <- l3
+        wc[k] <- n
+        w1[k] <- e1
+        w2[k] <- e2
+        w3[k] <- e3
         wk[k] <- kind
     end
 end
@@ -118,7 +127,7 @@ end
 # event stands after the events of every token behind it in the window.
 
 state mk[W + 1], tot
-entail tot = cnt
+entail tot = n
 for i in 1 to W
     entail mk[i] when (sum j in 1 to i : wx[j]) >= i
     entail tot = wc[i] when mk[i]
@@ -130,7 +139,7 @@ entail ev[0] = l1
 entail ev[1] = l2
 for i in 1 to W
     for r in 0 to E - 1
-        entail at[i][r] when mk[i], cnt + (sum j in 1 to i-1 : wc[j]) == r
+        entail at[i][r] when mk[i], n + (sum j in 1 to i-1 : wc[j]) == r
     end
 end
 for i in 1 to W
@@ -466,6 +475,42 @@ def events(token):
     return [EVENTS[w] for w in found]
 
 
+def cuts(t, codes_of):
+    """Operators the tokenizer writes as a lead that is not logic and a tail that is:
+    (lead, tail, the operator's event)."""
+    found = {}
+    for name, code in EVENTS.items():
+        if len(name) < 2:
+            continue
+        for text in (name, " " + name):
+            pieces = [t.decode([i]) for i in t.encode(text, add_special_tokens=False).ids]
+            if len(pieces) == 2 and codes_of(pieces[0]) is None and codes_of(pieces[1]) is not None \
+                    and len(codes_of(pieces[1])) == 1:
+                found[(pieces[0], pieces[1])] = code
+    return [(lead, tail, code) for (lead, tail), code in sorted(found.items())]
+
+
+def cut_lines(pairs):
+    """The lead holds the operator; the tail straight after its lead adds no event."""
+    if not pairs:
+        return ["# none: this tokenizer keeps every operator whole",
+                "entail n = cnt", "entail e1 = l1", "entail e2 = l2", "entail e3 = l3"]
+    lines = []
+    names = []
+    for i, (lead, tail, code) in enumerate(pairs):
+        names += [f"lead{i}", f"tail{i}", f"prev_lead{i}", f"drop{i}"]
+    lines.append("state drop, " + ", ".join(names))
+    for i, (lead, tail, code) in enumerate(pairs):
+        lines.append(f'# {lead + tail!r} is {lead!r} then {tail!r}')
+        lines.append(f'token "{lead}" means isx = 1, cnt = 1, l1 = {code}, lead{i} = 1')
+        lines.append(f'token "{tail}" means tail{i} = 1')
+        lines.append(f"carry prev_lead{i} from lead{i}")
+        lines.append(f"entail drop{i} when tail{i}, prev_lead{i}")
+        lines.append(f"entail drop when drop{i}")
+    lines += [f"entail {a} = {b} when not drop" for a, b in [("n", "cnt"), ("e1", "l1"), ("e2", "l2"), ("e3", "l3")]]
+    return lines
+
+
 def token_line(token, codes, answer):
     parts = ["isx = 1", f"cnt = {len(codes)}"]
     for i, code in enumerate(reversed(codes)):
@@ -484,9 +529,11 @@ def main():
     pieces = [t.decode([i]) for i in t.encode(" tautology", add_special_tokens=False).ids]
     said = {" a", " contradiction", " contingent", *pieces}
     lines = []
+    pairs = cuts(t, events)
+    leads = {lead for lead, _, _ in pairs}
     for w in words:
         codes = events(w)
-        if codes:
+        if codes and w not in leads:
             lines.append(token_line(w, codes, w in (" true", " false")))
     lines.append('token "0" means isx = 1, cnt = 1, l1 = 5, an = 1')
     lines.append('token "1" means isx = 1, cnt = 1, l1 = 4, an = 1')
@@ -495,11 +542,11 @@ def main():
     always = [f"entail code[{i + 1}] = C_WORD + {i} when vAlways" for i in range(len(pieces))]
     always.append(f"entail code[{len(pieces) + 1}] = C_END when vAlways")
     emits = [f'emit "{w}" when o[C_WORD + {i}]' for i, w in enumerate(pieces)]
-    text = (RULES.replace("@TOKENS@", "\n".join(lines)).replace("@ALWAYS@", "\n".join(always))
-            .replace("@WORD@", "\n".join(emits)))
+    text = (RULES.replace("@TOKENS@", "\n".join(lines)).replace("@CUTS@", "\n".join(cut_lines(pairs)))
+            .replace("@ALWAYS@", "\n".join(always)).replace("@WORD@", "\n".join(emits)))
     with open(sys.argv[2], "w", encoding="utf8", newline="\n") as f:
         f.write(text)
-    print(len(lines), "tokens;", "tautology is", pieces)
+    print(len(lines), "tokens;", "tautology is", pieces, "; cut operators:", [a + b for a, b, _ in pairs] or "none")
 
 
 if __name__ == "__main__":

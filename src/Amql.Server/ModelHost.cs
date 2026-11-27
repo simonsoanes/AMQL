@@ -259,8 +259,9 @@ public sealed class ModelHost : IDisposable
                 return new ModelHost(id, path, container, store, null, null, null, null, notes);
             }
             var loaded = new List<IEntailAdapter>();
-            foreach (string dir in adapters ?? Array.Empty<string>())
+            foreach (string named in adapters ?? Array.Empty<string>())
             {
+                string dir = Amql.Entail.ShippedAdapters.Resolve(named, path);
                 loaded.Add(EntailAdapterRunner.Load(dir, path));
                 notes.Add($"entail adapter {System.IO.Path.GetFileName(System.IO.Path.GetFullPath(dir).TrimEnd('/', '\\'))} runs beside the model");
             }
@@ -273,7 +274,7 @@ public sealed class ModelHost : IDisposable
             {
                 notes.Add(generator.UseVision(vision, store)
                     ? $"images: up to {vision.SoftTokens} tokens each"
-                    : "images are not read: the vision tower runs on the GPU engine, without adapters");
+                    : "images are not read: the vision tower runs on the GPU engine's batches");
             }
             else if (container.Graph?.Components.Any(c => c.Role == ComponentRole.Perception) == true)
             {
@@ -801,7 +802,8 @@ public sealed class TextGenerator : IDisposable
     /// <summary>Lets requests carry images: the container's tower runs on the GPU engine.</summary>
     internal bool UseVision(VisionPlan plan, OperandStore store)
     {
-        if (_batch is null || Adapters.Count > 0)
+        // Adapters read an image's tokens as tokens they do not know, as they read any other.
+        if (_batch is null)
         {
             return false;
         }
@@ -2072,6 +2074,14 @@ internal sealed class BatchScheduler : IDisposable
 
         var seqs = active.Select(j => j.Seq!).ToList();
         var tokens = active.Select(j => j.Token).ToArray();
+        // The adapters read the token the device is about to run, and need nothing of its
+        // logits: their verdicts on it are worked out while it runs.
+        var ruling = active[0].Adapters.Length == 0 ? null : active.Select(j =>
+        {
+            int token = j.Token;
+            var adapters = j.Adapters;
+            return Task.Run(() => SideBySideSession.Rule(adapters, a => a.Step(token)));
+        }).ToArray();
         long t1 = System.Diagnostics.Stopwatch.GetTimestamp();
         Device(() =>
         {
@@ -2084,7 +2094,7 @@ internal sealed class BatchScheduler : IDisposable
             var job = active[i];
             job.Row = i;
             job.Context?.Add(job.Token);
-            var verdict = EntailVerdict.Merge(job.Adapters.Select(a => a.Step(job.Token)).ToList());
+            var verdict = ruling?[i].GetAwaiter().GetResult() ?? EntailVerdict.Merge([]);
             // Read in place, before the next step overwrites it: no copy of the vocabulary per row.
             job.Run.Fed(() => _engine.HostLogits(job.Row), verdict);
         }
@@ -2149,12 +2159,43 @@ internal sealed class BatchScheduler : IDisposable
             var all = new int[drafts.Length + 1];
             all[0] = token;
             drafts.CopyTo(all, 1);
-            long t1 = System.Diagnostics.Stopwatch.GetTimestamp();
-            _tDraft += t1 - t0;
-            _engine.Verify(seq, all);
-            _tVerify += System.Diagnostics.Stopwatch.GetTimestamp() - t1;
             return all;
         });
+        long t1 = System.Diagnostics.Stopwatch.GetTimestamp();
+        _tDraft += t1 - t0;
+
+        // The adapters read the token and every draft while the device
+        // verifies them: a row's verdict depends only on the rows before it.
+        // Those past the last kept row are taken back afterwards. An adapter
+        // that cannot rewind that far is stepped row by row after the verify.
+        IReadOnlyList<IEntailAdapter> adapters = job.Adapters;
+        bool ahead = adapters.Count > 0 && adapters.All(a => a.CanRewind(rows.Length - 1));
+        Task<EntailVerdict[]>? ruling = ahead
+            ? Task.Run(() =>
+            {
+                var perAdapter = new EntailVerdict[adapters.Count][];
+                Parallel.For(0, adapters.Count, a =>
+                {
+                    var verdicts = new EntailVerdict[rows.Length];
+                    for (int r = 0; r < rows.Length; r++)
+                    {
+                        verdicts[r] = adapters[a].Step(rows[r]);
+                    }
+                    perAdapter[a] = verdicts;
+                });
+                return Enumerable.Range(0, rows.Length)
+                    .Select(r => EntailVerdict.Merge(perAdapter.Select(v => v[r]).ToList()))
+                    .ToArray();
+            })
+            : null;
+        Device(() =>
+        {
+            _engine.Verify(seq, rows);
+            return 0;
+        });
+        _tVerify += System.Diagnostics.Stopwatch.GetTimestamp() - t1;
+        var ruled = ruling?.GetAwaiter().GetResult();
+
         long t2 = System.Diagnostics.Stopwatch.GetTimestamp();
         int kept = 0;
         bool going = true;
@@ -2162,7 +2203,9 @@ internal sealed class BatchScheduler : IDisposable
         {
             int row = kept;
             job.Row = row;
-            var verdict = EntailVerdict.Merge(job.Adapters.Select(a => a.Step(rows[row])).ToList());
+            var verdict = ruled is not null
+                ? ruled[row]
+                : EntailVerdict.Merge(adapters.Select(a => a.Step(rows[row])).ToList());
             job.Run.Fed(() => _engine.HostLogits(job.Row), verdict);
             kept++;
             if (job.Run.Next() is not { } choice)
@@ -2176,6 +2219,13 @@ internal sealed class BatchScheduler : IDisposable
                 break;
             }
             job.Context.Add(choice);
+        }
+        if (ruled is not null && kept < rows.Length)
+        {
+            foreach (var adapter in adapters)
+            {
+                adapter.Rewind(rows.Length - kept);
+            }
         }
         Device(() =>
         {

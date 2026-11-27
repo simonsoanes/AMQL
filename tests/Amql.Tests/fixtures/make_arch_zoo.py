@@ -123,6 +123,20 @@ FAMILIES = {
                          rope_parameters={"full_attention": {"rope_type": "proportional", "partial_rotary_factor": 0.25,
                                                              "rope_theta": 1000000.0},
                                           "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0}}),
+    # Inkling 2 looped: layers 4-7 run three passes, each later pass gated on
+    # messages from the one before; no rotary (a relative bias over 4 tokens),
+    # sinks, short convolutions, attention residuals over blocks of 2, and a
+    # log scaling that starts at position 4, so all of it acts on 12 tokens.
+    # The vocabulary is padded (136 rows, 128 logits). Saved in the original
+    # checkpoint's names.
+    "inkling2_loop": dict(model_type="inkling2_loop_text", vocab_size=136, unpadded_vocab_size=128,
+                          num_hidden_layers=12, swa_num_attention_heads=4, swa_num_key_value_heads=2, swa_head_dim=16,
+                          sliding_window_size=4, d_rel=4, rel_extent=4, log_scaling_n_floor=4,
+                          n_layers_per_attn_res_block=2, intermediate_size=32, n_routed_experts=8,
+                          num_experts_per_tok=2, loop_layer_index_start=4, loop_layer_index_end=8, loop_num_passes=3,
+                          loop_gate_rank=8,
+                          layer_types=["hybrid_sliding"] * 3 + ["hybrid"] + ["hybrid_sliding"] * 3 + ["hybrid"]
+                          + ["hybrid_sliding"] * 3 + ["hybrid"]),
 }
 
 

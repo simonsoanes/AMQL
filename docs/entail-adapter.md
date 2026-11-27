@@ -49,6 +49,20 @@ or `Entail`.
 `SideBySideSession` in `src/Amql.Inference/SideBySideSession.cs` is the whole
 pathway: `Prefill`, `Step`, `Choose`. With no adapters it is the partner alone.
 
+Adapters rule while the partner computes its step, and beside one another, so they cost
+time only when one is slower than the model's step. An adapter's *reach* (how far back
+any of its states can depend on a token, found when it compiles) bounds what a prompt
+must feed it: only the last reach plus its window, and the verdicts are the same as
+feeding every token. A program that repeats or cycles has no reach and is fed the
+whole prompt.
+
+```bash
+amql-cli entail time --tokenizer <container> --adapter adapters/dates,adapters/bases --text sample.txt
+```
+
+prints each adapter's time per token, its reach, and a check of the shortcut against
+token-by-token feeding at 25 cuts of the text.
+
 ## Two forms of the same adapter
 
 A compiled program is almost entirely zeros, because it is a block of exact
@@ -101,6 +115,58 @@ A partner token the program doesn't know is row 0, which still takes up its plac
 in the text. Loading against a different `tokenizer.json` is refused, because ids
 would silently mean other tokens. Nothing else about the partner matters: its
 architecture, size and precision don't appear here.
+
+## One program, any model
+
+A program that reads a conversation has to know the model's marks: where reasoning
+closes, where a turn starts, how a call opens. They differ by family. Qwen writes
+`<think>`, `<|im_start|>assistant` and `<tool_call>`; Gemma 4 writes `<|channel>`,
+`<|turn>model` and `<|tool_call>`. So a program names them instead of spelling them,
+and `entail adapter` spells them from the partner's own chat template, learned by
+probing it as the server does ([server.md](server.md#chat-templates)):
+
+| Mark | Qwen 3.5 | Gemma 4 |
+| --- | --- | --- |
+| `{mark:think_open}`, `{mark:think_close}` | `<think>`, `</think>` | `<|channel>`, `<channel|>` |
+| `{mark:reply_open}`, the last token before a reply | `\n\n` | `<channel|>` |
+| `{mark:call_open}` | `<tool_call>` | `<|tool_call>` |
+| `{mark:turn_open}`, `{mark:turn_close}` | `<|im_start|>`, `<|im_end|>` | `<|turn>`, `<turn|>` |
+| `{mark:system}`, `{mark:user}`, `{mark:assistant}` | `system`, `user`, `assistant` | `system`, `user`, `model` |
+| `{mark:eos}` | `<|im_end|>` | `<eos>` |
+
+```
+token "{mark:think_close}" means close_think = 1
+emit "{mark:think_close}" when close
+```
+
+The adapter keeps the program as spelt, so it loads with no template. A mark the
+template does not write is refused when the adapter is built. Built for Qwen,
+`stop-circling` and `call-gate` give the same manifests as they did when they named
+Qwen's tokens.
+
+A token declared twice means both: Gemma's `<channel|>` both closes reasoning and
+leads the reply. A text is bound in the partner's own spelling, `▁` for a space in a
+SentencePiece-style vocabulary and `Ġ` in a byte-level one, because Gemma's vocabulary
+also holds `Ġ` and `Ċ` as letters, and a space there is not `Ġ`.
+`entail adapter` lists the program's texts that are not one of the partner's tokens:
+those never match.
+
+The generated programs (`make_bases.py`, `make_logic.py`, `make_json.py`,
+`make_callgate.py`) list the tokens of the vocabulary they are given, so each partner
+gets its own. Where a tokenizer cuts an operator into a piece that is not logic and one
+that is, as Gemma's cuts ` <->` into ` <` and `->`, `make_logic.py` reads the pair as
+the one operator.
+
+## Carried in a container
+
+```bash
+amql-cli attach <container> --adapter adapters/stop-circling,adapters/dates
+```
+
+copies adapters into `adapters/` and lists them, in order, in the index. A server runs
+them beside the model unless its configuration names others ([server.md](server.md#entail-adapters)),
+and `--adapter <name>` finds them by name in `entail side`, `eval` and `bench`. An adapter
+built for another tokenizer is refused.
 
 ## Results
 

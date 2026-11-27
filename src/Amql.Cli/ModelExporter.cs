@@ -336,6 +336,15 @@ public static class ModelExporter
         // processor configs, generation config — has to come back out, or the
         // exported checkpoint can tokenize but not format a conversation.
         var ancillary = HfAncillaryFiles.CopyInto(container.Root, outDir);
+        // Inkling 2's experts go back as stored, so the file describing
+        // their formats does too (it is never carried for other families,
+        // whose exports may be re-encoded).
+        string quantConfig = Path.Combine(container.Root, Amql.Hf.Inkling2.QuantConfigFile);
+        if (graph.Components.Any(c => c.Execution?.Inkling2 is not null) && File.Exists(quantConfig))
+        {
+            File.Copy(quantConfig, Path.Combine(outDir, Amql.Hf.Inkling2.QuantConfigFile), overwrite: true);
+            ancillary = ancillary.Append(Amql.Hf.Inkling2.QuantConfigFile).ToList();
+        }
         if (ancillary.Count > 0)
         {
             notes.Add($"carried from the container: {string.Join(", ", ancillary)}");
@@ -625,6 +634,28 @@ public static class ModelExporter
         bool patched = patch?.TryGet(objectId, tensor.Name, out _) == true;
         bool paged = tensor.Len > LargePayloadThresholdBytes;
 
+        // FP4 is two elements a byte, which safetensors can only call U8 at
+        // half the last dimension, as the quantised checkpoint did (a 2-D
+        // weight, or a 3-D stack of experts).
+        if (dtype == Dtype.FP4 && tensor.Shape.Length >= 2)
+        {
+            if (patched)
+            {
+                throw new CliException(
+                    $"'{objectId}/{tensor.Name}' is stored FP4 with block scales — export does not re-quantise a patched weight");
+            }
+            var packedShape = (long[])tensor.Shape.Clone();
+            packedShape[^1] /= 2;
+            return new TensorPayload
+            {
+                Name = name,
+                Dtype = Dtype.U8,
+                Shape = packedShape,
+                Data = paged ? Array.Empty<byte>() : ExportTensor(objectId, segment, tensor, patch),
+                Chunks = paged ? ReadChunked(segment, tensor.Name, tensor.Len) : null,
+            };
+        }
+
         if (paged)
         {
             var chunks = ReadChunked(segment, tensor.Name, tensor.Len);
@@ -642,16 +673,11 @@ public static class ModelExporter
             return new TensorPayload { Name = name, Dtype = dtype, Shape = tensor.Shape, Chunks = chunks };
         }
 
-        // FP4 is two elements a byte, which safetensors can only call U8 at
-        // half the columns, as the quantised checkpoint did.
-        var (exportDtype, exportShape) = dtype == Dtype.FP4 && tensor.Shape.Length == 2
-            ? (Dtype.U8, new[] { tensor.Shape[0], tensor.Shape[1] / 2 })
-            : (dtype, tensor.Shape);
         return new TensorPayload
         {
             Name = name,
-            Dtype = exportDtype,
-            Shape = exportShape,
+            Dtype = dtype,
+            Shape = tensor.Shape,
             Data = ExportTensor(objectId, segment, tensor, patch),
         };
     }

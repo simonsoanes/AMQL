@@ -1568,6 +1568,9 @@ public static class EntailWeights
     /// or a byte-fallback piece (<c>&lt;0x41&gt;</c>), in a dictionary or
     /// Unigram-list vocabulary. A token the vocabulary does not hold as one
     /// piece is simply not part of this model's alphabet.</summary>
+    /// <summary>The program's texts that are not one of the partner's tokens: rules on them never fire.</summary>
+    public static IReadOnlyList<string> UnboundTokens(EntailProgram p, string partnerTokenizerDir) => BindTokens(p, partnerTokenizerDir).Missing;
+
     private static (Dictionary<string, int> Ids, List<string> Missing) BindTokens(EntailProgram p, string hostDir)
     {
         var root = JsonNode.Parse(File.ReadAllText(Path.Combine(hostDir, "tokenizer.json")))!.AsObject();
@@ -1588,6 +1591,9 @@ public static class EntailWeights
                 break;
         }
         var byteMap = ByteLevelMap();
+        // A byte-level vocabulary spells a space Ġ; a SentencePiece-style one spells it ▁ and
+        // may hold Ġ, Ċ and the like as letters of their own, so the style is the tokenizer's, not a guess.
+        bool byteLevel = ByteLevel(root["pre_tokenizer"]) || ByteLevel(root["decoder"]);
         var added = (root["added_tokens"]?.AsArray() ?? new JsonArray()).ToDictionary(
             t => t!["content"]!.GetValue<string>(), t => t!["id"]!.GetValue<int>(), StringComparer.Ordinal);
         var ids = new Dictionary<string, int>(StringComparer.Ordinal);
@@ -1596,11 +1602,9 @@ public static class EntailWeights
             .Concat(p.Masks.SelectMany(m => m.Texts)).Concat(p.Prefers.Select(f => f.Text)).Distinct())
         {
             var bytes = Encoding.UTF8.GetBytes(token);
-            var spellings = new List<string>
-            {
-                string.Concat(bytes.Select(b => byteMap[b])),
-                token.Replace(' ', '▁'),
-            };
+            var spellings = byteLevel
+                ? new List<string> { string.Concat(bytes.Select(b => byteMap[b])) }
+                : new List<string> { token.Replace(' ', '▁') };
             if (bytes.Length == 1)
             {
                 spellings.Add($"<0x{bytes[0]:X2}>");
@@ -1621,6 +1625,11 @@ public static class EntailWeights
         }
         return (ids, missing);
     }
+
+    /// <summary>Whether a pre-tokenizer or decoder, or one in its sequence, is ByteLevel.</summary>
+    private static bool ByteLevel(JsonNode? node) => node is JsonObject o &&
+        ((string?)o["type"] == "ByteLevel" ||
+         new[] { "pretokenizers", "decoders" }.Any(k => o[k] is JsonArray list && list.Any(ByteLevel)));
 
     private static char[] ByteLevelMap()
     {

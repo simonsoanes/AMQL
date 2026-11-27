@@ -31,11 +31,17 @@ public static class ModelToContainer
         ArchMapper.EncodeOptions? options = null)
     {
         string modelName = modelId ?? Path.GetFileName(modelDir.TrimEnd('\\', '/'));
-        var facts = ModelConfig.ReadTextFacts(Path.Combine(modelDir, "config.json"));
+        string configPath = Path.Combine(modelDir, "config.json");
+        // Inkling 2 looped shares no roles with the stacks the generic reader
+        // judges (its router alone would be refused there): it has its own.
+        bool inkling = File.Exists(configPath) && Inkling2.Describes(configPath);
+        var facts = inkling ? null : ModelConfig.ReadTextFacts(configPath);
         using var inventory = HfInventory.Open(modelDir);
-        var classification = ModelConfig.ReadClassificationFacts(Path.Combine(modelDir, "config.json"), inventory);
-        var spec = ArchMapper.MapToContainerSpec(modelName, facts, inventory, options ?? new ArchMapper.EncodeOptions(),
-            classification);
+        var classification = inkling ? null : ModelConfig.ReadClassificationFacts(configPath, inventory);
+        var spec = inkling
+            ? ArchMapper.MapInkling2(modelName, configPath, inventory, options ?? new ArchMapper.EncodeOptions())
+            : ArchMapper.MapToContainerSpec(modelName, facts!, inventory, options ?? new ArchMapper.EncodeOptions(),
+                classification);
         var result = ContainerEncoder.Encode(containerOut, spec);
 
         // The tokenizer travels with the container: if the checkpoint ships
@@ -59,7 +65,20 @@ public static class ModelToContainer
         // The config itself rides along too, as the base an export overwrites
         // with the container's judged facts: keys this build has no notion of
         // survive the round trip instead of being dropped.
-        if (facts.SourceConfig is { } sourceConfig)
+        if (inkling)
+        {
+            File.Copy(configPath, Path.Combine(containerOut, SourceConfigFile), overwrite: true);
+            ancillaryCopied = ancillaryCopied.Append(SourceConfigFile).ToList();
+            // Its experts are kept as stored (NVFP4, MXFP8), so the file that
+            // says how they are stored is still true of an export.
+            string quant = Path.Combine(modelDir, Inkling2.QuantConfigFile);
+            if (File.Exists(quant))
+            {
+                File.Copy(quant, Path.Combine(containerOut, Inkling2.QuantConfigFile), overwrite: true);
+                ancillaryCopied = ancillaryCopied.Append(Inkling2.QuantConfigFile).ToList();
+            }
+        }
+        else if (facts!.SourceConfig is { } sourceConfig)
         {
             File.WriteAllText(Path.Combine(containerOut, SourceConfigFile), sourceConfig.GetRawText());
             ancillaryCopied = ancillaryCopied.Append(SourceConfigFile).ToList();

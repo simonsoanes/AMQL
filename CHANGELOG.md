@@ -8,6 +8,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- **kaja-gem:** Kaja-gem 26B A4B, Gemma 4 26B A4B in one 15.6 GB container: the long-context edit, GPTQ NVFP4 weights, its drafter and vision tower, and five Entail adapters carried inside it ([docs](docs/kaja-gem.md), [model card](docs/model-cards/kaja-gem-26b-a4b.md)). Dates, number bases, logic and JSON validity: 1,151 of 1,156 against 267. The hard suite thinking within 3,072 tokens: 77 of 80 against 2.
+- **inkling 2:** Inkling 2 looped (Inkling-2-Mini) imports with its experts as stored (NVFP4 and MXFP8) and runs on a managed reference runtime: its loop of 12 layers run three times, each later pass gated on messages from the one before, the attention residuals over blocks, the relative bias, sinks and short convolutions ([docs](docs/inkling-2.md)). A tiny looped model matches transformers' logits, and the export writes the checkpoint back byte for byte. No GPU path yet.
+- **entail:** one program runs beside any model ([docs](docs/entail-adapter.md#one-program-any-model)). `{mark:think_close}`, `{mark:turn_close}` and eight more chat marks are spelt from the partner's own chat template when the adapter is built.
+  - Tokens bind in the vocabulary's own style (byte-level `Ġ` or SentencePiece `▁`). Gemma's vocabulary holds `Ġ` and `Ċ` as tokens of their own, which left dates silent on month names.
+  - A token declared twice keeps the writes of both declarations; the later one replaced the earlier before, which broke call-gate on Gemma.
+  - Logic reads an operator the tokenizer cuts in two (Gemma cuts ` <->` and ` xor`): 179 to 225 of 226 on Gemma 4.
+- **entail:** adapters ship inside a container ([docs](docs/entail-adapter.md#carried-in-a-container)). `amql-cli attach <container> --adapter <dir>,…` copies them into `adapters/`, in order, and the server runs them unless a model's `"adapters"` in `--config` says otherwise (`[]` runs none).
+- **entail:** adapters rule while the model computes its step, and beside one another. A prompt is fed to an adapter only as far back as it can still read: number bases on 106K tokens, 150 s to 0.14 s, with the same verdicts. `amql-cli entail time` measures each adapter's cost per token and checks that shortcut against token-by-token feeding.
+- **server:** with a drafter, adapters read the token and its drafts while the GPU verifies them, and take back the drafts not kept (`IEntailAdapter.Rewind`). Gemma 4 26B with five adapters, one reply: 163–218 to 254–411 tok/s, against 274–433 with none, the same replies.
+- **cli:** `amql-cli upload <dir> <owner/name>` publishes a container to Hugging Face: private unless `--public`, large files through LFS (multipart above its part size), and only the files that changed since the last upload. `--dry-run` lists what would be sent.
 - **gemma 4:** Gemma 4's dense and mixture-of-experts text models import, quantise and run ([docs](docs/gemma-4.md)). Gemma 4 26B A4B takes 14.2 GB on disk and 18.1 GB of GPU memory with its whole 256K context, and decodes at 266 tok/s on an RTX 5090 (Qwen 3.5 4B: 275).
   - The GPU engine runs routed experts, alone (Mixtral, OLMoE, Qwen3-MoE) or beside a dense FFN. Prompts gather each expert's rows for tensor-core GEMMs; a prompt gives the same bits every run.
   - A sliding-window layer's KV cache holds about two windows and slides, at any context: 0.6 GB for Gemma 4's 25 windowed layers at 256K instead of 50 GB. Marks, rewinds and paging follow it.
@@ -216,6 +226,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **fix(entail):** `entail bench` took a reply's thinking to be closed only by `</think>`, so for Gemma 4 (`<channel|>`) every reply counted as still thinking. It now reads the model's own close mark from its chat template.
+- **fix(entail):** the Entail commands gave a quantised partner the working set of a graft, its weights expanded to f32 or streamed from disk. A quantised container now runs beside its adapters with its weights as stored, on the device engine.
 - **fix:** `export --arch qwen4-next` wrote a layout no qwen4_exp runtime would load or compute correctly: the wrong tensor names, ignored norms, no QSA indexers, a SiLU/sigmoid mix-up and `num_experts: 0` for dense models. It is now an exact rewrite of a Qwen3.5-family model: norms folded into the gated residual, a dense MLP as one routed expert, and a QSA budget covering the context. The output encodes back and runs to the source model's logits.
 - **fix(gpu):** the device engine replayed a stale decode graph after a prefill grew the KV cache. A session that had decoded a short prompt, and was then reset and given a longer one (past 1,024, 2,048, … rows), failed its next step with CUDA status 700 or read freed memory. `GpuEngineTests.Engine_Recaptures_After_A_Prefill_Grows_The_Cache` covers it.
 - **fix(entail):** `entail run --tokenizer` dropped special tokens such as `<|im_start|>` when splitting a text, so no program could read a chat template's markers. Adapters were not affected.

@@ -34,6 +34,12 @@ internal static class GenericExport
             ?? throw new CliException("container has no primary text component — cannot regenerate config.json");
         var surface = component.Execution
             ?? throw new CliException($"component '{component.Id}' declares no execution surface — cannot regenerate config.json");
+        if (surface.Inkling2 is not null)
+        {
+            // Inkling 2's facts are its config's, read and never rewritten:
+            // the checkpoint's own config is the export's.
+            return File.ReadAllText(path);
+        }
         var policies = component.Attention
             ?? throw new CliException($"component '{component.Id}' declares no per-layer attention table — cannot regenerate config.json");
 

@@ -15,6 +15,18 @@ public interface IEntailAdapter : IDisposable
 
     /// <summary>Reads one more token and says what must follow it.</summary>
     EntailVerdict Step(int partnerToken);
+
+    /// <summary>How many of the latest tokens <see cref="Rewind"/> can un-read now; 0 when it cannot.</summary>
+    int RewindLimit => 0;
+
+    /// <summary>Whether, stepped through <paramref name="drafts"/> more tokens
+    /// than will be kept, it can take every one of them back.</summary>
+    bool CanRewind(int drafts) => false;
+
+    /// <summary>Un-reads the latest <paramref name="tokens"/> tokens, at most
+    /// <see cref="RewindLimit"/>, as if they had never been read: speculation
+    /// steps an adapter through drafts and takes back those not kept.</summary>
+    void Rewind(int tokens) => throw new NotSupportedException($"adapter '{Manifest.Program}' cannot rewind");
 }
 
 /// <summary>
@@ -43,8 +55,10 @@ public sealed class EntailSparseAdapter : IEntailAdapter
     private EntailSparseAdapter(Compiled plan)
     {
         _plan = plan;
-        _repeat = new EntailRepeat(plan.RepeatSpans);
-        _ring = new double[plan.Window + 1][];
+        _repeat = new EntailRepeat(plan.RepeatSpans, MaxRewind);
+        // Rows beyond the window let the latest MaxRewind tokens be taken back:
+        // their steps overwrite no row a later step at the rewound position reads.
+        _ring = new double[plan.Window + 1 + MaxRewind][];
         for (int i = 0; i < _ring.Length; i++)
         {
             _ring[i] = new double[plan.Lanes];
@@ -75,18 +89,62 @@ public sealed class EntailSparseAdapter : IEntailAdapter
 
     public IEntailAdapter Sibling() => new EntailSparseAdapter(_plan);
 
+    /// <summary>How many of the latest tokens can be taken back: more than a
+    /// speculative step drafts (<c>GpuEngine.MaxDrafts</c>, 7).</summary>
+    public const int MaxRewind = 16;
+
+    // The furthest position stepped: a row is safe to read again only while no
+    // step since has run more than MaxRewind positions past it.
+    private int _furthest;
+
+    public int RewindLimit => Math.Max(0, Math.Min(_position, Math.Min(MaxRewind - (_furthest - _position), _repeat.Undoable)));
+
+    public bool CanRewind(int drafts)
+    {
+        int after = _position + drafts + 1;
+        int furthest = Math.Max(_furthest, after);
+        long undoable = _repeat.Any ? Math.Min(MaxRewind, (long)_repeat.Undoable + drafts + 1) : long.MaxValue;
+        return drafts >= 0 && MaxRewind - (furthest - after) >= drafts && undoable >= drafts;
+    }
+
     public void Reset()
     {
         _position = 0;
+        _furthest = 0;
         _repeat.Reset();
     }
 
+    /// <summary>Un-reads the latest tokens. A row is rebuilt whole when its
+    /// position is stepped again, and the ring keeps <see cref="MaxRewind"/>
+    /// rows past the window, so moving the position back is the whole of it,
+    /// with the repeat table's own undo.</summary>
+    public void Rewind(int tokens)
+    {
+        if (tokens < 0 || tokens > RewindLimit)
+        {
+            throw new ArgumentOutOfRangeException(nameof(tokens), $"can rewind 0 to {RewindLimit} tokens, not {tokens}");
+        }
+        _position -= tokens;
+        _repeat.Rewind(tokens);
+    }
+
+    /// <summary>How many tokens back the program's state can depend on, or null when a
+    /// carry or a repeat lets it depend on any of them (see <see cref="Compiled.Reach"/>).</summary>
+    public int? Reach => _plan.Reach;
+
     public EntailVerdict Prefill(int[] partnerTokens)
     {
-        var verdict = EntailVerdict.Silence;
-        foreach (int token in partnerTokens)
+        // A program that cannot see further back than its reach reads a long text from where it
+        // can: every row from there on, and so the verdict, is what reading all of it gives.
+        int from = 0;
+        if (_position == 0 && _plan.Reach is { } reach && partnerTokens.Length > reach + _plan.Window + 2)
         {
-            verdict = Step(token);
+            from = partnerTokens.Length - (reach + _plan.Window + 2);
+        }
+        var verdict = EntailVerdict.Silence;
+        for (int i = from; i < partnerTokens.Length; i++)
+        {
+            verdict = Step(partnerTokens[i]);
         }
         return verdict;
     }
@@ -148,6 +206,7 @@ public sealed class EntailSparseAdapter : IEntailAdapter
             x.CopyTo(_first, 0);
         }
         _position++;
+        _furthest = Math.Max(_furthest, _position);
 
         for (int i = 0; i < _outputs.Length; i++)
         {
@@ -265,6 +324,68 @@ public sealed class EntailSparseAdapter : IEntailAdapter
             {
                 Window = Math.Max(Window, 1);
             }
+            Reach = ReachOf(p);
+        }
+
+        /// <summary>
+        /// How far back any lane of a row can depend on the text, in tokens: what a token writes
+        /// reaches 0; a carry one more than the lane it copies; a head its offset more than what it
+        /// reads (its pointer's lanes too); a neuron as far as its inputs. Worked to a fixed point,
+        /// since a head reads the finished rows of earlier tokens. A cycle through a carry, such as
+        /// a count, never settles: such a program, and one with a repeat, depends on the whole text.
+        /// </summary>
+        public int? Reach { get; }
+
+        private static int? ReachOf(EntailProgram p)
+        {
+            if (p.Repeats.Count > 0)
+            {
+                return null;
+            }
+            const int Unbounded = 1 << 16;
+            var reach = new int[p.Lanes.Count];
+            bool changed = true;
+            for (int pass = 0; changed; pass++)
+            {
+                changed = false;
+                void Raise(int lane, int to)
+                {
+                    if (to > reach[lane])
+                    {
+                        reach[lane] = Math.Min(to, Unbounded);
+                        changed = true;
+                    }
+                }
+                int Max(Lin lin) => lin.Terms.Keys.Select(l => reach[l]).DefaultIfEmpty(0).Max();
+                foreach (var (from, to) in p.Carries)
+                {
+                    Raise(to, reach[from] + 1);
+                }
+                foreach (var op in p.Ops.OrderBy(o => o.Layer))
+                {
+                    switch (op)
+                    {
+                        case Neuron n:
+                            Raise(n.Dest, Math.Max(Max(n.Gate), Max(n.Up)));
+                            break;
+                        case Head h:
+                            int back = Math.Max(h.Offset, h.Pointer?.Max(x => x.Offset) ?? 0);
+                            int choose = h.Pointer?.Select(x => reach[x.Lane]).DefaultIfEmpty(0).Max() ?? 0;
+                            foreach (var (dest, source) in h.Copies)
+                            {
+                                Raise(dest, Math.Max(choose, back + Max(source)));
+                            }
+                            break;
+                    }
+                }
+                // A chain settles within a pass for each head or carry along it; one that has not
+                // settled by then runs round a cycle.
+                if (reach.Any(r => r >= Unbounded) || pass > 256)
+                {
+                    return null;
+                }
+            }
+            return reach.DefaultIfEmpty(0).Max();
         }
 
         public (int From, int To)[] Carries { get; }

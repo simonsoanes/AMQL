@@ -1036,19 +1036,39 @@ public static partial class ArchMapper
     /// U8 E8M0 exponents per 32 (MXFP4). The bytes are kept; the container
     /// records them as FP4 at their logical shape, so every shape check and
     /// the operand store see the matrix the model multiplies by.
+    /// <para>A stack of experts packed in one tensor (Inkling 2's
+    /// <c>mlp.experts.w13_weight</c>, <c>U8 [experts, rows, in/2]</c> with an
+    /// E4M3 <c>[experts, rows, in/16]</c> scale) is the same thing a rank
+    /// higher: every dimension but the last matches its scale's, and the last
+    /// doubles. Its tensor scale, where it has one, is a companion of its own
+    /// (<c>_amax</c> over <c>_outer_scale_denominator</c> per expert), kept
+    /// as stored for the runtime to apply.</para>
     /// </summary>
     internal static (Dtype Dtype, long[] Shape)? PackedFp4(HfInventory inventory, string fullName, TensorInfo info)
     {
-        if (info.Dtype != Dtype.U8 || info.Shape.Length != 2 ||
-            !inventory.TryGet(fullName + "_scale", out var scale) || scale.Shape.Length != 2 ||
-            scale.Shape[0] != info.Shape[0])
+        int rank = info.Shape.Length;
+        if (info.Dtype != Dtype.U8 || rank is not (2 or 3) ||
+            !inventory.TryGet(fullName + "_scale", out var scale) || scale.Shape.Length != rank)
         {
             return null;
         }
-        long cols = info.Shape[1] * 2;
-        bool nvfp4 = scale.Dtype == Dtype.F8_E4M3 && scale.Shape[1] * 16 == cols;
-        bool mxfp4 = scale.Dtype is Dtype.U8 or Dtype.F8_E8M0 && scale.Shape[1] * 32 == cols;
-        return nvfp4 || mxfp4 ? (Dtype.FP4, new[] { info.Shape[0], cols }) : null;
+        for (int i = 0; i < rank - 1; i++)
+        {
+            if (scale.Shape[i] != info.Shape[i])
+            {
+                return null;
+            }
+        }
+        long cols = info.Shape[^1] * 2;
+        bool nvfp4 = scale.Dtype == Dtype.F8_E4M3 && scale.Shape[^1] * 16 == cols;
+        bool mxfp4 = scale.Dtype is Dtype.U8 or Dtype.F8_E8M0 && scale.Shape[^1] * 32 == cols;
+        if (!nvfp4 && !mxfp4)
+        {
+            return null;
+        }
+        var shape = (long[])info.Shape.Clone();
+        shape[^1] = cols;
+        return (Dtype.FP4, shape);
     }
 
     private static RepresentationSpec Rep(string objectId, string encoding, List<NamedTensorData> tensors) => new()

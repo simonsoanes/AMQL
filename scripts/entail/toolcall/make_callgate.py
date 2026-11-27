@@ -6,7 +6,11 @@ instead. The gate is a fold over the whole prompt (carry, so any length):
 
   * words in the system turn mark which concepts the offered tools cover
   * words in the latest user turn mark which concepts the request touches
-  * on the reply's first token, if a requested concept is offered, say <tool_call>
+  * on the reply's first token, if a requested concept is offered, open a call
+
+The turn, reasoning and call markers are chat marks ({mark:turn_open} and so on),
+spelt in the partner's own tokens by `amql-cli entail adapter`, so one program
+serves Qwen's <|im_start|>/<tool_call> and Gemma 4's <|turn>/<|tool_call> alike.
 
 Otherwise it is silent and the model decides. The lexicon below is written by
 hand from the tools' descriptions plus common words for each concept, BEFORE
@@ -50,12 +54,12 @@ def main():
              "# offered tool covers. A fold over the prompt: memory is one row, whatever its length.",
              "",
              "state im_start, is_sys, is_user, is_asst, think_end, blank",
-             'token "<|im_start|>" means im_start = 1',
-             'token "system" means is_sys = 1',
-             'token "user" means is_user = 1',
-             'token "assistant" means is_asst = 1',
-             'token "</think>" means think_end = 1',
-             'token "\\n\\n" means blank = 1',
+             'token "{mark:turn_open}" means im_start = 1',
+             'token "{mark:system}" means is_sys = 1',
+             'token "{mark:user}" means is_user = 1',
+             'token "{mark:assistant}" means is_asst = 1',
+             'token "{mark:think_close}" means think_end = 1',
+             'token "{mark:reply_open}" means blank = 1',
              "",
              f"state cw[{len(names)}]"]
     dropped = []
@@ -69,7 +73,7 @@ def main():
                 lines.append(f'token "{esc(p)}" means cw[{c}] = 1')
     n = len(names)
     lines += f"""
-# Which turn this token is in, held until the next <|im_start|>.
+# Which turn this token is in, held until the turn's next opening mark.
 state after_start, prev_think
 carry after_start from im_start
 carry prev_think from think_end
@@ -97,13 +101,17 @@ for c in 0 to {n - 1}
     entail asked[c] when role_user, cw[c], not last_asked[c]
 end
 
-# The reply's first token: "\\n\\n" after </think>, in the assistant's turn.
+# The reply's first token comes after its lead: the close mark itself (Gemma 4), or
+# what the template writes straight after it ("\\n\\n" after Qwen's </think>).
 state hit, call
 for c in 0 to {n - 1}
     entail hit when offered[c], asked[c]
 end
-entail call when blank, prev_think, role_asst, hit >= 1
-emit "<tool_call>" when call
+state closed
+entail closed when think_end
+entail closed when prev_think
+entail call when blank, closed, role_asst, hit >= 1
+emit "{{mark:call_open}}" when call
 """.splitlines()
     open(sys.argv[2], "w", encoding="utf-8", newline="\n").write("\n".join(lines) + "\n")
     print(f"wrote {sys.argv[2]}; words with no single-token spelling: {' '.join(dropped) or 'none'}")

@@ -39,6 +39,11 @@ public class ArchZooTests
     {
         using var container = Vindex3Container.Open(containerDir);
         using var store = container.CreateOperandStore();
+        if (Inkling2Model.Serves(container))
+        {
+            // A looped stack has no planned layers: it runs on its own runtime.
+            return Inkling2Model.Load(container, store).Prefill(ids);
+        }
         var plan = Planner.Plan(container, "target", store);
         var runtime = new GenericRuntime(plan, store);
         var hidden = runtime.Embed(ids);

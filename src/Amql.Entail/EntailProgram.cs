@@ -305,7 +305,9 @@ public static class EntailCompiler
                     var key = template[(i + 1)..end];
                     sb.Append(_env.TryGetValue(key, out var v)
                         ? Convert.ToString(v, CultureInfo.InvariantCulture)
-                        : throw new EntailException($"'{{{key}}}' is not defined"));
+                        : key.StartsWith("mark:", StringComparison.Ordinal)
+                            ? throw new EntailException($"'{{{key}}}' is a chat mark: it is spelt from a partner's chat template, by 'entail adapter --tokenizer <dir>'")
+                            : throw new EntailException($"'{{{key}}}' is not defined"));
                     i = end + 1;
                 }
                 else
@@ -470,12 +472,18 @@ public static class EntailCompiler
                 case TokenStmt s:
                     foreach (var text in s.Texts)
                     {
-                        var writes = new Dictionary<int, double>();
+                        // A token declared again means more: its lanes join the earlier ones (a lane
+                        // written twice takes the later value). A program spelt from chat marks may
+                        // name one token twice, as Gemma's <channel|> both closes reasoning and leads the reply.
+                        string key = Literal(Name(text));
+                        if (!Program.Tokens.TryGetValue(key, out var writes))
+                        {
+                            Program.Tokens[key] = writes = new Dictionary<int, double>();
+                        }
                         foreach (var (lane, value) in s.Means)
                         {
                             writes[LaneFor(lane)] = Eval(value).Const;
                         }
-                        Program.Tokens[Literal(Name(text))] = writes;
                     }
                     break;
                 case ForStmt s:

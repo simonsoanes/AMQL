@@ -519,6 +519,12 @@ token that would continue a run already written three times, broke Hydra's tool 
 `D:\Temp\Model`; replayed without it, the same request gives the right path. Serve agents with `stop-circling`
 alone, which acts only inside the thinking block.
 
+A container may carry its own adapters (`amql-cli attach <container> --adapter <dir>,…`, in `adapters/`). A
+model given no adapters, by `--model` or by a `--config` entry with no `"adapters"`, runs those, in the order the
+container lists them; `"adapters": []` runs none, and a name in `"adapters"` that is no folder is one of the
+container's own (`"adapters": ["stop-circling"]`). Adapters read an image's tokens as tokens they do not know, so
+images and adapters run together.
+
 ```bash
 dotnet bin/Release/amql-server.dll --model qwen=<qwen3.5-0.8b container> --think \
     --adapter qwen=<adapters>/stop-circling

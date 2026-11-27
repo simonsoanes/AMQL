@@ -690,7 +690,7 @@ def main():
         guard.append(f"entail s_{state} when g_{state}, guard")
         if state in INSIDE:
             banned = [q for q in (quoted(w) for w in words if not fits(w, state)) if q]
-            banned += ['"<|im_end|>"', '"<|endoftext|>"']
+            banned += ['"{mark:turn_close}"', '"{mark:eos}"']  # the partner's own, spelt by entail adapter
             guard.append("forbid " + ",\n    ".join(banned) + f" when s_{state}")
             sizes[state] = -len(banned)
         else:

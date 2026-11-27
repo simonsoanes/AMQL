@@ -20866,8 +20866,8 @@ forbid "\t",
     "。\e",
     "！\q,",
     "：\q+",
-    "<|im_end|>",
-    "<|endoftext|>" when s_ink
+    "{mark:turn_close}",
+    "{mark:eos}" when s_ink
 state s_invo
 entail s_invo when g_invo, guard
 forbid "\t",
@@ -23335,8 +23335,8 @@ forbid "\t",
     "~\q:\q",
     "。\e",
     "：\q+",
-    "<|im_end|>",
-    "<|endoftext|>" when s_invo
+    "{mark:turn_close}",
+    "{mark:eos}" when s_invo
 state s_inva
 entail s_inva when g_inva, guard
 forbid "\t",
@@ -25799,8 +25799,8 @@ forbid "\t",
     "~\q:\q",
     "。\e",
     "：\q+",
-    "<|im_end|>",
-    "<|endoftext|>" when s_inva
+    "{mark:turn_close}",
+    "{mark:eos}" when s_inva
 state s_inv0
 entail s_inv0 when g_inv0, guard
 forbid "\t",
@@ -28272,8 +28272,8 @@ forbid "\t",
     "~\q:\q",
     "。\e",
     "：\q+",
-    "<|im_end|>",
-    "<|endoftext|>" when s_inv0
+    "{mark:turn_close}",
+    "{mark:eos}" when s_inv0
 
 # Blank space is always legal between tokens, so a host with nothing better to say can
 # say it for ever. Two blanks in a row are enough for any layout.

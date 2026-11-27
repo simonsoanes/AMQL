@@ -29,6 +29,11 @@ public static class Planner
         var surface = component.Execution
             ?? throw new ContainerException(
                 $"component '{componentId}' has no execution surface — nothing to execute");
+        if (surface.Inkling2 is not null)
+        {
+            throw new UnsupportedOperatorException(
+                $"component '{componentId}' is an Inkling 2 looped stack: it runs on Inkling2Model, not on planned layers");
+        }
         var normSurface = surface.Norm;
 
         var objects = graph.Objects.Where(o => o.Component == componentId).ToList();

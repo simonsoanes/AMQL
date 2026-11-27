@@ -202,6 +202,7 @@ internal static partial class Program
             {
                 "encode" => Encode(args[1..]),
                 "download" => Download(args[1..]),
+                "upload" => Upload(args[1..]),
                 "verify" => Verify(args[1..]),
                 "synth-model" => SynthModel(args[1..]),
                 "tokens" => Tokens(args[1..]),
@@ -353,6 +354,53 @@ internal static partial class Program
         Console.WriteLine($"done. encode it with: amql-cli encode \"{dir}\" --out <container-dir>");
         CliProgress.Result(new { directory = dir, repo = hub.Repo, revision = hub.Revision });
         return 0;
+    }
+
+    /// <summary><c>upload &lt;dir&gt; &lt;owner/name&gt; [--public] [--revision main] [--message "…"] [--dry-run]</c>:
+    /// publishes a folder (a container with its adapters and card) as a Hub model in one commit.
+    /// A repository it makes is private unless --public is given.</summary>
+    private static int Upload(string[] args)
+    {
+        var pos = Positionals(args, "--revision", "--message");
+        if (pos.Length < 2)
+        {
+            throw new CliException("upload requires a folder and a Hub model id, e.g. 'amql-cli upload containers/my-model me/my-model'");
+        }
+        string dir = pos[0], repo = pos[1];
+        if (!Directory.Exists(dir))
+        {
+            throw new CliException($"no folder '{dir}'");
+        }
+        var files = Amql.Hf.HfUploader.Files(dir);
+        Console.WriteLine($"{files.Count} files, {Amql.Hf.HfDownloader.FormatBytes(files.Sum(f => f.Size))}, to https://huggingface.co/{repo}" +
+                          $" ({(HasOption(args, "--public") ? "public" : "private unless it exists already")})");
+        if (HasOption(args, "--dry-run"))
+        {
+            foreach (var f in files)
+            {
+                Console.WriteLine($"  {f.Path}  {Amql.Hf.HfDownloader.FormatBytes(f.Size)}");
+            }
+            return 0;
+        }
+        CliProgress.Phase("upload");
+        try
+        {
+            var result = Amql.Hf.HfUploader.UploadAsync(dir, new Amql.Hf.HfUploadOptions
+            {
+                Repo = repo,
+                Revision = OptionValue(args, "--revision") ?? "main",
+                Private = !HasOption(args, "--public"),
+                Message = OptionValue(args, "--message"),
+            }, line => Console.WriteLine($"  {line}")).GetAwaiter().GetResult();
+            int sent = result.Files.Count(f => f.Sent);
+            Console.WriteLine($"done: {sent} of {result.Files.Count} files sent ({Amql.Hf.HfDownloader.FormatBytes(result.Files.Where(f => f.Sent).Sum(f => f.Size))}), {result.PageUrl}");
+            CliProgress.Result(new { repo = result.Repo, revision = result.Revision, commit = result.CommitUrl, sent, files = result.Files.Count });
+            return 0;
+        }
+        catch (Amql.Hf.HfDownloadException e)
+        {
+            throw new CliException(e.Message);
+        }
     }
 
     /// <summary>Downloads a Hub model (to --download-dir, the given folder, or the cache) with progress, and returns the folder.</summary>
@@ -3005,10 +3053,15 @@ internal static partial class Program
                               [--dtype Q4_0|Q8_0|FP4|BF16|FP32]   single-encoding slim import
                               [--revision main] [--download-dir <dir>] [--all-files]
                               a Hugging Face URL or owner/name is downloaded first (HF_TOKEN for gated models)
-              amql-cli attach <container-dir> [--drafter <checkpoint | hf-url>] [--vision <checkpoint | hf-url>] [--format nvfp4|mxfp4|none]
-                              adds a drafter (Gemma 4's assistant) or a checkpoint's vision tower to a container
+              amql-cli attach <container-dir> [--drafter <checkpoint | hf-url>] [--vision <checkpoint | hf-url>] [--adapter <dir>,…] [--format nvfp4|mxfp4|none]
+                              adds a drafter (Gemma 4's assistant), a checkpoint's vision tower, or Entail adapters
+                              built for the model (a server runs them unless its config names others)
               amql-cli download <hf-url | owner/name> [--out <dir>] [--revision main] [--all-files]
                               fetch a checkpoint from the Hugging Face Hub (resumable, SHA-256 checked)
+              amql-cli upload <dir> <owner/name> [--public] [--revision main] [--message "text"] [--dry-run]
+                              publish a folder (a container, its adapters and card) as a Hub model in one commit;
+                              a repository it makes is private unless --public; files the Hub holds unchanged
+                              are not sent again (HF_TOKEN with write access, or 'huggingface-cli login')
               amql-cli strip <container-dir> --keep <encoding> [--out <slim-dir>]   slim copy
               amql-cli verify <container-dir>                     integrity + readiness
               amql-cli context bench <container> --text <file|dir>[;…] [--lengths 8K,32K,128K,256K]

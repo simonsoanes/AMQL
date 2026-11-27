@@ -53,8 +53,12 @@ public class EntailTests
     public void Chemistry_Adds_Up_Atoms_And_Conserves_Mass(string tokens, string answer) =>
         Assert.Equal(answer, EntailInterpreter.Answer(Chemistry.Value, tokens.Split('|')));
 
+    // The scripts name a partner's chat marks ({mark:turn_close}), which
+    // 'entail adapter' spells from its template; read here, they are Qwen's.
     private static EntailProgram Load(string name) =>
-        EntailCompiler.Compile(File.ReadAllText(RepoFile("scripts", "entail", name + ".entail.txt")));
+        EntailCompiler.Compile(File.ReadAllText(RepoFile("scripts", "entail", name + ".entail.txt"))
+            .Replace("{mark:turn_close}", "<|im_end|>")
+            .Replace("{mark:eos}", "<|endoftext|>"));
 
     private static readonly Lazy<EntailProgram> Dates = new(() => Load("dates"));
     private static readonly Lazy<EntailProgram> Bases = new(() => Load("bases"));

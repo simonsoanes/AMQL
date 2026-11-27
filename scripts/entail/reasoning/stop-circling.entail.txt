@@ -17,15 +17,16 @@ program stop_circling
 # the right number was written in 60 of the 61 replies that wrote it.
 #
 # Nothing here knows about the problem or its words: only the block's markers, line
-# breaks, a count, and the text's match against itself.
+# breaks, a count, and the text's match against itself. The markers are the partner's own
+# (the opening mark is <think> for Qwen, <|channel> for Gemma 4), spelt by `entail adapter`.
 
 const SPAN = 16
 const SEEN = 3
 const BUDGET = 1536
 
 state open_think, close_think, newline
-token "<think>" means open_think = 1
-token "</think>" means close_think = 1
+token "{mark:think_open}" means open_think = 1
+token "{mark:think_close}" means close_think = 1
 token "\n", "\n\n", "\n\n\n", " \n", " \n\n", "\r\n" means newline = 1
 
 state thinking, last_thinking
@@ -48,4 +49,4 @@ entail done when count >= BUDGET, thinking, not last_done, not again
 
 state close
 entail close when done, newline
-emit "</think>" when close
+emit "{mark:think_close}" when close

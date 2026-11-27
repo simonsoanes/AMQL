@@ -3,12 +3,12 @@ program call_gate
 # offered tool covers. A fold over the prompt: memory is one row, whatever its length.
 
 state im_start, is_sys, is_user, is_asst, think_end, blank
-token "<|im_start|>" means im_start = 1
-token "system" means is_sys = 1
-token "user" means is_user = 1
-token "assistant" means is_asst = 1
-token "</think>" means think_end = 1
-token "\n\n" means blank = 1
+token "{mark:turn_open}" means im_start = 1
+token "{mark:system}" means is_sys = 1
+token "{mark:user}" means is_user = 1
+token "{mark:assistant}" means is_asst = 1
+token "{mark:think_close}" means think_end = 1
+token "{mark:reply_open}" means blank = 1
 
 state cw[7]
 # weather
@@ -212,7 +212,7 @@ token " code" means cw[6] = 1
 token "Code" means cw[6] = 1
 token "code" means cw[6] = 1
 
-# Which turn this token is in, held until the next <|im_start|>.
+# Which turn this token is in, held until the turn's next opening mark.
 state after_start, prev_think
 carry after_start from im_start
 carry prev_think from think_end
@@ -240,10 +240,14 @@ for c in 0 to 6
     entail asked[c] when role_user, cw[c], not last_asked[c]
 end
 
-# The reply's first token: "\n\n" after </think>, in the assistant's turn.
+# The reply's first token comes after its lead: the close mark itself (Gemma 4), or
+# what the template writes straight after it ("\n\n" after Qwen's </think>).
 state hit, call
 for c in 0 to 6
     entail hit when offered[c], asked[c]
 end
-entail call when blank, prev_think, role_asst, hit >= 1
-emit "<tool_call>" when call
+state closed
+entail closed when think_end
+entail closed when prev_think
+entail call when blank, closed, role_asst, hit >= 1
+emit "{mark:call_open}" when call

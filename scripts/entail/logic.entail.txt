@@ -48,8 +48,9 @@ const K_TABLE = 5
 #
 # isx: this token can stand in an expression. cnt: how many events it holds.
 # l1, l2, l3: those events, last first. an: an answer can hold it.
+# n, e1, e2, e3: what it adds, which is nothing for the tail of a cut operator (section 1b).
 
-state isx, cnt, l1, l2, l3, an, kind
+state isx, cnt, l1, l2, l3, an, kind, n, e1, e2, e3
 
 token " is" means kind = K_IS
 token " =", "=" means kind = K_EQ
@@ -252,16 +253,42 @@ token " t" means an = 1
 token "aut" means an = 1
 token "ology" means an = 1
 
+# ─── 1b. Operators the tokenizer cuts ───────────────────────────────────────
+
+state drop, lead0, tail0, prev_lead0, drop0, lead1, tail1, prev_lead1, drop1, lead2, tail2, prev_lead2, drop2
+# '<->' is '<' then '->'
+token "<" means isx = 1, cnt = 1, l1 = 11, lead0 = 1
+token "->" means tail0 = 1
+carry prev_lead0 from lead0
+entail drop0 when tail0, prev_lead0
+entail drop when drop0
+# '<=>' is '<' then '=>'
+token "<" means isx = 1, cnt = 1, l1 = 11, lead1 = 1
+token "=>" means tail1 = 1
+carry prev_lead1 from lead1
+entail drop1 when tail1, prev_lead1
+entail drop when drop1
+# 'XOR' is 'X' then 'OR'
+token "X" means isx = 1, cnt = 1, l1 = 9, lead2 = 1
+token "OR" means tail2 = 1
+carry prev_lead2 from lead2
+entail drop2 when tail2, prev_lead2
+entail drop when drop2
+entail n = cnt when not drop
+entail e1 = l1 when not drop
+entail e2 = l2 when not drop
+entail e3 = l3 when not drop
+
 # ─── 2. Sight ───────────────────────────────────────────────────────────────
 
 state wx[W + 2], wc[W + 2], w1[W + 2], w2[W + 2], w3[W + 2], wk[W + 3], wa_[S]
 for k in 1 to W + 1
     attend back k
         wx[k] <- isx
-        wc[k] <- cnt
-        w1[k] <- l1
-        w2[k] <- l2
-        w3[k] <- l3
+        wc[k] <- n
+        w1[k] <- e1
+        w2[k] <- e2
+        w3[k] <- e3
         wk[k] <- kind
     end
 end
@@ -280,7 +307,7 @@ end
 # event stands after the events of every token behind it in the window.
 
 state mk[W + 1], tot
-entail tot = cnt
+entail tot = n
 for i in 1 to W
     entail mk[i] when (sum j in 1 to i : wx[j]) >= i
     entail tot = wc[i] when mk[i]
@@ -292,7 +319,7 @@ entail ev[0] = l1
 entail ev[1] = l2
 for i in 1 to W
     for r in 0 to E - 1
-        entail at[i][r] when mk[i], cnt + (sum j in 1 to i-1 : wc[j]) == r
+        entail at[i][r] when mk[i], n + (sum j in 1 to i-1 : wc[j]) == r
     end
 end
 for i in 1 to W

@@ -215,6 +215,61 @@ public class EntailAdapterTests
         }
     }
 
+    /// <summary>Speculation steps an adapter through drafts and takes back the
+    /// ones not kept: what it says on the kept text must be what reading the
+    /// text straight through says, for a program with heads over a window and
+    /// for one that matches the text against itself (repeat).</summary>
+    [Theory]
+    [InlineData("maths")]
+    [InlineData("repeat")]
+    public void Rewinding_Drafts_Gives_What_Reading_Straight_Through_Gives(string which)
+    {
+        using var dir = new TempDir();
+        var (checkpoint, _) = Partner(dir.Path);
+        string source = which == "maths"
+            ? Maths
+            : "program circling\nstate again, a\nrepeat again over 2 times 1\ntoken \"x\" means a = 1\nstate both\nentail both when again, a\nemit \"y\" when both";
+        EntailSparseAdapter.Write(source, checkpoint, Path.Combine(dir.Path, "sparse"));
+        using var straight = EntailSparseAdapter.Open(Path.Combine(dir.Path, "sparse"), checkpoint);
+        var drafted = (EntailSparseAdapter)straight.Sibling();
+        var tokenizer = HfTokenizer.FromModelDir(checkpoint);
+        string text = which == "maths"
+            ? string.Concat(Enumerable.Repeat(" 12+34=46 and 7*8=56, not 99-1 but 144/12=12;", 6))
+            : string.Concat(Enumerable.Repeat(" a x b x a x c x a x", 8));
+        var ids = tokenizer.EncodeToIds(text).ToArray();
+        var vocabulary = ids.Distinct().ToArray();
+        var random = new Random(7);
+
+        var expected = ids.Select(straight.Step).ToArray();
+        Assert.Contains(expected, v => !v.Silent);
+        int at = 0;
+        while (at < ids.Length)
+        {
+            // A step: the true next token, then up to 7 drafts that follow the
+            // text for a while and then go wrong.
+            int drafts = random.Next(0, 8);
+            int right = random.Next(0, drafts + 1);
+            var rows = new List<int> { ids[at] };
+            for (int d = 1; d <= drafts; d++)
+            {
+                rows.Add(d <= right && at + d < ids.Length ? ids[at + d] : vocabulary[random.Next(vocabulary.Length)]);
+            }
+            Assert.True(drafted.CanRewind(rows.Count - 1));
+            var verdicts = rows.Select(drafted.Step).ToArray();
+            int kept = 0;
+            while (kept < rows.Count && at + kept < ids.Length && rows[kept] == ids[at + kept])
+            {
+                var (a, b) = (expected[at + kept], verdicts[kept]);
+                Assert.Equal(a.Say, b.Say);
+                Assert.Equal(a.Silent, b.Silent);
+                Assert.Equal(a.Banned.Order(), b.Banned.Order());
+                kept++;
+            }
+            drafted.Rewind(rows.Count - kept);
+            at += kept;
+        }
+    }
+
     [Fact]
     public void Readers_Of_One_Program_Keep_Their_Own_Place()
     {

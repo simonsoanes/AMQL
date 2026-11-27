@@ -28,6 +28,8 @@ internal static partial class Program
         var stop = ResolveStopTokens(tokenizerDir, tokenizer);
         var template = ChatTemplate.Load(tokenizerDir);
         bool think = !args.Contains("--no-think");
+        // The token that closes reasoning in this model's own template: </think>, Gemma 4's <channel|>.
+        string thinkClose = template?.Dialect.ThinkCloseMark is { Length: > 0 } mark ? mark : "</think>";
         int maxTokens = IntOption(args, "--max-tokens", think ? 2048 : 512);
         string? reportPath = OptionValue(args, "--report");
         // --score answer (the default) reads a committed number; --score tools reads what a
@@ -140,7 +142,7 @@ internal static partial class Program
             allTokens += reply.Count;
             string expected = problem.Answer.ToString();
             string text = string.Concat(pieces);
-            var a = ReplyAnalysis.Read(reply, pieces, expected, thinking, hitBudget);
+            var a = ReplyAnalysis.Read(reply, pieces, expected, thinking, hitBudget, thinkClose);
             JsonObject detail;
             if (score == "tools")
             {

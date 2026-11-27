@@ -49,13 +49,15 @@ public sealed record ReplyAnalysis(
     /// <summary>
     /// Reads a reply. <paramref name="tokens"/> are the reply's ids, <paramref name="pieces"/>
     /// their decoded text one by one (so a position in tokens can be found from text), and
-    /// <paramref name="thinking"/> says the reply began inside a reasoning block.
+    /// <paramref name="thinking"/> says the reply began inside a reasoning block, or opens one
+    /// (Gemma 4 writes its own <c>&lt;|channel&gt;</c>), and <paramref name="closeMark"/> is
+    /// the token that closes it in the model's own template.
     /// </summary>
     public static ReplyAnalysis Read(IReadOnlyList<int> tokens, IReadOnlyList<string> pieces, string expected,
-        bool thinking, bool hitBudget)
+        bool thinking, bool hitBudget, string closeMark = "</think>")
     {
         string text = string.Concat(pieces);
-        int close = thinking ? IndexOfPiece(pieces, "</think>") : -1;
+        int close = thinking ? IndexOfPiece(pieces, closeMark) : -1;
         bool closed = !thinking || close >= 0;
         int thinkingTokens = thinking ? (close >= 0 ? close : tokens.Count) : 0;
         string answerText = thinking ? (close >= 0 ? string.Concat(pieces.Skip(close + 1)) : string.Empty) : text;

@@ -28,6 +28,7 @@ internal static partial class Program
             "adapter" => EntailAdapter(rest),
             "side" => EntailSide(rest),
             "eval" => EntailEval(rest),
+            "time" => EntailTime(rest),
             "bench" => EntailBench(rest),
             "settle" => EntailSettle(rest),
             "find" => EntailFind(rest),
@@ -43,12 +44,14 @@ internal static partial class Program
         };
     }
 
-    private static EntailProgram LoadEntail(string[] args, int? neuronsPerLayer = null, int headsPerLayer = EntailProgram.HeadsPerLayer)
+    private static EntailProgram LoadEntail(string[] args, int? neuronsPerLayer = null, int headsPerLayer = EntailProgram.HeadsPerLayer, string? source = null)
     {
         var path = Arg(args, 0) ?? throw new CliException("entail needs a program file");
         try
         {
-            return EntailCompiler.Compile(File.ReadAllText(path), IntOption(args, "--neurons-per-layer", neuronsPerLayer ?? 3584), headsPerLayer);
+            // With a partner, the chat marks a program names are spelt in its tokens.
+            source ??= OptionValue(args, "--tokenizer") is { } partner ? EntailMarks.Fill(File.ReadAllText(path), partner) : File.ReadAllText(path);
+            return EntailCompiler.Compile(source, IntOption(args, "--neurons-per-layer", neuronsPerLayer ?? 3584), headsPerLayer);
         }
         catch (EntailException e)
         {
@@ -187,14 +190,21 @@ internal static partial class Program
     /// that can only run a model.</summary>
     private static int EntailAdapter(string[] args)
     {
-        var p = LoadEntail(args);
         string tokenizer = OptionValue(args, "--tokenizer") ?? throw new CliException("entail adapter requires '--tokenizer <partner-dir>'");
         string outDir = OptionValue(args, "--out") ?? throw new CliException("entail adapter requires '--out <dir>'");
+        // Marks the program names ({mark:think_close}, {mark:call_open} …) are spelt in the partner's own tokens.
+        string source = EntailMarks.Fill(File.ReadAllText(Arg(args, 0) ?? throw new CliException("entail needs a program file")), tokenizer);
+        var p = LoadEntail(args, source: source);
         PrintEntail(p);
         if (!args.Contains("--dense"))
         {
-            var written = EntailSparseAdapter.Write(File.ReadAllText(args[0]), tokenizer, outDir);
+            var written = EntailSparseAdapter.Write(source, tokenizer, outDir);
             Console.WriteLine($"outputs:    {written.Outputs.Count} ({written.Rows.Count} partner tokens read)");
+            if (EntailWeights.UnboundTokens(p, tokenizer) is { Count: > 0 } unbound)
+            {
+                Console.WriteLine($"not tokens: {unbound.Count} of the program's texts are not one token of the partner's, and never match: " +
+                    string.Join(" ", unbound.Take(12).Select(t => System.Text.Json.JsonSerializer.Serialize(t))) + (unbound.Count > 12 ? " …" : ""));
+            }
             Console.WriteLine($"wrote:      {outDir}");
             return 0;
         }
@@ -212,11 +222,19 @@ internal static partial class Program
     /// either resident in f32 or from disk. <c>--weights disk</c> (or
     /// AMQL_WEIGHTS=disk) streams the weights from the container; with
     /// neither, disk is chosen when the model's f32 weights would not fit in
-    /// the memory budget, which a graft of a large host easily exceeds.</summary>
-    private static WeightWorkingSet EntailWorkingSet(string[] args, Vindex3Container container)
+    /// the memory budget, which a graft of a large host easily exceeds.
+    /// A quantised container is no graft: it is a partner for adapters, which
+    /// run in doubles beside it, so it runs as it is served (null: the
+    /// default working set, and the device engine).</summary>
+    private static WeightWorkingSet? EntailWorkingSet(string[] args, Vindex3Container container)
     {
         string? mode = OptionValue(args, "--weights")
             ?? (WeightWorkingSetExtensions.FromEnv() == WeightWorkingSet.Disk ? "disk" : null);
+        if (mode is null && Quantised(container))
+        {
+            Console.Error.WriteLine("weights:    as stored (quantised: a partner beside adapters, not a graft)");
+            return null;
+        }
         switch (mode)
         {
             case "f32" or "fp32":
@@ -239,14 +257,89 @@ internal static partial class Program
         }
     }
 
+    private static bool Quantised(Vindex3Container container)
+    {
+        string path = Path.Combine(container.Root, "index.json");
+        return File.Exists(path) && System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(path))?["quantisation"] is System.Text.Json.Nodes.JsonObject;
+    }
+
     private static string FormatGiB(long bytes) => $"{bytes / (double)(1L << 30):0.0} GiB";
+
+    /// <summary><c>entail time --tokenizer &lt;dir&gt; --adapter &lt;dir&gt;,… --text &lt;file&gt;</c>: what each
+    /// adapter costs a token, stepped alone over a text with no model. A server pays it for every
+    /// token of every prompt and reply, beside the model's own time.</summary>
+    private static int EntailTime(string[] args)
+    {
+        string tokenizerDir = OptionValue(args, "--tokenizer") ?? throw new CliException("entail time requires '--tokenizer <partner-dir>'");
+        string textPath = OptionValue(args, "--text") ?? throw new CliException("entail time requires '--text <file>'");
+        var ids = Tokenizer(tokenizerDir).EncodeToIds(File.ReadAllText(textPath)).ToArray();
+        var adapters = OpenAdapters(args, tokenizerDir);
+        if (adapters.Count == 0)
+        {
+            throw new CliException("entail time requires '--adapter <dir>,…'");
+        }
+        Console.WriteLine($"text:       {ids.Length} tokens");
+        double total = 0;
+        foreach (var (adapter, name) in adapters.Zip((OptionValue(args, "--adapter") ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries)))
+        {
+            adapter.Prefill(ids[..Math.Min(64, ids.Length)]);   // warm
+            adapter.Reset();
+            // Every verdict, folded into one number: two builds that rule alike print the same.
+            static long Fold(long print, EntailVerdict v)
+            {
+                print = print * 31 + (v.Say ?? -1);
+                foreach (int t in (v.Allowed ?? new HashSet<int>()).Order().Concat(v.Banned.Order()))
+                {
+                    print = print * 31 + t;
+                }
+                return print;
+            }
+            long print = 17;
+            int spoke = 0;
+            var each = new long[ids.Length];
+            var clock = Stopwatch.StartNew();
+            for (int i = 0; i < ids.Length; i++)
+            {
+                var v = adapter.Step(ids[i]);
+                each[i] = Fold(17, v);
+                if (!v.Silent)
+                {
+                    spoke++;
+                    print = Fold(print, v);
+                }
+            }
+            double ms = clock.Elapsed.TotalMilliseconds / ids.Length;
+            total += ms;
+
+            // Read at once, a text gives the verdict reading it token by token gave there.
+            var rng = new Random(5);
+            var cuts = Enumerable.Range(0, 24).Select(_ => rng.Next(1, ids.Length + 1)).Append(ids.Length).ToList();
+            int differ = 0;
+            double slowest = 0;
+            foreach (int n in cuts)
+            {
+                adapter.Reset();
+                var whole = Stopwatch.StartNew();
+                var read = adapter.Prefill(ids[..n]);
+                slowest = Math.Max(slowest, whole.Elapsed.TotalMilliseconds);
+                differ += Fold(17, read) == each[n - 1] ? 0 : 1;
+            }
+            string reach = adapter is EntailSparseAdapter sparse ? sparse.Reach is { } r ? $"reach {r} tokens" : "reaches the whole text" : "dense";
+            Console.WriteLine($"  {Path.GetFileName(name.TrimEnd('/', '\\')),-24} {ms,8:F3} ms a token   spoke at {spoke}, verdicts {print & 0xFFFFFFFF:x8}");
+            Console.WriteLine($"    {reach}; a prompt read at once in {slowest:F0} ms at most, " +
+                              (differ == 0 ? $"as token by token at all {cuts.Count} cuts" : $"DIFFERENT from token by token at {differ} of {cuts.Count} cuts"));
+            adapter.Dispose();
+        }
+        Console.WriteLine($"  {"all, one after another",-24} {total,8:F3} ms a token");
+        return 0;
+    }
 
     private static List<IEntailAdapter> OpenAdapters(string[] args, string tokenizerDir)
     {
         try
         {
             return (OptionValue(args, "--adapter") ?? string.Empty).Split(',', StringSplitOptions.RemoveEmptyEntries)
-                .Select(dir => EntailAdapterRunner.Load(dir, tokenizerDir)).ToList();
+                .Select(dir => EntailAdapterRunner.Load(ShippedAdapters.Resolve(dir, tokenizerDir), tokenizerDir)).ToList();
         }
         catch (EntailException e)
         {
@@ -622,12 +715,12 @@ internal static partial class Program
 
     private static readonly Regex EntailNumber = new(@"-?\d[\d,]*(?:\.\d+)?", RegexOptions.Compiled);
 
-    private static bool EntailScore(string reply, string answer, bool first)
+    private static bool EntailScore(string reply, string answer, bool first, string thinkClose = "</think>")
     {
-        int think = reply.LastIndexOf("</think>", StringComparison.Ordinal);
+        int think = reply.LastIndexOf(thinkClose, StringComparison.Ordinal);
         if (think >= 0)
         {
-            reply = reply[(think + 8)..];
+            reply = reply[(think + thinkClose.Length)..];
         }
         var numbers = EntailNumber.Matches(reply);
         if (numbers.Count == 0)

@@ -3,7 +3,7 @@ using System.Text.Json;
 namespace Amql.Server;
 
 /// <summary>One model of a <c>--config</c> file: where it is, the adapters beside it, its defaults.</summary>
-public sealed record ConfiguredModel(string Id, string Path, IReadOnlyList<string> Adapters, ModelDefaults Defaults)
+public sealed record ConfiguredModel(string Id, string Path, IReadOnlyList<string>? Adapters, ModelDefaults Defaults)
 {
     /// <summary>"nvfp4" or "mxfp4" to serve the container's GPTQ 4-bit copy
     /// (built beside it the first time), "fp16" for its weights as stored;
@@ -49,7 +49,7 @@ public static class ServerConfig
                 : Path.GetFileName(path.TrimEnd('/', '\\'));
             var adapters = m.TryGetProperty("adapters", out var av) && av.ValueKind == JsonValueKind.Array
                 ? av.EnumerateArray().Select(a => Resolve(a.GetString() ?? throw new InvalidDataException($"{where}: adapters are paths"))).ToList()
-                : new List<string>();
+                : null;   // none named: the container's own (ShippedAdapters)
             float? Float(string name) => m.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number ? v.GetSingle() : null;
             int? Int(string name) => m.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number ? v.GetInt32() : null;
             bool? think = m.TryGetProperty("think", out var tv) && tv.ValueKind is JsonValueKind.True or JsonValueKind.False ? tv.GetBoolean() : null;

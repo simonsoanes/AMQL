@@ -1,0 +1,451 @@
+using System.Text.Json;
+using Amql.Safetensors;
+using Amql.Vindex3;
+
+namespace Amql.Hf;
+
+/// <summary>
+/// Inkling 2 looped (<c>inkling2_loop</c>, Thinking Machines). Its stack has
+/// none of the usual roles: no rotary but a relative bias per head, sinks,
+/// short causal convolutions around attention and the experts, a residual
+/// that attends over blocks of earlier states, and a core of layers run
+/// several times. So it is judged here, from its own names, and runs on
+/// <c>Inkling2Model</c> rather than the planner's layers.
+/// <para>
+/// Two spellings of the config are read: the checkpoint's own
+/// (<c>text_config</c> with <c>loop_config</c>, <c>local_layer_ids</c>,
+/// <c>sconv_kernel_size</c>, <c>intermediate_size</c>) and transformers'
+/// (<c>layer_types</c>, <c>loop_layer_index_start</c>, …). The tensors keep
+/// the checkpoint's names under <c>model.llm.</c> either way.
+/// </para>
+/// </summary>
+public static class Inkling2
+{
+    public const string Prefix = "model.llm.";
+    public const string Architecture = "Inkling2LoopForCausalLM";
+
+    /// <summary>The checkpoint's description of its stored formats, carried
+    /// through encode and export unchanged (the experts are too).</summary>
+    public const string QuantConfigFile = "hf_quant_config.json";
+
+    /// <summary>Whether <paramref name="configPath"/> describes an Inkling 2 looped model.</summary>
+    public static bool Describes(string configPath)
+    {
+        using var doc = JsonDocument.Parse(File.ReadAllBytes(configPath));
+        var root = doc.RootElement;
+        string? type = Str(root, "model_type");
+        string? textType = root.TryGetProperty("text_config", out var text) && text.ValueKind == JsonValueKind.Object
+            ? Str(text, "model_type")
+            : null;
+        return type is "inkling2_loop" or "inkling2_loop_text" || textType is "inkling2_loop_text";
+    }
+
+    public static Inkling2Surface ReadFacts(string configPath)
+    {
+        using var doc = JsonDocument.Parse(File.ReadAllBytes(configPath));
+        var root = doc.RootElement;
+        var text = root.TryGetProperty("text_config", out var nested) && nested.ValueKind == JsonValueKind.Object ? nested : root;
+
+        int layers = Int(text, "num_hidden_layers");
+        var full = new bool[layers];
+        if (text.TryGetProperty("layer_types", out var types) && types.ValueKind == JsonValueKind.Array)
+        {
+            var list = types.EnumerateArray().Select(t => t.GetString()).ToList();
+            if (list.Count != layers)
+            {
+                throw new ModelConfigException($"layer_types lists {list.Count} layers, num_hidden_layers is {layers}");
+            }
+            for (int l = 0; l < layers; l++)
+            {
+                full[l] = list[l] switch
+                {
+                    "hybrid" => true,
+                    "hybrid_sliding" => false,
+                    var other => throw new ModelConfigException($"layer {l}: Inkling 2 layer type '{other}' is not judged"),
+                };
+            }
+        }
+        else if (text.TryGetProperty("local_layer_ids", out var local) && local.ValueKind == JsonValueKind.Array)
+        {
+            Array.Fill(full, true);
+            foreach (var id in local.EnumerateArray())
+            {
+                full[id.GetInt32()] = false;
+            }
+        }
+        else
+        {
+            throw new ModelConfigException("Inkling 2 config gives neither layer_types nor local_layer_ids");
+        }
+
+        // The loop: transformers' flat keys, or the checkpoint's loop_config.
+        int loopStart, loopEnd, passes, rank;
+        if (text.TryGetProperty("loop_layer_index_start", out _))
+        {
+            loopStart = Int(text, "loop_layer_index_start");
+            loopEnd = Int(text, "loop_layer_index_end");
+            passes = Int(text, "loop_num_passes");
+            rank = Int(text, "loop_gate_rank");
+        }
+        else if (text.TryGetProperty("loop_config", out var loop) || root.TryGetProperty("loop_config", out loop))
+        {
+            loopStart = Int(loop, "core_start");
+            loopEnd = Int(loop, "core_end");
+            passes = Int(loop, "num_passes");
+            rank = Int(loop, "gate_rank");
+            if (loop.TryGetProperty("is_varloop", out var varloop) && varloop.ValueKind == JsonValueKind.True)
+            {
+                throw new ModelConfigException("a variable loop (is_varloop) is not judged by this build");
+            }
+        }
+        else
+        {
+            throw new ModelConfigException("Inkling 2 looped config states no loop (loop_config or loop_layer_index_start)");
+        }
+
+        int block = Int(text, "n_layers_per_attn_res_block");
+        if (passes < 2 || loopStart <= 0 || loopEnd <= loopStart || loopEnd > layers || loopStart % block != 0 || loopEnd % block != 0)
+        {
+            throw new ModelConfigException(
+                $"Inkling 2 loop [{loopStart}, {loopEnd}) x{passes} over {layers} layers in blocks of {block} is not a loop this build runs");
+        }
+
+        string scoring = Str(text, "scoring_func") ?? "sigmoid";
+        if (scoring != "sigmoid")
+        {
+            throw new ModelConfigException($"Inkling 2 router scoring '{scoring}' is not judged (sigmoid is)");
+        }
+        if (Num(text, "n_shared_experts") is > 0)
+        {
+            throw new ModelConfigException("Inkling 2 with shared experts is not judged by this build");
+        }
+        foreach (var (key, served) in new[] { ("q_bias", false), ("o_bias", false), ("use_value_norm_no_gamma", true),
+                     ("attn_res_normalize_values", true), ("use_gate_bias", true) })
+        {
+            if (text.TryGetProperty(key, out var v) && v.ValueKind is JsonValueKind.True or JsonValueKind.False && v.GetBoolean() != served)
+            {
+                throw new ModelConfigException($"Inkling 2 with {key} = {v.GetBoolean()} is not judged by this build");
+            }
+        }
+
+        int vocab = Int(text, "vocab_size");
+        return new Inkling2Surface
+        {
+            FullLayers = full,
+            FullHeads = Int(text, "num_attention_heads"),
+            FullKvHeads = Int(text, "num_key_value_heads"),
+            FullHeadDim = Int(text, "head_dim"),
+            SlidingHeads = (int)(Num(text, "swa_num_attention_heads") ?? Int(text, "num_attention_heads")),
+            SlidingKvHeads = (int)(Num(text, "swa_num_key_value_heads") ?? Int(text, "num_key_value_heads")),
+            SlidingHeadDim = (int)(Num(text, "swa_head_dim") ?? Int(text, "head_dim")),
+            SlidingWindow = Int(text, "sliding_window_size"),
+            RelativeDim = Int(text, "d_rel"),
+            RelativeExtent = Int(text, "rel_extent"),
+            LogScalingFloor = Int(text, "log_scaling_n_floor"),
+            LogScalingAlpha = Num(text, "log_scaling_alpha") ?? throw Missing("log_scaling_alpha"),
+            QkClip = Num(text, "qk_l2_clip_threshold") ?? throw Missing("qk_l2_clip_threshold"),
+            RelativeClip = Num(text, "rel_l2_clip_threshold") ?? throw Missing("rel_l2_clip_threshold"),
+            ConvKernel = (int)(Num(text, "conv_kernel_size") ?? Num(text, "sconv_kernel_size") ?? throw Missing("conv_kernel_size")),
+            BlockSize = block,
+            Experts = Int(text, "n_routed_experts"),
+            TopK = Int(text, "num_experts_per_tok"),
+            ExpertWidth = (int)(Num(text, "moe_intermediate_size") ?? Num(text, "intermediate_size") ?? throw Missing("moe_intermediate_size")),
+            RouteScale = Num(text, "route_scale") ?? throw Missing("route_scale"),
+            GateSoftcap = Num(text, "mlp_gate_softcap") ?? throw Missing("mlp_gate_softcap"),
+            UpSoftcap = Num(text, "mlp_up_softcap") ?? throw Missing("mlp_up_softcap"),
+            FinalSoftcap = Num(text, "final_logit_softcapping") ?? throw Missing("final_logit_softcapping"),
+            LoopStart = loopStart,
+            LoopEnd = loopEnd,
+            LoopPasses = passes,
+            GateRank = rank,
+            Eps = Num(text, "rms_norm_eps") ?? throw Missing("rms_norm_eps"),
+            PaddedVocab = vocab,
+            UnpaddedVocab = (int)(Num(text, "unpadded_vocab_size") ?? vocab),
+        };
+    }
+
+    internal static int Hidden(string configPath)
+    {
+        using var doc = JsonDocument.Parse(File.ReadAllBytes(configPath));
+        var root = doc.RootElement;
+        var text = root.TryGetProperty("text_config", out var nested) && nested.ValueKind == JsonValueKind.Object ? nested : root;
+        return Int(text, "hidden_size");
+    }
+
+    internal static long Context(string configPath)
+    {
+        using var doc = JsonDocument.Parse(File.ReadAllBytes(configPath));
+        var root = doc.RootElement;
+        var text = root.TryGetProperty("text_config", out var nested) && nested.ValueKind == JsonValueKind.Object ? nested : root;
+        return (long)(Num(text, "max_position_embeddings") ?? Num(text, "model_max_length") ?? 0);
+    }
+
+    private static ModelConfigException Missing(string key) => new($"Inkling 2 config is missing '{key}'");
+
+    private static int Int(JsonElement e, string key) =>
+        e.TryGetProperty(key, out var v) && v.ValueKind == JsonValueKind.Number ? v.GetInt32() : throw Missing(key);
+
+    private static double? Num(JsonElement e, string key) =>
+        e.TryGetProperty(key, out var v) && v.ValueKind == JsonValueKind.Number ? v.GetDouble() : null;
+
+    private static string? Str(JsonElement e, string key) =>
+        e.TryGetProperty(key, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
+}
+
+public static partial class ArchMapper
+{
+    /// <summary>Inkling 2 looped: four objects under the checkpoint's own
+    /// <c>model.llm.</c> names, so export writes them back as they were. The
+    /// residual's queries (<c>attn_res.*</c>, <c>middle_cycle_cross_pass_*</c>)
+    /// travel with the final norm: they are the stack's mixing, not a layer's.</summary>
+    public static ContainerSpec MapInkling2(string modelId, string configPath, HfInventory inventory, EncodeOptions options)
+    {
+        var facts = Inkling2.ReadFacts(configPath);
+        int hidden = Inkling2.Hidden(configPath);
+        const string p = Inkling2.Prefix;
+
+        // The drafter ships in its own file (mtp.safetensors, unprefixed names
+        // such as fuse_weight and layers.N.*) that the index does not list: it
+        // is not the model's, and is never encoded. The vision tower is in the
+        // model's own file and is refused unless left out with --no-vision.
+        var own = OwnTensorNames(inventory.Root);
+        bool SideFile(string n) => own is not null && !own.Contains(n);
+        var unmodelled = inventory.TensorNames
+            .Where(n => !SideFile(n) &&
+                        !n.StartsWith(p, StringComparison.Ordinal) &&
+                        !(n.StartsWith("model.visual.", StringComparison.Ordinal) && !options.IncludeVision) &&
+                        !(n.StartsWith("mtp.", StringComparison.Ordinal) && !options.IncludeMtp))
+            .ToList();
+        if (unmodelled.Count > 0)
+        {
+            throw new ModelConfigException(
+                $"Inkling 2 checkpoint carries {unmodelled.Count} tensor(s) this build does not model " +
+                $"(the vision tower and the drafter are not served yet: encode with --no-vision): " +
+                string.Join(", ", unmodelled.Take(4)) + (unmodelled.Count > 4 ? ", …" : string.Empty));
+        }
+        for (int l = 0; l < facts.FullLayers.Count; l++)
+        {
+            CheckExperts(inventory, $"{p}layers.{l}.mlp.experts.w13_weight", facts.Experts, 2L * facts.ExpertWidth, hidden);
+            CheckExperts(inventory, $"{p}layers.{l}.mlp.experts.w2_weight", facts.Experts, hidden, facts.ExpertWidth);
+        }
+
+        string encoding = EncodingFor(inventory, p + "embed.weight")
+            ?? throw new ModelConfigException($"Inkling 2 checkpoint has no '{p}embed.weight'");
+
+        var embedding = new List<NamedTensorData>();
+        var mixing = new List<NamedTensorData>();
+        var head = new List<NamedTensorData>();
+        foreach (string name in inventory.TensorNames.Where(n => n.StartsWith(p, StringComparison.Ordinal)))
+        {
+            string rel = name[p.Length..];
+            if (rel.StartsWith("layers.", StringComparison.Ordinal))
+            {
+                continue;
+            }
+            var list = rel is "embed.weight" or "embed_norm.weight" ? embedding
+                : rel.StartsWith("unembed.", StringComparison.Ordinal) ? head
+                : mixing;
+            list.Add(ToTensorData(inventory, name, list == head ? rel["unembed.".Length..] : rel));
+        }
+        var stack = BindUnder(inventory, p + "layers.");
+        if (head.Count == 0)
+        {
+            throw new ModelConfigException($"Inkling 2 checkpoint has no '{p}unembed.weight'");
+        }
+
+        long Shape0(string name) => inventory.Get(p + name).Shape[0];
+        if (Shape0("embed.weight") != facts.PaddedVocab || Shape0("unembed.weight") != facts.PaddedVocab)
+        {
+            throw new ModelConfigException($"Inkling 2 embedding or head rows differ from vocab_size {facts.PaddedVocab}");
+        }
+        int numLayers = facts.FullLayers.Count;
+        for (int l = 0; l < numLayers; l++)
+        {
+            bool fullLayer = facts.FullLayers[l];
+            int heads = fullLayer ? facts.FullHeads : facts.SlidingHeads;
+            int headDim = fullLayer ? facts.FullHeadDim : facts.SlidingHeadDim;
+            if (inventory.Get($"{p}layers.{l}.attn.wq_du.weight").Shape[0] != heads * headDim)
+            {
+                throw new ModelConfigException($"layer {l}: wq_du rows are not {heads} heads of {headDim}");
+            }
+            bool dynamic = inventory.TryGet($"{p}layers.{l}.attn.k_sconv.static_w", out _);
+            if (dynamic != fullLayer)
+            {
+                throw new ModelConfigException($"layer {l}: the key convolution is {(dynamic ? "dynamic" : "static")} on a {(fullLayer ? "full" : "sliding")} layer");
+            }
+            bool loop = l >= facts.LoopStart && l < facts.LoopEnd;
+            if (inventory.TryGet($"{p}layers.{l}.controllers.attn.down_weight", out _) != loop)
+            {
+                throw new ModelConfigException($"layer {l}: message gates {(loop ? "missing in" : "outside")} the loop");
+            }
+        }
+
+        var policies = facts.FullLayers.Select(fullLayer => new AttentionLayerPolicy
+        {
+            Operator = LayerOperators.Softmax,
+            Span = fullLayer ? AttentionSpan.Full : AttentionSpan.Sliding,
+            Window = fullLayer ? null : facts.SlidingWindow,
+            DeclaredSpan = fullLayer ? "full, relative bias over rel_extent" : "sliding window, relative bias over it",
+            Position = PositionPolicy.None,
+            Geometry = new HeadGeometry
+            {
+                HeadDim = fullLayer ? facts.FullHeadDim : facts.SlidingHeadDim,
+                NumKvHeads = fullLayer ? facts.FullKvHeads : facts.SlidingKvHeads,
+            },
+        }).ToList();
+
+        var norm = new NormSpec { Kind = NormType.RmsNorm, Eps = facts.Eps, WeightOffset = 0f };
+        var surface = new ExecutionSurface
+        {
+            ContextLength = Inkling2.Context(configPath) is > 0 and var context ? context : null,
+            Attention = new AttentionSurface
+            {
+                NumQHeads = facts.FullHeads,
+                NumKvHeads = facts.FullKvHeads,
+                HeadDim = facts.FullHeadDim,
+                ScoreScale = 1.0 / Math.Sqrt(facts.FullHeadDim),
+                AttentionBias = false,
+            },
+            Ffn = new FfnSurface
+            {
+                IntermediateSize = facts.ExpertWidth,
+                Activation = Activation.Silu,
+                FfnType = FfnType.Gated,
+            },
+            Norm = new NormSurface { Pre = norm, Post = norm, FinalNorm = norm, Placement = NormPlacement.PreOnly },
+            Head = new HeadSurface
+            {
+                VocabSize = facts.PaddedVocab,
+                HeadReusesEmbedding = false,
+                FinalLogitSoftcapping = (float)facts.FinalSoftcap,
+            },
+            Inkling2 = facts,
+        };
+
+        LogicalObject Obj(string id, ObjectKind kind, string prefix) => new()
+        {
+            Id = id,
+            Component = "target",
+            Kind = kind,
+            SourceBindings = new List<SourceBinding> { new() { Artifact = "model.safetensors", TensorPrefix = prefix, Tensors = 0, Bytes = 0 } },
+            Representations = new List<Representation> { new() { Encoding = encoding, Fidelity = Fidelity.Canonical } },
+        };
+        var objects = new List<LogicalObject>
+        {
+            Obj("target.embedding", ObjectKind.Embedding, "model.llm"),
+            Obj("target.decoder_stack", ObjectKind.DecoderStack, "model.llm.layers"),
+            Obj("target.final_norm", ObjectKind.FinalNorm, "model.llm"),
+            Obj("target.output_head", ObjectKind.OutputHead, "model.llm.unembed"),
+        };
+        var reps = new List<RepresentationSpec>
+        {
+            Rep("target.embedding", encoding, embedding),
+            Rep("target.decoder_stack", encoding, stack),
+            Rep("target.final_norm", encoding, mixing),
+            Rep("target.output_head", encoding, head),
+        };
+
+        var graph = new SystemGraph
+        {
+            Schema = SystemGraph.CurrentSchema,
+            Components = new List<Component>
+            {
+                new()
+                {
+                    Id = "target",
+                    Role = ComponentRole.PrimaryText,
+                    SourceArtifact = "model.safetensors",
+                    NumLayers = numLayers,
+                    HiddenSize = hidden,
+                    Attention = policies,
+                    Execution = surface,
+                },
+            },
+            Objects = objects,
+            Edges = new List<HiddenStateEdge>(),
+        };
+        return new ContainerSpec
+        {
+            Model = modelId,
+            Family = "inkling2_loop",
+            HiddenSize = hidden,
+            NumLayers = numLayers,
+            SystemGraph = graph,
+            Representations = reps,
+        };
+    }
+
+    /// <summary>The tensors <c>model.safetensors.index.json</c> says are the
+    /// model's, or null when there is no index (every shard is then the model's).</summary>
+    private static HashSet<string>? OwnTensorNames(string modelDir)
+    {
+        string index = Path.Combine(modelDir, "model.safetensors.index.json");
+        if (!File.Exists(index))
+        {
+            return null;
+        }
+        using var doc = JsonDocument.Parse(File.ReadAllBytes(index));
+        return doc.RootElement.TryGetProperty("weight_map", out var map) && map.ValueKind == JsonValueKind.Object
+            ? map.EnumerateObject().Select(e => e.Name).ToHashSet(StringComparer.Ordinal)
+            : null;
+    }
+
+    /// <summary>
+    /// An expert stack, <c>[experts, rows, cols]</c>, in one of the three forms
+    /// Inkling 2 checkpoints use, each kept as stored:
+    /// <list type="bullet">
+    ///   <item>plain (F32, BF16, F16);</item>
+    ///   <item>NVFP4: <c>U8 [E, rows, cols/2]</c> (bound as FP4 at the logical
+    ///   shape), an E4M3 <c>_scale [E, rows, cols/16]</c>, and the per-expert
+    ///   factor <c>_amax [E] / _outer_scale_denominator [1]</c>;</item>
+    ///   <item>MXFP8: E4M3 <c>[E, rows, cols]</c> and a U8 E8M0
+    ///   <c>_scale [E, rows, cols/32]</c>, with no amax.</item>
+    /// </list>
+    /// The factor is one per expert, shared by every pass of the loop: the
+    /// checkpoint has no per-pass scales.
+    /// </summary>
+    private static void CheckExperts(HfInventory inventory, string name, long experts, long rows, long cols)
+    {
+        if (!inventory.TryGet(name, out var info))
+        {
+            throw new ModelConfigException($"Inkling 2 checkpoint has no '{name}'");
+        }
+        string Shape(TensorInfo t) => $"{t.Dtype.Label()} [{string.Join(", ", t.Shape)}]";
+        bool Is(TensorInfo t, params long[] shape) => t.Shape.SequenceEqual(shape);
+        bool hasScale = inventory.TryGet(name + "_scale", out var scale);
+        bool hasAmax = inventory.TryGet(name + "_amax", out var amax);
+        bool hasDenominator = inventory.TryGet(name + "_outer_scale_denominator", out var denominator);
+        switch (info.Dtype)
+        {
+            case Dtype.F32 or Dtype.BF16 or Dtype.F16 when Is(info, experts, rows, cols) && !hasScale && !hasAmax:
+                return;
+            case Dtype.U8 when Is(info, experts, rows, cols / 2) && cols % 16 == 0:
+                if (!hasScale || scale.Dtype != Dtype.F8_E4M3 || !Is(scale, experts, rows, cols / 16))
+                {
+                    throw new ModelConfigException(
+                        $"'{name}' is NVFP4 but its '_scale' is {(hasScale ? Shape(scale) : "missing")}, not F8_E4M3 [{experts}, {rows}, {cols / 16}]");
+                }
+                if (!hasAmax || amax.Dtype != Dtype.F32 || !Is(amax, experts) ||
+                    !hasDenominator || denominator.Dtype != Dtype.F32 || denominator.ElementCount != 1)
+                {
+                    throw new ModelConfigException(
+                        $"'{name}' is NVFP4 but its per-expert factor is not F32 '_amax' [{experts}] over one F32 '_outer_scale_denominator'");
+                }
+                return;
+            case Dtype.F8_E4M3 when Is(info, experts, rows, cols) && cols % 32 == 0:
+                if (!hasScale || scale.Dtype is not (Dtype.U8 or Dtype.F8_E8M0) || !Is(scale, experts, rows, cols / 32))
+                {
+                    throw new ModelConfigException(
+                        $"'{name}' is MXFP8 but its '_scale' is {(hasScale ? Shape(scale) : "missing")}, not U8 [{experts}, {rows}, {cols / 32}]");
+                }
+                if (hasAmax || hasDenominator)
+                {
+                    throw new ModelConfigException($"'{name}' is MXFP8 but carries an NVFP4 amax or denominator");
+                }
+                return;
+            default:
+                throw new ModelConfigException(
+                    $"'{name}' is {Shape(info)}: not an expert stack of [{experts}, {rows}, {cols}] in F32/BF16/F16, NVFP4 or MXFP8");
+        }
+    }
+}

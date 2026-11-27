@@ -7,7 +7,7 @@ using Amql.Server;
 using System.Globalization;
 using System.Text.Json;
 
-var containers = new List<(string Id, string Path, List<string> Adapters, ModelDefaults Defaults, string? Format, string? KvDir, Amql.Vindex3.ContextExtension? Context)>();
+var containers = new List<(string Id, string Path, List<string>? Adapters, ModelDefaults Defaults, string? Format, string? KvDir, Amql.Vindex3.ContextExtension? Context)>();
 string? maxContext = null, ropeExtend = null;
 int thinkingBudget = 0;
 var adapterSpecs = new List<(string? Id, string[] Dirs)>();
@@ -38,13 +38,13 @@ for (int i = 0; i < args.Length; i++)
             int eq = spec.IndexOf('=');
             string path = eq > 0 ? spec[(eq + 1)..] : spec;
             string id = eq > 0 ? spec[..eq] : Path.GetFileName(Path.GetFullPath(path).TrimEnd('/', '\\'));
-            containers.Add((id, path, new List<string>(), new ModelDefaults(), null, null, null));
+            containers.Add((id, path, null, new ModelDefaults(), null, null, null));
             break;
         }
         case "--config":
             try
             {
-                containers.AddRange(ServerConfig.Read(Next()).Select(m => (m.Id, m.Path, m.Adapters.ToList(), m.Defaults, m.Format, m.KvDir, m.Context)));
+                containers.AddRange(ServerConfig.Read(Next()).Select(m => (m.Id, m.Path, m.Adapters?.ToList(), m.Defaults, m.Format, m.KvDir, m.Context)));
             }
             catch (Exception e) when (e is JsonException or InvalidDataException or IOException)
             {
@@ -326,7 +326,8 @@ foreach (var (id, given, own, defaults, format, kvDir, context) in containers)
         _ => given,
     };
     Console.WriteLine($"loading {id} from {path} …");
-    var adapters = own.Concat(adapterSpecs.Where(a => a.Id is null || a.Id == id).SelectMany(a => a.Dirs)).ToList();
+    // A model given no adapters runs the ones its container carries; "adapters": [] runs none.
+    var adapters = (own ?? Amql.Entail.ShippedAdapters.List(path).ToList()).Concat(adapterSpecs.Where(a => a.Id is null || a.Id == id).SelectMany(a => a.Dirs)).ToList();
     var host = ModelHost.Load(id, path, adapters, defaults, kvDir, context);
     if (warm)
     {

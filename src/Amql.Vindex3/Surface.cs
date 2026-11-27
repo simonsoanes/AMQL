@@ -508,6 +508,67 @@ public sealed class NgramEmbeddingSurface
 /// objects a component owns — a decoder stack implies attention + ffn +
 /// norm; an embedding/head implies a head surface.
 /// </summary>
+/// <summary>
+/// Inkling 2 (<c>inkling2_loop</c>): every fact its runtime reads, as the
+/// config states it. Layers <see cref="LoopStart"/> to <see cref="LoopEnd"/>
+/// run <see cref="LoopPasses"/> times; every pass after the first restarts
+/// from the layers before the loop and is gated on messages from the pass
+/// before it, with its own keys, values and convolution states.
+/// </summary>
+public sealed class Inkling2Surface
+{
+    /// <summary>Per layer: true for full attention (<c>hybrid</c>), false for a
+    /// sliding window (<c>hybrid_sliding</c>).</summary>
+    public required IReadOnlyList<bool> FullLayers { get; init; }
+
+    public required int FullHeads { get; init; }
+    public required int FullKvHeads { get; init; }
+    public required int FullHeadDim { get; init; }
+    public required int SlidingHeads { get; init; }
+    public required int SlidingKvHeads { get; init; }
+    public required int SlidingHeadDim { get; init; }
+    public required int SlidingWindow { get; init; }
+
+    /// <summary>Width per head of the states that mix the relative bias profiles.</summary>
+    public required int RelativeDim { get; init; }
+
+    /// <summary>How far back the full layers' relative bias reaches; a sliding
+    /// layer's reaches its window.</summary>
+    public required int RelativeExtent { get; init; }
+
+    /// <summary>Full layers scale queries and relative states by
+    /// <c>1 + alpha·ln(max(1, (pos+1)/floor))</c>.</summary>
+    public required int LogScalingFloor { get; init; }
+    public required double LogScalingAlpha { get; init; }
+
+    public required double QkClip { get; init; }
+    public required double RelativeClip { get; init; }
+    public required int ConvKernel { get; init; }
+
+    /// <summary>Layers per block of the attention residuals.</summary>
+    public required int BlockSize { get; init; }
+
+    public required int Experts { get; init; }
+    public required int TopK { get; init; }
+    public required int ExpertWidth { get; init; }
+    public required double RouteScale { get; init; }
+    public required double GateSoftcap { get; init; }
+    public required double UpSoftcap { get; init; }
+    public required double FinalSoftcap { get; init; }
+
+    public required int LoopStart { get; init; }
+    public required int LoopEnd { get; init; }
+    public required int LoopPasses { get; init; }
+    public required int GateRank { get; init; }
+
+    public required double Eps { get; init; }
+
+    /// <summary>Rows of the embedding and head; logits past
+    /// <see cref="UnpaddedVocab"/> are padding.</summary>
+    public required int PaddedVocab { get; init; }
+    public required int UnpaddedVocab { get; init; }
+}
+
 public sealed class ExecutionSurface
 {
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
@@ -578,6 +639,12 @@ public sealed class ExecutionSurface
     /// <summary>Qwen4's hashed n-gram embedding on selected layers.</summary>
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public NgramEmbeddingSurface? NgramEmbedding { get; init; }
+
+    /// <summary>Inkling 2's looped stack: present means the component runs on
+    /// its own runtime (block attention residuals, short convolutions, a
+    /// relative bias instead of rotary, and a core run several times).</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public Inkling2Surface? Inkling2 { get; init; }
 
     /// <summary>Which stack tensor plays which role, judged on import (see
     /// <see cref="TensorRoles"/>). Absent on containers written before roles

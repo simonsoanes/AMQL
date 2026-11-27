@@ -1,6 +1,4 @@
-# AMQL — AI Model Manipulation Tool
-
-VIndex3 Model Container & Graph Database with transformation and R&D tools
+# AMQL — Ariadne Model Quality Lab - AI Model Manipulation Tool
 
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![.NET 11.0](https://img.shields.io/badge/.NET-11.0-purple.svg)](https://dotnet.microsoft.com/download/dotnet)
@@ -11,14 +9,18 @@ container, then probe token relationships, trace causal pathways, edit weights, 
 LoRA adapters, merge models, prune layers, and export back to a standard checkpoint.
 Built in C# against .NET 11.0 with an optional CUDA backend and a WPF desktop GUI.
 
+This project also includes the AMQL inference runtime, which is a high performance generic
+runtime able to support various models.
+
 Credit for the VIndex3 design: [Chris Hay](https://github.com/chrishayuk).
 
 ## What is this for?
 
-AMQL is the model-introspection engine behind a continuous-cognition platform. It exposes
-the internal structure of a language model as a **graph** so you can query how tokens
-relate, find the edges that carry one concept into another, and then **edit those edges**
-— by patching weights, generating a LoRA adapter, or rewriting the base model.
+AMQL is the model-introspection engine and inference service behind a continuous-cognition
+platform. It exposes the internal structure of a language model as a **graph** so you can
+query how tokens relate, find the edges that carry one concept into another, and 
+then **edit those edges** — by patching weights, generating a LoRA adapter, or rewriting 
+the base model.
 
 At the token level you can remove false associations or add new ones in a familiar form
 (e.g. "PlaceA is the capital of PlaceB"). At the next layer of abstraction you can adjust
@@ -28,8 +30,17 @@ incorrect tool selection, biases introduced during post-training.
 Blending models via consensus-gated token alignment adds solution-space vectors from one
 model into another. Combined with automated self-learning, this extends a model's
 understanding beyond what fine-tuning alone can achieve — because fine-tuning is inherently
-gated at human-level textual representations. Generating genuinely novel solution vectors
-is a separate challenge, but AMQL lets you apply them once they exist.
+gated at human-level textual representations.
+
+This tool also makes it possible to **compile and graft AI programs**, which are 
+deterministic solutions written in a language called Entail.  This avoids the need 
+for training for specialised subjects and solutions and also avoids inherent problems with
+traditional training mechanisms.
+
+For example, it's possible to write an Entail program and graft it into a model to support 
+an **8MB context length** for specific tasks, with no post-training overhead, or to add
+support for calculator quality maths support.  We provide a set of pre-created scripts 
+that can be grafted to any model to add various capabilities.
 
 ## Quick Start
 
