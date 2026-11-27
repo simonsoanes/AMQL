@@ -1050,6 +1050,243 @@ __global__ void k_attn_merge(const float* __restrict__ part, const float* __rest
     }
 }
 
+// ── a prompt chunk's attention on the tensor cores ───────────────────────────
+//
+// FlashAttention-2 over FP16 tiles: a block takes one head, 64 queries of the
+// chunk (16 a warp) and one key split; every key tile (64 keys) is decoded from
+// the slot's format into shared memory once and serves all 64 queries. Q·Kᵀ and
+// P·V are mma.m16n8k16 with f32 sums; the online softmax is f32. The scale,
+// the relative bias (r · P[:, dist], from the table k_relbias makes) and the
+// causal and window masks are applied to the scores; the output is the split
+// partials k_attn_merge takes, which adds the sink and the output gate.
+
+static const int kTQ = 64, kTK = 64;
+
+// rb[z][h][dist] = r[z][h] · P[:, dist] for dist < extent.
+__global__ void k_relbias(const float* __restrict__ r, const float* __restrict__ relProj, float* __restrict__ rb,
+                          int heads, int dRel, int extent)
+{
+    int z = blockIdx.x, h = blockIdx.y;
+    const float* rr = r + ((long long)z * heads + h) * dRel;
+    float* o = rb + ((long long)z * heads + h) * extent;
+    for (int dist = threadIdx.x; dist < extent; dist += blockDim.x)
+    {
+        float b = 0.f;
+        for (int j = 0; j < dRel; j++) b += rr[j] * relProj[j * extent + dist];
+        o[dist] = b;
+    }
+}
+
+// Eight channels (ch0 .. ch0 + 7, one head's) of a key or value row as f32.
+__device__ __forceinline__ void kv_load8(const void* p, const unsigned char* sc, const float* g, int format,
+                                         long long row, int C, int hd, int ch0, float* o)
+{
+    long long idx = row * C + ch0;
+    if (format == KV_F32)
+    {
+        float4 a = *(const float4*)((const float*)p + idx), b = *(const float4*)((const float*)p + idx + 4);
+        o[0] = a.x; o[1] = a.y; o[2] = a.z; o[3] = a.w; o[4] = b.x; o[5] = b.y; o[6] = b.z; o[7] = b.w;
+        return;
+    }
+    if (format == KV_F16)
+    {
+        uint4 u = *(const uint4*)((const __half*)p + idx);
+        unsigned int w[4] = { u.x, u.y, u.z, u.w };
+        #pragma unroll
+        for (int j = 0; j < 4; j++)
+        {
+            float2 f = __half22float2(*reinterpret_cast<const __half2*>(&w[j]));
+            o[2 * j] = f.x; o[2 * j + 1] = f.y;
+        }
+        return;
+    }
+    unsigned int w = *(const unsigned int*)((const unsigned char*)p + (idx >> 1));
+    float scale = e4m3(sc[idx >> 4]) * g[row * (C / hd) + ch0 / hd];
+    #pragma unroll
+    for (int j = 0; j < 4; j++)
+    {
+        float2 v = e2m1x2(w >> (8 * j));
+        o[2 * j] = v.x * scale; o[2 * j + 1] = v.y * scale;
+    }
+}
+
+__device__ __forceinline__ unsigned int half2_bits(float lo, float hi)
+{
+    __half2 h = __floats2half2_rn(lo, hi);
+    return *reinterpret_cast<unsigned int*>(&h);
+}
+
+__device__ __forceinline__ void mma16816(float* c, const unsigned int* a, unsigned int b0, unsigned int b1)
+{
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+struct TileArgs
+{
+    const float* q; const float* rb;
+    KvView kv;
+    float* part;               // [T x heads x splits x (hd + 2)], as k_attn writes
+    int heads, kvHeads, extent, window, splits, T;
+    float scale;
+};
+
+// Grid (heads, splits, query tiles), 128 threads.
+template <int HD>
+__global__ void __launch_bounds__(128) k_attn_tiles(TileArgs a, const int* __restrict__ pos)
+{
+    constexpr int KS = HD + 8, VS = kTK + 8;    // padded strides (halves): conflict-free fragment reads
+    __shared__ __align__(16) __half sk[kTK * KS];   // keys [key][channel]
+    __shared__ __align__(16) __half sv[HD * VS];    // values transposed [channel][key]
+    const int h = blockIdx.x, split = blockIdx.y, tile = blockIdx.z;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tig = lane & 3;
+    const int p0 = *pos, C = a.kvHeads * HD, kvh = h / (a.heads / a.kvHeads);
+    const int zq0 = tile * kTQ, zLast = min(a.T, zq0 + kTQ) - 1;
+    const int tFirst = p0 + zq0, tLast = p0 + zLast;
+    const int lo = a.window ? max(0, tFirst + 1 - a.window) : 0;
+    const int chunk = (tLast + 1 - lo + a.splits - 1) / a.splits;
+    const int klo = lo + split * chunk, khi = min(tLast + 1, klo + chunk);
+
+    // This thread's two query rows: g and g + 8 of the warp's sixteen.
+    const int zr[2] = { zq0 + warp * 16 + g, zq0 + warp * 16 + g + 8 };
+    const bool live[2] = { zr[0] < a.T, zr[1] < a.T };
+    const int tq[2] = { p0 + zr[0], p0 + zr[1] };
+    const int wlo[2] = { a.window ? tq[0] + 1 - a.window : 0, a.window ? tq[1] + 1 - a.window : 0 };
+    const float* rb[2] = { a.rb + ((long long)(live[0] ? zr[0] : 0) * a.heads + h) * a.extent,
+                           a.rb + ((long long)(live[1] ? zr[1] : 0) * a.heads + h) * a.extent };
+
+    unsigned int qf[HD / 16][4];
+    {
+        const float* q0 = a.q + ((long long)(live[0] ? zr[0] : 0) * a.heads + h) * HD;
+        const float* q1 = a.q + ((long long)(live[1] ? zr[1] : 0) * a.heads + h) * HD;
+        #pragma unroll
+        for (int kk = 0; kk < HD / 16; kk++)
+        {
+            int c = kk * 16 + tig * 2;
+            qf[kk][0] = live[0] ? half2_bits(q0[c], q0[c + 1]) : 0u;
+            qf[kk][1] = live[1] ? half2_bits(q1[c], q1[c + 1]) : 0u;
+            qf[kk][2] = live[0] ? half2_bits(q0[c + 8], q0[c + 9]) : 0u;
+            qf[kk][3] = live[1] ? half2_bits(q1[c + 8], q1[c + 9]) : 0u;
+        }
+    }
+    float o[HD / 8][4];
+    #pragma unroll
+    for (int nb = 0; nb < HD / 8; nb++) o[nb][0] = o[nb][1] = o[nb][2] = o[nb][3] = 0.f;
+    float m[2] = { -INFINITY, -INFINITY }, l[2] = { 0.f, 0.f };
+    const KvView& kv = a.kv;
+
+    for (int k0 = klo; k0 < khi; k0 += kTK)
+    {
+        __syncthreads();
+        for (int it = threadIdx.x; it < kTK * HD / 8; it += blockDim.x)
+        {
+            int kr = it / (HD / 8), d0 = (it % (HD / 8)) * 8, p = k0 + kr;
+            float kx[8], vx[8];
+            if (p < khi)
+            {
+                long long row = kv.ring ? p % kv.cap : p;
+                kv_load8(kv.k, kv.ks, kv.kg, kv.format, row, C, HD, kvh * HD + d0, kx);
+                kv_load8(kv.v, kv.vs, kv.vg, kv.format, row, C, HD, kvh * HD + d0, vx);
+            }
+            else
+            {
+                #pragma unroll
+                for (int j = 0; j < 8; j++) kx[j] = vx[j] = 0.f;
+            }
+            *reinterpret_cast<uint4*>(&sk[kr * KS + d0]) =
+                make_uint4(half2_bits(kx[0], kx[1]), half2_bits(kx[2], kx[3]), half2_bits(kx[4], kx[5]), half2_bits(kx[6], kx[7]));
+            #pragma unroll
+            for (int j = 0; j < 8; j++) sv[(d0 + j) * VS + kr] = __float2half_rn(vx[j]);
+        }
+        __syncthreads();
+
+        float sc[kTK / 8][4];
+        #pragma unroll
+        for (int nb = 0; nb < kTK / 8; nb++)
+        {
+            sc[nb][0] = sc[nb][1] = sc[nb][2] = sc[nb][3] = 0.f;
+            #pragma unroll
+            for (int kk = 0; kk < HD / 16; kk++)
+            {
+                const __half* kp = &sk[(nb * 8 + g) * KS + kk * 16 + tig * 2];
+                mma16816(sc[nb], qf[kk], *reinterpret_cast<const unsigned int*>(kp), *reinterpret_cast<const unsigned int*>(kp + 8));
+            }
+        }
+        float mx[2] = { -INFINITY, -INFINITY };
+        #pragma unroll
+        for (int nb = 0; nb < kTK / 8; nb++)
+        {
+            #pragma unroll
+            for (int e = 0; e < 4; e++)
+            {
+                int rr = e >> 1, p = k0 + nb * 8 + tig * 2 + (e & 1), dist = tq[rr] - p;
+                bool ok = live[rr] && p < khi && dist >= 0 && p >= wlo[rr];
+                float x = sc[nb][e] * a.scale;
+                if (ok && dist < a.extent) x += rb[rr][dist];
+                sc[nb][e] = ok ? x : -INFINITY;
+                mx[rr] = fmaxf(mx[rr], sc[nb][e]);
+            }
+        }
+        float corr[2];
+        #pragma unroll
+        for (int rr = 0; rr < 2; rr++)
+        {
+            mx[rr] = fmaxf(mx[rr], __shfl_xor_sync(0xffffffffu, mx[rr], 1));
+            mx[rr] = fmaxf(mx[rr], __shfl_xor_sync(0xffffffffu, mx[rr], 2));
+            float mn = fmaxf(m[rr], mx[rr]);
+            corr[rr] = mn == -INFINITY ? 1.f : expf(m[rr] - mn);
+            m[rr] = mn;
+            l[rr] *= corr[rr];
+        }
+        #pragma unroll
+        for (int nb = 0; nb < kTK / 8; nb++)
+        {
+            #pragma unroll
+            for (int e = 0; e < 4; e++)
+            {
+                int rr = e >> 1;
+                float pe = sc[nb][e] == -INFINITY ? 0.f : expf(sc[nb][e] - m[rr]);
+                sc[nb][e] = pe;
+                l[rr] += pe;
+            }
+        }
+        #pragma unroll
+        for (int nb = 0; nb < HD / 8; nb++)
+        {
+            o[nb][0] *= corr[0]; o[nb][1] *= corr[0];
+            o[nb][2] *= corr[1]; o[nb][3] *= corr[1];
+        }
+        #pragma unroll
+        for (int j = 0; j < kTK / 16; j++)
+        {
+            unsigned int pa[4] = { half2_bits(sc[2 * j][0], sc[2 * j][1]), half2_bits(sc[2 * j][2], sc[2 * j][3]),
+                                   half2_bits(sc[2 * j + 1][0], sc[2 * j + 1][1]), half2_bits(sc[2 * j + 1][2], sc[2 * j + 1][3]) };
+            #pragma unroll
+            for (int nb = 0; nb < HD / 8; nb++)
+            {
+                const __half* vp = &sv[(nb * 8 + g) * VS + j * 16 + tig * 2];
+                mma16816(o[nb], pa, *reinterpret_cast<const unsigned int*>(vp), *reinterpret_cast<const unsigned int*>(vp + 8));
+            }
+        }
+    }
+    #pragma unroll
+    for (int rr = 0; rr < 2; rr++)
+    {
+        l[rr] += __shfl_xor_sync(0xffffffffu, l[rr], 1);
+        l[rr] += __shfl_xor_sync(0xffffffffu, l[rr], 2);
+        if (!live[rr]) continue;
+        float* out = a.part + (((long long)zr[rr] * a.heads + h) * a.splits + split) * (HD + 2);
+        if (tig == 0) { out[0] = m[rr]; out[1] = l[rr]; }
+        #pragma unroll
+        for (int nb = 0; nb < HD / 8; nb++)
+        {
+            out[2 + nb * 8 + tig * 2] = o[nb][2 * rr];
+            out[2 + nb * 8 + tig * 2 + 1] = o[nb][2 * rr + 1];
+        }
+    }
+}
+
 // A depthwise causal short convolution (Inkling2LoopShortConvolution) over
 // this slot's history, (conv + x) / sqrt(K + 1), plus `add` when given.
 __global__ void k_shortconv(const float* __restrict__ x, const float* __restrict__ w, float* __restrict__ hist,
@@ -1191,6 +1428,7 @@ struct Ctx
     cudaStream_t stream = nullptr;   // the engine's
     Engine* eng = nullptr;
     int err = 0;                     // the first engine call of a chunk that failed
+    int exactPrefill = 0;            // 1: prompts at f32 (the engine's SGEMMs, the f32 experts and attention here)
 };
 
 struct Slot
@@ -1211,6 +1449,7 @@ struct Seq
     float *rlogits, *q, *k, *v, *r, *sinks, *gate, *kdyn, *vdyn, *attn, *part, *mixed, *msg, *cat, *gvec, *xq, *xk, *xv,
           *nq, *nk, *nv, *res, *mlpIn, *mlpGated, *normed, *act, *epart, *ffn, *logits, *wt, *tmp;
     float* every = nullptr;                      // kChunk x vocab, made when a prompt's every position is asked for
+    float* rb = nullptr;                         // a chunk's relative bias [kChunk x heads x extent], for k_attn_tiles
     int *idx, *offsets, *order;
     int *gorder = nullptr, *ggroups = nullptr;   // the engine's grouping: [3 x (pairs + experts)] each
     std::vector<void*> owned;
@@ -1444,7 +1683,35 @@ static float* run_layer(Ctx* x, Seq* s, int l, Slot& slot, float* h, std::vector
     aa.window = L.full ? 0 : c.window;
     aa.splits = T == 1 ? splits_for(slot) : std::min(splits_for(slot), kRowSplits);
     aa.scale = 1.f / sqrtf((float)hd);
-    k_attn<<<dim3(heads, aa.splits, T), 128, 0, x->stream>>>(aa, s->dPos);
+    // AMQL_INK_TILED=0 keeps a chunk's attention on the per-query kernel (to compare, or as a way out).
+    static int tiledOn = -1;
+    if (tiledOn < 0) { const char* v = getenv("AMQL_INK_TILED"); tiledOn = v && v[0] == '0' ? 0 : 1; }
+    bool tiled = tiledOn && T > 1 && !x->exactPrefill && (hd == 16 || hd == 32 || hd == 64 || hd == 128) && heads <= 64;
+    if (tiled)
+    {
+        // A chunk on the tensor cores: splits enough to fill the device, a few hundred keys each at least.
+        int keys = L.full ? s->pos + T : std::min(s->pos + T, c.window + kTQ);
+        int sp = std::max(1, std::min(aa.splits, keys / 512));
+        if (L.extent > 0)
+            k_relbias<<<dim3(T, heads), 256, 0, x->stream>>>(s->r, L.v[V_RELPROJ], s->rb, heads, c.relDim, L.extent);
+        TileArgs ta = {};
+        ta.q = s->q; ta.rb = s->rb; ta.kv = view_of(slot.kv); ta.part = s->part;
+        ta.heads = heads; ta.kvHeads = kvh; ta.extent = L.extent; ta.window = aa.window; ta.splits = sp; ta.T = T;
+        ta.scale = aa.scale;
+        dim3 grid(heads, sp, (T + kTQ - 1) / kTQ);
+        switch (hd)
+        {
+            case 16: k_attn_tiles<16><<<grid, 128, 0, x->stream>>>(ta, s->dPos); break;
+            case 32: k_attn_tiles<32><<<grid, 128, 0, x->stream>>>(ta, s->dPos); break;
+            case 64: k_attn_tiles<64><<<grid, 128, 0, x->stream>>>(ta, s->dPos); break;
+            default: k_attn_tiles<128><<<grid, 128, 0, x->stream>>>(ta, s->dPos); break;
+        }
+        aa.splits = sp;
+    }
+    else
+    {
+        k_attn<<<dim3(heads, aa.splits, T), 128, 0, x->stream>>>(aa, s->dPos);
+    }
     k_attn_merge<<<dim3(heads, T), 128, 0, x->stream>>>(s->part, s->sinks, s->gate, s->tmp, aa.splits, hd);
     proj(x, T, { { L.m[M_WO], s->tmp, s->attn } });
 
@@ -1740,6 +2007,11 @@ INK_EXPORT int ink_seq_create(void* ctx, int capacity, int format, void** out)
     if ((rc = alloc_f(s, &s->order, R * c.topK))) return fail(rc);
     if ((rc = alloc_f(s, &s->offsets, c.experts + 1))) return fail(rc);
     if ((rc = alloc_f(s, &s->gorder, 3 * (R * c.topK + c.experts)))) return fail(rc);
+    {
+        size_t most = 1;
+        for (const Layer& L : x->layers) most = std::max(most, (size_t)L.heads * (size_t)std::max(L.extent, 1));
+        if ((rc = alloc_f(s, &s->rb, R * most))) return fail(rc);
+    }
     if ((rc = alloc_f(s, &s->ggroups, 3 * (R * c.topK + c.experts)))) return fail(rc);
     if ((rc = alloc_f(s, &s->dToks, R + 1))) return fail(rc);
     s->dPos = s->dToks + R;
@@ -1959,10 +2231,12 @@ INK_EXPORT const char* ink_error_string(int code)
     return code < 0 && code > -1000 ? cudaGetErrorString((cudaError_t)(-code)) : "amql_inkling error";
 }
 
-/// Prompts at f32 (1): projections as f32 SGEMMs and the experts as the f32
-/// kernels here, which keeps a chunk within 1e-3 of the managed runtime.
-/// 0 (the default): the engine's BF16 tensor cores.
+/// Prompts at f32 (1): projections as f32 SGEMMs, and the experts and the
+/// attention as the f32 kernels here, which keeps a chunk within 1e-3 of the
+/// managed runtime. 0 (the default): tensor cores, the engine's BF16 GEMMs and
+/// the FP16 tiled attention (k_attn_tiles).
 INK_EXPORT int ink_set_prefill_f32(void* ctx, int f32)
 {
+    ((Ctx*)ctx)->exactPrefill = f32 ? 1 : 0;
     return amqe_set_prefill_f32(((Ctx*)ctx)->eng, f32);
 }

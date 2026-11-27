@@ -167,9 +167,9 @@ asked for; their sizes as measured are in the GPU section. Remaining work for
   sliding ones), about 384 KiB per token. It is a reference, not a server.
 - With 17.6 GiB of weights on a 32 GB card, 1M fits only with NVFP4 rows
   (about 10 GiB). FP16 rows reach about 256K.
-- A prompt's attention is per query over its keys (split-key, CUDA cores), so
-  very long prompts are attention-bound. A tiled tensor-core attention is the
-  next step there.
+- The managed runtime's prompt attention is per query over its keys. The
+  GPU path's runs on tensor cores in tiles (see below), so prompt speed stays
+  nearly flat to 64K tokens there.
 
 ## GPU path
 
@@ -218,10 +218,23 @@ prompts run (`amqe_linear`, `amqe_moe_experts_paired`). The kernels mirror
   scale per head and row). The format is `GpuEngine.RequestedKvFormat`
   (`AMQL_KV_FORMAT`, `--kv-format`). Full slots grow by doubling, keeping
   their rows, and the step graph is captured again.
-- **Attention** is split-key flash decoding with the model's extras: the sink
-  logit in the softmax's denominator, the relative bias `r · P[:, dist]`
-  within 1,024 of the newest key, the full layers' log scaling on q and r, the
-  q and k L2 clips, the value RMS, and the sigmoid output gate.
+- **Attention** has the model's extras: the sink logit in the softmax's
+  denominator, the relative bias `r · P[:, dist]` within 1,024 of the newest
+  key, the full layers' log scaling on q and r, the q and k L2 clips, the
+  value RMS, and the sigmoid output gate. The clips and scaling are applied to
+  q, r, k and v before the attention, and the sink and gate where the key
+  splits are merged, so the attention itself is masked softmax attention with
+  a bias near the diagonal.
+  - **A step** is split-key flash decoding.
+  - **A prompt chunk** is FlashAttention-2 on the tensor cores
+    (`k_attn_tiles`). A block takes one head, 64 of the chunk's queries and one
+    key split. Each tile of 64 keys is decoded once from the slot's format
+    (f32, fp16 or NVFP4) into FP16 in shared memory and serves all 64 queries.
+    Q·Kᵀ and P·V are `mma.m16n8k16` with f32 sums, and the softmax is f32.
+    The relative bias for the chunk is computed first, as a table of query,
+    head and distance, and added to the scores within its extent.
+  - **The old kernel:** `ExactPrefill` keeps a chunk on the f32 per-query
+    kernel, and so does `AMQL_INK_TILED=0`.
 
 **Served.** `ModelHost` sends an Inkling 2 container to
 `DecodeSession.ForInkling2`: the GPU path when a device and the library are
@@ -263,23 +276,39 @@ Measured on the RTX 5090 (32 GB) on 2026-11-27 with nothing else running:
     is also why the top-5 set agrees at only 375 of the 614 positions.
 - **Speed**, with a prompt fed in chunks and then 128 greedy steps after it:
 
-  | KV rows | prompt tokens | prompt tok/s | before (f32 kernels) | decode tok/s after it |
-  |---|---|---|---|---|
-  | f32 | 512 | 1,834 | 630 | 100 |
-  | fp16 | 4,096 | 1,468 | 580 | 93 |
-  | f32 | 4,096 | 1,442 | 575 | 97 |
-  | nvfp4 | 4,096 | 1,206 | 522 | 92 |
-  | fp16 | 16,384 | 1,226 | 536 | 93 |
-  | nvfp4 | 16,384 | 702 | 400 | 82 |
-  | fp16 | 65,536 | 686 | 397 | 82 |
-  | nvfp4 | 65,536 | 263 | 208 | 55 |
+  | KV rows | prompt tokens | prompt tok/s | per-query attention | all f32 kernels | decode tok/s after it |
+  |---|---|---|---|---|---|
+  | f32 | 512 | 1,992 | 1,844 | 630 | 100 |
+  | fp16 | 4,096 | 2,002 | 1,390 | 580 | 98 |
+  | nvfp4 | 4,096 | 1,955 | 1,214 | 522 | 93 |
+  | fp16 | 16,384 | 1,985 | 1,157 | 536 | 95 |
+  | nvfp4 | 16,384 | 1,928 | 710 | 400 | 84 |
+  | fp16 | 65,536 | 1,839 | 654 | 397 | 83 |
+  | nvfp4 | 65,536 | 1,787 | 265 | 208 | 56 |
 
-  "Before" is the same run with the projections and experts on Inkling's own
-  f32 kernels. The first prompt of a run is slower, because cuBLAS picks its
-  algorithms on it: 728 tok/s at 512 tokens with fp16 rows, then 1,730 with
-  nvfp4. Long prompts are now bound by the attention, which is still per
-  query on CUDA cores, and most of all with NVFP4 rows, whose keys are decoded
-  per query.
+  The columns:
+  - **Prompt tok/s:** the default, tensor-core projections, experts and
+    attention.
+  - **Per-query attention:** the same run with `AMQL_INK_TILED=0`.
+  - **All f32 kernels:** projections, experts and attention all on Inkling's
+    own f32 kernels.
+
+  Repeated runs vary by about 8%. The first prompt of a run is slower, at
+  about 800 tok/s for 512 tokens, because cuBLAS picks its algorithms on it.
+  The decode speed after a prompt is the same with either attention, since a
+  step does not use the tiled kernel.
+- **The tiled attention is as close to f32 as the per-query one.** On a
+  2,048-token prompt (four key splits in the full layers, the sliding windows
+  wrapped), BF16 prompts compared with f32 prompts:
+
+  | KV rows | attention | same top token | KL median | KL p99 | KL max |
+  |---|---|---|---|---|---|
+  | fp16 | per query | 2,045 / 2,048 | 1.1e-5 | 0.015 | 0.14 |
+  | fp16 | tiled | 2,043 / 2,048 | 1.2e-5 | 0.014 | 0.15 |
+  | nvfp4 | per query | 2,046 / 2,048 | 2.0e-5 | 0.011 | 0.17 |
+  | nvfp4 | tiled | 2,046 / 2,048 | 2.0e-5 | 0.012 | 0.24 |
+
+  The tail comes from the BF16 projections and experts, not the attention.
 
   `amql-cli generate` on a 5-token prompt decodes at 110 tok/s. Decode reads
   about 5.4 GB a token: 2.6 GB of attention projections over 48 visits,
@@ -306,8 +335,6 @@ Measured on the RTX 5090 (32 GB) on 2026-11-27 with nothing else running:
 Not done yet:
 
 - Batching several requests in one step.
-- A tiled tensor-core attention for prompts. A prompt row's attention is
-  still per query over its keys, on CUDA cores.
 - Decode: fewer, fused kernels per visit (norms into the mixes, the gates'
   three steps into one).
 - W4A4 prefill, which `hf_quant_config.json` describes (`required_activation_quantization`).
