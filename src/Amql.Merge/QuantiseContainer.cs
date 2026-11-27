@@ -51,6 +51,22 @@ public sealed record QuantiseOptions(Fp4Format Format)
     /// when the rounding is).</summary>
     public bool Embedding { get; init; }
 
+    /// <summary>Projections whose names match stay at the source's precision, for
+    /// weights whose rounding costs more than their bytes save (attention at long
+    /// context, say). The engine stacks a layer's q, k and v, and stacks them at
+    /// 4 bits only when all three are: keep them together.</summary>
+    public System.Text.RegularExpressions.Regex? Keep { get; init; }
+
+    /// <summary>A quantised container of the same source: a projection it already
+    /// holds at 4 bits is copied from it rather than rounded again, so trying
+    /// another <see cref="Keep"/> takes minutes, not a calibration.</summary>
+    public string? Reuse { get; init; }
+
+    /// <summary>Tensors kept as they are whose names match a pattern are multiplied by
+    /// its factor: an edit with no training, such as sharpening a layer's attention
+    /// through its query norm.</summary>
+    public IReadOnlyList<(System.Text.RegularExpressions.Regex Pattern, float Factor)> Scale { get; init; } = [];
+
     /// <summary>At most this many calibration tokens.</summary>
     public int CalibrationTokens { get; init; } = 32768;
 
@@ -120,7 +136,7 @@ public static class QuantiseContainer
         {
             throw new MergeException($"quantise output '{outDir}' already exists and is not empty");
         }
-        if (options.Rounding == Fp4Rounding.Gptq && options.CalibrateWith is null && TooLargeForTheGpu(containerDir, out long stackBytes))
+        if (options.Rounding == Fp4Rounding.Gptq && options.CalibrateWith is null && options.Reuse is null && TooLargeForTheGpu(containerDir, out long stackBytes))
         {
             // The whole model has to be on the GPU to read the calibration text: a
             // nearest-rounded copy of it, made for that and then deleted.
@@ -145,7 +161,9 @@ public static class QuantiseContainer
         }
         using var container = Vindex3Container.Open(containerDir);
         var projections = Projections(container);
-        using var calibrator = options.Rounding == Fp4Rounding.Nearest ? null : new Calibrator(container, options);
+        var normOffsets = options.Scale.Count > 0 ? NormOffsets(container) : [];
+        using var reuse = options.Reuse is null ? null : Vindex3Container.Open(options.Reuse);
+        using var calibrator = options.Rounding == Fp4Rounding.Nearest || reuse is not null ? null : new Calibrator(container, options);
         Directory.CreateDirectory(outDir);
         foreach (var file in Directory.EnumerateFiles(container.Root))
         {
@@ -169,12 +187,35 @@ public static class QuantiseContainer
                 continue;
             }
             using var segment = SegmentFile.Open(from);
+            using var reused = reuse is not null && reuse.Index.Representations.TryGetValue(repId, out var other)
+                ? SegmentFile.Open(Path.Combine(reuse.Root, other.Segment)) : null;
             var tensors = new List<NamedTensorData>();
             foreach (var t in segment.Header.Tensors)
             {
                 var dtype = DtypeExtensions.FromLabel(t.Dtype);
                 before += t.Len;
-                if (Quantisable(entry.Object, t, dtype, segment, projections, out var reads))
+                bool keep = options.Keep?.IsMatch(t.Name) == true;
+                if (!keep && reuse is not null && Quantisable(entry.Object, t, dtype, segment, projections, out _))
+                {
+                    if (reused is null || !reused.Contains(t.Name + "_scale"))
+                    {
+                        throw new MergeException($"'{t.Name}' is not quantised in '{options.Reuse}'");
+                    }
+                    foreach (var part in new[] { t.Name, t.Name + "_scale", t.Name + "_scale_2" }.Where(reused.Contains))
+                    {
+                        var rt = reused.GetTensor(part);
+                        var seg = reused;
+                        tensors.Add(new NamedTensorData
+                        {
+                            Name = part, Dtype = DtypeExtensions.FromLabel(rt.Dtype), Shape = rt.Shape,
+                            Source = (offset, count) => seg.ReadBytes(part, offset, count), SourceLength = rt.Len,
+                        });
+                        after += rt.Len;
+                    }
+                    quantised++;
+                    continue;
+                }
+                if (!keep && Quantisable(entry.Object, t, dtype, segment, projections, out var reads))
                 {
                     int rows = checked((int)t.Shape[0]), cols = checked((int)t.Shape[1]);
                     // Quantised as the segment is written, one weight at a time: the whole
@@ -193,6 +234,16 @@ public static class QuantiseContainer
                 }
                 var name = t.Name;
                 long length = t.Len;
+                if (options.Scale.FirstOrDefault(s => s.Pattern.IsMatch(name)) is { Pattern: not null } rule)
+                {
+                    // A norm read as x·(offset + w) is scaled as a whole: the stored w becomes
+                    // factor·(offset + w) − offset, so the factor multiplies what the norm applies.
+                    float shift = entry.Object == "target.decoder_stack" && normOffsets.TryGetValue(name, out var o) ? o : 0f;
+                    tensors.Add(Scaled(t, dtype, segment.ReadBytes(name), rule.Factor, shift));
+                    after += length;
+                    kept++;
+                    continue;
+                }
                 tensors.Add(new NamedTensorData
                 {
                     Name = t.Name,
@@ -233,6 +284,23 @@ public static class QuantiseContainer
             ["objects"] = new JsonArray(objects.Select(o => (JsonNode?)o).ToArray()),
             ["quantised_tensors"] = quantised,
         };
+        if (options.Keep is not null)
+        {
+            q["kept"] = options.Keep.ToString();
+        }
+        if (options.Scale.Count > 0)
+        {
+            q["scaled"] = new JsonArray(options.Scale.Select(s => (JsonNode)$"{s.Pattern}={s.Factor.ToString(System.Globalization.CultureInfo.InvariantCulture)}").ToArray());
+        }
+        if (reuse is not null && JsonNode.Parse(File.ReadAllText(Path.Combine(reuse.Root, "index.json")))?["quantisation"] is JsonObject was)
+        {
+            // The 4-bit tensors are the reused container's: so is how they were rounded.
+            foreach (var key in new[] { "format", "rounding", "calibration_tokens", "damp", "calibrated_with", "searched_experts" })
+            {
+                q[key] = was[key]?.DeepClone();
+            }
+            q["reused"] = Path.GetFileName(Path.TrimEndingDirectorySeparator(Path.GetFullPath(options.Reuse!)));
+        }
         if (calibrator is not null && options.Rounding == Fp4Rounding.Gptq)
         {
             q["calibration_tokens"] = calibrator.Tokens;
@@ -252,12 +320,81 @@ public static class QuantiseContainer
         return new QuantiseReport(outDir, format, quantised, kept, before, after, notes);
     }
 
+    /// <summary>A float tensor whose effective value, <paramref name="offset"/> + w, is
+    /// multiplied by <paramref name="factor"/>, written back in its own dtype.</summary>
+    internal static NamedTensorData Scaled(SegmentTensor t, Dtype dtype, byte[] bytes, float factor, float offset = 0f)
+    {
+        var values = BitPattern.WidenToF32(dtype, bytes);
+        var data = new byte[bytes.Length];
+        for (int i = 0; i < values.Length; i++)
+        {
+            float v = factor * (offset + values[i]) - offset;
+            switch (dtype)
+            {
+                case Dtype.BF16: BitConverter.TryWriteBytes(data.AsSpan(2 * i), BitPattern.EncodeBf16(v)); break;
+                case Dtype.F16: BitConverter.TryWriteBytes(data.AsSpan(2 * i), BitPattern.EncodeF16(v)); break;
+                case Dtype.F32: BitConverter.TryWriteBytes(data.AsSpan(4 * i), v); break;
+                default: throw new MergeException($"'{t.Name}' is {dtype}: only float tensors can be scaled");
+            }
+        }
+        return new NamedTensorData { Name = t.Name, Dtype = dtype, Shape = t.Shape, Data = data };
+    }
+
     private static bool TooLargeForTheGpu(string containerDir, out long stackBytes)
     {
         using var container = Vindex3Container.Open(containerDir);
         stackBytes = container.Index.Representations.Values.Where(r => Objects.Contains(r.Object)).Sum(r => r.PayloadBytes);
         // Room is needed beside the weights for the Grams and the scratch.
         return CudaShim.TryMemoryInfo(out _, out long total) && stackBytes > total * 0.75;
+    }
+
+    /// <summary>Every norm weight of the stack the plan applies, by tensor name, with the
+    /// offset it is read with: 0 for x·w, 1 for x·(1 + w).</summary>
+    private static Dictionary<string, float> NormOffsets(Vindex3Container container)
+    {
+        using var store = container.CreateOperandStore();
+        var plan = Planner.Plan(container, "target", store);
+        var found = new Dictionary<string, float>(StringComparer.Ordinal);
+        var seen = new HashSet<object>(ReferenceEqualityComparer.Instance);
+        void Walk(object? node, int depth)
+        {
+            if (node is null || depth > 12 || node is string || node.GetType().IsPrimitive || node.GetType().IsEnum || !seen.Add(node))
+            {
+                return;
+            }
+            if (node is NormOp n)
+            {
+                if (n.Weight.ObjectId == "target.decoder_stack")
+                {
+                    found[n.Weight.TensorName] = n.WeightOffset;
+                }
+                return;
+            }
+            if (node is System.Collections.IEnumerable items)
+            {
+                foreach (var item in items)
+                {
+                    Walk(item, depth + 1);
+                }
+                return;
+            }
+            if (node.GetType().Namespace?.StartsWith("Amql", StringComparison.Ordinal) != true)
+            {
+                return;
+            }
+            foreach (var p in node.GetType().GetProperties(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance))
+            {
+                if (p.GetIndexParameters().Length == 0)
+                {
+                    Walk(p.GetValue(node), depth + 1);
+                }
+            }
+        }
+        foreach (var layer in plan.Layers)
+        {
+            Walk(layer, 0);
+        }
+        return found;
     }
 
     /// <summary>What a projection reads: its layer and which of the layer's

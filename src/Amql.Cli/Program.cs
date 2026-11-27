@@ -2045,6 +2045,9 @@ internal static partial class Program
             CalibrationTokens = IntOption(args, "--calibration-tokens", 32768),
             SequenceTokens = IntOption(args, "--sequence-tokens", 1024),
             Damp = DoubleOption(args, "--damp", 0.01),
+            Keep = OptionValue(args, "--keep") is { } keep ? new System.Text.RegularExpressions.Regex(keep) : null,
+            Reuse = OptionValue(args, "--reuse"),
+            Scale = ScaleRules(args),
             Log = line => Console.WriteLine($"            {line}"),
         };
         var report = Amql.Merge.QuantiseContainer.Transform(containerDir, outDir, options);
@@ -2069,6 +2072,26 @@ internal static partial class Program
         Amql.Merge.QuantCompare.Run(dirs[0], dirs.Skip(1).ToList(), text, IntOption(args, "--tokens", 4096), Console.WriteLine,
             IntOption(args, "--score-from", 0));
         return 0;
+    }
+
+    /// <summary>Every '--scale &lt;regex&gt;=&lt;factor&gt;'.</summary>
+    private static List<(System.Text.RegularExpressions.Regex, float)> ScaleRules(string[] args)
+    {
+        var rules = new List<(System.Text.RegularExpressions.Regex, float)>();
+        for (int i = 0; i + 1 < args.Length; i++)
+        {
+            if (args[i] != "--scale")
+            {
+                continue;
+            }
+            int eq = args[i + 1].LastIndexOf('=');
+            if (eq <= 0 || !float.TryParse(args[i + 1][(eq + 1)..], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float factor))
+            {
+                throw new CliException($"--scale needs <regex>=<factor>, not '{args[i + 1]}'");
+            }
+            rules.Add((new System.Text.RegularExpressions.Regex(args[i + 1][..eq]), factor));
+        }
+        return rules;
     }
 
     /// <summary>A file's text, or every file's under a folder, joined.</summary>
@@ -3324,6 +3347,12 @@ internal static partial class Program
             GPU (lossy). The default, fp16, keeps them exact.
             quantise rounds with GPTQ by default, calibrated on a
             built-in text unless --calibration names your own.
+            quantise --keep <regex> leaves the projections that match at
+            full precision, --scale <regex>=<factor> multiplies the tensors
+            that match (an edit with no training; a norm read as x·(1 + w)
+            has 1 + w multiplied), and --reuse <container>
+            copies the 4-bit weights of an earlier run instead of rounding
+            again (docs/long-context-editing.md).
             Prefill products with NVFP4 weights run on the FP4 tensor
             cores, quantising the activations to NVFP4 as well (W4A4,
             what NVFP4 checkpoints are trained for); decode keeps FP32

@@ -149,6 +149,8 @@ internal static partial class Program
             float[]? idle = null;
             double decodeSeconds = 0;
             var misses = new JsonArray();
+            var codeNlls = new List<double>();
+            var answers = new JsonArray();
             foreach (var needle in picks)
             {
                 engine.Rewind(seq);
@@ -169,6 +171,11 @@ internal static partial class Program
                 decodeSeconds += sw.Elapsed.TotalSeconds;
                 decoded += answer.Count;
                 string said = tokenizer.DecodeText(answer.ToArray());
+                // The right code's log-loss, read in place of the reply: finer than right or wrong.
+                engine.Rewind(seq);
+                double codeNll = CodeNll(engine, seq, question, tokenizer.EncodeToIds(needle.Code).ToArray());
+                codeNlls.Add(codeNll);
+                answers.Add(new JsonObject { ["name"] = needle.Name, ["at"] = needle.At, ["code_nll"] = codeNll, ["right"] = said.Contains(needle.Code, StringComparison.Ordinal) });
                 string? saidFocused = null;
                 if (focus > 0)
                 {
@@ -280,7 +287,9 @@ internal static partial class Program
                 ["repeat_nll"] = new JsonArray(repeats.Select(r => (JsonNode)r).ToArray()),
                 ["read_seconds"] = readSeconds, ["read_tokens"] = target - before,
                 ["decode_tokens_per_second"] = decodeSeconds > 0 ? decoded / decodeSeconds : null,
+                ["code_nll"] = codeNlls.Count > 0 ? codeNlls.Average() : null,
                 ["misses"] = misses,
+                ["answers"] = answers,
             };
             if (focus > 0)
             {
@@ -294,6 +303,11 @@ internal static partial class Program
             Console.WriteLine(plain
                 ? string.Create(CultureInfo.InvariantCulture, $"{target,8} {Math.Exp(nll),7:F3}   {repeat,8:F4}   {string.Join(' ', repeats.Select(r => r.ToString("F3", CultureInfo.InvariantCulture)))} {readSeconds,8:F1} {(target - before) / Math.Max(readSeconds, 1e-9),8:F0}")
                 : string.Create(CultureInfo.InvariantCulture, $"{target,8} {right,4}/{picks.Count,-3} {string.Join(' ', quarters.Select((q, i) => $"{q}/{quarterOf[i]}")),-24} {repeat,8:F4}  ({string.Join(' ', byQuarter.Select(r => r.ToString("F3", CultureInfo.InvariantCulture)))}) {readSeconds,10:F1} {(target - before) / Math.Max(readSeconds, 1e-9),8:F0} {decoded / Math.Max(decodeSeconds, 1e-9),8:F1}"));
+            if (codeNlls.Count > 0)
+            {
+                Console.WriteLine(string.Create(CultureInfo.InvariantCulture,
+                    $"         right code's log-loss: mean {codeNlls.Average():F3} nats, median {codeNlls.Order().ElementAt(codeNlls.Count / 2):F3} (0 is certain)"));
+            }
             if (focus > 0)
             {
                 Console.WriteLine($"         focused on {focus} passages: {rightFocused}/{picks.Count} right read again in place, {rightFresh}/{picks.Count} in a fresh conversation; the fact's passage was among them {foundAbove}/{picks.Count} ({foundRaw} without taking off idle attention)");
@@ -310,6 +324,37 @@ internal static partial class Program
         }
         engine.Release(seq);
         return ExitOk;
+    }
+
+    /// <summary>The log-loss (nats, summed) of <paramref name="code"/> as the reply to
+    /// <paramref name="question"/>, read on from where the sequence stands.</summary>
+    private static double CodeNll(GpuEngine engine, GpuSequence seq, int[] question, int[] code)
+    {
+        static double Nll(ReadOnlySpan<float> row, int id)
+        {
+            float max = float.NegativeInfinity;
+            foreach (float v in row)
+            {
+                max = Math.Max(max, v);
+            }
+            double z = 0;
+            foreach (float v in row)
+            {
+                z += Math.Exp(v - max);
+            }
+            return -(row[id] - max - Math.Log(z));
+        }
+        double sum = Nll(engine.Prefill(seq, question), code[0]);
+        if (code.Length > 1)
+        {
+            engine.Verify(seq, code.AsSpan(0, code.Length - 1));
+            for (int r = 0; r + 1 < code.Length; r++)
+            {
+                sum += Nll(engine.HostLogits(r), code[r + 1]);
+            }
+            engine.Accept(seq, code.Length - 1);
+        }
+        return sum;
     }
 
     /// <summary>Mean negative log-likelihood (nats a token) of a passage read on

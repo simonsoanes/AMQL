@@ -45,9 +45,11 @@ One RTX 5090, both NVFP4 (GPTQ), the same build, measured on 2026-11-25.
 | GPU memory at 256K, FP16 KV | 22.6 GB | 15.0 GB |
 | Hard reasoning suite, held-out seed | 80 of 80 without thinking (739 tokens a reply) | 75 of 80 with thinking closed at once, 80 at a 1,536-token budget, 60 with no limit |
 | Facts recalled among look-alikes at 28K, 127K, 258K | 12 of 14, 14 of 24, 5 of 24 | 14 of 14, 22 of 24, 17 of 24 |
+| The same with its global queries ×1.5 ([below](#long-contexts)) | 14 of 14, 37 of 48, 38 of 48 | |
 
 - The decode figures are without drafters, which both models have (see [below](#the-drafter)).
-- **Long contexts are Gemma's weak side.** It reads 256K and quotes from it, but tells one of 126
+- **Long contexts were Gemma's weak side**, and an edit with no training mends most of it
+  ([below](#long-contexts)). As shipped, it reads 256K and quotes from it, but tells one of 126
   facts of one form from another far worse than the 4B does (see
   [context-extension.md](context-extension.md) for the measure). The arithmetic was checked: 7,032
   tokens agree with transformers where the model writes its own turns, f32 prompts and FP16 or
@@ -58,6 +60,26 @@ One RTX 5090, both NVFP4 (GPTQ), the same build, measured on 2026-11-25.
   only the 5 full-attention layers grow with the context (see below).
 - Conversations reuse what they share: over a 203,949-token document through the server, the first
   question took 74 s and each one after it 1.0 s.
+
+## Long contexts
+
+Asked for one of 126 facts of one form, Gemma as shipped found the fact's passage with its attention
+(39 of 48 at 256K) far more often than it answered (14 of 48). Its global layers' attention is too
+flat over that many keys. Gemma 4 has no 1/√d in its attention, so its query norm sets how sharp a
+head is. Multiplying the query norms of the 5 global layers by 1.5 is an edit of 2,560 numbers:
+
+| Right of 14, 48, 48 | 28,672 | 126,976 | 258,048 |
+|---|---|---|---|
+| As shipped | 11 | 20 | 14 |
+| Global queries ×1.5 | 14 | 37 | 38 |
+
+The hard reasoning suite stays at 80 of 80 and the tool calls as they were. Keeping attention, the
+shared MLP or a third of the experts at BF16 did not help at long range. The search, the
+measurements, and how to run it on another model: [long-context-editing.md](long-context-editing.md).
+
+```bash
+amql-cli quantise containers/gemma-4-26b-a4b --out containers/gemma-4-26b-a4b-nvfp4-gptq-sharp --embedding --reuse containers/gemma-4-26b-a4b-nvfp4-gptq --scale '^(5|11|17|23|29)\.self_attn\.q_norm\.weight$=1.5'
+```
 
 ## What the 4 bits cost
 

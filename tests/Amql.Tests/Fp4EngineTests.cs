@@ -76,6 +76,59 @@ public class Fp4EngineTests : IDisposable
     }
 
     [Theory]
+    [InlineData("qwen3_5-gdn")] // q_norm read as x·(1 + w)
+    [InlineData("qwen3")] // q_norm read as x·w
+    public void Kept_Projections_Stay_Reused_Ones_Are_Copied_And_Scaled_Tensors_Are_Multiplied(string family)
+    {
+        using var dir = new TempDir();
+        string source = Encode(dir, family);
+        string first = Path.Combine(dir.Path, "q"), second = Path.Combine(dir.Path, "k");
+        QuantiseContainer.Transform(source, first, Nearest(Fp4Format.Nvfp4));
+        AttentionOp attention;
+        using (var c = Vindex3Container.Open(source))
+        using (var st = c.CreateOperandStore())
+        {
+            attention = Planner.Plan(c, "target", st).Layers.First(l => l.Attention is not null).Attention!;
+        }
+        string layer = attention.QProj.TensorName[..attention.QProj.TensorName.IndexOf('.')];
+        var report = QuantiseContainer.Transform(source, second, new QuantiseOptions(Fp4Format.Nvfp4)
+        {
+            Reuse = first,
+            Keep = new System.Text.RegularExpressions.Regex($@"^{layer}\.self_attn\.[qkv]_proj\."),
+            Scale = [(new System.Text.RegularExpressions.Regex($@"^{layer}\.self_attn\.q_norm\."), 2f)],
+        });
+        Assert.True(report.Quantised > 0);
+
+        using var original = Vindex3Container.Open(source);
+        using var originalStore = original.CreateOperandStore();
+        using var reused = Vindex3Container.Open(first);
+        using var reusedStore = reused.CreateOperandStore();
+        using var container = Vindex3Container.Open(second);
+        using var store = container.CreateOperandStore();
+        // The kept projection is the source's, the others the reused container's codes.
+        Assert.Null(store.ResolveScaled(attention.QProj));
+        Assert.Equal(originalStore.ResolveWidened(attention.QProj).Values, store.ResolveWidened(attention.QProj).Values);
+        Assert.NotNull(store.ResolveScaled(attention.OProj));
+        Assert.Equal(reusedStore.ResolveWidened(attention.OProj).Values, store.ResolveWidened(attention.OProj).Values);
+        // What the query norm applies, offset + w, is doubled, to BF16's rounding.
+        var norm = attention.QNorm!.Weight;
+        float offset = attention.QNorm.WeightOffset;
+        Assert.Equal(family == "qwen3" ? 0f : 1f, offset);
+        var was = originalStore.ResolveWidened(norm).Values;
+        var now = store.ResolveWidened(norm).Values;
+        Assert.Equal(was.Length, now.Length);
+        for (int i = 0; i < was.Length; i++)
+        {
+            float want = 2 * (offset + was[i]);
+            Assert.True(Math.Abs(offset + now[i] - want) <= 1e-2f * Math.Max(1f, Math.Abs(want)),
+                $"{family} q_norm[{i}]: {offset + now[i]} against {want}");
+        }
+        string index = File.ReadAllText(Path.Combine(second, "index.json"));
+        Assert.Contains("\"reused\"", index);
+        Assert.Contains("\"scaled\"", index);
+    }
+
+    [Theory]
     [InlineData("qwen3_5-gdn", Fp4Format.Nvfp4)]
     [InlineData("qwen3_5-gdn", Fp4Format.Mxfp4)]
     [InlineData("qwen3", Fp4Format.Nvfp4)]

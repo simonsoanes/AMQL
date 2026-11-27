@@ -17,6 +17,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   - Images (`attach --vision`, or encoded with the model): in chat, Responses and tool results, and `generate --image`. PNG and JPEG are read bit for bit as Pillow reads them, with no package added.
   - Tool calls in the server, written and read in the model's own notation and held to the request's tools.
   - All of it, with 256K tokens of context, in 18.4 GiB of GPU memory.
+- **long contexts:** Gemma 4 26B A4B's recall at 256K goes from 14 to 38 of 48 facts with no training: its 5 global layers' query norms ×1.5, found by a search that can be run on any model ([docs](docs/long-context-editing.md)). Its reasoning suite and tool calls are unchanged.
+  - `quantise --keep <regex>` leaves the projections that match at full precision, `--scale <regex>=<factor>` multiplies tensors (for a norm read as x·(1 + w), what it applies), and `--reuse <container>` copies the 4-bit weights of an earlier run, so each variant takes under a minute rather than a calibration.
+  - `context bench` scores the right code's log-loss for every question as well as the reply, to tell near misses from lost facts.
 - **chat templates:** AMQL runs a model's own chat template and learns from it how the model thinks, ends its turns and writes calls, so tools work for any family whose template marks its calls ([docs](docs/server.md#chat-templates)). Templates other than Qwen's, ChatML's, Llama 3's and Gemma 4's were refused before, and tools worked for two families.
   - A Jinja interpreter with no package added. On 23 models' templates, 966 conversations render exactly as transformers renders them.
   - Calls are learned in four forms: a JSON object, parameters one by one (Qwen 3.5, Nemotron, MiniCPM, GLM), a Python call (LFM 2.5), and an object with marked strings (Gemma 4). They are read, streamed and held to the request's tools in the model's own form.

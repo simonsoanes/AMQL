@@ -663,6 +663,12 @@ public static class CommandCatalog
             Opt("calibrationTokens", "--calibration-tokens", EditorKind.Int, "32768"),
             Opt("sequenceTokens", "--sequence-tokens", EditorKind.Int, "1024"),
             Opt("damp", "--damp", EditorKind.Float, "0.01", "GPTQ dampening, as a fraction of the mean diagonal."),
+            Opt("keep", "--keep regex", EditorKind.Text, "",
+                "Projections whose names match stay at full precision. Keep a layer's q, k and v together."),
+            Opt("reuse", "--reuse container", EditorKind.Directory, "",
+                "A quantised copy of the same model: its 4-bit weights are copied rather than rounded again, so trying another --keep or --scale takes minutes."),
+            Opt("scale", "--scale regex=factor", EditorKind.Text, "",
+                "Multiply the tensors that match, an edit with no training. A norm read as x·(1 + w) has 1 + w multiplied. Gemma 4 26B: '^(5|11|17|23|29)\\.self_attn\\.q_norm\\.weight$=1.5' sharpens its global attention for long contexts."),
         }),
         new("quantise compare", CatQuant, "Compare quantised copies against the original: KL, perplexity, agreement.", new[]
         {
