@@ -42,3 +42,7 @@ native/amql_cuda/probe/out/
 .qwen/
 ## Local exports (to-gguf / to-hf output)
 export/
+
+## Local research notes and AMQL project files
+.research/
+*.amqlproj
