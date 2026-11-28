@@ -22,17 +22,23 @@ namespace Amql.Inference;
 /// runs in chunks of <see cref="DepthChunk"/> tokens.
 /// </para>
 /// <para>
-/// What the path keeps fused: projections that share an input in one launch,
-/// the q, k and v message gates' steps batched, the norm after a depth mix in the
-/// mix's kernel, the router's top k in one warp, a step's experts on the
-/// engine's decode kernels and a chunk's grouped on its tensor cores. It runs one
-/// sequence at a time (no batching, marks or drafts).
+/// What the path keeps fused: a layer's attention projections in one launch,
+/// the q, k and v message gates batched, the norm after a depth mix in the mix's
+/// kernel, a step's input norms in its GEMVs, the output projection's conv in
+/// its epilogue, the attention's merge in its last split block, the routing in
+/// the experts' first kernel and their weighted sum in the conv after them; a
+/// step's experts on lane-group kernels and a chunk's grouped on the tensor
+/// cores. A step brings the next matrices into L2 while its small kernels run.
+/// It runs one sequence at a time (no batching, marks or drafts).
 /// </para>
 /// </summary>
 public sealed partial class GpuEngine
 {
-    /// <summary>Tokens a prompt chunk holds on the visit path.</summary>
-    public const int DepthChunk = 256;
+    /// <summary>Tokens a prompt chunk holds on the visit path: 512, or
+    /// <c>AMQL_DEPTH_CHUNK</c> (a multiple of 64 up to 1024). A larger chunk
+    /// decodes each chosen expert once for more tokens, for more scratch and ring rows.</summary>
+    public static readonly int DepthChunk =
+        int.TryParse(Environment.GetEnvironmentVariable("AMQL_DEPTH_CHUNK"), out var c) && c is >= 64 and <= 1024 && c % 64 == 0 ? c : 512;
 
     // Key splits a prompt row's attention takes at most (a decode step takes more).
     private const int DepthRowSplits = 8;
@@ -49,6 +55,11 @@ public sealed partial class GpuEngine
     /// <summary>False runs each visit-path step's launches directly instead of
     /// replaying its captured graph (<c>AMQL_GPU_GRAPHS=0</c>).</summary>
     public bool UseGraphs { get; set; } = Environment.GetEnvironmentVariable("AMQL_GPU_GRAPHS")?.Trim() is not "0";
+
+    /// <summary>False leaves a step's next matrices to their GEMVs instead of
+    /// bringing them into L2 while the small kernels before them run
+    /// (<c>AMQL_GPU_PREFETCH=0</c>).</summary>
+    public bool PrefetchWeights { get; set; } = Environment.GetEnvironmentVariable("AMQL_GPU_PREFETCH")?.Trim() is not "0";
 
     private static readonly bool TiledAttention = Environment.GetEnvironmentVariable("AMQL_TILED_ATTENTION")?.Trim() is not "0";
 
@@ -97,6 +108,7 @@ public sealed partial class GpuEngine
         public string[]? GateSites;
         public DepthMat[] Down = [], Forget = [], Gain = [];
         public IntPtr GateQueries;
+        public float[] GateQueryRows = [];
         public float GateEps, GateMixEps;
         public int GateRank;
         // The attention's geometry and conditioning.
@@ -149,8 +161,15 @@ public sealed partial class GpuEngine
         // Scratch, DepthChunk rows each.
         public IntPtr[] H = [];
         public IntPtr Tokens, Q, Gate, Tmp, K, V, R, Sinks, RouterLogits, KDyn, VDyn, Mixed, Msg, Cat, GateVec,
-            Attn, Xq, Xk, Xv, Nq, Nk, Nv, Res, FfnIn, FfnGated, Normed, Ffn, Act, ExpertPart, Logits, Wt, Rb, Every;
+            Attn, Xq, Xk, Xv, Nq, Nk, Nv, Res, FfnIn, FfnGated, Normed, Act, ExpertPart, Logits, Wt, Rb, Every;
         public IntPtr Idx, Order, Offsets, GroupOrder, Groups;
+        public IntPtr SplitCounts;  // [DepthChunk x heads] ints, zero between launches
+        // A step's message mixes for a whole pass of the loop in one launch: every
+        // loop layer's gate queries (they share the pass's bank), each layer's first row.
+        public IntPtr LoopQueries, LoopMessages;
+        public int LoopQueryCount;
+        public float LoopMixEps;
+        public int[] LoopQueryRow = [];
         public IntPtr HostTokens, HostLogits;
         public int MaxHeads, MaxExtentHeads;
     }
@@ -435,6 +454,7 @@ public sealed partial class GpuEngine
                 weights.Vector(g.Query, rows * d).AsSpan(g.QueryRow * d, d).CopyTo(queries.AsSpan(i * d, d));
             }
             L.GateQueries = UploadFloats(queries);
+            L.GateQueryRows = queries;
             L.GateEps = (float)gates[0].Eps;
             L.GateMixEps = (float)gates[0].MixEps;
             L.GateRank = gates[0].Rank;
@@ -489,6 +509,24 @@ public sealed partial class GpuEngine
             vd.OutputQuery = Vector(weights, block.OutputQuery.Queries, d);
             vd.OutputMixEps = (float)block.OutputQuery.Eps;
         }
+        if (plan.DepthLoop is { } loop)
+        {
+            var gated = Enumerable.Range(loop.Start, loop.End - loop.Start).Where(l => layers[l].GateSites is not null).ToArray();
+            if (gated.Length > 0 && gated.Select(l => layers[l].GateMixEps).Distinct().Count() == 1)
+            {
+                vd.LoopQueryRow = Enumerable.Repeat(-1, layers.Length).ToArray();
+                var rows = new List<float>();
+                foreach (int l in gated)
+                {
+                    vd.LoopQueryRow[l] = rows.Count / d;
+                    rows.AddRange(layers[l].GateQueryRows);
+                }
+                vd.LoopQueryCount = rows.Count / d;
+                vd.LoopQueries = UploadFloats(rows.ToArray());
+                vd.LoopMessages = Alloc((long)rows.Count * 4);
+                vd.LoopMixEps = layers[gated[0]].GateMixEps;
+            }
+        }
 
         long R = DepthChunk;
         int maxQ = layers.Max(l => l.Heads * l.HeadDim), maxC = layers.Max(l => l.KvHeads * l.HeadDim);
@@ -526,7 +564,6 @@ public sealed partial class GpuEngine
         vd.FfnIn = Alloc(R * d * 4);
         vd.FfnGated = Alloc(R * d * 4);
         vd.Normed = Alloc(R * d * 4);
-        vd.Ffn = Alloc(R * d * 4);
         vd.Act = Alloc(R * topK * width * 4);
         vd.ExpertPart = Alloc(R * topK * d * 4);
         vd.Logits = Alloc((long)vd.Vocab * 4);
@@ -537,6 +574,8 @@ public sealed partial class GpuEngine
         vd.GroupOrder = Alloc(3 * (R * topK + experts) * 4);
         vd.Groups = Alloc(3 * (R * topK + experts) * 4);
         vd.Rb = Alloc(R * vd.MaxExtentHeads * 4);
+        vd.SplitCounts = Alloc(R * maxHeads * 4);
+        Check(Native.amqe_memset(_engine, vd.SplitCounts, 0, (nuint)(R * maxHeads * 4)), "zero");
         Check(Native.amqe_host_alloc(out vd.HostTokens, (nuint)((R + 1) * 4)), "host alloc");
         Check(Native.amqe_host_alloc(out vd.HostLogits, (nuint)((long)vd.Vocab * 4)), "host alloc");
         _visits = vd;
@@ -762,6 +801,16 @@ public sealed partial class GpuEngine
         Check(DepthNative.amqe_projections(_engine, m, x, y, list.Length, T), "projections");
     }
 
+    /// <summary>Projections of inputs each RMS-normed first with its gain W: a
+    /// step's GEMVs norm from their own loads; a chunk's inputs are normed into Out.
+    /// With <paramref name="keepFirst"/> the first input's normed row stays in its Out for a step too.</summary>
+    private void ProjNormed(int T, float eps, bool keepFirst, params (DepthMat M, IntPtr X, IntPtr Y, IntPtr W, IntPtr Out)[] list)
+    {
+        Check(DepthNative.amqe_projections_normed(_engine, list.Select(p => p.M).ToArray(), list.Select(p => p.X).ToArray(),
+            list.Select(p => p.Y).ToArray(), list.Length, T, list.Select(p => p.W).ToArray(), list.Select(p => p.Out).ToArray(), eps,
+            keepFirst ? 1 : 0), "projections");
+    }
+
     private void Norms(int T, float eps, params (IntPtr X, IntPtr W, IntPtr Out)[] list)
     {
         Check(DepthNative.amqe_rms_rows(_engine, list.Select(n => n.X).ToArray(), list.Select(n => n.W).ToArray(),
@@ -791,7 +840,7 @@ public sealed partial class GpuEngine
     /// its residual conv, the residual join (or a new block), then the FFN the same
     /// way. Mirrors GenericRuntime.RunRowLayer.</summary>
     private IntPtr DepthVisit(DepthLayer L, DepthSlot slot, IntPtr h, List<IntPtr> bank, IntPtr messages, IntPtr output, int T,
-        int position)
+        int position, DepthLayer? next)
     {
         var vd = _visits!;
         int d = _hidden;
@@ -836,7 +885,11 @@ public sealed partial class GpuEngine
                 normed = false;
             }
         }
+        // The attention's normed inputs: from the mix's kernel, else normed by the
+        // projections themselves (a step's GEMVs from their own loads).
         IntPtr qIn, kIn, vIn;
+        IntPtr qW = IntPtr.Zero, kW = IntPtr.Zero, vW = IntPtr.Zero;
+        bool selfNorm = !normed;
         if (normed)
         {
             qIn = vd.Nq;
@@ -845,30 +898,42 @@ public sealed partial class GpuEngine
         }
         else if (single && xq == xk && xq == xv)
         {
-            Norms(T, L.AttnEps, (xq, L.QNorm, vd.Nq));
-            qIn = kIn = vIn = vd.Nq;
+            (qIn, kIn, vIn) = (xq, xq, xq);
+            qW = kW = vW = L.QNorm;
         }
         else
         {
-            Norms(T, L.AttnEps, (xq, L.QNorm, vd.Nq), (xk, L.KNorm, vd.Nk), (xv, L.VNorm, vd.Nv));
-            (qIn, kIn, vIn) = (vd.Nq, vd.Nk, vd.Nv);
+            (qIn, kIn, vIn) = (xq, xk, xv);
+            (qW, kW, vW) = (L.QNorm, L.KNorm, L.VNorm);
         }
+        IntPtr qOut = vd.Nq, kOut = kIn == qIn && kW == qW ? vd.Nq : vd.Nk, vOut = vIn == qIn && vW == qW ? vd.Nq : vIn == kIn && vW == kW ? kOut : vd.Nv;
 
         // The attention: projections sharing an input in one launch each.
         var qGroup = new List<(DepthMat, IntPtr, IntPtr)> { (L.Wq, qIn, vd.Q) };
         if (L.Rel is { } rel) qGroup.Add((rel, qIn, vd.R));
         if (L.SinkProj is { } sinkProj) qGroup.Add((sinkProj, qIn, vd.Sinks));
         if (L.OutGate is { } outGate) qGroup.Add((outGate, qIn, vd.Gate));
-        Proj(T, qGroup.ToArray());
-        var kvGroup = new List<(DepthMat, IntPtr, IntPtr)> { (L.Wk, kIn, vd.K), (L.Wv, vIn, vd.V) };
-        if (L.KTaps is { } kTaps) kvGroup.Add((kTaps, kIn, vd.KDyn));
-        if (L.VTaps is { } vTaps) kvGroup.Add((vTaps, vIn, vd.VDyn));
-        Proj(T, kvGroup.ToArray());
-        Check(DepthNative.amqe_head_prep(_engine, vd.Q, L.QScale, L.HeadDim, L.QkClip,
-            L.Rel is null ? IntPtr.Zero : vd.R, L.RelScale, L.RelRank, L.RelClip, L.Heads, T, L.LogScale, pos, L.Floor, L.Alpha), "head prep");
+        var kvGroup = new List<(DepthMat, IntPtr, IntPtr, IntPtr, IntPtr)> { (L.Wk, kIn, vd.K, kW, kOut), (L.Wv, vIn, vd.V, vW, vOut) };
+        if (L.KTaps is { } kTaps) kvGroup.Add((kTaps, kIn, vd.KDyn, kW, kOut));
+        if (L.VTaps is { } vTaps) kvGroup.Add((vTaps, vIn, vd.VDyn, vW, vOut));
+        // All of them in one launch (up to eight matrices), so one GEMV's ramp serves all.
+        if (selfNorm)
+        {
+            ProjNormed(T, L.AttnEps, false, qGroup.Select(p => (p.Item1, p.Item2, p.Item3, qW, qOut)).Concat(kvGroup).ToArray());
+        }
+        else
+        {
+            Proj(T, qGroup.Concat(kvGroup.Select(p => (p.Item1, p.Item2, p.Item3))).ToArray());
+        }
+        // The output projection into L2 while the attention runs.
+        Prefetch(T, L.Wo);
+
+        // The queries' and coefficients' prep and the keys' and values' rows (one launch for a step).
         var kv = slot.Kv;
-        Check(DepthNative.amqe_kv_prep(_engine, ref kv, vd.K, vd.V, vd.KDyn, vd.VDyn, L.KConv, L.VConv, slot.KHist, slot.VHist,
-            L.KMode, L.VMode, slot.C, L.HeadDim, L.ConvKernel, L.KvHeads, T, L.QkClip, L.VNormOn, L.VEps, pos), "keys and values");
+        Check(DepthNative.amqe_step_prep(_engine, vd.Q, L.QScale, L.HeadDim, L.QkClip,
+            L.Rel is null ? IntPtr.Zero : vd.R, L.RelScale, L.RelRank, L.RelClip, L.Heads, L.LogScale, L.Floor, L.Alpha,
+            ref kv, vd.K, vd.V, vd.KDyn, vd.VDyn, L.KConv, L.VConv, slot.KHist, slot.VHist,
+            L.KMode, L.VMode, slot.C, L.HeadDim, L.ConvKernel, L.KvHeads, T, L.QkClip, L.VNormOn, L.VEps, pos), "queries, keys and values");
 
         int splits = DepthNative.amqe_depth_attention_splits(kv.Cap, kv.Ring);
         if (T > 1)
@@ -883,22 +948,22 @@ public sealed partial class GpuEngine
             long keys = L.Window == 0 ? position + T : Math.Min(position + T, L.Window + 64);
             splits = (int)Math.Max(1, Math.Min(splits, keys / 512));
         }
-        Check(DepthNative.amqe_depth_attention(_engine, vd.Q, vd.R, L.RelTable, vd.Rb, ref kv, DepthPartOf(),
-            L.Heads, L.KvHeads, hd, L.RelRank, L.Extent, L.Window, splits, L.Scale, T, tiled ? 1 : 0, pos), "attention");
+        // The splits merged with the sink and the output gate (by the last split block of each head, without tiles).
         IntPtr sinks = L.SinkProj is not null ? vd.Sinks : L.SinkStatic;
         int sinkStride = L.SinkProj is not null ? L.Heads : 0;
-        Check(DepthNative.amqe_depth_attention_merge(_engine, DepthPartOf(), sinks, sinkStride, L.OutGate is null ? IntPtr.Zero : vd.Gate,
-            vd.Tmp, L.Heads, splits, hd, T), "attention merge");
-        Proj(T, (L.Wo, vd.Tmp, vd.Attn));
-
-        // The attention's residual conv and the join: a block's first layer keeps
-        // its input in the bank and restarts the residual from the mixer's output.
+        Check(DepthNative.amqe_depth_attention_merged(_engine, vd.Q, vd.R, L.RelTable, vd.Rb, ref kv, DepthPartOf(),
+            L.Heads, L.KvHeads, hd, L.RelRank, L.Extent, L.Window, splits, L.Scale, T, tiled ? 1 : 0, pos,
+            vd.SplitCounts, sinks, sinkStride, L.OutGate is null ? IntPtr.Zero : vd.Gate, vd.Tmp), "attention");
+        // The output projection, its residual conv and the join (a step's conv in
+        // the GEMV's epilogue): a block's first layer keeps its input in the bank
+        // and restarts the residual from the mixer's output.
         if (L.OpensBlock)
         {
             bank.Add(h);
         }
-        Check(DepthNative.amqe_residual_conv(_engine, vd.Attn, L.MixerConv, slot.MixerHist, L.OpensBlock ? IntPtr.Zero : h, vd.Res,
-            d, L.MixerConvKernel, T, pos), "mixer conv");
+        var wo = L.Wo;
+        Check(DepthNative.amqe_projection_conv(_engine, ref wo, vd.Tmp, vd.Attn, T, L.MixerConv, slot.MixerHist,
+            L.OpensBlock ? IntPtr.Zero : h, vd.Res, L.MixerConvKernel, pos), "output projection and mixer conv");
 
         // The FFN's input.
         int ffnGate = Gate("ffn");
@@ -916,21 +981,31 @@ public sealed partial class GpuEngine
             Gates(L, [ffnGate], [ffnIn], messages, [vd.FfnGated], T);
             ffnIn = vd.FfnGated;
         }
-        if (!ffnNormed)
-        {
-            Norms(T, L.FfnEps, (ffnIn, L.FfnNorm, vd.Normed));
-        }
 
-        // The experts: sigmoid routing over the chosen, a softcapped GLU.
-        Proj(T, (L.Router, vd.Normed, vd.RouterLogits));
-        Check(DepthNative.amqe_route_sigmoid_selected(_engine, vd.RouterLogits, L.SelectionBias, L.Experts, L.TopK, L.RouteScale,
-            vd.Idx, vd.Wt, T), "router");
+        // The experts: sigmoid routing over the chosen (inside the experts' first
+        // kernel for a step), a softcapped GLU; their weighted sum in the conv.
+        // Unless the mix normed it, the router's projection norms the FFN's input
+        // and leaves it normed for the experts.
+        if (ffnNormed)
+        {
+            Proj(T, (L.Router, vd.Normed, vd.RouterLogits));
+        }
+        else
+        {
+            ProjNormed(T, L.FfnEps, true, (L.Router, ffnIn, vd.RouterLogits, L.FfnNorm, vd.Normed));
+        }
         var gu = L.GateUp;
         var dn = L.DownExperts;
         Check(DepthNative.amqe_packed_experts(_engine, ref gu, ref dn, L.Experts, d, L.Width, L.TopK, L.GateCap, L.UpCap,
-            vd.Normed, T, vd.Idx, vd.Wt, vd.Act, vd.ExpertPart, vd.Ffn, vd.Order, vd.Offsets, vd.GroupOrder, vd.Groups), "experts");
-        Check(DepthNative.amqe_residual_conv(_engine, vd.Ffn, L.FfnConv, slot.FfnHist, vd.Res, output, d, L.FfnConvKernel, T, pos),
-            "ffn conv");
+            vd.Normed, T, vd.Idx, vd.Wt, vd.Act, vd.ExpertPart, IntPtr.Zero, vd.Order, vd.Offsets, vd.GroupOrder, vd.Groups,
+            vd.RouterLogits, L.SelectionBias, L.RouteScale), "experts");
+        // The next visit's attention projections into L2 while its inputs are made.
+        if (next is not null)
+        {
+            Prefetch(T, AttentionMatrices(next));
+        }
+        Check(DepthNative.amqe_residual_conv_parts(_engine, vd.ExpertPart, vd.Wt, L.TopK, L.FfnConv, slot.FfnHist, vd.Res, output, d,
+            L.FfnConvKernel, T, pos), "ffn conv");
         return output;
     }
 
@@ -952,6 +1027,7 @@ public sealed partial class GpuEngine
         IntPtr h = vd.H[buf++];
         var embed = vd.Embed;
         Check(DepthNative.amqe_embed_rows(_engine, ref embed, vd.Tokens, vd.EmbedNorm, vd.EmbedNormed ? 1 : 0, vd.EmbedEps, h, T), "embed");
+        Prefetch(T, AttentionMatrices(vd.Layers[vd.Schedule[0].Layer]));
         var bank = new List<IntPtr>();
         var loop = _plan.DepthLoop;
         IntPtr saved = IntPtr.Zero, messageOut = IntPtr.Zero;
@@ -973,17 +1049,30 @@ public sealed partial class GpuEngine
                     messageOut = h;
                     h = saved;
                     bank = savedBank.ToList();
+                    if (T == 1 && vd.LoopQueries != IntPtr.Zero)
+                    {
+                        // Every gate's message of the pass, [layer gates][d], from one mix.
+                        Mix(messageBank, messageOut, vd.LoopQueries, vd.LoopQueryCount, vd.LoopMessages, 1, vd.LoopMixEps);
+                    }
                 }
             }
             var L = vd.Layers[visit.Layer];
             IntPtr messages = IntPtr.Zero;
             if (visit.Pass > 0 && L.GateSites is { } sites)
             {
-                // Every gate's message, [gates][T][d], from one mix.
-                Mix(messageBank!, messageOut, L.GateQueries, sites.Length, vd.Msg, T, L.GateMixEps);
-                messages = vd.Msg;
+                if (T == 1 && vd.LoopQueries != IntPtr.Zero && vd.LoopQueryRow[visit.Layer] >= 0)
+                {
+                    messages = At(vd.LoopMessages, (long)vd.LoopQueryRow[visit.Layer] * d);
+                }
+                else
+                {
+                    // Every gate's message, [gates][T][d], from one mix.
+                    Mix(messageBank!, messageOut, L.GateQueries, sites.Length, vd.Msg, T, L.GateMixEps);
+                    messages = vd.Msg;
+                }
             }
-            h = DepthVisit(L, s.Slots[visit.CacheSlot], h, bank, messages, vd.H[buf++], T, position);
+            var nextVisit = buf < vd.Schedule.Count ? vd.Layers[vd.Schedule[buf].Layer] : null;
+            h = DepthVisit(L, s.Slots[visit.CacheSlot], h, bank, messages, vd.H[buf++], T, position, nextVisit);
         }
         if (_plan.BlockResidual is not null)
         {
@@ -1009,6 +1098,21 @@ public sealed partial class GpuEngine
                 Check(DepthNative.amqe_softcap(_engine, vd.Logits, vd.Vocab, cap), "softcap");
             }
         }
+        Check(DepthNative.amqe_l2_join(_engine), "prefetch");
+    }
+
+    private static DepthMat[] AttentionMatrices(DepthLayer L) =>
+        new DepthMat?[] { L.Wq, L.Rel, L.SinkProj, L.OutGate, L.Wk, L.Wv, L.KTaps, L.VTaps }.OfType<DepthMat>().ToArray();
+
+    /// <summary>A step's matrices into L2 on a side branch (<see cref="PrefetchWeights"/>).</summary>
+    private void Prefetch(int T, params DepthMat[] mats)
+    {
+        if (T != 1 || !PrefetchWeights || mats.Length == 0)
+        {
+            return;
+        }
+        Check(DepthNative.amqe_l2_prefetch(_engine, mats.Select(m => m.W).ToArray(),
+            mats.Select(m => (long)m.Rows * m.Cols * (m.Type == F32 ? 4 : 2)).ToArray(), mats.Length), "prefetch");
     }
 
     private void DepthTokens(ReadOnlySpan<int> tokens, int position)
@@ -1206,28 +1310,33 @@ public sealed partial class GpuEngine
         private const string Lib = "amql_cuda";
 
         [DllImport(Lib)] public static extern int amqe_projections(IntPtr e, DepthMat[] m, IntPtr[] x, IntPtr[] y, int n, int rows);
+        [DllImport(Lib)] public static extern int amqe_projections_normed(IntPtr e, DepthMat[] m, IntPtr[] x, IntPtr[] y, int n, int rows,
+            IntPtr[] normW, IntPtr[] normOut, float eps, int keepFirst);
         [DllImport(Lib)] public static extern int amqe_rms_rows(IntPtr e, IntPtr[] x, IntPtr[] w, IntPtr[] output, int n, int rows, int d, float eps);
         [DllImport(Lib)] public static extern int amqe_depth_mix(IntPtr e, IntPtr[] states, int n, IntPtr queries, int count, IntPtr output,
             int rows, int d, float eps, IntPtr[]? normW, IntPtr[]? normOut, float normEps);
+        [DllImport(Lib)] public static extern int amqe_l2_prefetch(IntPtr e, IntPtr[] ptrs, long[] bytes, int n);
+        [DllImport(Lib)] public static extern int amqe_l2_join(IntPtr e);
+        [DllImport(Lib)] public static extern int amqe_projection_conv(IntPtr e, ref DepthMat m, IntPtr x, IntPtr y, int rows,
+            IntPtr w, IntPtr hist, IntPtr add, IntPtr output, int k, IntPtr pos);
         [DllImport(Lib)] public static extern int amqe_message_gates(IntPtr e, int n, IntPtr[] h, IntPtr[] m, IntPtr[] output,
             DepthMat[] down, DepthMat[] forget, DepthMat[] gain, IntPtr cat, IntPtr g, int stride, int rows, int d, int rank, float eps);
-        [DllImport(Lib)] public static extern int amqe_head_prep(IntPtr e, IntPtr q, IntPtr qScale, int qDim, float qClip,
-            IntPtr r, IntPtr rScale, int rDim, float rClip, int heads, int rows, int logScale, IntPtr pos, int floor, float alpha);
-        [DllImport(Lib)] public static extern int amqe_kv_prep(IntPtr e, ref DepthKv slot, IntPtr kRaw, IntPtr vRaw, IntPtr kDyn, IntPtr vDyn,
+        [DllImport(Lib)] public static extern int amqe_step_prep(IntPtr e, IntPtr q, IntPtr qScale, int qDim, float qClip,
+            IntPtr r, IntPtr rScale, int rDim, float rClip, int heads, int logScale, int floor, float alpha,
+            ref DepthKv slot, IntPtr kRaw, IntPtr vRaw, IntPtr kDyn, IntPtr vDyn,
             IntPtr kConv, IntPtr vConv, IntPtr kHist, IntPtr vHist, int kMode, int vMode, int c, int hd, int k, int kvHeads, int rows,
             float clip, int vnorm, float eps, IntPtr pos);
+        [DllImport(Lib)] public static extern int amqe_depth_attention_merged(IntPtr e, IntPtr q, IntPtr r, IntPtr relProj, IntPtr rb, ref DepthKv kv,
+            IntPtr part, int heads, int kvHeads, int hd, int dRel, int extent, int window, int splits, float scale, int rows, int tiled, IntPtr pos,
+            IntPtr counter, IntPtr sinks, int sinkStride, IntPtr gate, IntPtr output);
         [DllImport(Lib)] public static extern int amqe_depth_attention_splits(int cap, int ring);
-        [DllImport(Lib)] public static extern int amqe_depth_attention(IntPtr e, IntPtr q, IntPtr r, IntPtr relProj, IntPtr rb, ref DepthKv kv,
-            IntPtr part, int heads, int kvHeads, int hd, int dRel, int extent, int window, int splits, float scale, int rows, int tiled, IntPtr pos);
-        [DllImport(Lib)] public static extern int amqe_depth_attention_merge(IntPtr e, IntPtr part, IntPtr sinks, int sinkStride, IntPtr gate,
-            IntPtr output, int heads, int splits, int hd, int rows);
         [DllImport(Lib)] public static extern int amqe_residual_conv(IntPtr e, IntPtr x, IntPtr w, IntPtr hist, IntPtr add, IntPtr output,
             int c, int k, int rows, IntPtr pos);
-        [DllImport(Lib)] public static extern int amqe_route_sigmoid_selected(IntPtr e, IntPtr logits, IntPtr bias, int experts, int topK,
-            float routeScale, IntPtr idx, IntPtr wt, int rows);
+        [DllImport(Lib)] public static extern int amqe_residual_conv_parts(IntPtr e, IntPtr part, IntPtr wt, int topK, IntPtr w, IntPtr hist,
+            IntPtr add, IntPtr output, int c, int k, int rows, IntPtr pos);
         [DllImport(Lib)] public static extern int amqe_packed_experts(IntPtr e, ref DepthExperts gateUp, ref DepthExperts down, int experts,
             int d, int width, int topK, float gateCap, float upCap, IntPtr x, int rows, IntPtr idx, IntPtr wt, IntPtr act, IntPtr part,
-            IntPtr ffn, IntPtr order, IntPtr offsets, IntPtr groupOrder, IntPtr groups);
+            IntPtr ffn, IntPtr order, IntPtr offsets, IntPtr groupOrder, IntPtr groups, IntPtr logits, IntPtr selectionBias, float routeScale);
         [DllImport(Lib)] public static extern int amqe_expert_row_scale(IntPtr e, IntPtr factor, int rows, long count, IntPtr output);
         [DllImport(Lib)] public static extern int amqe_embed_rows(IntPtr e, ref DepthMat table, IntPtr tokens, IntPtr normW, int normed, float eps,
             IntPtr output, int rows);

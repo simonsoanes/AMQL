@@ -64,17 +64,16 @@ nine blocks in the bank). The C# side walks `plan.Schedule` the way
 | Plan op | Primitive (amqe_*) | What it fuses |
 |---|---|---|
 | `EmbeddingOp` (+ `NormWeight`) | `embed_rows` | the norm in the gather |
-| `DepthMixOp`, `BlockResidualOp.OutputQuery` | `depth_mix` | each thread holds a float4 of every state in registers; the softmax in one warp; the norm that follows (q/k/v input norms, the FFN norm, the final norm) in the same kernel |
-| `MessageGateOp` | `message_gates` | the q, k and v gates' three steps (cat, down projection, apply) one launch each; every gate's message from one mix |
-| `LayerPlan.Q/K/VInputNorm`, `PreFfnNorm` | `rms_rows` | up to three norms a launch |
-| projections sharing an input | `projections` | up to four in one launch: GEMVs for a step, the engine's GEMMs (`amqe_linear`) for a chunk |
-| `QueryChannelScale`, `QkClip`, `LogScaling`, `RelativeBiasOp` coefficients | `head_prep` | queries and coefficients in one launch |
-| `AttentionOp.KeyConv/ValueConv` (static or dynamic), key clip, `ParameterFreeQkNorm.V` | `kv_prep` | the conv, clip, norm and the row stored (f32, FP16 or NVFP4) in one kernel |
-| attention with `RelativeBiasOp` | `depth_attention` | a step: split-key flash decoding; a chunk: FlashAttention-2 on the tensor cores (FP16 tiles, f32 sums), the bias as a table first |
-| `AttentionSinkOp`, `OutputGateProjection` | `depth_attention_merge` | the sink and the sigmoid gate where the key splits merge |
-| `MixerOutputConv`, `FfnOutputConv`, the residual join | `residual_conv` | the conv and the residual add |
-| `SigmoidNormalisedOverSelected` + `SelectionBias` + `RouteScale` | `route_sigmoid_selected` | the top k in one warp |
-| `PackedExpertsOp` + `ExpertGateSoftcappedGlu` | `packed_experts` | a step: the engine's decode kernels (`amqe_moe_experts_paired_step`), only the chosen rows read; a chunk: grouped by expert, each decoded to BF16 once, on its tensor cores (`amqe_moe_experts_paired`); f32 prompts: f32 kernels |
+| `DepthMixOp`, `BlockResidualOp.OutputQuery` | `depth_mix` | each thread holds a float4 of every state in registers; the softmax in one warp; the norm that follows (q/k/v input norms, the FFN norm, the final norm) in the same kernel; a step's message mixes for a whole pass of the loop in one launch (every loop layer's gate queries share the pass's bank) |
+| `MessageGateOp` | `message_gates` | the q, k and v gates batched; a step's down projection norms `[h; m]` itself (two normed segments, from the loads it makes anyway); a chunk's `F g` and `G g` as the engine's GEMMs, then the gates |
+| `LayerPlan.Q/K/VInputNorm`, `PreFfnNorm` | `projections_normed` | a step's GEMVs take the input raw and its gain, the sum of squares from their own loads; the router's leaves the normed row for the experts; a chunk's inputs normed first (`rms_rows`) |
+| projections sharing an input | `projections` | up to eight in one launch (a layer's q, rel, sink, gate, k, v and tap projections): a step's GEMVs split over the columns for short matrices, several loads in flight a lane; the engine's GEMMs (`amqe_linear`) for a chunk |
+| `OProj` + `MixerOutputConv` + the join | `projection_conv` | a step's conv and residual add in the GEMV's epilogue |
+| `QueryChannelScale`, `QkClip`, `LogScaling`, `RelativeBiasOp` coefficients; `AttentionOp.KeyConv/ValueConv` (static or dynamic), key clip, `ParameterFreeQkNorm.V` | `step_prep` (`head_prep`, `kv_prep`) | a step's queries, coefficients and the new key and value rows (conv, clip, norm, stored as f32, FP16 or NVFP4) in one launch; a chunk's rows all at once, the histories after |
+| attention with `RelativeBiasOp`, `AttentionSinkOp`, `OutputGateProjection` | `depth_attention_merged` | a step: split-key flash decoding, a lane four channels of a row and a warp four keys a turn; past 1,024 keys a block takes a key head for all its query heads, so its rows are read once (`AMQE_ATTN_GROUP_FROM`); the last split block merges the splits with the sink and the sigmoid gate (a counter, the same order every time); a chunk: FlashAttention-2 on the tensor cores (FP16 tiles, f32 sums), the bias as a table first, then the merge |
+| `FfnOutputConv`, the residual join | `residual_conv_parts` | the experts' weighted sum and the conv; a chunk's tokens all at once |
+| `SigmoidNormalisedOverSelected` + `SelectionBias` + `RouteScale` | `packed_experts` (`route_sigmoid_selected`) | each expert's place is the number of keys that beat it, the whole block counting; a step routes inside its first expert kernel |
+| `PackedExpertsOp` + `ExpertGateSoftcappedGlu` | `packed_experts` | a step: NVFP4 and MXFP8 rows read by lane groups (8 lanes a gate/up row of 1,152 bytes, 4 a down row of 576), the input staged in shared memory in the groups' order (`AMQE_STEP_EXPERTS=engine` keeps the engine's decode kernels); a chunk: grouped by expert, each decoded to BF16 once, on its tensor cores (`amqe_moe_experts_paired`); f32 prompts: f32 kernels |
 | `OutputOp.TableRows`, softcap | `projections`, `softcap` | only the vocabulary's rows of a padded head are read |
 
 - **Weights once.** Each physical layer's weights go up once and every visit
@@ -89,10 +88,18 @@ nine blocks in the bank). The C# side walks `plan.Schedule` the way
   has its convolutions' histories.
 - **A step** reads its token and position from device memory, so its launches
   are captured once per sequence as a CUDA graph (`amqe_pass_*`) and replayed.
-  **A prompt** runs in chunks of 256 tokens; convolutions and cache rows advance
-  token by token inside their kernels. `ExactPrefill` (`AMQL_GPU_PREFILL=f32`)
-  keeps a chunk at f32 (SGEMMs, the f32 expert kernels, the per-query
-  attention); `AMQL_TILED_ATTENTION=0` keeps the per-query attention only.
+  While a step's small kernels run, the matrices it reads next come into L2 on
+  a side branch of the graph (the next visit's attention projections after the
+  experts, the output projection after them; `amqe_l2_prefetch`,
+  `GpuEngine.PrefetchWeights`, `AMQL_GPU_PREFETCH=0` turns it off).
+  **A prompt** runs in chunks of 512 tokens (`GpuEngine.DepthChunk`,
+  `AMQL_DEPTH_CHUNK`, a multiple of 64 up to 1,024: a larger chunk decodes each
+  chosen expert once for more tokens, for more scratch and ring rows);
+  convolutions and cache rows take all of a chunk's tokens at once, each
+  token's lags read from the chunk's own rows, the histories advanced after.
+  `ExactPrefill` (`AMQL_GPU_PREFILL=f32`) keeps a chunk at f32 (SGEMMs, the
+  f32 expert kernels, the per-query attention); `AMQL_TILED_ATTENTION=0` keeps
+  the per-query attention only.
 - **One sequence at a time.** `GpuEngine.BatchRefusal` says so: no batched
   steps, marks, rewinds or drafts on this path, and the server runs such a
   model one request at a time.
@@ -102,7 +109,7 @@ with NVFP4, MXFP8 and plain experts mixed in the loop, every position of 3-,
 21- and 200-token prompts and greedy steps, to 1e-3 of the largest logit with
 f32 rows and f32 prompts and 2e-2 with FP16 rows (NVFP4 rows by the decision);
 a replayed step graph equals its direct launches bit for bit; a 600-token
-prompt in three chunks matches the same tokens stepped. On the tiny fixture
+prompt in chunks matches the same tokens stepped. On the tiny fixture
 the visit path also gave exactly the logits of the dedicated GPU path it
 replaced, at every position of 3-, 40- and 600-token prompts and a step after
 them, in all three KV formats, with BF16 and f32 prompts.
@@ -111,11 +118,12 @@ On Inkling-2-Mini (RTX 5090, 2026-11-28; `LoopedCheckpointTests`):
 
 - f32 rows and f32 prompts against the planned CPU path: the top five at all
   614 positions of four prompts (5, 7, 20 and 582 tokens) in set and order,
-  worst logit difference 4.0e-4, the greedy continuations the same; BF16
-  prompts (the default): the same top token at 612 of 614.
-- Decode about 142 tok/s from a 5-token prompt, prompts 1,800-2,000 tok/s from
-  4K to 64K tokens: the same as the dedicated path it replaced, measured the
-  same way (table in [inkling-2.md](inkling-2.md#on-the-gpu)).
+  worst logit difference 2.6e-4, the greedy continuations the same; BF16
+  prompts (the default): the same top token at 614 of 614.
+- Decode about 175 tok/s from a 5-token prompt (142 before the fusions above),
+  118 after a 64K-token prompt (101; with nvfp4 rows 114, from 63), prompts
+  3,300-3,900 tok/s from 512 to 64K tokens (1,800-2,000 with chunks of 256 run
+  token by token); table in [inkling-2.md](inkling-2.md#on-the-gpu).
 
 ## Containers encoded before these surfaces
 

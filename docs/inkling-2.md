@@ -185,45 +185,59 @@ runs it with the experts as stored. Measured on the RTX 5090 (32 GB) on
 2026-11-28 with nothing else running:
 
 - **Against the planned CPU path** (f32 rows and f32 prompts, four prompts of
-  5, 7, 20 and 582 tokens, the last over three chunks): the top five at all 614
-  positions agree in set and order, the worst logit difference is 4.0e-4, and
+  5, 7, 20 and 582 tokens, the last over two chunks): the top five at all 614
+  positions agree in set and order, the worst logit difference is 2.6e-4, and
   the greedy continuations are token for token the same. With BF16 prompts (the
-  default) the top token agrees at 612 of 614; the largest logit differences
-  (up to 14) are in the improbable tail, where the softcap at 30 compresses
+  default) the top token agrees at 614 of 614; the largest logit differences
+  (up to 10) are in the improbable tail, where the softcap at 30 compresses
   values and BF16 then shifts them.
-- **Speed**, a prompt fed in chunks and then 128 greedy steps after it; the
-  dedicated path the visit path replaced, measured the same way in the same
-  session, is in brackets:
+- **Speed**, a prompt fed in chunks and then 128 greedy steps after it
+  (`LoopedDepth_Real_Checkpoint_Gpu_Speed`); in brackets the same before the
+  step's fusions, the lane-group experts and the prompt's chunks of 512 taken
+  token-parallel (2026-11-28, measured the same way):
 
   | KV rows | prompt tokens | prompt tok/s | decode tok/s after it |
   |---|---|---|---|
-  | fp16 | 5 | — | 143 (140) |
-  | fp16 | 512 | 2,007 (2,017) | 136 (130) |
-  | fp16 | 4,096 | 2,019 (2,037) | 128 (125) |
-  | fp16 | 16,384 | 1,999 (2,015) | 121 (120) |
-  | fp16 | 65,536 | 1,855 (1,868) | 101 (101) |
-  | nvfp4 | 4,096 | 1,956 (1,973) | 122 (117) |
-  | nvfp4 | 65,536 | 1,791 (1,805) | 63 (63) |
+  | fp16 | 5 | — | 175 (143) |
+  | fp16 | 512 | 3,908 (2,007) | 171 (136) |
+  | fp16 | 4,096 | 3,853 (2,019) | 150 (128) |
+  | fp16 | 16,384 | 3,787 (1,999) | 142 (121) |
+  | fp16 | 65,536 | 3,366 (1,855) | 118 (101) |
+  | nvfp4 | 4,096 | 3,895 (1,956) | 149 (122) |
+  | nvfp4 | 65,536 | 3,320 (1,791) | 114 (63) |
 
-  `amql-cli generate <container> --prompt "The capital of France is" --steps 128`
-  prints the same: about 142 tok/s. The first prompt of a run is slower (about
-  800 tok/s for 512 tokens) while cuBLAS picks its algorithms.
+  The 512-token prompt is the nvfp4 run's (the first prompt of a run is slower,
+  about 1,000 tok/s, while cuBLAS picks its algorithms). `amql-cli generate
+  <container> --prompt "The capital of France is" --steps 128` prints about
+  175 tok/s (165.3, 174.5 and 177.0 in three runs). `AMQL_DEPTH_CHUNK=1024`
+  takes prompts to about 4,500 tok/s for 0.6 GiB more scratch.
 - **Decode** reads about 5.4 GB a token (2.6 GB of attention projections over
   48 visits, 1.85 GB of chosen experts, 0.9 GB of head), so the bandwidth bound
-  is near 330 tok/s. A step is about 8 ms on the GPU: the projections and head
-  2.5 ms at about 77% of bandwidth, the experts about 2.4 ms, and about 900
-  small kernels. Programmatic dependent launch gained nothing inside the graph.
+  is near 330 tok/s. A step is about 5.8 ms; on the GPU (Nsight Systems, graph
+  nodes, per step): the attention projections 1.08 ms (one launch a visit, 40 MB
+  in 22.7 µs, 1.76 TB/s, their input norms computed from the same loads), the
+  experts 1.46 ms (NVFP4 gate/up 19.3 µs and down 10.0 µs a visit on lane-group
+  kernels, the routing inside the first), the head 0.54 ms, the output
+  projection with its conv 0.51 ms, and about 14 launches a visit for the rest
+  (attention 6.5 µs with its merge, mixes 2.9 µs, the queries' and keys' prep
+  4.8 µs, the FFN conv with the experts' sum 6.5 µs, gates and router 2-4 µs).
+  While those small kernels run, the next matrices come into L2 on a side branch
+  of the step's graph: 171 against 168 tok/s without it (`AMQL_GPU_PREFETCH=0`).
+  Programmatic dependent launch gained nothing inside the graph. At long
+  contexts the attention reads the cache: from 1,024 keys a block takes a key
+  head for its three query heads, so each row is read once (at 64K tokens a
+  full slot's attention took 418 µs a visit with a block a query head).
 - **Memory.** The weights take 17.6 GiB, the chunk scratch and a first
-  sequence about 1.3 GiB more. A sequence's KV rows and convolution histories
-  (40 sliding rings of 1,280 f32 rows, plus the 8 full slots):
+  sequence about 1.5 GiB more. A sequence's KV rows and convolution histories
+  (40 sliding rings of 1,536 f32 rows, plus the 8 full slots):
 
   | positions | f32 | fp16 | nvfp4 |
   |---|---|---|---|
-  | 4,096 | 0.64 GiB | 0.52 GiB | 0.43 GiB |
-  | 32,768 | 2.39 GiB | 1.39 GiB | 0.69 GiB |
-  | 131,072 | 8.39 GiB | 4.39 GiB | 1.58 GiB |
-  | 262,144 | 16.39 GiB | 8.39 GiB | 2.77 GiB |
-  | 1,048,576 | 64.39 GiB | 32.39 GiB | 9.89 GiB |
+  | 4,096 | 0.72 GiB | 0.60 GiB | 0.51 GiB |
+  | 32,768 | 2.47 GiB | 1.47 GiB | 0.77 GiB |
+  | 131,072 | 8.47 GiB | 4.47 GiB | 1.66 GiB |
+  | 262,144 | 16.47 GiB | 8.47 GiB | 2.85 GiB |
+  | 1,048,576 | 64.47 GiB | 32.47 GiB | 9.97 GiB |
 
   So 1M fits on the 32 GB card only with nvfp4 rows.
 
