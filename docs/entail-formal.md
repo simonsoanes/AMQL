@@ -42,10 +42,15 @@ needed the new `only` and `forbid` statements in
 [the language](entail-language.md#output), which narrow what the host may say without
 choosing for it.
 
-Three of the programs are generated, because a tokenizer doesn't respect the notation. Qwen
+The programs are generated, because a tokenizer doesn't respect the notation. Qwen
 cuts `0xDEADBEEF` as `0|xDE|ADB|EE|F`, merges `((p`, and writes `":[` as one token, which
-means different things inside and outside a string. So `make_bases.py`, `make_logic.py` and
-`make_json.py` list each token with what it contributes. `make_json.py` runs one small
+means different things inside and outside a string. Qwen and Gemma write a date one digit
+to a token, but Inkling 2 groups digits in threes from the left, `190|0|-|01|-|31`. So
+`make_dates.py`, `make_bases.py`, `make_logic.py` and `make_json.py` list each token with
+what it contributes. `make_dates.py` lists every token of one to three digits with its
+digits, asks the tokenizer how it cuts a number of each length, and finds the date forms at
+the offsets that gives; it writes the answer in the same cuts, so ` 5536 days` comes out as
+` |553|6| days` for Inkling. `make_json.py` runs one small
 scanner over the whole vocabulary, from inside and outside a string, and that scanner
 decides both the verdict and the guard's token sets, so the two can't disagree.
 
@@ -159,7 +164,12 @@ which left room for 7 digits of 8. Both came right when the test did.
 
 ## Reproducing it
 
-`dates.entail.txt` is written by hand. The others are generated:
+The programs are generated for a tokenizer. The checked-in `dates.entail.txt` is Qwen's,
+which serves Gemma too:
+
+```bash
+python scripts/entail/make_dates.py <tokenizer.json> scripts/entail/dates.entail.txt
+```
 
 ```bash
 python scripts/entail/make_bases.py <tokenizer.json> scripts/entail/bases.entail.txt
