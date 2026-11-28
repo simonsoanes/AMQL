@@ -92,9 +92,18 @@ nine blocks in the bank). The C# side walks `plan.Schedule` the way
   a side branch of the graph (the next visit's attention projections after the
   experts, the output projection after them; `amqe_l2_prefetch`,
   `GpuEngine.PrefetchWeights`, `AMQL_GPU_PREFETCH=0` turns it off).
-  **A prompt** runs in chunks of 512 tokens (`GpuEngine.DepthChunk`,
-  `AMQL_DEPTH_CHUNK`, a multiple of 64 up to 1,024: a larger chunk decodes each
-  chosen expert once for more tokens, for more scratch and ring rows);
+  **A prompt** runs in chunks of 512 tokens (`GpuEngine.DepthChunk`), and a
+  longer one borrows a chunk of up to 1,024 rows (the prompt rounded up to 64)
+  while the device's free memory holds it with 1 GiB to spare: a larger chunk
+  decodes each chosen expert once for more tokens. The borrowed scratch and its
+  attention partials are freed when the prompt ends, so decode and long
+  contexts keep their memory; a step always runs, and its graph is captured, on
+  the engine's own scratch. A windowed slot that has not wrapped grows to its
+  window and the chunk (those rows stay); one that has wrapped bounds the chunk
+  to its rows past the window, so a chunk never overwrites keys its earlier rows
+  still read. Memory short, the engine's own chunk. `AMQL_DEPTH_CHUNK` (a
+  multiple of 64 up to 1,024) fixes the chunk, `GpuEngine.BorrowChunks = false`
+  turns borrowing off, and `LastPromptChunk` says what the last prompt used.
   convolutions and cache rows take all of a chunk's tokens at once, each
   token's lags read from the chunk's own rows, the histories advanced after.
   `ExactPrefill` (`AMQL_GPU_PREFILL=f32`) keeps a chunk at f32 (SGEMMs, the

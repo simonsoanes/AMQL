@@ -193,24 +193,34 @@ runs it with the experts as stored. Measured on the RTX 5090 (32 GB) on
   values and BF16 then shifts them.
 - **Speed**, a prompt fed in chunks and then 128 greedy steps after it
   (`LoopedDepth_Real_Checkpoint_Gpu_Speed`); in brackets the same before the
-  step's fusions, the lane-group experts and the prompt's chunks of 512 taken
-  token-parallel (2026-11-28, measured the same way):
+  step's fusions, the lane-group experts and the prompt's chunks taken
+  token-parallel (2026-11-28, measured the same way). Prompts past 512 tokens
+  borrow a chunk of up to 1,024 rows while memory allows (see
+  [depth-ops.md](depth-ops.md)); every prompt below did:
 
   | KV rows | prompt tokens | prompt tok/s | decode tok/s after it |
   |---|---|---|---|
-  | fp16 | 5 | — | 175 (143) |
-  | fp16 | 512 | 3,908 (2,007) | 171 (136) |
-  | fp16 | 4,096 | 3,853 (2,019) | 150 (128) |
-  | fp16 | 16,384 | 3,787 (1,999) | 142 (121) |
-  | fp16 | 65,536 | 3,366 (1,855) | 118 (101) |
-  | nvfp4 | 4,096 | 3,895 (1,956) | 149 (122) |
-  | nvfp4 | 65,536 | 3,320 (1,791) | 114 (63) |
+  | fp16 | 5 | — | 172 (143) |
+  | fp16 | 512 | 3,894 (2,007) | 172 (136) |
+  | fp16 | 4,096 | 4,400 (2,019) | 150 (128) |
+  | fp16 | 16,384 | 4,549 (1,999) | 141 (121) |
+  | fp16 | 65,536 | 3,993 (1,855) | 118 (101) |
+  | nvfp4 | 4,096 | 4,496 (1,956) | 148 (122) |
+  | nvfp4 | 65,536 | 3,940 (1,791) | 113 (63) |
 
   The 512-token prompt is the nvfp4 run's (the first prompt of a run is slower,
-  about 1,000 tok/s, while cuBLAS picks its algorithms). `amql-cli generate
-  <container> --prompt "The capital of France is" --steps 128` prints about
-  175 tok/s (165.3, 174.5 and 177.0 in three runs). `AMQL_DEPTH_CHUNK=1024`
-  takes prompts to about 4,500 tok/s for 0.6 GiB more scratch.
+  under 1,000 tok/s, while cuBLAS picks its algorithms). In the engine's own
+  chunks of 512 (`AMQL_DEPTH_CHUNK=512`) the 64K prompt is about 3,300 tok/s.
+  `amql-cli generate <container> --prompt "The capital of France is" --steps 128`
+  prints 160–176 tok/s: over 10 runs a median of 172, standard deviation 4.0
+  (2.3%), over 5 runs of 512 steps 170–175 (GPU clocks steady at 2.84–2.87 GHz;
+  the short run is 0.73 s, so a stall shows).
+- **Device memory on Windows.** Once the device's use passes about 23.4 GB,
+  the driver's reported use rises by about 6 GB at once (a 64K fp16 sequence, a
+  borrowed chunk, or an idle sequence reserved as padding all set it off); the
+  CUDA allocations do not (Nsight Systems' memory trace), the process's later
+  allocations fit in it, and it goes when the sequence is released. Other
+  processes, a game say, see the higher figure.
 - **Decode** reads about 5.4 GB a token (2.6 GB of attention projections over
   48 visits, 1.85 GB of chosen experts, 0.9 GB of head), so the bandwidth bound
   is near 330 tok/s. A step is about 5.8 ms; on the GPU (Nsight Systems, graph

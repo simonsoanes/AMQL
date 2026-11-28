@@ -34,11 +34,26 @@ namespace Amql.Inference;
 /// </summary>
 public sealed partial class GpuEngine
 {
-    /// <summary>Tokens a prompt chunk holds on the visit path: 512, or
-    /// <c>AMQL_DEPTH_CHUNK</c> (a multiple of 64 up to 1024). A larger chunk
+    /// <summary>Tokens a prompt chunk holds on the visit path by default: 512, or
+    /// <c>AMQL_DEPTH_CHUNK</c> (a multiple of 64 up to 1024, and then fixed). A
+    /// longer prompt borrows a chunk of up to <see cref="MaxDepthChunk"/> rows while
+    /// the device's free memory holds it (<see cref="BorrowScratch"/>): a larger chunk
     /// decodes each chosen expert once for more tokens, for more scratch and ring rows.</summary>
     public static readonly int DepthChunk =
-        int.TryParse(Environment.GetEnvironmentVariable("AMQL_DEPTH_CHUNK"), out var c) && c is >= 64 and <= 1024 && c % 64 == 0 ? c : 512;
+        int.TryParse(Environment.GetEnvironmentVariable("AMQL_DEPTH_CHUNK"), out var c) && c is >= 64 and <= MaxDepthChunk && c % 64 == 0 ? c : 512;
+
+    /// <summary>The rows a borrowed prompt chunk holds at most.</summary>
+    public const int MaxDepthChunk = 1024;
+
+    /// <summary>False runs every prompt in the engine's own chunk; a set
+    /// <c>AMQL_DEPTH_CHUNK</c> starts it false.</summary>
+    public bool BorrowChunks { get; set; } = Environment.GetEnvironmentVariable("AMQL_DEPTH_CHUNK") is not { Length: > 0 };
+
+    /// <summary>The rows the last prompt's chunks held.</summary>
+    public int LastPromptChunk { get; private set; }
+
+    // Free device memory a borrowed chunk leaves at least.
+    private const long BorrowReserve = 1L << 30;
 
     // Key splits a prompt row's attention takes at most (a decode step takes more).
     private const int DepthRowSplits = 8;
@@ -158,20 +173,33 @@ public sealed partial class GpuEngine
         public float FinalEps, OutputMixEps;
         public float? Softcap;
         public int Vocab, MaxBank;
-        // Scratch, DepthChunk rows each.
-        public IntPtr[] H = [];
-        public IntPtr Tokens, Q, Gate, Tmp, K, V, R, Sinks, RouterLogits, KDyn, VDyn, Mixed, Msg, Cat, GateVec,
-            Attn, Xq, Xk, Xv, Nq, Nk, Nv, Res, FfnIn, FfnGated, Normed, Act, ExpertPart, Logits, Wt, Rb, Every;
-        public IntPtr Idx, Order, Offsets, GroupOrder, Groups;
-        public IntPtr SplitCounts;  // [DepthChunk x heads] ints, zero between launches
+        // The engine's own chunk scratch (DepthChunk rows), and the one in use: it
+        // or a long prompt's borrowed one.
+        public DepthScratch Base = null!, W = null!;
+        public int ScratchQ, ScratchC, ScratchRel, ScratchTaps, ScratchExperts, ScratchTopK, ScratchWidth, ScratchGates, ScratchRank;
+        public IntPtr Logits;
         // A step's message mixes for a whole pass of the loop in one launch: every
         // loop layer's gate queries (they share the pass's bank), each layer's first row.
         public IntPtr LoopQueries, LoopMessages;
         public int LoopQueryCount;
         public float LoopMixEps;
         public int[] LoopQueryRow = [];
-        public IntPtr HostTokens, HostLogits;
+        public IntPtr HostLogits;
         public int MaxHeads, MaxExtentHeads;
+    }
+
+    /// <summary>One chunk's scratch, <see cref="Rows"/> rows each.</summary>
+    private sealed class DepthScratch
+    {
+        public int Rows;
+        public IntPtr[] H = [];
+        public IntPtr Tokens, Q, Gate, Tmp, K, V, R, Sinks, RouterLogits, KDyn, VDyn, Mixed, Msg, Cat, GateVec,
+            Attn, Xq, Xk, Xv, Nq, Nk, Nv, Res, FfnIn, FfnGated, Normed, Act, ExpertPart, Wt, Rb, Every;
+        public IntPtr Idx, Order, Offsets, GroupOrder, Groups;
+        public IntPtr SplitCounts;  // [Rows x heads] ints, zero between launches
+        public IntPtr HostTokens;   // Rows tokens, then the position
+        public IntPtr Part;         // a borrowed chunk's attention partials; zero: the sequence's
+        public readonly List<IntPtr> Owned = new();
     }
 
     // ── the plan's ops the visit path takes ───────────────────────────────────
@@ -528,7 +556,6 @@ public sealed partial class GpuEngine
             }
         }
 
-        long R = DepthChunk;
         int maxQ = layers.Max(l => l.Heads * l.HeadDim), maxC = layers.Max(l => l.KvHeads * l.HeadDim);
         int maxHeads = layers.Max(l => l.Heads), maxKv = layers.Max(l => l.KvHeads);
         int maxRel = Math.Max(1, layers.Max(l => l.Heads * l.RelRank));
@@ -537,48 +564,198 @@ public sealed partial class GpuEngine
         int gates = Math.Max(1, layers.Max(l => l.GateSites?.Length ?? 0)), rank = Math.Max(1, layers.Max(l => l.GateRank));
         vd.MaxHeads = maxHeads;
         vd.MaxExtentHeads = Math.Max(1, layers.Max(l => l.Heads * Math.Max(l.Extent, 1)));
-        vd.H = Enumerable.Range(0, schedule.Count + 1).Select(_ => Alloc(R * d * 4)).ToArray();
-        vd.Tokens = Alloc((R + 1) * 4);
-        vd.Q = Alloc(R * maxQ * 4);
-        vd.Gate = Alloc(R * maxQ * 4);
-        vd.Tmp = Alloc(R * maxQ * 4);
-        vd.K = Alloc(R * maxC * 4);
-        vd.V = Alloc(R * maxC * 4);
-        vd.R = Alloc(R * maxRel * 4);
-        vd.Sinks = Alloc(R * maxHeads * 4);
-        vd.RouterLogits = Alloc(R * experts * 4);
-        vd.KDyn = Alloc(R * maxTaps * 4);
-        vd.VDyn = Alloc(R * maxTaps * 4);
-        vd.Mixed = Alloc(R * 3 * d * 4);
-        vd.Msg = Alloc(R * gates * d * 4);
-        vd.Cat = Alloc(3 * R * 2 * d * 4);
-        vd.GateVec = Alloc(3 * R * rank * 4);
-        vd.Attn = Alloc(R * d * 4);
-        vd.Xq = Alloc(R * d * 4);
-        vd.Xk = Alloc(R * d * 4);
-        vd.Xv = Alloc(R * d * 4);
-        vd.Nq = Alloc(R * d * 4);
-        vd.Nk = Alloc(R * d * 4);
-        vd.Nv = Alloc(R * d * 4);
-        vd.Res = Alloc(R * d * 4);
-        vd.FfnIn = Alloc(R * d * 4);
-        vd.FfnGated = Alloc(R * d * 4);
-        vd.Normed = Alloc(R * d * 4);
-        vd.Act = Alloc(R * topK * width * 4);
-        vd.ExpertPart = Alloc(R * topK * d * 4);
+        vd.ScratchQ = maxQ;
+        vd.ScratchC = maxC;
+        vd.ScratchRel = maxRel;
+        vd.ScratchTaps = maxTaps;
+        vd.ScratchExperts = experts;
+        vd.ScratchTopK = topK;
+        vd.ScratchWidth = width;
+        vd.ScratchGates = gates;
+        vd.ScratchRank = rank;
+        _visits = vd;
+        vd.Base = vd.W = NewScratch(DepthChunk, part: false, dry: false, out _);
         vd.Logits = Alloc((long)vd.Vocab * 4);
-        vd.Wt = Alloc(R * topK * 4);
-        vd.Idx = Alloc(R * topK * 4);
-        vd.Order = Alloc(R * topK * 4);
-        vd.Offsets = Alloc((experts + 1) * 4L);
-        vd.GroupOrder = Alloc(3 * (R * topK + experts) * 4);
-        vd.Groups = Alloc(3 * (R * topK + experts) * 4);
-        vd.Rb = Alloc(R * vd.MaxExtentHeads * 4);
-        vd.SplitCounts = Alloc(R * maxHeads * 4);
-        Check(Native.amqe_memset(_engine, vd.SplitCounts, 0, (nuint)(R * maxHeads * 4)), "zero");
-        Check(Native.amqe_host_alloc(out vd.HostTokens, (nuint)((R + 1) * 4)), "host alloc");
         Check(Native.amqe_host_alloc(out vd.HostLogits, (nuint)((long)vd.Vocab * 4)), "host alloc");
         _visits = vd;
+    }
+
+    /// <summary>A chunk's scratch for <paramref name="rows"/> rows, with its own
+    /// attention partials when <paramref name="part"/>; with <paramref name="dry"/>
+    /// only its size; with <paramref name="every"/> room for every row's logits.
+    /// <paramref name="bytes"/> is the device bytes it holds.</summary>
+    private DepthScratch NewScratch(int rows, bool part, bool dry, out long bytes, bool every = false)
+    {
+        var vd = _visits!;
+        int d = _hidden;
+        long R = rows, total = 0;
+        var w = new DepthScratch { Rows = rows };
+        // One allocation carved in 256-byte steps, its size from a dry pass.
+        IntPtr block = IntPtr.Zero;
+        if (!dry)
+        {
+            NewScratch(rows, part, dry: true, out long size, every);
+            block = Alloc(size);
+            w.Owned.Add(block);
+        }
+        IntPtr A(long n)
+        {
+            var p = block == IntPtr.Zero ? IntPtr.Zero : block + (nint)total;
+            total += (Math.Max(16, n) + 255) / 256 * 256;
+            return p;
+        }
+        try
+        {
+            w.H = Enumerable.Range(0, vd.Schedule.Count + 1).Select(_ => A(R * d * 4)).ToArray();
+            w.Tokens = A((R + 1) * 4);
+            w.Q = A(R * vd.ScratchQ * 4);
+            w.Gate = A(R * vd.ScratchQ * 4);
+            w.Tmp = A(R * vd.ScratchQ * 4);
+            w.K = A(R * vd.ScratchC * 4);
+            w.V = A(R * vd.ScratchC * 4);
+            w.R = A(R * vd.ScratchRel * 4);
+            w.Sinks = A(R * vd.MaxHeads * 4);
+            w.RouterLogits = A(R * vd.ScratchExperts * 4);
+            w.KDyn = A(R * vd.ScratchTaps * 4);
+            w.VDyn = A(R * vd.ScratchTaps * 4);
+            w.Mixed = A(R * 3 * d * 4);
+            w.Msg = A(R * vd.ScratchGates * d * 4);
+            w.Cat = A(3 * R * 2 * d * 4);
+            w.GateVec = A(3 * R * vd.ScratchRank * 4);
+            w.Attn = A(R * d * 4);
+            w.Xq = A(R * d * 4);
+            w.Xk = A(R * d * 4);
+            w.Xv = A(R * d * 4);
+            w.Nq = A(R * d * 4);
+            w.Nk = A(R * d * 4);
+            w.Nv = A(R * d * 4);
+            w.Res = A(R * d * 4);
+            w.FfnIn = A(R * d * 4);
+            w.FfnGated = A(R * d * 4);
+            w.Normed = A(R * d * 4);
+            w.Act = A(R * vd.ScratchTopK * vd.ScratchWidth * 4);
+            w.ExpertPart = A(R * vd.ScratchTopK * d * 4);
+            w.Wt = A(R * vd.ScratchTopK * 4);
+            w.Idx = A(R * vd.ScratchTopK * 4);
+            w.Order = A(R * vd.ScratchTopK * 4);
+            w.Offsets = A((vd.ScratchExperts + 1) * 4L);
+            w.GroupOrder = A(3 * (R * vd.ScratchTopK + vd.ScratchExperts) * 4);
+            w.Groups = A(3 * (R * vd.ScratchTopK + vd.ScratchExperts) * 4);
+            w.Rb = A(R * vd.MaxExtentHeads * 4);
+            w.SplitCounts = A(R * vd.MaxHeads * 4);
+            if (part)
+            {
+                w.Part = A(R * DepthRowSplits * vd.MaxHeads * 130 * 4);
+            }
+            if (every)
+            {
+                w.Every = A(R * vd.Vocab * 4);
+            }
+            if (!dry)
+            {
+                Check(Native.amqe_memset(_engine, w.SplitCounts, 0, (nuint)(R * vd.MaxHeads * 4)), "zero");
+                Check(Native.amqe_host_alloc(out w.HostTokens, (nuint)((R + 1) * 4)), "host alloc");
+            }
+        }
+        catch
+        {
+            FreeScratch(w);
+            throw;
+        }
+        bytes = total;
+        return w;
+    }
+
+    private void FreeScratch(DepthScratch w)
+    {
+        Native.amqe_sync(_engine);
+        foreach (var p in w.Owned)
+        {
+            Free(p);
+        }
+        w.Owned.Clear();
+        if (w.HostTokens != IntPtr.Zero)
+        {
+            Native.amqe_host_free(w.HostTokens);
+            w.HostTokens = IntPtr.Zero;
+        }
+    }
+
+    /// <summary>A larger chunk's scratch for a prompt of <paramref name="tokens"/>
+    /// from the sequence's position, or null to run it in the engine's own: up to
+    /// <see cref="MaxDepthChunk"/> rows (the prompt rounded up to 64), fewer while
+    /// the scratch, the windowed slots' extra rows and <see cref="BorrowReserve"/>
+    /// would not fit in the device's free memory. A windowed slot that has not
+    /// wrapped grows to its window and the chunk; one that has bounds the chunk to
+    /// the rows past its window, so a chunk never overwrites keys its earlier rows read.</summary>
+    private DepthScratch? BorrowScratch(GpuSequence seq, int tokens, bool every)
+    {
+        var vd = _visits!;
+        var s = seq.Depth!;
+        int own = vd.Base.Rows;
+        if (!BorrowChunks || tokens <= own)
+        {
+            return null;
+        }
+        long end = seq.Position + (long)tokens;
+        int rows = Math.Min(MaxDepthChunk, (tokens + 63) / 64 * 64);
+        foreach (var slot in s.Slots)
+        {
+            var L = vd.Layers[slot.Layer];
+            if (slot.Ring && slot.Kv.Cap < end && seq.Position > slot.Kv.Cap)
+            {
+                rows = Math.Min(rows, (slot.Kv.Cap - L.Window) / 64 * 64);
+            }
+        }
+        List<(DepthSlot Slot, int Rows)> Grows(int r)
+        {
+            var list = new List<(DepthSlot, int)>();
+            foreach (var slot in s.Slots)
+            {
+                var L = vd.Layers[slot.Layer];
+                int want = (int)Math.Min(s.Capacity, L.Window + (long)r);
+                if (slot.Ring && slot.Kv.Cap < end && slot.Kv.Cap < want)
+                {
+                    list.Add((slot, want));
+                }
+            }
+            return list;
+        }
+        long free = DeviceMemory().Free;
+        for (; rows > own; rows -= 128)
+        {
+            NewScratch(rows, part: true, dry: true, out long need, every);
+            foreach (var (slot, want) in Grows(rows))
+            {
+                need += DepthKvBytes(want, slot.C, vd.Layers[slot.Layer].KvHeads, slot.Kv.Format);
+            }
+            if (need + BorrowReserve <= free)
+            {
+                break;
+            }
+        }
+        if (rows <= own)
+        {
+            return null;
+        }
+        try
+        {
+            var grows = Grows(rows);
+            foreach (var (slot, want) in grows)
+            {
+                GrowSlot(s, slot, want, seq.Position);
+            }
+            if (grows.Count > 0)
+            {
+                DropDepthGraph(s);
+            }
+            return NewScratch(rows, part: true, dry: false, out _, every);
+        }
+        catch (InvalidOperationException)
+        {
+            // The memory went elsewhere meanwhile: the engine's own chunk.
+            return null;
+        }
     }
 
     // ── sequences ─────────────────────────────────────────────────────────────
@@ -746,40 +923,7 @@ public sealed partial class GpuEngine
             {
                 continue;
             }
-            // A ring that grows has not wrapped yet: it held fewer rows than the
-            // positions so far would need only once the capacity exceeded it.
-            var old = slot.Kv;
-            var grown = AllocDepthKv(s, rows, slot.C, L.KvHeads, old.Format, slot.Ring);
-            long n = Math.Min(seq.Position, old.Cap);
-            void Copy(IntPtr to, IntPtr from, long bytes)
-            {
-                if (bytes > 0)
-                {
-                    Check(Native.amqe_copy_async(_engine, to, from, (nuint)bytes, 3), "grow");
-                }
-            }
-            if (old.Format == KvFp4)
-            {
-                Copy(grown.K, old.K, n * slot.C / 2);
-                Copy(grown.V, old.V, n * slot.C / 2);
-                Copy(grown.Ks, old.Ks, n * slot.C / 16);
-                Copy(grown.Vs, old.Vs, n * slot.C / 16);
-                Copy(grown.Kg, old.Kg, n * L.KvHeads * 4);
-                Copy(grown.Vg, old.Vg, n * L.KvHeads * 4);
-            }
-            else
-            {
-                long el = old.Format == KvF32 ? 4 : 2;
-                Copy(grown.K, old.K, n * slot.C * el);
-                Copy(grown.V, old.V, n * slot.C * el);
-            }
-            Check(Native.amqe_sync(_engine), "grow");
-            foreach (var p in new[] { old.K, old.V, old.Ks, old.Vs, old.Kg, old.Vg })
-            {
-                SeqFree(s, p);
-            }
-            s.Bytes -= DepthKvBytes(old.Cap, slot.C, L.KvHeads, old.Format);
-            slot.Kv = grown;
+            GrowSlot(s, slot, rows, seq.Position);
         }
         // A larger cache may take more splits than the partials were sized for.
         SeqFree(s, s.Part);
@@ -787,6 +931,47 @@ public sealed partial class GpuEngine
         Check(Native.amqe_sync(_engine), "grow");
         s.Capacity = capacity;
         DropDepthGraph(s);
+    }
+
+    /// <summary>A slot's rows moved to an allocation of <paramref name="rows"/>, its
+    /// rows so far kept (a ring that grows has not wrapped).</summary>
+    private void GrowSlot(DepthSequence s, DepthSlot slot, int rows, long position)
+    {
+        var L = _visits!.Layers[slot.Layer];
+        // A ring that grows has not wrapped yet: it held fewer rows than the
+        // positions so far would need only once the capacity exceeded it.
+        var old = slot.Kv;
+        var grown = AllocDepthKv(s, rows, slot.C, L.KvHeads, old.Format, slot.Ring);
+        long n = Math.Min(position, old.Cap);
+        void Copy(IntPtr to, IntPtr from, long bytes)
+        {
+            if (bytes > 0)
+            {
+                Check(Native.amqe_copy_async(_engine, to, from, (nuint)bytes, 3), "grow");
+            }
+        }
+        if (old.Format == KvFp4)
+        {
+            Copy(grown.K, old.K, n * slot.C / 2);
+            Copy(grown.V, old.V, n * slot.C / 2);
+            Copy(grown.Ks, old.Ks, n * slot.C / 16);
+            Copy(grown.Vs, old.Vs, n * slot.C / 16);
+            Copy(grown.Kg, old.Kg, n * L.KvHeads * 4);
+            Copy(grown.Vg, old.Vg, n * L.KvHeads * 4);
+        }
+        else
+        {
+            long el = old.Format == KvF32 ? 4 : 2;
+            Copy(grown.K, old.K, n * slot.C * el);
+            Copy(grown.V, old.V, n * slot.C * el);
+        }
+        Check(Native.amqe_sync(_engine), "grow");
+        foreach (var p in new[] { old.K, old.V, old.Ks, old.Vs, old.Kg, old.Vg })
+        {
+            SeqFree(s, p);
+        }
+        s.Bytes -= DepthKvBytes(old.Cap, slot.C, L.KvHeads, old.Format);
+        slot.Kv = grown;
     }
 
     // ── a forward pass ────────────────────────────────────────────────────────
@@ -832,7 +1017,7 @@ public sealed partial class GpuEngine
         var m = which.Select(g => At(messages, g * td)).ToArray();
         Check(DepthNative.amqe_message_gates(_engine, which.Length, h, m, output,
             which.Select(g => L.Down[g]).ToArray(), which.Select(g => L.Forget[g]).ToArray(), which.Select(g => L.Gain[g]).ToArray(),
-            vd.Cat, vd.GateVec, DepthChunk, T, _hidden, L.GateRank, L.GateEps), "message gates");
+            vd.W.Cat, vd.W.GateVec, vd.W.Rows, T, _hidden, L.GateRank, L.GateEps), "message gates");
     }
 
     /// <summary>One visit of a layer for T rows at the positions from the token
@@ -845,7 +1030,7 @@ public sealed partial class GpuEngine
         var vd = _visits!;
         int d = _hidden;
         long td = (long)T * d;
-        IntPtr pos = At(vd.Tokens, DepthChunk);
+        IntPtr pos = At(vd.W.Tokens, vd.W.Rows);
         int Gate(string site) => L.GateSites is { } sites && messages != IntPtr.Zero ? Array.IndexOf(sites, site) : -1;
 
         // The attention's inputs.
@@ -856,18 +1041,18 @@ public sealed partial class GpuEngine
         {
             bool fuse = messages == IntPtr.Zero && (L.MixerCount == 3 || single);
             IntPtr[]? w = fuse ? (L.MixerCount == 3 ? [L.QNorm, L.KNorm, L.VNorm] : [L.QNorm]) : null;
-            IntPtr[]? o = fuse ? (L.MixerCount == 3 ? [vd.Nq, vd.Nk, vd.Nv] : [vd.Nq]) : null;
-            Mix(bank, h, L.MixerQueries, L.MixerCount, vd.Mixed, T, L.MixerMixEps, w, o, L.AttnEps);
+            IntPtr[]? o = fuse ? (L.MixerCount == 3 ? [vd.W.Nq, vd.W.Nk, vd.W.Nv] : [vd.W.Nq]) : null;
+            Mix(bank, h, L.MixerQueries, L.MixerCount, vd.W.Mixed, T, L.MixerMixEps, w, o, L.AttnEps);
             normed = fuse;
-            xq = vd.Mixed;
-            xk = L.MixerCount == 3 ? At(vd.Mixed, td) : vd.Mixed;
-            xv = L.MixerCount == 3 ? At(vd.Mixed, 2 * td) : vd.Mixed;
+            xq = vd.W.Mixed;
+            xk = L.MixerCount == 3 ? At(vd.W.Mixed, td) : vd.W.Mixed;
+            xv = L.MixerCount == 3 ? At(vd.W.Mixed, 2 * td) : vd.W.Mixed;
         }
         {
             var sites = new List<int>();
             var ins = new List<IntPtr>();
             var outs = new List<IntPtr>();
-            foreach (var (site, x, to) in new[] { ("q", xq, vd.Xq), ("k", xk, vd.Xk), ("v", xv, vd.Xv) })
+            foreach (var (site, x, to) in new[] { ("q", xq, vd.W.Xq), ("k", xk, vd.W.Xk), ("v", xv, vd.W.Xv) })
             {
                 if (Gate(site) is >= 0 and var g)
                 {
@@ -879,9 +1064,9 @@ public sealed partial class GpuEngine
             if (sites.Count > 0)
             {
                 Gates(L, sites.ToArray(), ins.ToArray(), messages, outs.ToArray(), T);
-                if (Gate("q") >= 0) xq = vd.Xq;
-                if (Gate("k") >= 0) xk = vd.Xk;
-                if (Gate("v") >= 0) xv = vd.Xv;
+                if (Gate("q") >= 0) xq = vd.W.Xq;
+                if (Gate("k") >= 0) xk = vd.W.Xk;
+                if (Gate("v") >= 0) xv = vd.W.Xv;
                 normed = false;
             }
         }
@@ -892,9 +1077,9 @@ public sealed partial class GpuEngine
         bool selfNorm = !normed;
         if (normed)
         {
-            qIn = vd.Nq;
-            kIn = L.MixerCount == 3 ? vd.Nk : vd.Nq;
-            vIn = L.MixerCount == 3 ? vd.Nv : vd.Nq;
+            qIn = vd.W.Nq;
+            kIn = L.MixerCount == 3 ? vd.W.Nk : vd.W.Nq;
+            vIn = L.MixerCount == 3 ? vd.W.Nv : vd.W.Nq;
         }
         else if (single && xq == xk && xq == xv)
         {
@@ -906,16 +1091,16 @@ public sealed partial class GpuEngine
             (qIn, kIn, vIn) = (xq, xk, xv);
             (qW, kW, vW) = (L.QNorm, L.KNorm, L.VNorm);
         }
-        IntPtr qOut = vd.Nq, kOut = kIn == qIn && kW == qW ? vd.Nq : vd.Nk, vOut = vIn == qIn && vW == qW ? vd.Nq : vIn == kIn && vW == kW ? kOut : vd.Nv;
+        IntPtr qOut = vd.W.Nq, kOut = kIn == qIn && kW == qW ? vd.W.Nq : vd.W.Nk, vOut = vIn == qIn && vW == qW ? vd.W.Nq : vIn == kIn && vW == kW ? kOut : vd.W.Nv;
 
         // The attention: projections sharing an input in one launch each.
-        var qGroup = new List<(DepthMat, IntPtr, IntPtr)> { (L.Wq, qIn, vd.Q) };
-        if (L.Rel is { } rel) qGroup.Add((rel, qIn, vd.R));
-        if (L.SinkProj is { } sinkProj) qGroup.Add((sinkProj, qIn, vd.Sinks));
-        if (L.OutGate is { } outGate) qGroup.Add((outGate, qIn, vd.Gate));
-        var kvGroup = new List<(DepthMat, IntPtr, IntPtr, IntPtr, IntPtr)> { (L.Wk, kIn, vd.K, kW, kOut), (L.Wv, vIn, vd.V, vW, vOut) };
-        if (L.KTaps is { } kTaps) kvGroup.Add((kTaps, kIn, vd.KDyn, kW, kOut));
-        if (L.VTaps is { } vTaps) kvGroup.Add((vTaps, vIn, vd.VDyn, vW, vOut));
+        var qGroup = new List<(DepthMat, IntPtr, IntPtr)> { (L.Wq, qIn, vd.W.Q) };
+        if (L.Rel is { } rel) qGroup.Add((rel, qIn, vd.W.R));
+        if (L.SinkProj is { } sinkProj) qGroup.Add((sinkProj, qIn, vd.W.Sinks));
+        if (L.OutGate is { } outGate) qGroup.Add((outGate, qIn, vd.W.Gate));
+        var kvGroup = new List<(DepthMat, IntPtr, IntPtr, IntPtr, IntPtr)> { (L.Wk, kIn, vd.W.K, kW, kOut), (L.Wv, vIn, vd.W.V, vW, vOut) };
+        if (L.KTaps is { } kTaps) kvGroup.Add((kTaps, kIn, vd.W.KDyn, kW, kOut));
+        if (L.VTaps is { } vTaps) kvGroup.Add((vTaps, vIn, vd.W.VDyn, vW, vOut));
         // All of them in one launch (up to eight matrices), so one GEMV's ramp serves all.
         if (selfNorm)
         {
@@ -930,9 +1115,9 @@ public sealed partial class GpuEngine
 
         // The queries' and coefficients' prep and the keys' and values' rows (one launch for a step).
         var kv = slot.Kv;
-        Check(DepthNative.amqe_step_prep(_engine, vd.Q, L.QScale, L.HeadDim, L.QkClip,
-            L.Rel is null ? IntPtr.Zero : vd.R, L.RelScale, L.RelRank, L.RelClip, L.Heads, L.LogScale, L.Floor, L.Alpha,
-            ref kv, vd.K, vd.V, vd.KDyn, vd.VDyn, L.KConv, L.VConv, slot.KHist, slot.VHist,
+        Check(DepthNative.amqe_step_prep(_engine, vd.W.Q, L.QScale, L.HeadDim, L.QkClip,
+            L.Rel is null ? IntPtr.Zero : vd.W.R, L.RelScale, L.RelRank, L.RelClip, L.Heads, L.LogScale, L.Floor, L.Alpha,
+            ref kv, vd.W.K, vd.W.V, vd.W.KDyn, vd.W.VDyn, L.KConv, L.VConv, slot.KHist, slot.VHist,
             L.KMode, L.VMode, slot.C, L.HeadDim, L.ConvKernel, L.KvHeads, T, L.QkClip, L.VNormOn, L.VEps, pos), "queries, keys and values");
 
         int splits = DepthNative.amqe_depth_attention_splits(kv.Cap, kv.Ring);
@@ -949,11 +1134,11 @@ public sealed partial class GpuEngine
             splits = (int)Math.Max(1, Math.Min(splits, keys / 512));
         }
         // The splits merged with the sink and the output gate (by the last split block of each head, without tiles).
-        IntPtr sinks = L.SinkProj is not null ? vd.Sinks : L.SinkStatic;
+        IntPtr sinks = L.SinkProj is not null ? vd.W.Sinks : L.SinkStatic;
         int sinkStride = L.SinkProj is not null ? L.Heads : 0;
-        Check(DepthNative.amqe_depth_attention_merged(_engine, vd.Q, vd.R, L.RelTable, vd.Rb, ref kv, DepthPartOf(),
+        Check(DepthNative.amqe_depth_attention_merged(_engine, vd.W.Q, vd.W.R, L.RelTable, vd.W.Rb, ref kv, DepthPartOf(),
             L.Heads, L.KvHeads, hd, L.RelRank, L.Extent, L.Window, splits, L.Scale, T, tiled ? 1 : 0, pos,
-            vd.SplitCounts, sinks, sinkStride, L.OutGate is null ? IntPtr.Zero : vd.Gate, vd.Tmp), "attention");
+            vd.W.SplitCounts, sinks, sinkStride, L.OutGate is null ? IntPtr.Zero : vd.W.Gate, vd.W.Tmp), "attention");
         // The output projection, its residual conv and the join (a step's conv in
         // the GEMV's epilogue): a block's first layer keeps its input in the bank
         // and restarts the residual from the mixer's output.
@@ -962,24 +1147,24 @@ public sealed partial class GpuEngine
             bank.Add(h);
         }
         var wo = L.Wo;
-        Check(DepthNative.amqe_projection_conv(_engine, ref wo, vd.Tmp, vd.Attn, T, L.MixerConv, slot.MixerHist,
-            L.OpensBlock ? IntPtr.Zero : h, vd.Res, L.MixerConvKernel, pos), "output projection and mixer conv");
+        Check(DepthNative.amqe_projection_conv(_engine, ref wo, vd.W.Tmp, vd.W.Attn, T, L.MixerConv, slot.MixerHist,
+            L.OpensBlock ? IntPtr.Zero : h, vd.W.Res, L.MixerConvKernel, pos), "output projection and mixer conv");
 
         // The FFN's input.
         int ffnGate = Gate("ffn");
-        IntPtr ffnIn = vd.Res;
+        IntPtr ffnIn = vd.W.Res;
         bool ffnNormed = false;
         if (L.FfnQueries != IntPtr.Zero)
         {
             bool fuse = ffnGate < 0;
-            Mix(bank, vd.Res, L.FfnQueries, 1, vd.FfnIn, T, L.FfnMixEps, fuse ? [L.FfnNorm] : null, fuse ? [vd.Normed] : null, L.FfnEps);
+            Mix(bank, vd.W.Res, L.FfnQueries, 1, vd.W.FfnIn, T, L.FfnMixEps, fuse ? [L.FfnNorm] : null, fuse ? [vd.W.Normed] : null, L.FfnEps);
             ffnNormed = fuse;
-            ffnIn = vd.FfnIn;
+            ffnIn = vd.W.FfnIn;
         }
         if (ffnGate >= 0)
         {
-            Gates(L, [ffnGate], [ffnIn], messages, [vd.FfnGated], T);
-            ffnIn = vd.FfnGated;
+            Gates(L, [ffnGate], [ffnIn], messages, [vd.W.FfnGated], T);
+            ffnIn = vd.W.FfnGated;
         }
 
         // The experts: sigmoid routing over the chosen (inside the experts' first
@@ -988,30 +1173,30 @@ public sealed partial class GpuEngine
         // and leaves it normed for the experts.
         if (ffnNormed)
         {
-            Proj(T, (L.Router, vd.Normed, vd.RouterLogits));
+            Proj(T, (L.Router, vd.W.Normed, vd.W.RouterLogits));
         }
         else
         {
-            ProjNormed(T, L.FfnEps, true, (L.Router, ffnIn, vd.RouterLogits, L.FfnNorm, vd.Normed));
+            ProjNormed(T, L.FfnEps, true, (L.Router, ffnIn, vd.W.RouterLogits, L.FfnNorm, vd.W.Normed));
         }
         var gu = L.GateUp;
         var dn = L.DownExperts;
         Check(DepthNative.amqe_packed_experts(_engine, ref gu, ref dn, L.Experts, d, L.Width, L.TopK, L.GateCap, L.UpCap,
-            vd.Normed, T, vd.Idx, vd.Wt, vd.Act, vd.ExpertPart, IntPtr.Zero, vd.Order, vd.Offsets, vd.GroupOrder, vd.Groups,
-            vd.RouterLogits, L.SelectionBias, L.RouteScale), "experts");
+            vd.W.Normed, T, vd.W.Idx, vd.W.Wt, vd.W.Act, vd.W.ExpertPart, IntPtr.Zero, vd.W.Order, vd.W.Offsets, vd.W.GroupOrder, vd.W.Groups,
+            vd.W.RouterLogits, L.SelectionBias, L.RouteScale), "experts");
         // The next visit's attention projections into L2 while its inputs are made.
         if (next is not null)
         {
             Prefetch(T, AttentionMatrices(next));
         }
-        Check(DepthNative.amqe_residual_conv_parts(_engine, vd.ExpertPart, vd.Wt, L.TopK, L.FfnConv, slot.FfnHist, vd.Res, output, d,
+        Check(DepthNative.amqe_residual_conv_parts(_engine, vd.W.ExpertPart, vd.W.Wt, L.TopK, L.FfnConv, slot.FfnHist, vd.W.Res, output, d,
             L.FfnConvKernel, T, pos), "ffn conv");
         return output;
     }
 
     private DepthSequence? _depthNow;
 
-    private IntPtr DepthPartOf() => _depthNow!.Part;
+    private IntPtr DepthPartOf() => _visits!.W.Part != IntPtr.Zero ? _visits.W.Part : _depthNow!.Part;
 
     /// <summary>T rows through the visit schedule, as launches on the engine's
     /// stream (a step's are captured into a graph): the last row's logits into the
@@ -1024,9 +1209,9 @@ public sealed partial class GpuEngine
         long td = (long)T * d;
         _depthNow = s;
         int buf = 0;
-        IntPtr h = vd.H[buf++];
+        IntPtr h = vd.W.H[buf++];
         var embed = vd.Embed;
-        Check(DepthNative.amqe_embed_rows(_engine, ref embed, vd.Tokens, vd.EmbedNorm, vd.EmbedNormed ? 1 : 0, vd.EmbedEps, h, T), "embed");
+        Check(DepthNative.amqe_embed_rows(_engine, ref embed, vd.W.Tokens, vd.EmbedNorm, vd.EmbedNormed ? 1 : 0, vd.EmbedEps, h, T), "embed");
         Prefetch(T, AttentionMatrices(vd.Layers[vd.Schedule[0].Layer]));
         var bank = new List<IntPtr>();
         var loop = _plan.DepthLoop;
@@ -1067,32 +1252,32 @@ public sealed partial class GpuEngine
                 else
                 {
                     // Every gate's message, [gates][T][d], from one mix.
-                    Mix(messageBank!, messageOut, L.GateQueries, sites.Length, vd.Msg, T, L.GateMixEps);
-                    messages = vd.Msg;
+                    Mix(messageBank!, messageOut, L.GateQueries, sites.Length, vd.W.Msg, T, L.GateMixEps);
+                    messages = vd.W.Msg;
                 }
             }
             var nextVisit = buf < vd.Schedule.Count ? vd.Layers[vd.Schedule[buf].Layer] : null;
-            h = DepthVisit(L, s.Slots[visit.CacheSlot], h, bank, messages, vd.H[buf++], T, position, nextVisit);
+            h = DepthVisit(L, s.Slots[visit.CacheSlot], h, bank, messages, vd.W.H[buf++], T, position, nextVisit);
         }
         if (_plan.BlockResidual is not null)
         {
-            Mix(bank, h, vd.OutputQuery, 1, vd.Mixed, T, vd.OutputMixEps, [vd.FinalNorm], [vd.Normed], vd.FinalEps);
+            Mix(bank, h, vd.OutputQuery, 1, vd.W.Mixed, T, vd.OutputMixEps, [vd.FinalNorm], [vd.W.Normed], vd.FinalEps);
         }
         else
         {
-            Norms(T, vd.FinalEps, (h, vd.FinalNorm, vd.Normed));
+            Norms(T, vd.FinalEps, (h, vd.FinalNorm, vd.W.Normed));
         }
         if (every)
         {
-            Proj(T, (vd.Head, vd.Normed, vd.Every));
+            Proj(T, (vd.Head, vd.W.Normed, vd.W.Every));
             if (vd.Softcap is { } cap)
             {
-                Check(DepthNative.amqe_softcap(_engine, vd.Every, (long)T * vd.Vocab, cap), "softcap");
+                Check(DepthNative.amqe_softcap(_engine, vd.W.Every, (long)T * vd.Vocab, cap), "softcap");
             }
         }
         else
         {
-            Proj(1, (vd.Head, At(vd.Normed, td - d), vd.Logits));
+            Proj(1, (vd.Head, At(vd.W.Normed, td - d), vd.Logits));
             if (vd.Softcap is { } cap)
             {
                 Check(DepthNative.amqe_softcap(_engine, vd.Logits, vd.Vocab, cap), "softcap");
@@ -1124,11 +1309,11 @@ public sealed partial class GpuEngine
             {
                 throw new ArgumentOutOfRangeException(nameof(tokens), $"token {tokens[i]} is outside the vocabulary of {_plan.Embedding.VocabSize}");
             }
-            Marshal.WriteInt32(vd.HostTokens, i * 4, tokens[i]);
+            Marshal.WriteInt32(vd.W.HostTokens, i * 4, tokens[i]);
         }
-        Marshal.WriteInt32(vd.HostTokens, DepthChunk * 4, position);
-        Check(Native.amqe_copy_async(_engine, vd.Tokens, vd.HostTokens, (nuint)(tokens.Length * 4), 1), "tokens");
-        Check(Native.amqe_copy_async(_engine, At(vd.Tokens, DepthChunk), At(vd.HostTokens, DepthChunk), 4, 1), "position");
+        Marshal.WriteInt32(vd.W.HostTokens, vd.W.Rows * 4, position);
+        Check(Native.amqe_copy_async(_engine, vd.W.Tokens, vd.W.HostTokens, (nuint)(tokens.Length * 4), 1), "tokens");
+        Check(Native.amqe_copy_async(_engine, At(vd.W.Tokens, vd.W.Rows), At(vd.W.HostTokens, vd.W.Rows), 4, 1), "position");
     }
 
     /// <summary>One token through the schedule; the logits land in the pinned
@@ -1182,15 +1367,45 @@ public sealed partial class GpuEngine
         var vd = _visits!;
         int vocab = vd.Vocab;
         DepthRoom(seq, seq.Position + (long)tokens.Length);
-        if (every && vd.Every == IntPtr.Zero)
+        if (every && vd.W.Every == IntPtr.Zero)
         {
-            vd.Every = Alloc((long)DepthChunk * vocab * 4);
+            vd.W.Every = Alloc((long)vd.W.Rows * vocab * 4);
+            vd.W.Owned.Add(vd.W.Every);
         }
         var result = new float[every ? tokens.Length : 1][];
+        var borrowed = BorrowScratch(seq, tokens.Length, every);
+        _lastChunkBorrowed = borrowed is not null;
+        LastPromptChunk = borrowed?.Rows ?? vd.Base.Rows;
+        try
+        {
+            DepthChunks(seq, tokens, every, borrowed, result);
+        }
+        finally
+        {
+            vd.W = vd.Base;
+            if (borrowed is not null)
+            {
+                FreeScratch(borrowed);
+            }
+        }
+        return result;
+    }
+
+    // Whether the last prompt ran in a borrowed chunk (its visit outputs are freed).
+    private bool _lastChunkBorrowed;
+
+    private void DepthChunks(GpuSequence seq, ReadOnlySpan<int> tokens, bool every, DepthScratch? borrowed, float[][] result)
+    {
+        var s = seq.Depth!;
+        var vd = _visits!;
+        int vocab = vd.Vocab;
+        int rows = borrowed?.Rows ?? vd.Base.Rows;
         for (int done = 0; done < tokens.Length;)
         {
-            int T = Math.Min(DepthChunk, tokens.Length - done);
+            int T = Math.Min(rows, tokens.Length - done);
             bool last = done + T == tokens.Length;
+            // A step runs (and its graph is captured) on the engine's own scratch.
+            vd.W = T > 1 && borrowed is not null ? borrowed : vd.Base;
             if (T == 1)
             {
                 DepthStep(seq, tokens[done], logits: every || last);
@@ -1210,7 +1425,7 @@ public sealed partial class GpuEngine
                 var handle = GCHandle.Alloc(flat, GCHandleType.Pinned);
                 try
                 {
-                    Check(Native.amqe_download(_engine, handle.AddrOfPinnedObject(), vd.Every, (nuint)((long)T * vocab * 4)), "logits");
+                    Check(Native.amqe_download(_engine, handle.AddrOfPinnedObject(), vd.W.Every, (nuint)((long)T * vocab * 4)), "logits");
                 }
                 finally
                 {
@@ -1235,7 +1450,6 @@ public sealed partial class GpuEngine
             seq.Position += T;
             done += T;
         }
-        return result;
     }
 
     /// <summary>Every position's logits for <paramref name="tokens"/> fed from the
@@ -1260,16 +1474,20 @@ public sealed partial class GpuEngine
     public float[][] VisitOutput(int visit, int rows)
     {
         var vd = _visits ?? throw new NotSupportedException("visit outputs are the visit path's");
-        if (visit < 0 || visit >= vd.Schedule.Count || rows < 1 || rows > DepthChunk)
+        if (visit < 0 || visit >= vd.Schedule.Count || rows < 1 || rows > vd.Base.Rows)
         {
             throw new ArgumentOutOfRangeException(nameof(visit));
+        }
+        if (_lastChunkBorrowed)
+        {
+            throw new InvalidOperationException("the last prompt ran in a borrowed chunk, whose visit outputs are freed");
         }
         Check(Native.amqe_sync(_engine), "visit output");
         var flat = new float[rows * _hidden];
         var handle = GCHandle.Alloc(flat, GCHandleType.Pinned);
         try
         {
-            Check(Native.amqe_download(_engine, handle.AddrOfPinnedObject(), vd.H[visit + 1], (nuint)((long)rows * _hidden * 4)), "visit output");
+            Check(Native.amqe_download(_engine, handle.AddrOfPinnedObject(), vd.W.H[visit + 1], (nuint)((long)rows * _hidden * 4)), "visit output");
         }
         finally
         {

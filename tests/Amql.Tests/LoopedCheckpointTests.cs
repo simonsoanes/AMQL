@@ -592,7 +592,7 @@ public sealed class LoopedCheckpointTests
                     }
                     double decode = 128 / clock.Elapsed.TotalSeconds;
                     var (free, _) = GpuEngine.DeviceMemory();
-                    _output.WriteLine($"{format} rows, {promptLength}-token prompt: prompt {prefill:F0} tok/s, then decode {decode:F1} tok/s; " +
+                    _output.WriteLine($"{format} rows, {promptLength}-token prompt: prompt {prefill:F0} tok/s in chunks of {gpu.LastPromptChunk}, then decode {decode:F1} tok/s; " +
                                       $"sequence {gpu.DeviceBytes(seq) / (double)(1 << 20):F0} MiB, device used {(total - free) / (double)(1 << 30):F2} GiB");
                     gpu.Release(seq);
                 }

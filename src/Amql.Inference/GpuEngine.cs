@@ -3616,7 +3616,7 @@ public sealed partial class GpuEngine : IDisposable
                     depth.Graph = IntPtr.Zero;
                 }
             }
-            Native.amqe_host_free(visits.HostTokens);
+            Native.amqe_host_free(visits.Base.HostTokens);
             Native.amqe_host_free(visits.HostLogits);
             _visits = null;
         }

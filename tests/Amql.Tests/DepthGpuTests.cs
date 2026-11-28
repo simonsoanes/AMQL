@@ -180,12 +180,38 @@ public sealed class DepthGpuTests : IDisposable
             {
                 AssertClose(c[t], b[t], $"chunked prompt against steps, position {t}");
             }
+            _output.WriteLine($"600-token prompt in chunks of {gpu.LastPromptChunk}");
             gpu.Reset(chunked);
             Assert.Equal(c[^1], gpu.PrefillAll(chunked, tokens)[^1]);
+            // The engine's own chunk against the borrowed one (or the same when memory is short).
+            gpu.BorrowChunks = false;
+            gpu.Reset(chunked);
+            var own = gpu.PrefillAll(chunked, tokens);
+            Assert.Equal(GpuEngine.DepthChunk, gpu.LastPromptChunk);
+            for (int t = 0; t < tokens.Length; t++)
+            {
+                AssertClose(own[t], b[t], $"own-chunk prompt against steps, position {t}");
+            }
+            // Steps after a borrowed prompt, on the rings it grew.
+            gpu.BorrowChunks = true;
+            var tail = gpu.NewSequence();
+            try
+            {
+                gpu.PrefillAll(tail, tokens.AsSpan(0, 580));
+                for (int t = 580; t < tokens.Length; t++)
+                {
+                    AssertClose(gpu.Step([tail], [tokens[t]])[0], b[t], $"step after a borrowed prompt, position {t}");
+                }
+            }
+            finally
+            {
+                gpu.Release(tail);
+            }
         }
         finally
         {
             gpu.UseGraphs = true;
+            gpu.BorrowChunks = true;
             gpu.Release(direct);
             gpu.Release(graphed);
             gpu.Release(chunked);
