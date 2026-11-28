@@ -237,6 +237,7 @@ internal static partial class Program
                 "tool-trace" => ToolTrace(args[1..]),
                 "kv-probe" => KvProbe(args[1..]),
                 "context" => ContextCommand(args[1..]),
+                "graph" => GraphCommand(args[1..]),
                 "entail" => EntailCommand(args[1..]),
                 "ngram" => NGramCommand(args[1..]),
                 "classify" => Classify(args[1..]),
@@ -3113,6 +3114,9 @@ internal static partial class Program
                               are not sent again (HF_TOKEN with write access, or 'huggingface-cli login')
               amql-cli strip <container-dir> --keep <encoding> [--out <slim-dir>]   slim copy
               amql-cli verify <container-dir>                     integrity + readiness
+              amql-cli graph upgrade <container-dir> [--out <dir>] [--dry-run]
+                              rewrite system_graph.json with the generic surfaces the planner reads, from
+                              the facts it already records (tensors untouched; --out writes the graph there)
               amql-cli context bench <container> --text <file|dir>[;…] [--lengths 8K,32K,128K,256K]
                               [--questions 24] [--needle-every 2048] [--score-tokens 1024]
                               [--text-offset N] [--seed 1] [--plain] [--out <json>]

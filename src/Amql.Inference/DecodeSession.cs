@@ -64,12 +64,19 @@ public sealed class DecodeSession : IDisposable
     /// </summary>
     public static DecodeSession Open(Vindex3Container container, string component, OperandStore store, WeightWorkingSet? workingSet = null)
     {
-        if (Inkling2Model.Serves(container, component))
+        if (Inkling2Model.Serves(container, component) && !PlannedRequested)
         {
             return ForInkling2(container, store);
         }
         return new DecodeSession(Planner.Plan(container, component, store), store, null, workingSet);
     }
+
+    /// <summary><c>AMQL_RUNTIME=planned</c>: a container that also has a dedicated
+    /// session (an Inkling 2 graph carries both descriptions) opens on the planned
+    /// path instead — today the CPU's row-exact path, a reference for the
+    /// dedicated session until the device engine runs the same ops.</summary>
+    public static bool PlannedRequested =>
+        Environment.GetEnvironmentVariable("AMQL_RUNTIME")?.Trim().ToLowerInvariant() == "planned";
 
     private InvalidOperationException NoPlan(string what) =>
         new($"{what} needs a planned stack; this session runs {(_model is Inkling2Model ? "Inkling2Model" : _model!.GetType().Name)}");
@@ -215,8 +222,10 @@ public sealed class DecodeSession : IDisposable
         // plan: the projections become real GEMMs instead of one matrix-vector
         // product per token. Verified bit-identical to position-major on
         // Qwen3.5. The LFM gated short conv likewise convolves a whole
-        // sequence against its carried history, so every plan runs layer-major.
-        bool layerMajor = true;
+        // sequence against its carried history, so every plan runs layer-major —
+        // except one that runs by visit schedule (a depth loop or a block
+        // residual), whose row-exact path takes one token at a time.
+        bool layerMajor = !_runtime.Plan.RunsByVisit;
         if (!layerMajor)
         {
             // Position-major: one token through every layer at a time, so

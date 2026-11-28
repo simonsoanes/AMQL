@@ -10,7 +10,7 @@ namespace Amql.Inference;
 /// Operand closure is enforced: every surface-implied tensor must exist in
 /// the object's segment, or the whole component refuses.
 /// </summary>
-public static class Planner
+public static partial class Planner
 {
     public static ComponentOpPlan Plan(Vindex3Container container, string componentId, OperandStore store)
     {
@@ -29,10 +29,13 @@ public static class Planner
         var surface = component.Execution
             ?? throw new ContainerException(
                 $"component '{componentId}' has no execution surface — nothing to execute");
-        if (surface.Inkling2 is not null)
+        if (surface.Inkling2 is not null && surface.DepthLoop is null)
         {
+            // Encoded before the generic surfaces existed: the facts are there,
+            // the planner's description is not (amql-cli graph upgrade adds it).
             throw new UnsupportedOperatorException(
-                $"component '{componentId}' is an Inkling 2 looped stack: it runs on Inkling2Model, not on planned layers");
+                $"component '{componentId}' records its looped stack only in the facts of a dedicated session; " +
+                "its graph predates the generic depth surfaces — rewrite it with 'amql-cli graph upgrade <container>'");
         }
         var normSurface = surface.Norm;
 
@@ -108,8 +111,11 @@ public static class Planner
         var layers = new List<LayerPlan>(component.NumLayers);
         for (int l = 0; l < component.NumLayers; l++)
         {
-            layers.Add(BuildLayer(store, stack.Id, l, policies[l], surface, ffnSurface, normSurface, roles, component.HiddenSize));
+            var built = BuildLayer(store, stack.Id, l, policies[l], surface, ffnSurface, normSurface, roles, component.HiddenSize);
+            layers.Add(DecorateDepth(store, stack.Id, l, built, surface, normSurface, roles, component.HiddenSize, component.NumLayers));
         }
+        var (depthLoop, visits) = DepthSchedule(surface, component.NumLayers, layers);
+        var blockResidual = BindBlockResidual(store, surface, component.HiddenSize);
         if (surface.NgramEmbedding is { } ngram && ngram.Layers.Any(l => l < 0 || l >= component.NumLayers))
         {
             throw new ContainerException($"component '{componentId}': the n-gram embedding names layers outside the stack");
@@ -132,7 +138,7 @@ public static class Planner
             Layers = layers,
             FinalNorm = finalMixer is not null
                 ? null
-                : NormOp.From(Bound(store, finalNormObj.Id, "weight"), normSurface.FinalNorm, component.HiddenSize,
+                : NormOp.From(Bound(store, finalNormObj.Id, normSurface.FinalNormWeight ?? "weight"), normSurface.FinalNorm, component.HiddenSize,
                     store.ContainsTensor(finalNormObj.Id, "bias") ? new OperandRef(finalNormObj.Id, "bias") : null),
             FinalMixer = finalMixer,
             Output = BuildOutput(store, embedObj, headObj, surface, component.HiddenSize),
@@ -140,6 +146,9 @@ public static class Planner
             Diffusion = surface.Diffusion is { } diffusion
                 ? new MaskedDiffusionOp { MaskTokenId = diffusion.MaskTokenId }
                 : null,
+            DepthLoop = depthLoop,
+            Visits = visits,
+            BlockResidual = blockResidual,
         };
     }
 
@@ -170,7 +179,8 @@ public static class Planner
             throw new UnsupportedOperatorException(
                 $"layer {layer}: position policy '{unresolved.Kind}' has no managed implementation");
         }
-        if (ffnSurface.GatePolicy is not ExpertGateGated)
+        if (ffnSurface.GatePolicy is not (ExpertGateGated or ExpertGateSoftcappedGlu) ||
+            (ffnSurface.GatePolicy is ExpertGateSoftcappedGlu && ffnSurface.Moe is not { PackedExperts: true }))
         {
             throw new UnsupportedOperatorException(
                 $"layer {layer}: expert gate policy '{ffnSurface.GatePolicy.GetType().Name}' has no managed implementation");
@@ -309,6 +319,20 @@ public static class Planner
             KBias = RoleOperand(store, stackId, layer, roles, TensorRoles.K, "bias"),
             VBias = RoleOperand(store, stackId, layer, roles, policy.SharedKvProjection ? TensorRoles.K : TensorRoles.V, "bias"),
             OBias = RoleOperand(store, stackId, layer, roles, TensorRoles.O, "bias"),
+            SeparateInputs = RoleTensor(store, stackId, layer, roles, TensorRoles.QInNorm) is not null,
+            QueryChannelScale = RoleOperand(store, stackId, layer, roles, TensorRoles.QChannelScale),
+            QkClip = attnSurface.QkClip,
+            LogScaling = attnSurface.LogScaling is { } logScaling && logScaling.Layers.Contains(layer)
+                ? new PositionLogScaleOp { Floor = logScaling.Floor, Alpha = logScaling.Alpha }
+                : null,
+            RelativeBias = BindRelativeBias(store, stackId, layer, roles, attnSurface, store.ShapeOf(stackId, Projection(TensorRoles.Q).TensorName)[1]),
+            Sink = BindSink(store, stackId, layer, roles, attnSurface),
+            OutputGateProjection = attnSurface.SeparateOutputGate
+                ? RoleOperand(store, stackId, layer, roles, TensorRoles.OutGateProj)
+                  ?? throw new ContainerException($"operand closure: layer {layer}: a separate output gate is declared but the layer has no '{TensorRoles.OutGateProj}' projection")
+                : null,
+            KeyConv = BindProjectionConv(store, stackId, layer, roles, TensorRoles.KConv, surface, geometry),
+            ValueConv = BindProjectionConv(store, stackId, layer, roles, TensorRoles.VConv, surface, geometry),
         };
     }
 
@@ -493,6 +517,10 @@ public static class Planner
 
     private static LayerFfn? BuildFfn(OperandStore store, string stackId, int layer, FfnSurface ffnSurface, LayerRoleMap roles, int hiddenSize, NormSurface normSurface)
     {
+        if (ffnSurface.Moe is { PackedExperts: true } packed)
+        {
+            return BindPackedExperts(store, stackId, layer, ffnSurface, packed, roles, hiddenSize);
+        }
         if (ffnSurface.Moe is { } routedMoe && roles.Experts is { } experts)
         {
             // Routed where this layer's own tensors include the router; a
@@ -632,13 +660,21 @@ public static class Planner
         {
             return null;
         }
-        Require(store, embedObj.Id, "weight", 0, "embedding table");
+        string table = surface.Head?.EmbeddingWeight ?? "weight";
+        Require(store, embedObj.Id, table, 0, "embedding table");
+        OperandRef? normWeight = null;
+        if (surface.Head?.EmbeddingNorm is { Weight: { } weightName })
+        {
+            Require(store, embedObj.Id, weightName, 0, "embedding norm weight");
+            normWeight = new OperandRef(embedObj.Id, weightName);
+        }
         return new EmbeddingOp
         {
-            Table = new OperandRef(embedObj.Id, "weight"),
+            Table = new OperandRef(embedObj.Id, table),
             VocabSize = surface.Head?.VocabSize ?? 0,
             HiddenSize = hiddenSize,
             Norm = surface.Head?.EmbeddingNorm,
+            NormWeight = normWeight,
             Scale = surface.Head?.EmbedScale,
         };
     }
@@ -650,15 +686,23 @@ public static class Planner
         {
             return null;
         }
+        if (headSurface.UnpaddedVocabSize is { } unpadded && (unpadded <= 0 || unpadded > headSurface.VocabSize))
+        {
+            throw new ContainerException($"head surface: {unpadded} unpadded tokens of a {headSurface.VocabSize}-row vocabulary");
+        }
+        int scored = headSurface.UnpaddedVocabSize ?? headSurface.VocabSize;
+        int? tableRows = scored < headSurface.VocabSize ? headSurface.VocabSize : null;
         if (headSurface.HeadReusesEmbedding)
         {
             var embed = embedObj ?? throw new ContainerException(
                 "head surface reuses the embedding, but this component owns no embedding object");
-            Require(store, embed.Id, "weight", 0, "embedding table (tied head)");
+            string table = headSurface.EmbeddingWeight ?? "weight";
+            Require(store, embed.Id, table, 0, "embedding table (tied head)");
             return new OutputOp
             {
-                Projection = new OperandRef(embed.Id, "weight"),
-                VocabSize = headSurface.VocabSize,
+                Projection = new OperandRef(embed.Id, table),
+                VocabSize = scored,
+                TableRows = tableRows,
                 HiddenSize = hiddenSize,
                 ReusesEmbedding = true,
                 Multiplier = headSurface.OutputMultiplier,
@@ -670,7 +714,8 @@ public static class Planner
         return new OutputOp
         {
             Projection = new OperandRef(headObj.Id, "weight"),
-            VocabSize = headSurface.VocabSize,
+            VocabSize = scored,
+            TableRows = tableRows,
             HiddenSize = hiddenSize,
             ReusesEmbedding = false,
             Multiplier = headSurface.OutputMultiplier,

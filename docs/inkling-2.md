@@ -39,6 +39,23 @@ amql-cli encode D:\Models\Inkling-2-Mini --out <container> --no-vision
   back unchanged (export writes FP4 back as `U8` at half the last dimension,
   for any rank).
 
+## Described generically
+
+The graph describes the stack to the planner by structure, not by family: a
+depth loop (layers 6-17 three times, each pass with its own cache slots), a
+block residual (a bank of block inputs every 6 layers, depth mixes at each
+sub-block and at the final norm), cross-pass message gates, residual short
+convolutions, and the attention's conditioning (separate q/k/v inputs, query
+scale and clip, log-scaling on the full layers, a relative bias, projected
+sinks, a separate output gate), with packed experts routed by sigmoid scores
+and a softcapped GLU. See [depth-ops.md](depth-ops.md) for each surface and
+plan op. `GenericRuntime` runs that plan on the CPU and matches `Inkling2Model`
+bit for bit on the tiny fixture; the device engine does not run those ops yet,
+so `amql-server`, `generate` and `DecodeSession.Open` still use the dedicated
+session below (`AMQL_RUNTIME=planned` opens the planned path in
+`DecodeSession.Open`). A container encoded before this needs
+`amql-cli graph upgrade <container>` (graph only; tensors untouched).
+
 ## Runtime (host memory)
 
 `Inkling2Model` keeps every expert stack packed and decodes only the rows of

@@ -111,6 +111,40 @@ public static class TensorRoles
     public const string DenseOut = "dense_out_norm";
     public const string LayerScale = "layer_scale";
 
+    // Attention that reads separate q, k and v inputs, each with its own norm.
+    public const string QInNorm = "q_in_norm";
+    public const string KInNorm = "k_in_norm";
+    public const string VInNorm = "v_in_norm";
+
+    // Attention conditioning: a learned per-channel query scale, a relative
+    // score bias (projection, per-channel scale, distance table), a sink logit
+    // projected from the query input (or a static one), and an output gate
+    // with its own projection.
+    public const string QChannelScale = "q_channel_scale";
+    public const string RelProj = "rel_proj";
+    public const string RelChannelScale = "rel_channel_scale";
+    public const string RelTable = "rel_table";
+    public const string Sink = "sink";
+    public const string SinkProj = "sink_proj";
+    public const string OutGateProj = "out_gate_proj";
+
+    // Residual short convolutions (see ResidualConvSurface): on the key and
+    // value projections (parts weight, or static + tap_proj) and on each
+    // sub-block's output.
+    public const string KConv = "k_conv";
+    public const string VConv = "v_conv";
+    public const string MixerOutConv = "mixer_out_conv";
+    public const string FfnOutConv = "ffn_out_conv";
+
+    // Experts stored one tensor per projection for the whole layer, with the
+    // parts of their stored format (scale, amax, denominator).
+    public const string PackedGateUp = "packed_experts_gate_up";
+    public const string PackedDown = "packed_experts_down";
+
+    /// <summary>A message gate's role for an input site (q, k, v or ffn); parts
+    /// <c>down</c>, <c>forget</c>, <c>gain</c>.</summary>
+    public static string MessageGate(string site) => $"message_gate_{site}";
+
     /// <summary>Expert projection stems, by role, as each family spells them
     /// inside <c>experts.N.</c>.</summary>
     private static readonly (string Role, string[] Stems)[] ExpertStems =

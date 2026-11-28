@@ -74,6 +74,12 @@ public sealed class WeightLoader
 
     public WeightWorkingSet WorkingSet => _workingSet;
 
+    private RowOperands? _rows;
+
+    /// <summary>The row-exact path's operands over the same store (resolved on
+    /// first use and kept, whatever the working set): see <see cref="RowOperands"/>.</summary>
+    public RowOperands Rows => _rows ??= new RowOperands(_store);
+
     /// <summary>Whether the store holds this tensor (a module the plan does
     /// not run, such as an MTP drafter, may be absent).</summary>
     public bool Contains(OperandRef operand)

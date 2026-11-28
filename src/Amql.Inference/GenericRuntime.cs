@@ -58,12 +58,17 @@ public sealed partial class GenericRuntime
             ?? TensorOps.GatherRows(_weights.Matrix(embed.Table, embed.VocabSize, embed.HiddenSize), tokens);
         if (embed.Norm is { } norm)
         {
-            var ones = new float[hidden.Cols];
-            for (int i = 0; i < ones.Length; i++)
+            float[] weight;
+            if (embed.NormWeight is { } learned)
             {
-                ones[i] = 1f;
+                weight = _weights.Vector(learned, hidden.Cols);
             }
-            Norms.ApplyInPlace(hidden, norm.Kind, norm.Eps, ones, 0f);
+            else
+            {
+                weight = new float[hidden.Cols];
+                Array.Fill(weight, 1f);
+            }
+            Norms.ApplyInPlace(hidden, norm.Kind, norm.Eps, weight, 0f);
         }
         if (embed.Scale is { } scale)
         {
@@ -90,6 +95,11 @@ public sealed partial class GenericRuntime
     public Tensor2D RunLayerInternal(Tensor2D x, int layer, int[] queryPositions, int[] kvPositions, bool appendKv,
         int[][]? positionStreams = null)
     {
+        if (_plan.RunsByVisit)
+        {
+            throw new UnsupportedOperatorException(
+                "this plan runs by visit schedule (a depth loop, a block residual or a row-exact op): step it with StepForward, not layer by layer");
+        }
         var layerPlan = _plan.Layers[layer];
         int hidden = _plan.HiddenSize;
         if (layerPlan.MixerHyperConnection is not null)
@@ -621,6 +631,7 @@ public sealed partial class GenericRuntime
         _linearStates.Clear();
         _convStates.Clear();
         ResetQwen4State();
+        ResetVisitState();
         SessionPosition = 0;
         if (_patches.Count > 0)
         {
@@ -1053,6 +1064,10 @@ public sealed partial class GenericRuntime
             throw new UnsupportedOperatorException(
                 "step decoding is causal-only — a masked diffusion model generates with MaskedDiffusionSampler");
         }
+        if (_plan.RunsByVisit)
+        {
+            return StepVisits(token);
+        }
         int position = SessionPosition;
         var hidden = Embed(new[] { token });
         var queryPositions = new[] { position };
@@ -1276,6 +1291,10 @@ public sealed partial class GenericRuntime
             // Qwen4: the streams are read into one hidden state, not normalised in place.
             return HyperRead(hidden, mixer).Read;
         }
+        if (_plan.RunsByVisit)
+        {
+            return RowFinalNorm(hidden);
+        }
         ApplyNorm(hidden, _plan.FinalNorm!, hidden.Cols);
         return hidden;
     }
@@ -1288,9 +1307,23 @@ public sealed partial class GenericRuntime
         {
             throw new UnsupportedOperatorException("plan carries no output head");
         }
+        if (_plan.RunsByVisit)
+        {
+            return RowHead(hidden);
+        }
         // A head the lean working set cannot hold is used a block of rows at a time.
-        var logits = _weights.StreamedProduct(hidden, output.Projection, output.VocabSize, output.HiddenSize)
-            ?? TensorOps.MatMulTransposedB(hidden, _weights.Matrix(output.Projection, output.VocabSize, output.HiddenSize));
+        var logits = _weights.StreamedProduct(hidden, output.Projection, output.StoredRows, output.HiddenSize)
+            ?? TensorOps.MatMulTransposedB(hidden, _weights.Matrix(output.Projection, output.StoredRows, output.HiddenSize));
+        if (output.TableRows is not null)
+        {
+            // A padded vocabulary: the rows past it are never scored.
+            var scored = new float[hidden.Rows * output.VocabSize];
+            for (int r = 0; r < hidden.Rows; r++)
+            {
+                Array.Copy(logits.Data, r * logits.Cols, scored, r * output.VocabSize, output.VocabSize);
+            }
+            logits = new Tensor2D(scored, hidden.Rows, output.VocabSize);
+        }
         if (output.Multiplier is { } multiplier)
         {
             for (int i = 0; i < logits.Data.Length; i++)

@@ -106,6 +106,7 @@ The `ExecutionSurface` type is the contract between planner and executor. It cap
 - **FFN type** — dense (Gated/DotGated/Glu), MoE (router, experts, top-k, routing policy)
 - **Head** — vocab size, embedding tie, output scale, logit soft-capping
 - **Optional operators** — linear attention (GatedDeltaNet), KDA, MLA, Mamba2, conv-qkv, residual-in-fp32
+- **Depth and conditioning** — looped layers (a visit schedule with per-visit cache slots), a block residual that mixes over depth, cross-pass message gates, residual short convolutions, attention conditioning (relative bias, sinks, clips, log-scaling, separate inputs) and packed experts ([depth-ops.md](depth-ops.md))
 
 An unknown operator appears as a `JsonElement` carry-forward; the planner refuses execution rather than guessing.
 

@@ -470,6 +470,53 @@ public sealed partial class GpuEngine : IDisposable
         {
             return "Qwen4 gated residual";
         }
+        // The row-exact path's ops have no device kernels in this engine yet.
+        if (plan.DepthLoop is not null)
+        {
+            return "looped depth (a range of layers run several times)";
+        }
+        if (plan.BlockResidual is not null)
+        {
+            return "block attention residual (depth mixing)";
+        }
+        if (plan.Output?.TableRows is not null)
+        {
+            return "a padded vocabulary";
+        }
+        foreach (var layer in plan.Layers)
+        {
+            if (layer.MessageGates is not null)
+            {
+                return "cross-pass message gates";
+            }
+            if (layer.MixerOutputConv is not null || layer.FfnOutputConv is not null ||
+                layer.Attention is { KeyConv: not null } or { ValueConv: not null })
+            {
+                return "residual short convolutions";
+            }
+            if (layer.Attention is { RelativeBias: not null })
+            {
+                return "a learned relative score bias";
+            }
+            if (layer.Attention is { Sink: not null })
+            {
+                return "attention sink logits";
+            }
+            if (layer.Attention is { IsConditioned: true })
+            {
+                return "attention conditioning (separate inputs, query scale or clip, log-scaling, a separate output gate)";
+            }
+            if (layer.Ffn?.Routed is { Packed: not null })
+            {
+                return "packed experts in their stored formats";
+            }
+            if (layer.Ffn?.Routed is { } routedFfn &&
+                (routedFfn.RoutingPolicy == ExpertRoutingPolicy.SigmoidNormalisedOverSelected || routedFfn.SelectionBias is not null ||
+                 routedFfn.GatePolicy is not ExpertGateGated))
+            {
+                return "sigmoid routing with a selection bias, or a softcapped GLU";
+            }
+        }
         foreach (var layer in plan.Layers)
         {
             if (layer.Ngram is not null || layer.Attention?.Indexer is not null)

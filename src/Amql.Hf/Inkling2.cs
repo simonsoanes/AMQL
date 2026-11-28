@@ -9,8 +9,10 @@ namespace Amql.Hf;
 /// none of the usual roles: no rotary but a relative bias per head, sinks,
 /// short causal convolutions around attention and the experts, a residual
 /// that attends over blocks of earlier states, and a core of layers run
-/// several times. So it is judged here, from its own names, and runs on
-/// <c>Inkling2Model</c> rather than the planner's layers.
+/// several times. This is its config adapter: it reads the checkpoint's keys
+/// and names, and describes the stack with the generic surfaces the planner
+/// reads (<see cref="DescribeSurface"/>) and a role map of its tensors, beside
+/// the facts its dedicated session (<c>Inkling2Model</c>, <c>Inkling2Gpu</c>) reads.
 /// <para>
 /// Two spellings of the config are read: the checkpoint's own
 /// (<c>text_config</c> with <c>loop_config</c>, <c>local_layer_ids</c>,
@@ -164,6 +166,189 @@ public static class Inkling2
         };
     }
 
+    /// <summary>
+    /// The execution surface for these facts: the generic surfaces the planner
+    /// reads (depth loop, block residual, message gates, residual convolutions,
+    /// the attention's conditioning and relative bias, the packed experts'
+    /// routing and gate) with the layer role map that names this checkpoint's
+    /// tensors, beside the facts themselves for the dedicated session. A fresh
+    /// encode and <see cref="UpgradeGraph"/> both build it here, so the two agree.
+    /// </summary>
+    public static ExecutionSurface DescribeSurface(Inkling2Surface facts, long? contextLength)
+    {
+        if (facts.SlidingHeads != facts.FullHeads)
+        {
+            throw new ModelConfigException(
+                $"Inkling 2 with {facts.SlidingHeads} sliding and {facts.FullHeads} full query heads is not described to the planner " +
+                "(its attention surface holds one query-head count)");
+        }
+        int layers = facts.FullLayers.Count;
+        var norm = new NormSpec { Kind = NormType.RmsNorm, Eps = facts.Eps, WeightOffset = 0f };
+        var fullLayers = Enumerable.Range(0, layers).Where(l => facts.FullLayers[l]).ToList();
+        return new ExecutionSurface
+        {
+            ContextLength = contextLength,
+            Attention = new AttentionSurface
+            {
+                NumQHeads = facts.FullHeads,
+                NumKvHeads = facts.FullKvHeads,
+                HeadDim = facts.FullHeadDim,
+                ScoreScale = 1.0 / Math.Sqrt(facts.FullHeadDim),
+                AttentionBias = false,
+                ParameterFreeQkNorm = new ParameterFreeQkNorm { V = true },
+                QkClip = facts.QkClip,
+                LogScaling = new PositionLogScaling { Floor = facts.LogScalingFloor, Alpha = facts.LogScalingAlpha, Layers = fullLayers },
+                RelativeBias = new RelativeBiasSurface { Rank = facts.RelativeDim, Clip = facts.RelativeClip },
+                SinkLogits = SinkLogitKind.Projected,
+                SeparateOutputGate = true,
+            },
+            Ffn = new FfnSurface
+            {
+                IntermediateSize = facts.ExpertWidth,
+                Activation = Activation.Silu,
+                FfnType = FfnType.Gated,
+                GatePolicy = new ExpertGateSoftcappedGlu { GateCap = facts.GateSoftcap, UpCap = facts.UpSoftcap },
+                Moe = new MoeSurface
+                {
+                    Experts = facts.Experts,
+                    TopK = facts.TopK,
+                    ExpertIntermediateSize = facts.ExpertWidth,
+                    RoutingPolicy = ExpertRoutingPolicy.SigmoidNormalisedOverSelected,
+                    SelectionBias = true,
+                    RouteScale = facts.RouteScale,
+                    PackedExperts = true,
+                    GateUpLayout = GateUpLayouts.InterleavedRows,
+                    ExpertFormat = "as_stored",
+                },
+            },
+            Norm = new NormSurface
+            {
+                Pre = norm, Post = norm, FinalNorm = norm, Placement = NormPlacement.PreOnly, FinalNormWeight = "norm.weight",
+            },
+            Head = new HeadSurface
+            {
+                VocabSize = facts.PaddedVocab,
+                UnpaddedVocabSize = facts.UnpaddedVocab < facts.PaddedVocab ? facts.UnpaddedVocab : null,
+                HeadReusesEmbedding = false,
+                FinalLogitSoftcapping = (float)facts.FinalSoftcap,
+                EmbeddingWeight = "embed.weight",
+                EmbeddingNorm = new EmbeddingNorm { Kind = NormType.RmsNorm, Eps = facts.Eps, Weight = "embed_norm.weight" },
+            },
+            DepthLoop = new DepthLoopSurface { Start = facts.LoopStart, End = facts.LoopEnd, Passes = facts.LoopPasses },
+            BlockResidual = new BlockResidualSurface
+            {
+                BlockSize = facts.BlockSize,
+                Eps = 1e-6,
+                QueryObject = "target.final_norm",
+                MixerQueries = Enumerable.Range(0, layers).Select(l => l == 0 ? null : $"attn_res.attn_queries.{l - 1}").ToList(),
+                FfnQueries = Enumerable.Range(0, layers).Select(l => $"attn_res.mlp_queries.{l}").ToList(),
+                OutputQuery = "attn_res.output_query",
+            },
+            MessageGates = new MessageGateSurface
+            {
+                Rank = facts.GateRank,
+                Eps = facts.Eps,
+                SkipBlocks = 1,
+                // The checkpoint keeps [q, ffn] and [k, v] per looped layer in two tensors.
+                Sites = new List<MessageGateSite>
+                {
+                    new() { Input = "q", Query = "middle_cycle_cross_pass_queries", Stride = 2, Offset = 0 },
+                    new() { Input = "k", Query = "middle_cycle_cross_pass_kv_queries", Stride = 2, Offset = 0 },
+                    new() { Input = "v", Query = "middle_cycle_cross_pass_kv_queries", Stride = 2, Offset = 1 },
+                    new() { Input = "ffn", Query = "middle_cycle_cross_pass_queries", Stride = 2, Offset = 1 },
+                },
+            },
+            ResidualConv = new ResidualConvSurface { Kernel = facts.ConvKernel },
+            Roles = Roles(),
+            Provenance = new Dictionary<string, string>
+            {
+                ["block_residual.eps"] = "modeling_inkling2_loop: the depth mix normalises its states with a fixed 1e-6",
+                ["message_gates.skip_blocks"] = "modeling_inkling2_loop: a pass's first block is the state the loop restarts from",
+            },
+            Inkling2 = facts,
+        };
+    }
+
+    /// <summary>This checkpoint's layer tensors by role (layer-relative names).</summary>
+    public static LayerRoleMap Roles()
+    {
+        var roles = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            [$"{TensorRoles.AttnIn}.weight"] = "attn_norm.weight",
+            [$"{TensorRoles.QInNorm}.weight"] = "q_input_norm.weight",
+            [$"{TensorRoles.KInNorm}.weight"] = "k_input_norm.weight",
+            [$"{TensorRoles.VInNorm}.weight"] = "v_input_norm.weight",
+            [$"{TensorRoles.FfnIn}.weight"] = "mlp_norm.weight",
+            [$"{TensorRoles.Q}.weight"] = "attn.wq_du.weight",
+            [$"{TensorRoles.K}.weight"] = "attn.wk_dv.weight",
+            [$"{TensorRoles.V}.weight"] = "attn.wv_dv.weight",
+            [$"{TensorRoles.O}.weight"] = "attn.wo_ud.weight",
+            [$"{TensorRoles.OutGateProj}.weight"] = "attn.gate_attn.weight",
+            [$"{TensorRoles.SinkProj}.weight"] = "attn.attn_sink_proj.weight",
+            [$"{TensorRoles.QChannelScale}.weight"] = "attn.q_l2_clip.scale",
+            [$"{TensorRoles.RelProj}.weight"] = "attn.wr_du.weight",
+            [$"{TensorRoles.RelChannelScale}.weight"] = "attn.rel_l2_clip.scale",
+            [$"{TensorRoles.RelTable}.weight"] = "attn.rel_logits_proj.proj",
+            [$"{TensorRoles.KConv}.weight"] = "attn.k_sconv.weight",
+            [$"{TensorRoles.KConv}.static"] = "attn.k_sconv.static_w",
+            [$"{TensorRoles.KConv}.tap_proj"] = "attn.k_sconv.weight_proj",
+            [$"{TensorRoles.VConv}.weight"] = "attn.v_sconv.weight",
+            [$"{TensorRoles.VConv}.static"] = "attn.v_sconv.static_w",
+            [$"{TensorRoles.VConv}.tap_proj"] = "attn.v_sconv.weight_proj",
+            [$"{TensorRoles.MixerOutConv}.weight"] = "attn_sconv.weight",
+            [$"{TensorRoles.FfnOutConv}.weight"] = "mlp_sconv.weight",
+            [$"{TensorRoles.Router}.weight"] = "mlp.gate.weight",
+            [$"{TensorRoles.Router}.bias"] = "mlp.gate.bias",
+        };
+        foreach (var (role, stem) in new[] { (TensorRoles.PackedGateUp, "mlp.experts.w13_weight"), (TensorRoles.PackedDown, "mlp.experts.w2_weight") })
+        {
+            roles[$"{role}.weight"] = stem;
+            roles[$"{role}.scale"] = stem + "_scale";
+            roles[$"{role}.amax"] = stem + "_amax";
+            roles[$"{role}.denominator"] = stem + "_outer_scale_denominator";
+        }
+        foreach (var (site, controller) in new[] { ("q", "attn"), ("k", "k"), ("v", "v"), ("ffn", "mlp") })
+        {
+            foreach (var part in new[] { "down", "forget", "gain" })
+            {
+                roles[$"{TensorRoles.MessageGate(site)}.{part}"] = $"controllers.{controller}.{part}_weight";
+            }
+        }
+        return new LayerRoleMap { Roles = roles };
+    }
+
+    /// <summary>
+    /// Rewrites a system graph encoded before the generic surfaces existed:
+    /// every component that carries Inkling 2's facts but no depth loop gets
+    /// <see cref="DescribeSurface"/> of those facts (its context length kept).
+    /// Tensors and every other component are untouched. Returns the components
+    /// rewritten (none when the graph is already current).
+    /// </summary>
+    public static (SystemGraph Graph, IReadOnlyList<string> Upgraded) UpgradeGraph(SystemGraph graph)
+    {
+        var upgraded = new List<string>();
+        var components = graph.Components.Select(c =>
+        {
+            if (c.Execution is not { Inkling2: { } facts, DepthLoop: null } old)
+            {
+                return c;
+            }
+            upgraded.Add(c.Id);
+            return new Component
+            {
+                Id = c.Id,
+                Role = c.Role,
+                SourceArtifact = c.SourceArtifact,
+                NumLayers = c.NumLayers,
+                HiddenSize = c.HiddenSize,
+                Attention = c.Attention,
+                Perception = c.Perception,
+                Execution = DescribeSurface(facts, old.ContextLength),
+            };
+        }).ToList();
+        return (new SystemGraph { Schema = graph.Schema, Components = components, Objects = graph.Objects, Edges = graph.Edges }, upgraded);
+    }
+
     internal static int Hidden(string configPath)
     {
         using var doc = JsonDocument.Parse(File.ReadAllBytes(configPath));
@@ -294,33 +479,7 @@ public static partial class ArchMapper
             },
         }).ToList();
 
-        var norm = new NormSpec { Kind = NormType.RmsNorm, Eps = facts.Eps, WeightOffset = 0f };
-        var surface = new ExecutionSurface
-        {
-            ContextLength = Inkling2.Context(configPath) is > 0 and var context ? context : null,
-            Attention = new AttentionSurface
-            {
-                NumQHeads = facts.FullHeads,
-                NumKvHeads = facts.FullKvHeads,
-                HeadDim = facts.FullHeadDim,
-                ScoreScale = 1.0 / Math.Sqrt(facts.FullHeadDim),
-                AttentionBias = false,
-            },
-            Ffn = new FfnSurface
-            {
-                IntermediateSize = facts.ExpertWidth,
-                Activation = Activation.Silu,
-                FfnType = FfnType.Gated,
-            },
-            Norm = new NormSurface { Pre = norm, Post = norm, FinalNorm = norm, Placement = NormPlacement.PreOnly },
-            Head = new HeadSurface
-            {
-                VocabSize = facts.PaddedVocab,
-                HeadReusesEmbedding = false,
-                FinalLogitSoftcapping = (float)facts.FinalSoftcap,
-            },
-            Inkling2 = facts,
-        };
+        var surface = Inkling2.DescribeSurface(facts, Inkling2.Context(configPath) is > 0 and var context ? context : null);
 
         LogicalObject Obj(string id, ObjectKind kind, string prefix) => new()
         {

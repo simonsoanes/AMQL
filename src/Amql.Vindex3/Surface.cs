@@ -22,12 +22,18 @@ public sealed class NormSpec
     public float WeightOffset { get; init; }
 }
 
-/// <summary>A weightless normalisation applied to the embedding output
-/// (RMS-normalises every looked-up row, no learned weights ship).</summary>
+/// <summary>A normalisation applied to the embedding output: every looked-up
+/// row RMS-normalised, without a learned weight unless <see cref="Weight"/>
+/// names one.</summary>
 public sealed class EmbeddingNorm
 {
     public required NormType Kind { get; init; }
     public required double Eps { get; init; }
+
+    /// <summary>The norm's learned weight, a tensor of the embedding object;
+    /// null for the weightless norm.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Weight { get; init; }
 }
 
 /// <summary>The norm placement on a stack. Established from operand
@@ -54,6 +60,11 @@ public sealed class NormSurface
 
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public NormPlacement? Placement { get; init; }
+
+    /// <summary>The final norm's weight in the final-norm object, when it is
+    /// not simply <c>weight</c> (the object also holds other tensors).</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? FinalNormWeight { get; init; }
 }
 
 // ── Attention surface ──────────────────────────────────────────────────────
@@ -117,6 +128,162 @@ public sealed class AttentionSurface
     /// Cohere and GLM use — rather than the two halves of the rotary window.</summary>
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
     public bool RopeInterleaved { get; init; }
+
+    /// <summary>Each query head and key head is scaled down to this L2 length
+    /// when longer: <c>x · min(1, clip / (|x| + 1e-6))</c>. Queries first take
+    /// their learned per-channel scale (role <c>q_channel_scale</c>, when the
+    /// layer carries it).</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public double? QkClip { get; init; }
+
+    /// <summary>Queries (and relative-bias states) are multiplied by
+    /// <c>1 + alpha·ln(max(1, (t+1)/floor))</c> at position t, on the listed layers.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public PositionLogScaling? LogScaling { get; init; }
+
+    /// <summary>A learned score bias over backward distance, in place of a
+    /// rotary embedding (see <see cref="RelativeBiasSurface"/>).</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public RelativeBiasSurface? RelativeBias { get; init; }
+
+    /// <summary>A sink logit per head joins every softmax and takes probability
+    /// mass without contributing a value. Not the legacy <see cref="Sinks"/>
+    /// field, which stays refused.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public SinkLogitKind? SinkLogits { get; init; }
+
+    /// <summary>The attention context is gated elementwise by
+    /// <c>sigmoid(G · q_input)</c>, G a projection of its own
+    /// (role <c>out_gate_proj</c>), before the output projection.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool SeparateOutputGate { get; init; }
+}
+
+/// <summary>Where an attention sink's logit comes from.</summary>
+public enum SinkLogitKind
+{
+    /// <summary>One learned logit per head (role <c>sink</c>, [heads]).</summary>
+    Static,
+
+    /// <summary>Projected from the query input (role <c>sink_proj</c>, [heads, hidden]).</summary>
+    Projected,
+}
+
+/// <summary>Position log-scaling of queries on long contexts.</summary>
+public sealed class PositionLogScaling
+{
+    public required int Floor { get; init; }
+    public required double Alpha { get; init; }
+
+    /// <summary>The layers (0-based) that scale; the rest leave queries as they are.</summary>
+    public required IReadOnlyList<int> Layers { get; init; }
+}
+
+/// <summary>
+/// A learned relative score bias. Per head, a state
+/// <c>r = scale ⊙ (R · q_input)</c> of width <see cref="Rank"/> is L2-clipped to
+/// <see cref="Clip"/> (and log-scaled where the layer's queries are); the bias
+/// on a key at backward distance <c>δ &lt; extent</c> is <c>r · T[:, δ]</c>, T the
+/// layer's table <c>[rank, extent]</c> (role <c>rel_table</c>; its width is the
+/// extent). R is role <c>rel_proj</c> [heads·rank, hidden], the scale
+/// <c>rel_channel_scale</c> [heads, rank].
+/// </summary>
+public sealed class RelativeBiasSurface
+{
+    public required int Rank { get; init; }
+    public required double Clip { get; init; }
+}
+
+// ── Depth: looped layers, block residuals, cross-pass messages ────────────
+
+/// <summary>
+/// Layers <c>[Start, End)</c> run <see cref="Passes"/> times. Each pass has
+/// its own key, value and convolution cache slots; every pass after the first
+/// restarts from the state (and residual bank) saved after layer
+/// <c>Start − 1</c>. Weights are shared between passes.
+/// </summary>
+public sealed class DepthLoopSurface
+{
+    public required int Start { get; init; }
+    public required int End { get; init; }
+    public required int Passes { get; init; }
+}
+
+/// <summary>
+/// A residual that attends over depth. The stream keeps a bank of block inputs:
+/// at a layer whose index is a multiple of <see cref="BlockSize"/>, the layer's
+/// input joins the bank and the residual restarts from the attention output
+/// instead of adding to it. A sub-block's input is a depth mix:
+/// <code>
+/// s_i   = rms(state_i)            (no weight, eps <see cref="Eps"/>), states = bank ++ [current]
+/// w     = softmax_i(query · s_i / √hidden)
+/// input = Σ_i w_i s_i
+/// </code>
+/// Queries are tensors of <see cref="QueryObject"/>: per layer one for the
+/// mixer (<see cref="MixerQueries"/>, [hidden] or [3, hidden] — three give the
+/// attention separate q, k and v inputs; null reads the state itself) and one
+/// for the FFN; the final norm reads the mix of <see cref="OutputQuery"/>.
+/// </summary>
+public sealed class BlockResidualSurface
+{
+    public required int BlockSize { get; init; }
+    public required double Eps { get; init; }
+    public required string QueryObject { get; init; }
+    public required IReadOnlyList<string?> MixerQueries { get; init; }
+    public required IReadOnlyList<string> FfnQueries { get; init; }
+    public required string OutputQuery { get; init; }
+}
+
+/// <summary>
+/// A gate on a looped layer's inputs from the pass before it (passes after the
+/// first). For each site the message is a depth mix (as
+/// <see cref="BlockResidualSurface"/>) over the previous pass's bank — the
+/// blocks it opened after its first <see cref="SkipBlocks"/> — and its output:
+/// <code>
+/// g  = Down · [rms(h); rms(m)]        (no weights, eps <see cref="Eps"/>)
+/// h' = (1 − tanh(Forget · g)) ⊙ h + tanh(Gain · g) ⊙ m
+/// </code>
+/// Down [rank, 2·hidden], Forget and Gain [hidden, rank] are the layer's roles
+/// <c>message_gate_{site}</c> (parts <c>down</c>, <c>forget</c>, <c>gain</c>).
+/// </summary>
+public sealed class MessageGateSurface
+{
+    public required int Rank { get; init; }
+    public required double Eps { get; init; }
+    public required int SkipBlocks { get; init; }
+    public required IReadOnlyList<MessageGateSite> Sites { get; init; }
+}
+
+/// <summary>One gated input. The site's query for looped layer i (counted
+/// from the loop's start) is row <c>Offset + Stride·i</c> of
+/// <see cref="Query"/>, a tensor of the residual's query object.</summary>
+public sealed class MessageGateSite
+{
+    /// <summary><c>q</c>, <c>k</c>, <c>v</c> (the attention's inputs) or <c>ffn</c>.</summary>
+    public required string Input { get; init; }
+
+    public required string Query { get; init; }
+    public required int Stride { get; init; }
+    public required int Offset { get; init; }
+}
+
+/// <summary>
+/// Short causal depthwise convolutions with a residual, of width
+/// <see cref="Kernel"/>. Each site's output is <c>(Σ taps·x + x) / √(n + 1)</c>,
+/// n the number of tap terms. Sites, by layer role:
+/// <list type="bullet">
+///   <item><c>mixer_out_conv</c>, <c>ffn_out_conv</c>: on a sub-block's output before its
+///   residual join; weights [C, 1, K], the last tap on the current token (n = K).</item>
+///   <item><c>k_conv</c>, <c>v_conv</c> on the key and value projections: static weights
+///   [C, 1, K] as above, or dynamic taps <c>static[lag, c] + dyn[head, lag]</c>,
+///   lag 0 the current token, with parts <c>static</c> [K, C] and <c>tap_proj</c>
+///   [kv_heads·K, hidden] read from the projection's input (n = 2K).</item>
+/// </list>
+/// The key and value convolutions run before the key clip and the value norm.
+/// </summary>
+public sealed class ResidualConvSurface
+{
+    public required int Kernel { get; init; }
 }
 
 // ── Masked diffusion surface ─────────────────────────────────────────────
@@ -169,15 +336,24 @@ public enum ExpertRoutingPolicy
 {
     SoftmaxThenSelect,
     NormalisedOverSelected,
+
+    /// <summary>Scores are <c>sigmoid(router · x)</c>; the experts are chosen by
+    /// score plus the router's bias (when <see cref="MoeSurface.SelectionBias"/>),
+    /// which does not enter the weights; the chosen scores are normalised to sum
+    /// to one (over their sum + 1e-20) and multiplied by
+    /// <see cref="MoeSurface.RouteScale"/>.</summary>
+    SigmoidNormalisedOverSelected,
 }
 
 /// <summary>Expert gate arithmetic. <c>Gated</c> is the plain
 /// activation(gate) * up used by Mixtral/Gemma/OLMoE;
 /// <c>ClampedGlu</c> is GPT-OSS's clamped GLU (clamps both halves,
-/// scales the sigmoid argument, adds one to the up branch).</summary>
+/// scales the sigmoid argument, adds one to the up branch);
+/// <c>SoftcappedGlu</c> softcaps both halves.</summary>
 [JsonPolymorphic(TypeDiscriminatorPropertyName = "kind")]
 [JsonDerivedType(typeof(ExpertGateGated), "gated")]
 [JsonDerivedType(typeof(ExpertGateClampedGlu), "clamped_glu")]
+[JsonDerivedType(typeof(ExpertGateSoftcappedGlu), "softcapped_glu")]
 public abstract class ExpertGatePolicy
 {
     public static ExpertGatePolicy GatedDefault { get; } = new ExpertGateGated();
@@ -191,6 +367,15 @@ public sealed class ExpertGateClampedGlu : ExpertGatePolicy
 {
     public float Limit { get; init; }
     public float Alpha { get; init; }
+}
+
+/// <summary>A SwiGLU whose halves are softcapped:
+/// <c>cap(g, GateCap) · sigmoid(g) · cap(u, UpCap)</c>, <c>cap(x, c) = c·tanh(x/c)</c>
+/// (the sigmoid reads the raw gate).</summary>
+public sealed class ExpertGateSoftcappedGlu : ExpertGatePolicy
+{
+    public double GateCap { get; init; }
+    public double UpCap { get; init; }
 }
 
 public sealed class MoeSurface
@@ -231,6 +416,32 @@ public sealed class MoeSurface
     /// <summary>The router reads its input RMS-normalised without a weight.</summary>
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
     public bool RouterInputNorm { get; init; }
+
+    /// <summary>The router's bias (role <c>moe_router.bias</c>) is added to the
+    /// scores only to choose the experts, not to weight them.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool SelectionBias { get; init; }
+
+    /// <summary>What every selected expert's weight is multiplied by.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public double? RouteScale { get; init; }
+
+    /// <summary>All of a layer's experts are stored in one tensor per projection
+    /// (roles <c>packed_experts_gate_up</c> [E, 2I, hidden] and
+    /// <c>packed_experts_down</c> [E, hidden, I]), each in its stored format —
+    /// plain, NVFP4 (FP4 elements with parts <c>scale</c> (E4M3 per 16),
+    /// <c>amax</c> [E] and <c>denominator</c> [1]) or MXFP8 (E4M3 with an E8M0
+    /// <c>scale</c> per 32) — decoded a row at a time. <see cref="GateUpLayout"/>
+    /// says how gate and up rows sit in the first.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool PackedExperts { get; init; }
+}
+
+/// <summary>Values of <see cref="MoeSurface.GateUpLayout"/> for packed experts.</summary>
+public static class GateUpLayouts
+{
+    /// <summary>Rows alternate gate, up: row 2j is gate j, row 2j+1 up j.</summary>
+    public const string InterleavedRows = "interleaved_rows";
 }
 
 public sealed class FfnSurface
@@ -265,6 +476,17 @@ public sealed class HeadSurface
 
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
     public bool HeadReusesEmbedding { get; init; }
+
+    /// <summary>The embedding table's tensor in the embedding object, when it
+    /// is not simply <c>weight</c>.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? EmbeddingWeight { get; init; }
+
+    /// <summary>The vocabulary the logits cover, when the embedding and head
+    /// carry more rows (<see cref="VocabSize"/>) than that: the rows past it are
+    /// padding, never scored.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? UnpaddedVocabSize { get; init; }
 }
 
 // ── Pooling surface (shared by embedding and classifier families) ────────
@@ -501,19 +723,15 @@ public sealed class NgramEmbeddingSurface
 // ── The surface proper ─────────────────────────────────────────────────────
 
 /// <summary>
-/// What the generic operations need to run a component: grouped by op
-/// (attention, ffn, norm, optional head), every value fully resolved at
-/// build time. Presence means presence in schema ≥ 6 (older graphs refused
-/// rather than upgraded). The completeness contract derives from the
-/// objects a component owns — a decoder stack implies attention + ffn +
-/// norm; an embedding/head implies a head surface.
-/// </summary>
-/// <summary>
-/// Inkling 2 (<c>inkling2_loop</c>): every fact its runtime reads, as the
-/// config states it. Layers <see cref="LoopStart"/> to <see cref="LoopEnd"/>
-/// run <see cref="LoopPasses"/> times; every pass after the first restarts
-/// from the layers before the loop and is gated on messages from the pass
-/// before it, with its own keys, values and convolution states.
+/// Inkling 2 (<c>inkling2_loop</c>): every fact its dedicated session
+/// (<c>Inkling2Model</c>, <c>Inkling2Gpu</c>) reads, as the config states it.
+/// Kept beside the generic surfaces (<see cref="DepthLoopSurface"/>,
+/// <see cref="BlockResidualSurface"/>, …) that describe the same stack to the
+/// planner, until the device engine runs those; the planner never reads it.
+/// Layers <see cref="LoopStart"/> to <see cref="LoopEnd"/> run
+/// <see cref="LoopPasses"/> times; every pass after the first restarts from the
+/// layers before the loop and is gated on messages from the pass before it,
+/// with its own keys, values and convolution states.
 /// </summary>
 public sealed class Inkling2Surface
 {
@@ -569,6 +787,14 @@ public sealed class Inkling2Surface
     public required int UnpaddedVocab { get; init; }
 }
 
+/// <summary>
+/// What the generic operations need to run a component: grouped by op
+/// (attention, ffn, norm, optional head), every value fully resolved at
+/// build time. Presence means presence in schema ≥ 6 (older graphs refused
+/// rather than upgraded). The completeness contract derives from the
+/// objects a component owns — a decoder stack implies attention + ffn +
+/// norm; an embedding/head implies a head surface.
+/// </summary>
 public sealed class ExecutionSurface
 {
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
@@ -640,11 +866,30 @@ public sealed class ExecutionSurface
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public NgramEmbeddingSurface? NgramEmbedding { get; init; }
 
-    /// <summary>Inkling 2's looped stack: present means the component runs on
-    /// its own runtime (block attention residuals, short convolutions, a
-    /// relative bias instead of rotary, and a core run several times).</summary>
+    /// <summary>Inkling 2's facts for its dedicated session (see
+    /// <see cref="Inkling2Surface"/>); the planner reads the generic surfaces
+    /// below instead.</summary>
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public Inkling2Surface? Inkling2 { get; init; }
+
+    /// <summary>A range of layers run several times (see <see cref="DepthLoopSurface"/>).</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public DepthLoopSurface? DepthLoop { get; init; }
+
+    /// <summary>The residual attends over a bank of block inputs (see
+    /// <see cref="BlockResidualSurface"/>); the layers' inputs and the final
+    /// norm's are depth mixes.</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public BlockResidualSurface? BlockResidual { get; init; }
+
+    /// <summary>Looped layers gate their inputs on messages from the previous
+    /// pass (see <see cref="MessageGateSurface"/>).</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public MessageGateSurface? MessageGates { get; init; }
+
+    /// <summary>Short residual convolutions (see <see cref="ResidualConvSurface"/>).</summary>
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public ResidualConvSurface? ResidualConv { get; init; }
 
     /// <summary>Which stack tensor plays which role, judged on import (see
     /// <see cref="TensorRoles"/>). Absent on containers written before roles

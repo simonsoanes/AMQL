@@ -53,9 +53,11 @@ public class GpuEngineTests : IDisposable
         using var store = container.CreateOperandStore();
         if (Inkling2Model.Serves(container))
         {
-            // Inkling 2's looped stack is not a plan: it has its own GPU path
-            // (amql_inkling.cu in amql_cuda), held to its own managed runtime.
-            Assert.Throws<UnsupportedOperatorException>(() => Planner.Plan(container, "target", store));
+            // Inkling 2's looped stack plans (see DepthOpsTests), but the engine
+            // does not run its depth ops yet and refuses them by name; its own
+            // GPU path (amql_inkling.cu in amql_cuda) is held to its managed runtime.
+            Assert.Equal("looped depth (a range of layers run several times)",
+                GpuEngine.Unsupported(Planner.Plan(container, "target", store)));
             InklingMatchesManaged(container, store, family);
             return;
         }
