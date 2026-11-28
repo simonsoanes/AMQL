@@ -78,6 +78,12 @@ public static class InferenceRunner
     /// <summary>How many top candidates a traced step records.</summary>
     private const int TraceTopK = 10;
 
+    /// <summary>How the last <see cref="Generate"/> ran: where, and how long its
+    /// prompt and its steps took (the device engine's upload is not counted).</summary>
+    public sealed record Speed(string Backend, int PromptTokens, double PrefillSeconds, int Steps, double DecodeSeconds);
+
+    public static Speed? LastSpeed { get; private set; }
+
     public static (int[] Prefill, List<StepOutcome> Steps) Generate(
         Vindex3Container container, string componentId, int[] tokens,
         int steps, SamplingConfig config, int? showTopK = null,
@@ -113,7 +119,11 @@ public static class InferenceRunner
                 onTensorLoad(new TensorTraceLine(objId, tensor, shape, hit));
         }
 
+        // The device engine uploads its weights on first use: before the clock.
+        session.DeviceEngine();
+        var clock = System.Diagnostics.Stopwatch.StartNew();
         session.Prefill(options?.Images is { Count: > 0 } images ? WithImages(container, store, session, tokens, images) : tokens);
+        double prefillSeconds = clock.Elapsed.TotalSeconds;
 
         // Recorded once and reused, so the stream header and the finished
         // document cannot drift apart.
@@ -166,6 +176,8 @@ public static class InferenceRunner
             effectiveSteps = 0;
 
         var outcomes = new List<StepOutcome>(Math.Max(effectiveSteps, 0));
+        clock.Restart();
+        int forwards = 0;
         for (int step = 0; step < effectiveSteps; step++)
         {
             var logits = session.LastLogits;
@@ -204,6 +216,7 @@ public static class InferenceRunner
             if (tracing) { session.Runtime.BeginTrace(); }
 
             session.Step(token);
+            forwards++;
 
             List<LayerTraceLine>? trace = null;
             if (tracing)
@@ -246,6 +259,8 @@ public static class InferenceRunner
                 Logprobs = stepLogprobs,
             });
         }
+
+        LastSpeed = new Speed(session.Backend, tokens.Length, prefillSeconds, forwards, clock.Elapsed.TotalSeconds);
 
         // Detach before attribution. CausalTracer replays the whole context
         // once per traced layer, and leaving the operator hook attached would

@@ -4,7 +4,7 @@
 
 // ── MXFP8 weights ──────────────────────────────────────────────────────────
 //
-// E4M3 elements, an E8M0 exponent per 32 (Inkling 2's last layers' experts).
+// E4M3 elements, an E8M0 exponent per 32 (packed experts stored MXFP8).
 // The tag picks the reader, as Fp4Nv and Fp4Mx do; a row is k bytes.
 
 struct Fp8Mx { unsigned char b; };
@@ -30,8 +30,8 @@ __device__ __forceinline__ float loadw1(const Fp8Mx* w, const unsigned char* sc,
     return __half2float(*reinterpret_cast<__half*>(&h)) * e8m0_value(__ldg(sc + (idx >> 5)));
 }
 
-// Inkling 2's gate: capped(g) . sigmoid(g) . capped(u), cap(v) = c . tanh(v / c).
-__device__ __forceinline__ float capped_swiglu(float g, float u, float gateCap, float upCap)
+// The softcapped GLU (ExpertGateSoftcappedGlu): cap(g) . sigmoid(g) . cap(u), cap(v) = c . tanh(v / c).
+__device__ __forceinline__ float softcapped_glu(float g, float u, float gateCap, float upCap)
 {
     return tanhf(g / gateCap) * gateCap / (1.f + expf(-g)) * (tanhf(u / upCap) * upCap);
 }
@@ -312,13 +312,13 @@ struct MoeGemvArgs
     const int* idx;
     float* y;                                  // [pairs x n]
     int act; int glu;
-    float gateCap, upCap;                      // PAIR: Inkling 2's caps
+    float gateCap, upCap;                      // PAIR: the softcapped GLU's caps
 };
 
 // One warp per RW output rows of a group's expert, over the group's R inputs.
 // A GLU takes an output's gate and up rows together, so their loads are in
 // flight at once: rows j and n + j, or with PAIR rows 2j and 2j + 1 (gate and
-// up interleaved) through Inkling 2's capped SwiGLU.
+// up interleaved) through the softcapped GLU.
 template <typename WT, int R, int RW, bool GLU, bool PAIR = false>
 __global__ void __launch_bounds__(256) moe_gemv_kernel(MoeGemvArgs a)
 {
@@ -439,7 +439,7 @@ __global__ void __launch_bounds__(256) moe_gemv_kernel(MoeGemvArgs a)
             if (a.rowScale)
                 #pragma unroll
                 for (int s = 0; s < S; s++) v[s] *= a.rowScale[rowBase0 + (PAIR ? 2 * j + s : (s ? a.n : 0) + j)];
-            if constexpr (PAIR) yr[r][j] = capped_swiglu(v[0], v[S - 1], a.gateCap, a.upCap);
+            if constexpr (PAIR) yr[r][j] = softcapped_glu(v[0], v[S - 1], a.gateCap, a.upCap);
             else yr[r][j] = GLU ? activate(v[0], a.act) * v[S - 1] : activate(v[0], a.act);
         }
 }
@@ -709,8 +709,8 @@ __global__ void moe_glu_kernel(const float* raw, int n, const int* blocks, const
     }
 }
 
-// The GLU of interleaved rows (gate 2c, up 2c + 1), each softcapped: Inkling 2's
-// capped(g) · sigmoid(g) · capped(u), with cap(v) = c · tanh(v / c).
+// The GLU of interleaved rows (gate 2c, up 2c + 1), each softcapped:
+// cap(g) · sigmoid(g) · cap(u), with cap(v) = c · tanh(v / c).
 __global__ void moe_glu_pairs_kernel(const float* raw, int n, const int* blocks, const float* rowScale, int rowsPerExpert,
                                      float gateCap, float upCap, __nv_bfloat16* out)
 {
@@ -1055,7 +1055,7 @@ AMQE_EXPORT int amqe_moe_experts(Engine* e,
 }
 
 /// A prompt's experts on the tensor cores, for gate and up rows interleaved
-/// (gate 2c, up 2c + 1) and each softcapped (Inkling 2): slots[pair] = the
+/// (gate 2c, up 2c + 1) and each softcapped (a softcapped GLU): slots[pair] = the
 /// expert's output for that pair, unweighted. guType and dType: 0 BF16, 2 NVFP4,
 /// 3 MXFP4, 4 MXFP8; a row scale is [experts x rows], or null. Scratch as for
 /// amqe_moe_experts. -100: not a shape or mode this path takes (the caller runs
@@ -1076,10 +1076,10 @@ AMQE_EXPORT int amqe_moe_experts_paired(Engine* e,
 }
 
 /// A decode step's experts (rows <= 8) for gate and up rows interleaved and
-/// softcapped (Inkling 2): glu[pair] = the capped SwiGLU of the pair's expert,
+/// softcapped: glu[pair] = the softcapped GLU of the pair's expert,
 /// then slots[pair] = its down projection, unweighted (the caller weighs and
 /// sums them). A warp takes several short down rows of one pair, which suits
-/// narrow experts (Inkling's 1,152) better than amqe_moe_experts' mix. guType
+/// narrow experts (1,152 wide, say) better than amqe_moe_experts' mix. guType
 /// and dType: 0 BF16, 1 f32, 2 NVFP4, 3 MXFP4, 4 MXFP8; a row scale is
 /// [experts x rows] or null. glu: [rows x topK x inter], slots [rows x topK x hidden].
 AMQE_EXPORT int amqe_moe_experts_paired_step(Engine* e,

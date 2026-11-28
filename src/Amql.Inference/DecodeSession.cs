@@ -30,56 +30,14 @@ public sealed class DecodeSession : IDisposable
 
     private DecodeSession(GenericRuntime runtime) => _runtime = runtime;
 
-    // A runtime that is not a planned stack (Inkling 2 looped): it owns its
-    // own device or managed state, and this session only feeds it.
-    private readonly ITokenModel? _model;
-
-    /// <summary>A session over a model that runs outside the planner
-    /// (<see cref="ForInkling2"/>): prefill, step, reset and the logits, with
-    /// no plan, no hidden states and no shared weights.</summary>
-    public DecodeSession(ITokenModel model, string? gpuRefusal = null)
-    {
-        _runtime = null!;
-        _model = model;
-        _onGpu = model.Backend == "gpu";
-        GpuRefusal = gpuRefusal ?? (_onGpu ? "it runs on a GPU path of its own, one sequence at a time" : null);
-    }
-
-    /// <summary>An Inkling 2 looped container's session: its GPU path when a
-    /// device and amql_cuda are present (and <c>AMQL_GPU_ENGINE</c> is
-    /// not 0), else the managed runtime.</summary>
-    public static DecodeSession ForInkling2(Vindex3Container container, OperandStore store)
-    {
-        var gpu = Inkling2Gpu.TryCreate(container, store, out string? reason);
-        return gpu is not null
-            ? new DecodeSession(new Inkling2GpuSession(gpu))
-            : new DecodeSession(Inkling2Model.Load(container, store), reason);
-    }
-
     /// <summary>
-    /// The session for a container's component, however it runs: a planned
-    /// stack, or a model with a runtime of its own (an Inkling 2 looped
-    /// container, until the planner describes it). The one place callers that
-    /// only need a session should open it from.
+    /// The session for a container's component: its plan, run on the device
+    /// engine when it can be (see <see cref="GpuEngine.Unsupported"/>), else on
+    /// the managed runtime. The one place callers that only need a session
+    /// should open it from.
     /// </summary>
-    public static DecodeSession Open(Vindex3Container container, string component, OperandStore store, WeightWorkingSet? workingSet = null)
-    {
-        if (Inkling2Model.Serves(container, component) && !PlannedRequested)
-        {
-            return ForInkling2(container, store);
-        }
-        return new DecodeSession(Planner.Plan(container, component, store), store, null, workingSet);
-    }
-
-    /// <summary><c>AMQL_RUNTIME=planned</c>: a container that also has a dedicated
-    /// session (an Inkling 2 graph carries both descriptions) opens on the planned
-    /// path instead — today the CPU's row-exact path, a reference for the
-    /// dedicated session until the device engine runs the same ops.</summary>
-    public static bool PlannedRequested =>
-        Environment.GetEnvironmentVariable("AMQL_RUNTIME")?.Trim().ToLowerInvariant() == "planned";
-
-    private InvalidOperationException NoPlan(string what) =>
-        new($"{what} needs a planned stack; this session runs {(_model is Inkling2Model ? "Inkling2Model" : _model!.GetType().Name)}");
+    public static DecodeSession Open(Vindex3Container container, string component, OperandStore store, WeightWorkingSet? workingSet = null) =>
+        new(Planner.Plan(container, component, store), store, null, workingSet);
 
     /// <summary>
     /// A second session over the same weights, so sequences can run on separate
@@ -92,10 +50,6 @@ public sealed class DecodeSession : IDisposable
     /// </summary>
     public DecodeSession Sibling()
     {
-        if (_model is not null)
-        {
-            throw NoPlan("sharing weights");
-        }
         if (CudaShim.Enabled)
         {
             throw new InvalidOperationException("sessions can only share weights on the CPU");
@@ -111,12 +65,12 @@ public sealed class DecodeSession : IDisposable
         return new DecodeSession(new GenericRuntime(_runtime.Plan, _runtime.Weights));
     }
 
-    public GenericRuntime Runtime => _model is null ? _runtime : throw NoPlan("the generic runtime");
+    public GenericRuntime Runtime => _runtime;
 
     /// <summary>Tokens consumed so far — the next token's absolute position.
     /// Independent of the KV cache shape (mixed plans may have no key/value
     /// rows at layer 0).</summary>
-    public int Position => _model?.Position ?? _runtime.SessionPosition;
+    public int Position => _runtime.SessionPosition;
 
     public Tensor2D LastLogits { get; private set; } = null!;
 
@@ -127,11 +81,6 @@ public sealed class DecodeSession : IDisposable
     /// </summary>
     public Tensor2D Prefill(int[] tokens)
     {
-        if (_model is not null)
-        {
-            LastLogits = new Tensor2D(_model.Prefill(tokens), 1, _model.VocabSize);
-            return LastLogits;
-        }
         if (tokens.Length > 0 && _runtime.SessionPosition == 0 && Gpu() is { } gpu)
         {
             if (gpu.ExactPrefill != ExactGpuPrefill)
@@ -161,10 +110,6 @@ public sealed class DecodeSession : IDisposable
     /// </summary>
     public Tensor2D PrefillLogits(int[] tokens)
     {
-        if (_model is not null)
-        {
-            throw NoPlan("every position's logits");
-        }
         var allLogits = _runtime.FinalNormAndHead(RunPrefill(tokens));
         LastLogits = SliceLastRow(allLogits);
         return allLogits;
@@ -201,10 +146,6 @@ public sealed class DecodeSession : IDisposable
 
     private Tensor2D RunPrefill(int[] tokens, List<float[]>? everyRow = null)
     {
-        if (_model is not null)
-        {
-            throw NoPlan("hidden states");
-        }
         if (tokens.Length == 0)
         {
             throw new ArgumentException("prefill requires at least one token", nameof(tokens));
@@ -269,11 +210,6 @@ public sealed class DecodeSession : IDisposable
     /// </summary>
     public Tensor2D Step(int token)
     {
-        if (_model is not null)
-        {
-            LastLogits = new Tensor2D(_model.Step(token), 1, _model.VocabSize);
-            return LastLogits;
-        }
         if (_onGpu)
         {
             LastLogits = new Tensor2D(_gpu!.Step(token), 1, _runtime.Plan.Output!.VocabSize);
@@ -289,12 +225,6 @@ public sealed class DecodeSession : IDisposable
     /// fresh session.</summary>
     public void Reset()
     {
-        if (_model is not null)
-        {
-            _model.Reset();
-            LastLogits = null!;
-            return;
-        }
         _runtime.Kv.Reset();
         _runtime.ResetSession();
         LastLogits = null!;
@@ -325,10 +255,6 @@ public sealed class DecodeSession : IDisposable
     /// capture or patch on the runtime, which only the managed path has.</summary>
     private GpuEngine? Gpu()
     {
-        if (_model is not null)
-        {
-            return null;   // its own GPU path, if any, batches nothing with the planned engine
-        }
         if (_runtime.HasObservers)
         {
             return null;
@@ -390,7 +316,6 @@ public sealed class DecodeSession : IDisposable
     /// <summary>Releases the device engine's memory.</summary>
     public void Dispose()
     {
-        _model?.Dispose();
         _gpu?.Dispose();
         _gpu = null;
         _onGpu = false;

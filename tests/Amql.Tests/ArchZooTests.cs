@@ -39,12 +39,20 @@ public class ArchZooTests
     {
         using var container = Vindex3Container.Open(containerDir);
         using var store = container.CreateOperandStore();
-        if (Inkling2Model.Serves(container))
-        {
-            // A looped stack has no planned layers: it runs on its own runtime.
-            return Inkling2Model.Load(container, store).Prefill(ids);
-        }
         var plan = Planner.Plan(container, "target", store);
+        if (plan.RunsByVisit)
+        {
+            // A plan run by visit (a depth loop, a block residual) has no
+            // layer-major entry: a token at a time through the schedule.
+            using var session = new DecodeSession(plan, store) { AllowGpuEngine = false };
+            var rows = new float[ids.Length][];
+            rows[0] = session.Prefill([ids[0]]).FirstRow().ToArray();
+            for (int t = 1; t < ids.Length; t++)
+            {
+                rows[t] = session.Step(ids[t]).FirstRow().ToArray();
+            }
+            return rows;
+        }
         var runtime = new GenericRuntime(plan, store);
         var hidden = runtime.Embed(ids);
         var positions = Enumerable.Range(0, ids.Length).ToArray();

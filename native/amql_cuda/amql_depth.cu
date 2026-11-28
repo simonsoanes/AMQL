@@ -1,31 +1,30 @@
-// amql_inkling.cu — Inkling 2 looped (inkling2_loop) on the GPU.
+// amql_depth.cu — the engine's kernels for looped depth and its residuals, and
+// for attention conditioned without a rotary embedding.
 //
-// Built into amql_cuda.dll beside the engine (amql_engine.cu) and run on an
-// engine's stream: a prompt chunk's projections and experts are the engine's
-// (amqe_linear, amqe_moe_experts_paired: BF16 tensor cores), and what is
-// Inkling's own (its attention, the short convolutions, the loop and its
-// messages, a step's GEMVs) is here. It mirrors src/Amql.Inference/Inkling2Model.cs,
-// the managed runtime transcribed from transformers, kernel for step:
+// Primitives the managed engine (src/Amql.Inference/GpuEngine.Visits.cs) calls
+// for the plan ops GenericRuntime's row-exact path runs on the CPU
+// (docs/depth-ops.md), each on the engine's stream so a decode step's calls are
+// captured into one CUDA graph:
 //
-//   h = embed_norm(embed[token]);  blocks = []
-//   layers [0, start), then the core [start, end) three times (passes 1 and 2
-//   restart from the prelude's state and read messages from the pass before),
-//   then [end, n); logits = softcap(unembed . norm(mix(output_query, blocks, h)))
+//   depth mixes over a bank of block inputs, with the norm that follows fused
+//   (DepthMixOp, BlockResidualOp); message gates, up to three batched
+//   (MessageGateOp); residual short convolutions, static or with dynamic taps on
+//   keys and values (ResidualConvOp), with the key clip and the gainless value
+//   RMS; the query and relative-coefficient preparation (QueryChannelScale,
+//   QkClip, LogScaling); attention with a relative score bias, a sink logit and
+//   a separate output gate, split-key for a step and FlashAttention-2 tiles on
+//   the tensor cores for a prompt chunk; sigmoid routing normalised over the
+//   chosen experts with a selection bias and a route scale; packed experts in
+//   their stored formats (NVFP4, MXFP8, plain) through a softcapped GLU; an
+//   embedding with a weighted norm, the head's softcap.
 //
-// Every layer visit has its own cache slot (keys, values and the short
-// convolutions' histories): 24 physical layers and 2 x 12 for the core's extra
-// passes. A sliding slot is a ring of `window` rows; a full slot grows with the
-// sequence and holds f32, f16 or NVFP4 rows. The experts stay as stored
-// (NVFP4 with its E4M3 block scales and per-expert factor, MXFP8 with E8M0
-// exponents, or plain f32/BF16) and only the chosen ones are read.
-//
-// A step reads its token and position from device memory, so the whole step is
-// captured once as a CUDA graph and replayed for every token. A prompt runs in
-// chunks of up to kChunk tokens with a token dimension: the projections and the
-// experts (grouped, each chosen expert decoded once per chunk) as the engine's
-// tensor-core GEMMs, or, with prompts kept at f32 (ink_set_prefill_f32), the
-// projections as f32 SGEMMs and the experts as the f32 kernels here; the
-// convolutions and the cache rows advance token by token inside their kernels.
+// Projections that share a launch run as GEMVs for one row and as the engine's
+// GEMMs (amqe_linear) for a chunk; a chunk's experts are the engine's grouped
+// tensor-core experts (amqe_moe_experts_paired) and a step's its decode kernels
+// (amqe_moe_experts_paired_step). With prompts kept at f32 the engine's SGEMMs
+// and the f32 expert kernels here run instead. Convolution histories and cache
+// rows advance token by token inside their kernels, reading the first position
+// from device memory.
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -36,27 +35,20 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <vector>
 #include <algorithm>
-#include <tuple>
-#include <initializer_list>
 
 #if defined(_WIN32)
-  #define INK_EXPORT extern "C" __declspec(dllexport)
+  #define DEPTH_EXPORT extern "C" __declspec(dllexport)
 #else
-  #define INK_EXPORT extern "C" __attribute__((visibility("default")))
+  #define DEPTH_EXPORT extern "C" __attribute__((visibility("default")))
 #endif
 
-static int ok(cudaError_t e) { return e == cudaSuccess ? 0 : -(int)e; }
 #define TRY(x) do { cudaError_t _e = (x); if (_e != cudaSuccess) return -(int)_e; } while (0)
 
 // -- the engine (amql_engine.cu, amql_moe.cu), in the same library --
 
 struct Engine;
-extern "C" int amqe_create(Engine** out);
-extern "C" void amqe_destroy(Engine* e);
 extern "C" cudaStream_t amqe_stream(Engine* e);
-extern "C" int amqe_set_prefill_f32(Engine* e, int f32);
 extern "C" int amqe_linear(Engine* e, const void* w, int wType, int n, int k,
     const float* x, int ldx, int rows, float* y, int ldy,
     const float* bias, const float* residual, int ldr, float resScale, int act, int glu, float* raw,
@@ -75,37 +67,30 @@ extern "C" int amqe_moe_experts_paired(Engine* e,
 
 // ── types shared with the managed side ───────────────────────────────────────
 
-enum { W_F32 = 0, W_BF16 = 1, W_NVFP4 = 2, W_MXFP8 = 3 };
+// Weight forms, the engine's codes: BF16, f32, NVFP4 (E2M1 + E4M3 per 16 + a
+// factor per expert), MXFP8 (E4M3 + E8M0 per 32).
+enum { W_BF16 = 0, W_F32 = 1, W_NVFP4 = 2, W_MXFP8 = 4 };
 enum { KV_F32 = 0, KV_F16 = 1, KV_FP4 = 2 };
 
-// Layer matrices (ink_set_mat).
-enum { M_WQ = 0, M_WK, M_WV, M_WR, M_WO, M_GATE, M_SINK, M_KPROJ, M_VPROJ, M_ROUTER,
-       M_CTRL = 10 /* + 3 g + {down, forget, gain}, g in q, k, v, mlp */, M_COUNT = 22 };
-// Layer vectors (ink_set_vec), always f32.
-enum { V_QSCALE = 0, V_RELSCALE, V_RELPROJ, V_KCONV, V_VCONV, V_KSTATIC, V_VSTATIC, V_ATTNNORM, V_QNORM,
-       V_KNORM, V_VNORM, V_MLPNORM, V_ATTNCONV, V_MLPCONV, V_ROUTERBIAS, V_ATTNQUERY, V_MLPQUERY, V_COUNT };
-// Model-wide tensors (ink_set_global): two matrices, then f32 vectors.
-enum { G_EMBED = 0, G_UNEMBED, G_EMBEDNORM, G_FINALNORM, G_OUTPUTQUERY, G_MESSAGES, G_COUNT };
+// A matrix [rows x cols], BF16 or f32 (GpuEngine.DepthMat).
+struct Mat { const void* w; int type; int rows; int cols; int pad; };
+// An expert stack [experts x rows x cols] as stored (GpuEngine.DepthExperts).
+// rowScale: NVFP4's factor for every row, [experts x rows], for the engine's kernels.
+struct Experts { const void* w; const unsigned char* scales; const float* factor; const float* rowScale; int type; int rows; int cols; int pad; };
 
-struct InkConfig
+// A cache slot's key and value rows (GpuEngine.DepthKv).
+struct KvView
 {
-    int d, layers, experts, topK, width, convK, block, loopStart, loopEnd, passes, rank;
-    int paddedVocab, vocab, relDim, relExtent, window, logFloor;
-    float alpha, qkClip, relClip, eps, gateCap, upCap, finalCap, routeScale;
+    const void* k; const void* v;                  // rows x C elements (FP4: rows x C/2 bytes)
+    const unsigned char* ks; const unsigned char* vs; // FP4: rows x C/16 E4M3 block scales
+    const float* kg; const float* vg;               // FP4: rows x kvHeads tensor scales
+    int cap;                                       // rows held
+    int ring;                                      // 1: a sliding window, row = position % cap
+    int format;
+    int pad;
 };
 
-struct Mat { const void* w = nullptr; int type = 0; int rows = 0; int cols = 0; };
-struct Experts { const void* w = nullptr; const unsigned char* scales = nullptr; const float* factor = nullptr;
-                 int type = 0; int rows = 0; int cols = 0;
-                 const float* rowScale = nullptr; };   // NVFP4: the factor for every row, [experts x rows], for the engine
-
-struct Layer
-{
-    int full = 0, heads = 0, kvHeads = 0, headDim = 0, extent = 0, loop = 0, queries = 0;
-    Mat m[M_COUNT];
-    const float* v[V_COUNT] = {};
-    Experts w13, w2;
-};
+namespace {
 
 // ── device helpers ───────────────────────────────────────────────────────────
 
@@ -360,15 +345,6 @@ __global__ void k_gemv_rows(Mat m, const float* __restrict__ x, float* __restric
 
 // ── kernels ──────────────────────────────────────────────────────────────────
 
-// y[r] = W[r] . x, a warp a row (rows of W from `first`).
-__global__ void k_gemv(Mat m, const float* __restrict__ x, float* __restrict__ y, int rows)
-{
-    int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
-    if (row >= rows) return;
-    float s = row_dot(m.w, m.type, row, m.cols, x);
-    if ((threadIdx.x & 31) == 0) y[row] = s;
-}
-
 struct Gemvs { Mat m[4]; const float* x[4]; float* y[4]; int first[5]; int n; };
 
 __global__ void k_gemvs(Gemvs g)
@@ -473,65 +449,6 @@ __global__ void k_group(const int* __restrict__ idx, int pairs, int experts, int
     }
     __syncthreads();
     for (int p = threadIdx.x; p < pairs; p += blockDim.x) order[atomicAdd(&cur[idx[p]], 1)] = p;
-}
-
-// 32 elements of one expert row (columns 32b .. 32b + 31) as f32, without the
-// NVFP4 per-expert factor (it multiplies the dot product).
-__device__ __forceinline__ void expert_chunk(const Experts& e, int expert, int row, int b, float* w)
-{
-    long long r = (long long)expert * e.rows + row;
-    int cols = e.cols;
-    if (e.type == W_NVFP4)
-    {
-        uint4 q = __ldg((const uint4*)((const unsigned char*)e.w + r * (cols / 2) + b * 16));
-        unsigned short sp = __ldg((const unsigned short*)(e.scales + r * (cols / 16) + b * 2));
-        float s0 = e4m3(sp & 255), s1 = e4m3(sp >> 8);
-        unsigned int words[4] = { q.x, q.y, q.z, q.w };
-        #pragma unroll
-        for (int k = 0; k < 4; k++)
-        {
-            float s = k < 2 ? s0 : s1;
-            #pragma unroll
-            for (int j = 0; j < 4; j++)
-            {
-                float2 v = e2m1x2(words[k] >> (8 * j));
-                w[8 * k + 2 * j] = v.x * s;
-                w[8 * k + 2 * j + 1] = v.y * s;
-            }
-        }
-        return;
-    }
-    if (e.type == W_MXFP8)
-    {
-        const uint4* q4 = (const uint4*)((const unsigned char*)e.w + r * cols + b * 32);
-        uint4 a = __ldg(q4), c = __ldg(q4 + 1);
-        float s = e8m0(__ldg(e.scales + r * (cols / 32) + b));
-        unsigned int words[8] = { a.x, a.y, a.z, a.w, c.x, c.y, c.z, c.w };
-        #pragma unroll
-        for (int k = 0; k < 8; k++)
-        {
-            __half2_raw lo = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)(words[k] & 0xffffu), __NV_E4M3);
-            __half2_raw hi = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)(words[k] >> 16), __NV_E4M3);
-            float2 x0 = __half22float2(*reinterpret_cast<__half2*>(&lo)), x1 = __half22float2(*reinterpret_cast<__half2*>(&hi));
-            w[4 * k] = x0.x * s; w[4 * k + 1] = x0.y * s; w[4 * k + 2] = x1.x * s; w[4 * k + 3] = x1.y * s;
-        }
-        return;
-    }
-    #pragma unroll
-    for (int k = 0; k < 32; k++) w[k] = ld(e.w, e.type, r * cols + b * 32 + k);
-}
-
-__device__ __forceinline__ float dot32(const float* w, const float* x)
-{
-    const float4* x4 = (const float4*)x;
-    float t = 0.f;
-    #pragma unroll
-    for (int k = 0; k < 8; k++)
-    {
-        float4 v = x4[k];
-        t += w[4 * k] * v.x + w[4 * k + 1] * v.y + w[4 * k + 2] * v.z + w[4 * k + 3] * v.w;
-    }
-    return t;
 }
 
 // Eight columns (8g .. 8g + 7) of one expert row as f32, without the NVFP4
@@ -710,8 +627,10 @@ __global__ void k_rmsnorm(Norms a, int d, float eps)
     for (int i = threadIdx.x; i < d; i += blockDim.x) out[i] = x[i] * inv * (w ? w[i] : 1.f);
 }
 
-// h = embed_norm(embed[token]).
-__global__ void k_embed(Mat embed, const int* __restrict__ token, const float* __restrict__ norm, float* __restrict__ out, float eps)
+// h = norm(embed[token]): RMS-normed with `norm` as the gain (null: none) when
+// `normed`, else the row as it is.
+__global__ void k_embed(Mat embed, const int* __restrict__ token, const float* __restrict__ norm, float* __restrict__ out, float eps,
+                        int normed)
 {
     __shared__ float sh[32];
     long long row = token[blockIdx.x];
@@ -724,13 +643,14 @@ __global__ void k_embed(Mat embed, const int* __restrict__ token, const float* _
         out[i] = v;
         s += v * v;
     }
+    if (!normed) return;
     float inv = rsqrtf(block_sum(s, sh) / d + eps);
-    for (int i = threadIdx.x; i < d; i += blockDim.x) out[i] = out[i] * inv * norm[i];
+    for (int i = threadIdx.x; i < d; i += blockDim.x) out[i] = out[i] * inv * (norm ? norm[i] : 1.f);
 }
 
-// Attention over depth (Inkling2Loop{Block,Message}AttentionResidual): each
-// state RMS-normed without a gain, weighted by softmax(query . state / sqrt d).
-struct States { const float* s[10]; int n; };
+// A depth mix over a bank of states (a block residual, a message): each state
+// RMS-normed without a gain (eps), weighted by softmax(query . state / sqrt d).
+struct States { const float* s[10]; int n; float eps; };
 // The norm that follows a mix, done in the same block: query i's output is
 // also written RMS-normed with w[i] (null: no gain) into out[i] + row * d.
 struct MixNorm { const float* w[4]; float* out[4]; float eps; };
@@ -765,7 +685,7 @@ __global__ void k_mix(States st, const float* __restrict__ queries, float* __res
         int i = threadIdx.x;
         float a = 0.f, b = 0.f;
         for (int k = 0; k < (int)(blockDim.x >> 5); k++) { a += part[i][0][k]; b += part[i][1][k]; }
-        inv[i] = rsqrtf(a / d + 1e-6f);
+        inv[i] = rsqrtf(a / d + st.eps);
         w[i] = b * inv[i] * rsqrtf((float)d);
     }
     __syncthreads();
@@ -826,7 +746,7 @@ __global__ void __launch_bounds__(1024) k_mix4(States st, const float* __restric
         float a = 0.f, b = 0.f;
         if (lane < n)
             for (int k = 0; k < warps; k++) { a += part[lane][0][k]; b += part[lane][1][k]; }
-        float inv = rsqrtf(a / d + 1e-6f);
+        float inv = rsqrtf(a / d + st.eps);
         float logit = lane < n ? b * inv * rsqrtf((float)d) : -INFINITY;
         float m = warp_max(logit);
         float e = lane < n ? expf(logit - m) : 0.f;
@@ -891,22 +811,23 @@ __global__ void k_gate_apply(GateApplies args, int d, int rank)
 }
 
 // Queries and relative-bias coefficients, a head a block (z = 0 queries, 1
-// coefficients): a learned scale per channel, clipped to `clip`, then the full
-// layers' log scaling. Grid (heads, T, 2).
+// coefficients): a learned scale per channel (null: none), L2-clipped to `clip`
+// (inf: none), then the position log scaling where `logScale` is set.
+// Grid (heads, T, 1 or 2).
 struct HeadPreps { float* x[2]; const float* scale[2]; int dim[2]; float clip[2]; };
 
-__global__ void k_head_prep(HeadPreps a, int full, const int* __restrict__ pos, int floor, float alpha)
+__global__ void k_head_prep(HeadPreps a, int logScale, const int* __restrict__ pos, int floor, float alpha)
 {
     __shared__ float sh[32];
     const int z = blockIdx.z, dim = a.dim[z];
     const float clip = a.clip[z];
     float* hx = a.x[z] + ((long long)blockIdx.y * gridDim.x + blockIdx.x) * dim;
-    const float* sc = a.scale[z] + blockIdx.x * dim;
+    const float* sc = a.scale[z] ? a.scale[z] + blockIdx.x * dim : nullptr;
     float s = 0.f;
-    for (int i = threadIdx.x; i < dim; i += blockDim.x) { float v = hx[i] * sc[i]; hx[i] = v; s += v * v; }
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) { float v = hx[i] * (sc ? sc[i] : 1.f); hx[i] = v; s += v * v; }
     float norm = sqrtf(block_sum(s, sh));
     float f = fminf(1.f, clip / (norm + 1e-6f));
-    if (full)
+    if (logScale)
     {
         float t = (float)(*pos + blockIdx.y + 1);
         f *= 1.f + alpha * logf(fmaxf(1.f, t / (float)floor));
@@ -916,22 +837,6 @@ __global__ void k_head_prep(HeadPreps a, int full, const int* __restrict__ pos, 
 }
 
 // ── the key/value rows ───────────────────────────────────────────────────────
-
-struct KvSlot
-{
-    void* k = nullptr; void* v = nullptr;                  // rows x C elements (FP4: rows x C/2 bytes)
-    unsigned char* ks = nullptr; unsigned char* vs = nullptr; // FP4: rows x C/16 E4M3 block scales
-    float* kg = nullptr; float* vg = nullptr;               // FP4: rows x kvHeads tensor scales
-    int cap = 0;                                           // rows held
-    int ring = 0;                                          // 1: a sliding window, row = position % cap
-    int format = KV_F32;
-};
-
-struct KvView
-{
-    const void* k; const void* v; const unsigned char* ks; const unsigned char* vs; const float* kg; const float* vg;
-    int cap, ring, format;
-};
 
 __device__ __forceinline__ float kv_load(const void* p, const unsigned char* sc, const float* g, int format,
                                          long long row, int C, int hd, int i)
@@ -945,19 +850,25 @@ __device__ __forceinline__ float kv_load(const void* p, const unsigned char* sc,
     return e * e4m3(sc[idx >> 4]) * g[row * (C / hd) + i / hd];
 }
 
-// The conv taps, clips and norm of one step's keys and values, then the row
-// stored. Grid (kvHeads, 2): y = 0 keys, 1 values. Sliding layers: a static
-// depthwise convolution; full layers: static taps plus one per head projected
-// from the layer's input. The histories hold the projections before the conv.
+// The residual convolutions, clip and norm of a chunk's keys and values, then
+// the rows stored, token by token. Grid (kvHeads, 2): y = 0 keys, 1 values. A
+// conv is none, static (depthwise [C x K], the last tap on the current token)
+// or dynamic (static taps [K x C] plus one per head and lag projected from the
+// projection's input). The histories hold the projections before the conv.
+// Keys are L2-clipped per head (clip = inf: none); values RMS-normed per head
+// without a gain when vnorm is set.
+enum { CONV_NONE = 0, CONV_STATIC = 1, CONV_DYNAMIC = 2 };
+
 struct KvPrep
 {
     const float* raw[2];       // projections
-    const float* dyn[2];       // full: [kvHeads x K] dynamic taps
-    const float* conv[2];      // sliding [C x K]; full: static [K x C]
+    const float* dyn[2];       // dynamic: [kvHeads x K] taps per token
+    const float* conv[2];      // static [C x K]; dynamic: static taps [K x C]
     float* hist[2];            // [(K-1) x C]
     KvView slot;
     void* dst[2]; unsigned char* dsc[2]; float* dg[2];
-    int C, hd, K, full, count, kvHeads;
+    int C, hd, K, count, kvHeads, vnorm;
+    int mode[2];
     float clip, eps;
 };
 
@@ -968,6 +879,7 @@ __global__ void k_kv_prep(KvPrep a, const int* __restrict__ pos)
     int which = blockIdx.y, head = blockIdx.x, i = threadIdx.x;
     int K = a.K, C = a.C, hd = a.hd;
     int ch = head * hd + i;
+    const int mode = a.mode[which];
     for (int tok = 0; tok < a.count; tok++)
     {
     int t = *pos + tok;
@@ -979,7 +891,11 @@ __global__ void k_kv_prep(KvPrep a, const int* __restrict__ pos)
         float* hist = a.hist[which];
         float x = raw[ch];
         float sum;
-        if (!a.full)
+        if (mode == CONV_NONE)
+        {
+            out = x;
+        }
+        else if (mode == CONV_STATIC)
         {
             sum = w[ch * K + K - 1] * x;
             for (int lag = 1; lag < K; lag++)
@@ -994,7 +910,7 @@ __global__ void k_kv_prep(KvPrep a, const int* __restrict__ pos)
                 if (t - lag >= 0) sum += (w[lag * C + ch] + dyn[lag]) * hist[((t - lag) % (K - 1)) * C + ch];
             out = (sum + x) * rsqrtf((float)(2 * K + 1));
         }
-        hist[(t % (K - 1)) * C + ch] = x;
+        if (mode != CONV_NONE) hist[(t % (K - 1)) * C + ch] = x;
     }
     float ss = block_sum(i < hd ? out * out : 0.f, sh);
     if (which == 0)
@@ -1002,7 +918,7 @@ __global__ void k_kv_prep(KvPrep a, const int* __restrict__ pos)
         float f = fminf(1.f, a.clip / (sqrtf(ss) + 1e-6f));
         out *= f;
     }
-    else
+    else if (a.vnorm)
     {
         out *= rsqrtf(ss / hd + a.eps);
     }
@@ -1120,25 +1036,25 @@ __global__ void k_attn(AttnArgs a, const int* __restrict__ pos)
     }
 }
 
-// The splits merged with the sink logit, then the output gate.
-__global__ void k_attn_merge(const float* __restrict__ part, const float* __restrict__ sinks, const float* __restrict__ gate,
-                             float* __restrict__ out, int splits, int hd)
+// The splits merged with the sink logit (sinks null: none; sinkStride 0: one
+// logit per head for every row), then the sigmoid output gate (null: none).
+__global__ void k_attn_merge(const float* __restrict__ part, const float* __restrict__ sinks, int sinkStride,
+                             const float* __restrict__ gate, float* __restrict__ out, int splits, int hd)
 {
     int h = blockIdx.x, z = blockIdx.y, heads = gridDim.x;
     const float* p = part + ((long long)z * heads + h) * splits * (hd + 2);
-    sinks += (long long)z * heads;
-    gate += (long long)z * heads * hd;
+    if (sinks) sinks += (long long)z * sinkStride;
+    if (gate) gate += (long long)z * heads * hd;
     out += (long long)z * heads * hd;
-    float M = sinks[h];
+    float M = sinks ? sinks[h] : -INFINITY;
     for (int s = 0; s < splits; s++) M = fmaxf(M, p[s * (hd + 2)]);
-    float L = expf(sinks[h] - M);
+    float L = sinks ? expf(sinks[h] - M) : 0.f;
     for (int s = 0; s < splits; s++) { float ms = p[s * (hd + 2)]; if (ms > -INFINITY) L += p[s * (hd + 2) + 1] * expf(ms - M); }
     for (int i = threadIdx.x; i < hd; i += blockDim.x)
     {
         float v = 0.f;
         for (int s = 0; s < splits; s++) { float ms = p[s * (hd + 2)]; if (ms > -INFINITY) v += p[s * (hd + 2) + 2 + i] * expf(ms - M); }
-        float g = gate[h * hd + i];
-        out[h * hd + i] = v / L * (1.f / (1.f + expf(-g)));
+        out[h * hd + i] = gate ? v / L * (1.f / (1.f + expf(-gate[h * hd + i]))) : v / L;
     }
 }
 
@@ -1379,8 +1295,8 @@ __global__ void __launch_bounds__(128) k_attn_tiles(TileArgs a, const int* __res
     }
 }
 
-// A depthwise causal short convolution (Inkling2LoopShortConvolution) over
-// this slot's history, (conv + x) / sqrt(K + 1), plus `add` when given.
+// A residual short convolution over this slot's history, depthwise and causal,
+// (conv + x) / sqrt(K + 1), plus `add` when given; no weights: x + add.
 __global__ void k_shortconv(const float* __restrict__ x, const float* __restrict__ w, float* __restrict__ hist,
                             const float* __restrict__ add, float* __restrict__ out, int C, int K, const int* __restrict__ pos, int count)
 {
@@ -1391,6 +1307,7 @@ __global__ void k_shortconv(const float* __restrict__ x, const float* __restrict
         int t = *pos + tok;
         long long o = (long long)tok * C + ch;
         float xv = x[o];
+        if (w == nullptr) { out[o] = xv + (add ? add[o] : 0.f); continue; }
         float sum = w[ch * K + K - 1] * xv;
         for (int lag = 1; lag < K; lag++)
             if (t - lag >= 0) sum += w[ch * K + K - 1 - lag] * hist[((t - lag) % (K - 1)) * C + ch];
@@ -1399,8 +1316,9 @@ __global__ void k_shortconv(const float* __restrict__ x, const float* __restrict
     }
 }
 
-// Router (Inkling2LoopTopKRouter): sigmoid scores, the top k by score + bias
-// (ties to the lower index), weights renormalised over the chosen, times route_scale.
+// Sigmoid routing normalised over the chosen: sigmoid scores, the top k by
+// score + selection bias (ties to the lower index), the chosen scores
+// renormalised (sum + 1e-20), times the route scale. One warp a row.
 __global__ void k_router(const float* __restrict__ logits, const float* __restrict__ bias, int experts, int topK,
                          float routeScale, int* __restrict__ idx, float* __restrict__ wt)
 {
@@ -1415,7 +1333,7 @@ __global__ void k_router(const float* __restrict__ logits, const float* __restri
     int lane = threadIdx.x & 31;
     float key[16];
     #pragma unroll
-    for (int j = 0; j < 16; j++) { int e = lane + 32 * j; key[j] = e < experts ? score[e] + bias[e] : -INFINITY; }
+    for (int j = 0; j < 16; j++) { int e = lane + 32 * j; key[j] = e < experts ? score[e] + (bias ? bias[e] : 0.f) : -INFINITY; }
     float total = 0.f;
     for (int k = 0; k < topK; k++)
     {
@@ -1448,7 +1366,7 @@ __global__ void k_router(const float* __restrict__ logits, const float* __restri
 }
 
 // The chosen experts' gate and up rows (interleaved: gate j = row 2j), through
-// the softcapped SwiGLU. Grid (topK, rows / 8 of the width), a warp an output.
+// the softcapped GLU. Grid (topK, rows / 8 of the width), a warp an output.
 __global__ void k_expert_up(Experts w13, const float* __restrict__ x, const int* __restrict__ idx, float* __restrict__ act,
                             int width, float gateCap, float upCap)
 {
@@ -1471,8 +1389,7 @@ __global__ void k_expert_down(Experts w2, const float* __restrict__ act, const i
     if ((threadIdx.x & 31) == 0) part[k * d + i] = wt[k] * s;
 }
 
-// The experts summed in their chosen order, then the MLP's short convolution
-// and the residual: out = residual + conv(ffn).
+// The chosen experts' weighted outputs summed in their chosen order.
 __global__ void k_expert_sum(const float* __restrict__ part, int topK, int d, float* __restrict__ ffn)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1502,931 +1419,326 @@ __global__ void k_expand_factor(const float* __restrict__ factor, int rows, long
     if (i < count) out[i] = factor[i / rows];
 }
 
-// ── the model and a sequence ─────────────────────────────────────────────────
+// ── host helpers ─────────────────────────────────────────────────────────────
 
-// Tokens a prompt chunk holds: every per-token buffer has this many rows.
-static const int kChunk = 256;
-// Key splits a prompt row's attention takes at most (a decode step takes more).
-static const int kRowSplits = 8;
-
-struct Ctx
+// Projections that share nothing but a launch: one row (a step) as GEMVs, T
+// rows (a chunk) as the engine's GEMMs (BF16 tensor cores, or f32 SGEMM with
+// prompts kept at f32).
+int proj(Engine* e, const Mat* m, const float* const* x, float* const* y, int n, int T)
 {
-    InkConfig c;
-    std::vector<Layer> layers;
-    Mat g[2];
-    const float* gv[G_COUNT] = {};
-    std::vector<void*> owned;
-    long long bytes = 0;
-    cudaStream_t stream = nullptr;   // the engine's
-    Engine* eng = nullptr;
-    int err = 0;                     // the first engine call of a chunk that failed
-    int exactPrefill = 0;            // 1: prompts at f32 (the engine's SGEMMs, the f32 experts and attention here)
-};
-
-struct Slot
-{
-    KvSlot kv;
-    float* khist = nullptr; float* vhist = nullptr; float* ahist = nullptr; float* mhist = nullptr;
-    int full = 0, C = 0;
-};
-
-struct Seq
-{
-    int capacity = 0, format = KV_F32, pos = 0;
-    std::vector<Slot> slots;
-    int* dToks = nullptr; int* dPos = nullptr;   // device: kChunk tokens, then the first position
-    int* hToks = nullptr;                        // pinned, the same layout
-    float* hLogits = nullptr;
-    std::vector<float*> hbuf;                    // per visit, kChunk rows of d
-    float *rlogits, *q, *k, *v, *r, *sinks, *gate, *kdyn, *vdyn, *attn, *part, *mixed, *msg, *cat, *gvec, *xq, *xk, *xv,
-          *nq, *nk, *nv, *res, *mlpIn, *mlpGated, *normed, *act, *epart, *ffn, *logits, *wt, *tmp;
-    float* every = nullptr;                      // kChunk x vocab, made when a prompt's every position is asked for
-    float* rb = nullptr;                         // a chunk's relative bias [kChunk x heads x extent], for k_attn_tiles
-    int *idx, *offsets, *order;
-    int *gorder = nullptr, *ggroups = nullptr;   // the engine's grouping: [3 x (pairs + experts)] each
-    std::vector<void*> owned;
-    long long bytes = 0;
-    cudaGraph_t graph = nullptr;
-    cudaGraphExec_t exec = nullptr;
-};
-
-// Zeroed on the legacy stream, which the context's non-blocking stream does
-// not wait for: whoever allocates synchronises the device before the next step.
-static int dev_alloc(std::vector<void*>& owned, long long& bytes, void** p, size_t n)
-{
-    if (n == 0) n = 4;
-    TRY(cudaMalloc(p, n));
-    TRY(cudaMemset(*p, 0, n));
-    owned.push_back(*p);
-    bytes += (long long)n;
+    cudaStream_t st = amqe_stream(e);
+    if (n < 1 || n > 4) return -4000;
+    int first[5] = { 0 };
+    for (int i = 0; i < n; i++) first[i + 1] = first[i] + m[i].rows;
+    int rows = first[n];
+    if (T == 1 && n == 1 && rows <= 256)
+    {
+        k_gemv_rows<<<rows, 256, 0, st>>>(m[0], x[0], y[0]);
+        return 0;
+    }
+    if (T == 1)
+    {
+        Gemvs v = {};
+        for (int i = 0; i < n; i++) { v.m[i] = m[i]; v.x[i] = x[i]; v.y[i] = y[i]; }
+        for (int i = 0; i <= n; i++) v.first[i] = first[i];
+        v.n = n;
+        k_gemvs<<<(rows + 7) / 8, 256, 0, st>>>(v);
+        return 0;
+    }
+    for (int i = 0; i < n; i++)
+    {
+        const Mat& w = m[i];
+        int rc = w.type == W_BF16 || w.type == W_F32
+            ? amqe_linear(e, w.w, w.type, w.rows, w.cols, x[i], w.cols, T, y[i], w.rows,
+                          nullptr, nullptr, 0, 1.f, 0, 0, nullptr, nullptr, 0.f, nullptr, 0.f, 0, nullptr, nullptr)
+            : -100;
+        if (rc == -100)
+        {
+            Gemms one = {};
+            one.m[0] = w; one.x[0] = x[i]; one.y[0] = y[i];
+            one.first[1] = w.rows; one.n = 1; one.T = T;
+            k_gemms<<<(w.rows + 7) / 8, 256, 0, st>>>(one);
+        }
+        else if (rc) return rc;
+    }
     return 0;
 }
 
-template <typename T> static int alloc_f(Seq* s, T** p, size_t count)
+int mix(cudaStream_t st, const float* const* states, int n, const float* queries, int count, float* out, int T, int d, float eps,
+        const float* const* normW, float* const* normOut, float normEps)
 {
-    return dev_alloc(s->owned, s->bytes, (void**)p, count * sizeof(T));
-}
-
-static int splits_for(const Slot& s)
-{
-    if (s.kv.ring) return std::max(1, std::min(16, (s.kv.cap + 63) / 64));
-    return std::max(1, std::min(64, s.kv.cap / 128));
-}
-
-static long long kv_bytes(int rows, int C, int kvHeads, int format)
-{
-    if (format == KV_F32) return 2LL * rows * C * 4;
-    if (format == KV_F16) return 2LL * rows * C * 2;
-    return 2LL * ((long long)rows * C / 2 + (long long)rows * C / 16 + (long long)rows * kvHeads * 4);
-}
-
-static int alloc_kv(Seq* s, KvSlot& kv, int rows, int C, int kvHeads)
-{
-    kv.cap = rows;
-    if (kv.format == KV_F32 || kv.format == KV_F16)
-    {
-        size_t el = kv.format == KV_F32 ? 4 : 2;
-        if (int rc = dev_alloc(s->owned, s->bytes, &kv.k, (size_t)rows * C * el)) return rc;
-        return dev_alloc(s->owned, s->bytes, &kv.v, (size_t)rows * C * el);
-    }
-    int rc = 0;
-    if ((rc = dev_alloc(s->owned, s->bytes, &kv.k, (size_t)rows * C / 2))) return rc;
-    if ((rc = dev_alloc(s->owned, s->bytes, &kv.v, (size_t)rows * C / 2))) return rc;
-    if ((rc = dev_alloc(s->owned, s->bytes, (void**)&kv.ks, (size_t)rows * C / 16))) return rc;
-    if ((rc = dev_alloc(s->owned, s->bytes, (void**)&kv.vs, (size_t)rows * C / 16))) return rc;
-    if ((rc = dev_alloc(s->owned, s->bytes, (void**)&kv.kg, (size_t)rows * kvHeads * 4))) return rc;
-    return dev_alloc(s->owned, s->bytes, (void**)&kv.vg, (size_t)rows * kvHeads * 4);
-}
-
-static int phys_of(const Ctx* x, int slot)
-{
-    int n = x->c.layers, core = x->c.loopEnd - x->c.loopStart;
-    return slot < n ? slot : x->c.loopStart + (slot - n) % core;
-}
-
-// The rows a slot holds for a sequence of `capacity` positions: a full slot
-// every position; a sliding slot its window and a chunk more, so the rows a
-// chunk writes never overwrite keys its earlier rows still read.
-static int slot_rows(const Ctx* x, int full, int capacity)
-{
-    return full ? capacity : std::min(capacity, x->c.window + kChunk);
-}
-
-// Projections that share nothing but a launch: one row (a step) as GEMVs, T
-// rows (a chunk) as GEMMs.
-static void proj(Ctx* x, int T, std::initializer_list<std::tuple<Mat, const float*, float*>> list)
-{
-    Gemms g = {};
-    g.first[0] = 0;
-    for (auto& [m, in, out] : list)
-    {
-        g.m[g.n] = m; g.x[g.n] = in; g.y[g.n] = out;
-        g.first[g.n + 1] = g.first[g.n] + m.rows;
-        g.n++;
-    }
-    g.T = T;
-    int rows = g.first[g.n];
-    if (T == 1 && g.n == 1 && rows <= 256)
-    {
-        k_gemv_rows<<<rows, 256, 0, x->stream>>>(g.m[0], g.x[0], g.y[0]);
-    }
-    else if (T == 1)
-    {
-        Gemvs v = {};
-        for (int i = 0; i < g.n; i++) { v.m[i] = g.m[i]; v.x[i] = g.x[i]; v.y[i] = g.y[i]; }
-        for (int i = 0; i <= g.n; i++) v.first[i] = g.first[i];
-        v.n = g.n;
-        k_gemvs<<<(rows + 7) / 8, 256, 0, x->stream>>>(v);
-    }
-    else
-    {
-        // The engine's GEMMs (BF16 tensor cores, or f32 SGEMM with prompts kept at f32).
-        for (int i = 0; i < g.n; i++)
-        {
-            const Mat& m = g.m[i];
-            int wType = m.type == W_BF16 ? 0 : m.type == W_F32 ? 1 : -1;
-            int rc = wType < 0 ? -100
-                : amqe_linear(x->eng, m.w, wType, m.rows, m.cols, g.x[i], m.cols, T, g.y[i], m.rows,
-                              nullptr, nullptr, 0, 1.f, 0, 0, nullptr, nullptr, 0.f, nullptr, 0.f, 0, nullptr, nullptr);
-            if (rc == -100)
-            {
-                Gemms one = {};
-                one.m[0] = m; one.x[0] = g.x[i]; one.y[0] = g.y[i];
-                one.first[1] = m.rows; one.n = 1; one.T = T;
-                k_gemms<<<(m.rows + 7) / 8, 256, 0, x->stream>>>(one);
-            }
-            else if (rc && !x->err) x->err = rc;
-        }
-    }
-}
-
-// The engine's code for an expert stack's format: 0 BF16, 2 NVFP4, 4 MXFP8; -1 none.
-static int engine_type(int type) { return type == W_BF16 ? 0 : type == W_NVFP4 ? 2 : type == W_MXFP8 ? 4 : -1; }
-// The same for a step's experts, whose kernels also read f32 (1).
-static int engine_step_type(int type) { return type == W_F32 ? 1 : engine_type(type); }
-
-static void rmsnorm(Ctx* x, const float* in, const float* w, float* out, int T)
-{
-    Norms n = {};
-    n.x[0] = in; n.w[0] = w; n.out[0] = out;
-    k_rmsnorm<<<dim3(T, 1), 256, 0, x->stream>>>(n, x->c.d, x->c.eps);
-}
-
-// Three norms in one launch.
-static void rmsnorm3(Ctx* x, const float* const in[3], const float* const w[3], float* const out[3], int T)
-{
-    Norms n = {};
-    for (int i = 0; i < 3; i++) { n.x[i] = in[i]; n.w[i] = w[i]; n.out[i] = out[i]; }
-    k_rmsnorm<<<dim3(T, 3), 256, 0, x->stream>>>(n, x->c.d, x->c.eps);
-}
-
-static void mix(Ctx* x, const std::vector<float*>& blocks, const float* partial, const float* queries, int count, float* out, int T,
-                const float* const normW[] = nullptr, float* const normOut[] = nullptr)
-{
-    States st = {};
-    st.n = (int)blocks.size() + 1;
-    for (size_t i = 0; i < blocks.size(); i++) st.s[i] = blocks[i];
-    st.s[blocks.size()] = partial;
+    if (n < 1 || n > 10 || count < 1 || count > 4) return -4001;
+    States s = {};
+    s.n = n;
+    s.eps = eps;
+    for (int i = 0; i < n; i++) s.s[i] = states[i];
     MixNorm mn = {};
-    mn.eps = x->c.eps;
+    mn.eps = normEps;
     if (normOut)
-        for (int i = 0; i < count; i++) { mn.w[i] = normW[i]; mn.out[i] = normOut[i]; }
-    const int d = x->c.d;
+        for (int i = 0; i < count; i++) { mn.w[i] = normW ? normW[i] : nullptr; mn.out[i] = normOut[i]; }
     // The float4 kernel when every vector it reads or writes is 16-byte aligned.
     auto al = [](const void* p) { return ((uintptr_t)p & 15) == 0; };
-    bool fit = d % 4 == 0 && d / 4 <= 1024 && st.n <= 10 && al(queries) && al(out);
-    for (int i = 0; i < st.n; i++) fit = fit && al(st.s[i]);
+    bool fit = d % 4 == 0 && d / 4 <= 1024 && al(queries) && al(out);
+    for (int i = 0; i < n; i++) fit = fit && al(s.s[i]);
     for (int i = 0; i < count; i++) fit = fit && al(mn.w[i]) && al(mn.out[i]);
     if (fit)
-        k_mix4<<<dim3(count, T), ((d / 4 + 31) / 32) * 32, 0, x->stream>>>(st, queries, out, d, mn);
+        k_mix4<<<dim3(count, T), ((d / 4 + 31) / 32) * 32, 0, st>>>(s, queries, out, d, mn);
     else
-        k_mix<<<dim3(count, T), 1024, 0, x->stream>>>(st, queries, out, d, mn);
+        k_mix<<<dim3(count, T), 1024, 0, st>>>(s, queries, out, d, mn);
+    return 0;
 }
 
-// Message gates g0 .. g0 + n - 1 (n is 1 or 3): gate g reads h[i] and the
-// message m[i], and writes out[i]. The q, k and v gates are independent, so
-// their three steps (cat, the down projection, apply) each take one launch.
-static void message_gates(Ctx* x, Seq* s, const Layer& L, int g0, int n, const float* const h[3], const float* const m[3],
-                          float* const out[3], int T)
-{
-    int d = x->c.d, rank = x->c.rank;
-    GateCats gc = {};
-    GateApplies ga = {};
-    float* cat[3];
-    float* gv[3];
-    for (int i = 0; i < n; i++)
-    {
-        cat[i] = s->cat + (long long)i * kChunk * 2 * d;
-        gv[i] = s->gvec + (long long)i * kChunk * rank;
-        gc.h[i] = h[i]; gc.m[i] = m[i]; gc.cat[i] = cat[i];
-        ga.forget[i] = L.m[M_CTRL + 3 * (g0 + i) + 1];
-        ga.gain[i] = L.m[M_CTRL + 3 * (g0 + i) + 2];
-        ga.g[i] = gv[i]; ga.h[i] = h[i]; ga.m[i] = m[i]; ga.out[i] = out[i];
-    }
-    k_gate_cat<<<dim3(T, n), 256, 0, x->stream>>>(gc, d, x->c.eps);
-    if (n == 3)
-        proj(x, T, { { L.m[M_CTRL + 3 * g0], cat[0], gv[0] }, { L.m[M_CTRL + 3 * (g0 + 1)], cat[1], gv[1] },
-                     { L.m[M_CTRL + 3 * (g0 + 2)], cat[2], gv[2] } });
-    else
-        proj(x, T, { { L.m[M_CTRL + 3 * g0], cat[0], gv[0] } });
-    k_gate_apply<<<dim3((d + 7) / 8, T, n), 256, 0, x->stream>>>(ga, d, rank);
-}
-
-static KvView view_of(const KvSlot& kv) { return KvView{ kv.k, kv.v, kv.ks, kv.vs, kv.kg, kv.vg, kv.cap, kv.ring, kv.format }; }
-
-// One layer visit (Inkling2Loop{Sliding,Full}[Loop]DecoderLayer) for T rows
-// (consecutive positions from *dPos): every buffer holds T rows.
-static float* run_layer(Ctx* x, Seq* s, int l, Slot& slot, float* h, std::vector<float*>& blocks, const float* messages,
-                        float* outBuf, int T)
-{
-    const Layer& L = x->layers[l];
-    const InkConfig& c = x->c;
-    int d = c.d, K = c.convK;
-    long long Td = (long long)T * d;
-    const float *qIn, *kIn, *vIn;
-    if (L.full)
-    {
-        const float *xq = h, *xk = h, *xv = h;
-        const float* qkvNorm[3] = { L.v[V_QNORM], L.v[V_KNORM], L.v[V_VNORM] };
-        float* const qkvOut[3] = { s->nq, s->nk, s->nv };
-        bool normed = false;
-        if (L.v[V_ATTNQUERY])
-        {
-            mix(x, blocks, h, L.v[V_ATTNQUERY], 3, s->mixed, T, messages ? nullptr : qkvNorm, messages ? nullptr : qkvOut);
-            normed = !messages;
-            xq = s->mixed; xk = s->mixed + Td; xv = s->mixed + 2 * Td;
-        }
-        if (messages)
-        {
-            const float* hs[3] = { xq, xk, xv };
-            const float* ms[3] = { messages, messages + Td, messages + 2 * Td };
-            float* const outs[3] = { s->xq, s->xk, s->xv };
-            message_gates(x, s, L, 0, 3, hs, ms, outs, T);
-            xq = s->xq; xk = s->xk; xv = s->xv;
-        }
-        if (!normed)
-        {
-            const float* ins[3] = { xq, xk, xv };
-            rmsnorm3(x, ins, qkvNorm, qkvOut, T);
-        }
-        qIn = s->nq; kIn = s->nk; vIn = s->nv;
-    }
-    else
-    {
-        const float* xx = h;
-        const float* attnNorm[1] = { L.v[V_ATTNNORM] };
-        float* const attnOut[1] = { s->nq };
-        bool normed = false;
-        if (L.v[V_ATTNQUERY])
-        {
-            mix(x, blocks, h, L.v[V_ATTNQUERY], 1, s->mixed, T, messages ? nullptr : attnNorm, messages ? nullptr : attnOut);
-            normed = !messages;
-            xx = s->mixed;
-        }
-        if (messages)
-        {
-            const float* hs[3] = { xx, xx, xx };
-            const float* ms[3] = { messages, messages + Td, messages + 2 * Td };
-            float* const outs[3] = { s->xq, s->xk, s->xv };
-            message_gates(x, s, L, 0, 3, hs, ms, outs, T);
-            const float* ins[3] = { s->xq, s->xk, s->xv };
-            const float* ws[3] = { L.v[V_ATTNNORM], L.v[V_ATTNNORM], L.v[V_ATTNNORM] };
-            float* const nouts[3] = { s->nq, s->nk, s->nv };
-            rmsnorm3(x, ins, ws, nouts, T);
-            qIn = s->nq; kIn = s->nk; vIn = s->nv;
-        }
-        else
-        {
-            if (!normed) rmsnorm(x, xx, L.v[V_ATTNNORM], s->nq, T);
-            qIn = kIn = vIn = s->nq;
-        }
-    }
-
-    // Attention (Inkling2Loop{Sliding,Full}Attention).
-    int heads = L.heads, kvh = L.kvHeads, hd = L.headDim, C = kvh * hd;
-    proj(x, T, { { L.m[M_WQ], qIn, s->q }, { L.m[M_WR], qIn, s->r }, { L.m[M_SINK], qIn, s->sinks }, { L.m[M_GATE], qIn, s->gate } });
-    if (L.full)
-        proj(x, T, { { L.m[M_WK], kIn, s->k }, { L.m[M_WV], vIn, s->v }, { L.m[M_KPROJ], kIn, s->kdyn }, { L.m[M_VPROJ], vIn, s->vdyn } });
-    else
-        proj(x, T, { { L.m[M_WK], kIn, s->k }, { L.m[M_WV], vIn, s->v } });
-    {
-        HeadPreps hp = {};
-        hp.x[0] = s->q; hp.scale[0] = L.v[V_QSCALE]; hp.dim[0] = hd; hp.clip[0] = c.qkClip;
-        hp.x[1] = s->r; hp.scale[1] = L.v[V_RELSCALE]; hp.dim[1] = c.relDim; hp.clip[1] = c.relClip;
-        k_head_prep<<<dim3(heads, T, 2), 128, 0, x->stream>>>(hp, L.full, s->dPos, c.logFloor, c.alpha);
-    }
-    KvPrep kp = {};
-    kp.raw[0] = s->k; kp.raw[1] = s->v;
-    if (L.full)
-    {
-        kp.dyn[0] = s->kdyn; kp.dyn[1] = s->vdyn;
-        kp.conv[0] = L.v[V_KSTATIC]; kp.conv[1] = L.v[V_VSTATIC];
-    }
-    else
-    {
-        kp.conv[0] = L.v[V_KCONV]; kp.conv[1] = L.v[V_VCONV];
-    }
-    kp.hist[0] = slot.khist; kp.hist[1] = slot.vhist;
-    kp.slot = view_of(slot.kv);
-    kp.dst[0] = slot.kv.k; kp.dst[1] = slot.kv.v;
-    kp.dsc[0] = slot.kv.ks; kp.dsc[1] = slot.kv.vs;
-    kp.dg[0] = slot.kv.kg; kp.dg[1] = slot.kv.vg;
-    kp.C = C; kp.hd = hd; kp.K = K; kp.full = L.full; kp.clip = c.qkClip; kp.eps = c.eps;
-    kp.count = T; kp.kvHeads = kvh;
-    k_kv_prep<<<dim3(kvh, 2), 128, 0, x->stream>>>(kp, s->dPos);
-
-    AttnArgs aa = {};
-    aa.q = s->q; aa.r = s->r; aa.relProj = L.v[V_RELPROJ];
-    aa.kv = view_of(slot.kv);
-    aa.part = s->part;
-    aa.heads = heads; aa.kvHeads = kvh; aa.hd = hd; aa.dRel = c.relDim; aa.extent = L.extent;
-    aa.window = L.full ? 0 : c.window;
-    aa.splits = T == 1 ? splits_for(slot) : std::min(splits_for(slot), kRowSplits);
-    aa.scale = 1.f / sqrtf((float)hd);
-    // AMQL_TILED_ATTENTION=0 keeps a chunk's attention on the per-query kernel (to compare, or as a way out).
-    static int tiledOn = -1;
-    if (tiledOn < 0) { const char* v = getenv("AMQL_TILED_ATTENTION"); tiledOn = v && v[0] == '0' ? 0 : 1; }
-    bool tiled = tiledOn && T > 1 && !x->exactPrefill && (hd == 16 || hd == 32 || hd == 64 || hd == 128) && heads <= 64;
-    if (tiled)
-    {
-        // A chunk on the tensor cores: splits enough to fill the device, a few hundred keys each at least.
-        int keys = L.full ? s->pos + T : std::min(s->pos + T, c.window + kTQ);
-        int sp = std::max(1, std::min(aa.splits, keys / 512));
-        if (L.extent > 0)
-            k_relbias<<<dim3(T, heads), 256, 0, x->stream>>>(s->r, L.v[V_RELPROJ], s->rb, heads, c.relDim, L.extent);
-        TileArgs ta = {};
-        ta.q = s->q; ta.rb = s->rb; ta.kv = view_of(slot.kv); ta.part = s->part;
-        ta.heads = heads; ta.kvHeads = kvh; ta.extent = L.extent; ta.window = aa.window; ta.splits = sp; ta.T = T;
-        ta.scale = aa.scale;
-        dim3 grid(heads, sp, (T + kTQ - 1) / kTQ);
-        switch (hd)
-        {
-            case 16: k_attn_tiles<16><<<grid, 128, 0, x->stream>>>(ta, s->dPos); break;
-            case 32: k_attn_tiles<32><<<grid, 128, 0, x->stream>>>(ta, s->dPos); break;
-            case 64: k_attn_tiles<64><<<grid, 128, 0, x->stream>>>(ta, s->dPos); break;
-            default: k_attn_tiles<128><<<grid, 128, 0, x->stream>>>(ta, s->dPos); break;
-        }
-        aa.splits = sp;
-    }
-    else
-    {
-        k_attn<<<dim3(heads, aa.splits, T), 128, 0, x->stream>>>(aa, s->dPos);
-    }
-    k_attn_merge<<<dim3(heads, T), 128, 0, x->stream>>>(s->part, s->sinks, s->gate, s->tmp, aa.splits, hd);
-    proj(x, T, { { L.m[M_WO], s->tmp, s->attn } });
-
-    // The attention's short convolution, and the residual: a block's first
-    // layer keeps its input as a block and restarts the residual.
-    bool blockStart = l % c.block == 0;
-    if (blockStart) blocks.push_back(h);
-    k_shortconv<<<(d + 255) / 256, 256, 0, x->stream>>>(s->attn, L.v[V_ATTNCONV], slot.ahist, blockStart ? nullptr : h, s->res, d, K, s->dPos, T);
-
-    const float* mlpNorm[1] = { L.v[V_MLPNORM] };
-    float* const mlpOut[1] = { s->normed };
-    mix(x, blocks, s->res, L.v[V_MLPQUERY], 1, s->mlpIn, T, messages ? nullptr : mlpNorm, messages ? nullptr : mlpOut);
-    const float* mlpIn = s->mlpIn;
-    if (messages)
-    {
-        const float* hs[3] = { s->mlpIn };
-        const float* ms[3] = { messages + 3 * Td };
-        float* const outs[3] = { s->mlpGated };
-        message_gates(x, s, L, 3, 1, hs, ms, outs, T);
-        mlpIn = s->mlpGated;
-    }
-    if (messages) rmsnorm(x, mlpIn, L.v[V_MLPNORM], s->normed, T);
-
-    // The experts (Inkling2LoopTopKRouter, Inkling2LoopExperts): a step reads
-    // its chosen experts' rows; a chunk groups its pairs by expert first.
-    proj(x, T, { { L.m[M_ROUTER], s->normed, s->rlogits } });
-    k_router<<<T, 32, 0, x->stream>>>(s->rlogits, L.v[V_ROUTERBIAS], c.experts, c.topK, c.routeScale, s->idx, s->wt);
-    bool grouped = T > 1 && d % 32 == 0 && c.width % 32 == 0 && d % 8 == 0;
-    bool summed = false;
-    if (!grouped && T <= 8 && engine_step_type(L.w13.type) >= 0 && engine_step_type(L.w2.type) >= 0)
-    {
-        // A step's experts on the engine's decode kernels: the up rows with the
-        // capped SwiGLU, then each pair's down projection; weighed and summed here.
-        int rc = amqe_moe_experts_paired_step(x->eng, L.w13.w, engine_step_type(L.w13.type), L.w13.scales, L.w13.rowScale,
-                                              L.w2.w, engine_step_type(L.w2.type), L.w2.scales, L.w2.rowScale,
-                                              c.experts, d, c.width, c.topK, c.gateCap, c.upCap, s->normed, d, T, s->idx,
-                                              s->act, s->epart);
-        if (rc == 0)
-        {
-            k_expert_wsum<<<dim3((d + 255) / 256, T), 256, 0, x->stream>>>(s->epart, s->wt, c.topK, d, s->ffn);
-            summed = true;
-        }
-        else if (rc != -100 && !x->err) x->err = rc;
-    }
-    if (summed)
-    {
-    }
-    else if (!grouped)
-    {
-        for (int t = 0; t < T; t++)
-        {
-            k_expert_up<<<dim3(c.topK, (c.width + 7) / 8), 256, 0, x->stream>>>(L.w13, s->normed + (long long)t * d, s->idx + t * c.topK,
-                                                                               s->act + (long long)t * c.topK * c.width, c.width, c.gateCap, c.upCap);
-            k_expert_down<<<dim3(c.topK, (d + 7) / 8), 256, 0, x->stream>>>(L.w2, s->act + (long long)t * c.topK * c.width, s->idx + t * c.topK,
-                                                                           s->wt + t * c.topK, s->epart + (long long)t * c.topK * d, d, c.width);
-        }
-    }
-    else
-    {
-        int gu = engine_type(L.w13.type), dn = engine_type(L.w2.type);
-        int rc = gu < 0 || dn < 0 ? -100
-            : amqe_moe_experts_paired(x->eng, L.w13.w, gu, L.w13.scales, L.w13.rowScale, L.w2.w, dn, L.w2.scales, L.w2.rowScale,
-                                      c.experts, d, c.width, c.topK, c.gateCap, c.upCap, s->normed, d, T, s->idx,
-                                      s->gorder, s->ggroups, s->epart);
-        if (rc == 0)
-        {
-            k_expert_wsum<<<dim3((d + 255) / 256, T), 256, 0, x->stream>>>(s->epart, s->wt, c.topK, d, s->ffn);
-        }
-        else
-        {
-            if (rc != -100 && !x->err) x->err = rc;
-            k_group<<<1, 1024, 0, x->stream>>>(s->idx, T * c.topK, c.experts, s->offsets, s->order);
-            k_expert_up_g<<<dim3(c.experts, (c.width + 31) / 32), 256, 0, x->stream>>>(L.w13, s->normed, s->offsets, s->order, c.topK,
-                                                                                    s->act, c.width, c.gateCap, c.upCap);
-            k_expert_down_g<<<dim3(c.experts, (d + 63) / 64), 256, 0, x->stream>>>(L.w2, s->act, s->offsets, s->order, s->wt, s->epart, d, c.width);
-            k_expert_sum<<<dim3((d + 255) / 256, T), 256, 0, x->stream>>>(s->epart, c.topK, d, s->ffn);
-        }
-    }
-    if (!grouped && !summed) k_expert_sum<<<dim3((d + 255) / 256, T), 256, 0, x->stream>>>(s->epart, c.topK, d, s->ffn);
-    k_shortconv<<<(d + 255) / 256, 256, 0, x->stream>>>(s->ffn, L.v[V_MLPCONV], slot.mhist, s->res, outBuf, d, K, s->dPos, T);
-    return outBuf;
-}
-
-// T rows through the model, as launches on the context's stream (a step's are
-// captured into a graph). The logits: the last row's into s->logits, or
-// every row's into s->every.
-static void record(Ctx* x, Seq* s, int T, bool every)
-{
-    const InkConfig& c = x->c;
-    int d = c.d, core = c.loopEnd - c.loopStart;
-    long long Td = (long long)T * d;
-    int buf = 0;
-    float* h = s->hbuf[buf++];
-    k_embed<<<T, 256, 0, x->stream>>>(x->g[G_EMBED], s->dToks, x->gv[G_EMBEDNORM], h, c.eps);
-    std::vector<float*> blocks;
-    for (int l = 0; l < c.loopStart; l++) h = run_layer(x, s, l, s->slots[l], h, blocks, nullptr, s->hbuf[buf++], T);
-    float* prelude = h;
-    std::vector<float*> preludeBlocks = blocks;
-    for (int pass = 0; pass < c.passes; pass++)
-    {
-        std::vector<float*> bank;
-        float* bankOut = nullptr;
-        if (pass > 0)
-        {
-            bank.assign(blocks.begin() + preludeBlocks.size() + 1, blocks.end());
-            bankOut = h;
-            h = prelude;
-            blocks = preludeBlocks;
-        }
-        for (int ip = c.loopStart; ip < c.loopEnd; ip++)
-        {
-            int slot = pass == 0 ? ip : c.layers + (pass - 1) * core + (ip - c.loopStart);
-            float* messages = nullptr;
-            if (pass > 0)
-            {
-                // q, k, v and mlp messages from the previous pass: [4][T][d].
-                mix(x, bank, bankOut, x->gv[G_MESSAGES] + (long long)(ip - c.loopStart) * 4 * d, 4, s->msg, T);
-                messages = s->msg;
-            }
-            h = run_layer(x, s, ip, s->slots[slot], h, blocks, messages, s->hbuf[buf++], T);
-        }
-    }
-    for (int l = c.loopEnd; l < c.layers; l++) h = run_layer(x, s, l, s->slots[l], h, blocks, nullptr, s->hbuf[buf++], T);
-    {
-        const float* finalNorm[1] = { x->gv[G_FINALNORM] };
-        float* const finalOut[1] = { s->normed };
-        mix(x, blocks, h, x->gv[G_OUTPUTQUERY], 1, s->mixed, T, finalNorm, finalOut);
-    }
-    Mat head = x->g[G_UNEMBED];
-    head.rows = c.vocab;   // the padded rows are never read
-    if (every)
-    {
-        proj(x, T, { { head, s->normed, s->every } });
-        long long n = (long long)T * c.vocab;
-        k_softcap<<<(unsigned)((n + 255) / 256), 256, 0, x->stream>>>(s->every, (int)n, c.finalCap);
-    }
-    else
-    {
-        proj(x, 1, { { head, s->normed + Td - d, s->logits } });
-        k_softcap<<<(c.vocab + 255) / 256, 256, 0, x->stream>>>(s->logits, c.vocab, c.finalCap);
-    }
-}
+} // namespace
 
 // ── exports ──────────────────────────────────────────────────────────────────
 
-INK_EXPORT int ink_available()
+/// Up to four projections in one launch: y[i] = x[i] · m[i]ᵀ for T rows each.
+DEPTH_EXPORT int amqe_projections(Engine* e, const Mat* m, const float* const* x, float* const* y, int n, int T)
 {
-    int n = 0;
-    return cudaGetDeviceCount(&n) == cudaSuccess && n > 0 ? 1 : 0;
+    return proj(e, m, x, y, n, T);
 }
 
-INK_EXPORT int ink_mem_info(long long* freeBytes, long long* totalBytes)
+/// Up to three RMS norms of T rows of d in one launch: out[i] = x[i] / rms · w[i] (null: no gain).
+DEPTH_EXPORT int amqe_rms_rows(Engine* e, const float* const* x, const float* const* w, float* const* out, int n, int T, int d, float eps)
 {
-    size_t f = 0, t = 0;
-    TRY(cudaMemGetInfo(&f, &t));
-    *freeBytes = (long long)f;
-    *totalBytes = (long long)t;
+    if (n < 1 || n > 3) return -4002;
+    Norms a = {};
+    for (int i = 0; i < n; i++) { a.x[i] = x[i]; a.w[i] = w ? w[i] : nullptr; a.out[i] = out[i]; }
+    k_rmsnorm<<<dim3(T, n), 256, 0, amqe_stream(e)>>>(a, d, eps);
     return 0;
 }
 
-INK_EXPORT int ink_create(const InkConfig* cfg, void** out)
+/// The depth mix of `n` states (the bank, then the current state; each T x d)
+/// for `count` queries [count x d]: out[q][t] (query-major, T x d each). With
+/// normOut, query q's mix is also written RMS-normed with normW[q] (null: no
+/// gain) to normOut[q], in the same kernel.
+DEPTH_EXPORT int amqe_depth_mix(Engine* e, const float* const* states, int n, const float* queries, int count, float* out,
+                                int T, int d, float eps, const float* const* normW, float* const* normOut, float normEps)
 {
-    if (cfg->topK > 32 || cfg->experts > 512 || cfg->relDim > 32 || cfg->convK < 2 || cfg->topK * kChunk > 1 << 16)
-        return -1000;
-    Ctx* x = new Ctx();
-    x->c = *cfg;
-    x->layers.resize(cfg->layers);
-    if (int rc = amqe_create(&x->eng)) { delete x; return -2100 + (rc < 0 ? rc : 0); }
-    x->stream = amqe_stream(x->eng);
-    *out = x;
-    return 0;
+    return mix(amqe_stream(e), states, n, queries, count, out, T, d, eps, normW, normOut, normEps);
 }
 
-INK_EXPORT int ink_upload(void* ctx, const void* host, long long bytes, void** dev)
+/// Message gates on `n` input sites (1 to 3, independent, so each of their three
+/// steps is one launch): out[i] = (1 - tanh(F g)) h[i] + tanh(G g) m[i], g = D [rms h; rms m].
+/// cat: n x stride x 2d and g: n x stride x rank scratch (stride >= T rows).
+DEPTH_EXPORT int amqe_message_gates(Engine* e, int n, const float* const* h, const float* const* m, float* const* out,
+                                    const Mat* down, const Mat* forget, const Mat* gain, float* cat, float* g, int stride,
+                                    int T, int d, int rank, float eps)
 {
-    Ctx* x = (Ctx*)ctx;
-    TRY(cudaMalloc(dev, (size_t)std::max(bytes, 4LL)));
-    TRY(cudaMemcpy(*dev, host, (size_t)bytes, cudaMemcpyHostToDevice));
-    x->owned.push_back(*dev);
-    x->bytes += bytes;
-    return 0;
-}
-
-INK_EXPORT int ink_set_geometry(void* ctx, int l, int full, int heads, int kvHeads, int headDim, int extent, int loop)
-{
-    Ctx* x = (Ctx*)ctx;
-    if (l < 0 || l >= x->c.layers || headDim > 128 || headDim % 16 != 0 || heads % kvHeads != 0) return -1001;
-    Layer& L = x->layers[l];
-    L.full = full; L.heads = heads; L.kvHeads = kvHeads; L.headDim = headDim; L.extent = extent; L.loop = loop;
-    return 0;
-}
-
-INK_EXPORT int ink_set_mat(void* ctx, int l, int which, const void* dev, int type, int rows, int cols)
-{
-    Ctx* x = (Ctx*)ctx;
-    if (l < 0 || l >= x->c.layers || which < 0 || which >= M_COUNT || (type != W_F32 && type != W_BF16)) return -1002;
-    x->layers[l].m[which] = Mat{ dev, type, rows, cols };
-    return 0;
-}
-
-INK_EXPORT int ink_set_vec(void* ctx, int l, int which, const float* dev)
-{
-    Ctx* x = (Ctx*)ctx;
-    if (l < 0 || l >= x->c.layers || which < 0 || which >= V_COUNT) return -1003;
-    x->layers[l].v[which] = dev;
-    return 0;
-}
-
-INK_EXPORT int ink_set_experts(void* ctx, int l, int which, const void* w, const unsigned char* scales, const float* factor,
-                               int type, int rows, int cols)
-{
-    Ctx* x = (Ctx*)ctx;
-    if (l < 0 || l >= x->c.layers || type < W_F32 || type > W_MXFP8) return -1004;
-    if ((type == W_NVFP4 && cols % 16) || (type == W_MXFP8 && cols % 32)) return -1005;
-    Experts e{ w, scales, factor, type, rows, cols };
-    if (type == W_NVFP4 && factor)
+    if (n < 1 || n > 3 || T > stride) return -4003;
+    cudaStream_t st = amqe_stream(e);
+    GateCats gc = {};
+    GateApplies ga = {};
+    const float* cats[3];
+    float* gs[3];
+    for (int i = 0; i < n; i++)
     {
-        long long count = (long long)x->c.experts * rows;
-        float* rs = nullptr;
-        TRY(cudaMalloc((void**)&rs, (size_t)count * sizeof(float)));
-        x->owned.push_back(rs);
-        x->bytes += count * (long long)sizeof(float);
-        k_expand_factor<<<(unsigned)((count + 255) / 256), 256, 0, x->stream>>>(factor, rows, count, rs);
-        TRY(cudaGetLastError());
-        TRY(cudaStreamSynchronize(x->stream));
-        e.rowScale = rs;
+        float* ci = cat + (long long)i * stride * 2 * d;
+        gs[i] = g + (long long)i * stride * rank;
+        cats[i] = ci;
+        gc.h[i] = h[i]; gc.m[i] = m[i]; gc.cat[i] = ci;
+        ga.forget[i] = forget[i]; ga.gain[i] = gain[i];
+        ga.g[i] = gs[i]; ga.h[i] = h[i]; ga.m[i] = m[i]; ga.out[i] = out[i];
     }
-    (which == 0 ? x->layers[l].w13 : x->layers[l].w2) = e;
+    k_gate_cat<<<dim3(T, n), 256, 0, st>>>(gc, d, eps);
+    if (int rc = proj(e, down, cats, gs, n, T)) return rc;
+    k_gate_apply<<<dim3((d + 7) / 8, T, n), 256, 0, st>>>(ga, d, rank);
     return 0;
 }
 
-INK_EXPORT int ink_set_global(void* ctx, int which, const void* dev, int type, int rows, int cols)
+/// Queries [T x heads x qDim] (and relative coefficients [T x heads x rDim] when r
+/// is given), in place: a channel scale (null: none), an L2 clip per head (inf:
+/// none), then 1 + alpha ln(max(1, (t+1)/floor)) where logScale is set.
+DEPTH_EXPORT int amqe_head_prep(Engine* e, float* q, const float* qScale, int qDim, float qClip,
+                                float* r, const float* rScale, int rDim, float rClip,
+                                int heads, int T, int logScale, const int* pos, int floor, float alpha)
 {
-    Ctx* x = (Ctx*)ctx;
-    if (which < 0 || which >= G_COUNT) return -1006;
-    if (which <= G_UNEMBED) x->g[which] = Mat{ dev, type, rows, cols };
-    else x->gv[which] = (const float*)dev;
+    HeadPreps hp = {};
+    hp.x[0] = q; hp.scale[0] = qScale; hp.dim[0] = qDim; hp.clip[0] = qClip;
+    hp.x[1] = r; hp.scale[1] = rScale; hp.dim[1] = rDim; hp.clip[1] = rClip;
+    k_head_prep<<<dim3(heads, T, r ? 2 : 1), 128, 0, amqe_stream(e)>>>(hp, logScale, pos, floor, alpha);
     return 0;
 }
 
-INK_EXPORT long long ink_device_bytes(void* ctx) { return ((Ctx*)ctx)->bytes; }
-
-static void seq_release(Seq* s)
+/// A chunk's keys and values (projections kRaw, vRaw [T x C]) through their
+/// residual convolutions (mode 0 none, 1 static, 2 dynamic with taps kDyn, vDyn
+/// [T x kvHeads x K]), the key clip and the value norm, into the slot's rows at
+/// positions *pos.. (ring: modulo its rows).
+DEPTH_EXPORT int amqe_kv_prep(Engine* e, const KvView* slot, const float* kRaw, const float* vRaw,
+                              const float* kDyn, const float* vDyn, const float* kConv, const float* vConv,
+                              float* kHist, float* vHist, int kMode, int vMode,
+                              int C, int hd, int K, int kvHeads, int T, float clip, int vnorm, float eps, const int* pos)
 {
-    if (s->exec) cudaGraphExecDestroy(s->exec);
-    if (s->graph) cudaGraphDestroy(s->graph);
-    for (void* p : s->owned) cudaFree(p);
-    if (s->hToks) cudaFreeHost(s->hToks);
-    if (s->hLogits) cudaFreeHost(s->hLogits);
+    if (hd > 128 || ((kMode || vMode) && K < 2)) return -4004;
+    KvPrep kp = {};
+    kp.raw[0] = kRaw; kp.raw[1] = vRaw;
+    kp.dyn[0] = kDyn; kp.dyn[1] = vDyn;
+    kp.conv[0] = kConv; kp.conv[1] = vConv;
+    kp.hist[0] = kHist; kp.hist[1] = vHist;
+    kp.slot = *slot;
+    kp.dst[0] = (void*)slot->k; kp.dst[1] = (void*)slot->v;
+    kp.dsc[0] = (unsigned char*)slot->ks; kp.dsc[1] = (unsigned char*)slot->vs;
+    kp.dg[0] = (float*)slot->kg; kp.dg[1] = (float*)slot->vg;
+    kp.C = C; kp.hd = hd; kp.K = K; kp.count = T; kp.kvHeads = kvHeads; kp.vnorm = vnorm;
+    kp.mode[0] = kMode; kp.mode[1] = vMode;
+    kp.clip = clip; kp.eps = eps;
+    k_kv_prep<<<dim3(kvHeads, 2), 128, 0, amqe_stream(e)>>>(kp, pos);
+    return 0;
 }
 
-static int max_parts(const Ctx* x, const Seq* s)
+/// Key splits one row's attention takes over a slot: a ring a split per 64
+/// rows up to 16; full rows one per 128 up to 64.
+DEPTH_EXPORT int amqe_depth_attention_splits(int cap, int ring)
 {
-    int most = 1;
-    for (size_t i = 0; i < s->slots.size(); i++)
+    if (ring) return std::max(1, std::min(16, (cap + 63) / 64));
+    return std::max(1, std::min(64, cap / 128));
+}
+
+/// Split-key attention of T rows at positions *pos.. over a slot, into the split
+/// partials `part` [T x heads x splits x (hd + 2)]: per query an online softmax
+/// over its keys (the window's when window > 0), the relative bias r · P[:, dist]
+/// within `extent` of the query (extent 0: none). tiled: FlashAttention-2 on the
+/// tensor cores (FP16 tiles, f32 sums) for a chunk, the bias first made as a
+/// table rb [T x heads x extent].
+DEPTH_EXPORT int amqe_depth_attention(Engine* e, const float* q, const float* r, const float* relProj, float* rb,
+                                      const KvView* kv, float* part, int heads, int kvHeads, int hd, int dRel, int extent,
+                                      int window, int splits, float scale, int T, int tiled, const int* pos)
+{
+    cudaStream_t st = amqe_stream(e);
+    if (hd > 128 || heads % kvHeads != 0 || dRel > 32 || (extent > 0 && (r == nullptr || relProj == nullptr))) return -4005;
+    if (tiled)
     {
-        int heads = x->layers[phys_of(x, (int)i)].heads;
-        int sp = splits_for(s->slots[i]);
-        most = std::max(most, std::max(sp * heads, kChunk * std::min(sp, kRowSplits) * heads));
-    }
-    return most;
-}
-
-// A sequence of up to `capacity` positions: every slot's rows and histories,
-// and the scratch of a chunk of kChunk tokens.
-INK_EXPORT int ink_seq_create(void* ctx, int capacity, int format, void** out)
-{
-    Ctx* x = (Ctx*)ctx;
-    const InkConfig& c = x->c;
-    Seq* s = new Seq();
-    s->capacity = capacity;
-    s->format = format;
-    int core = c.loopEnd - c.loopStart, nslots = c.layers + (c.passes - 1) * core, d = c.d;
-    const size_t R = kChunk;
-    int rc = 0;
-    auto fail = [&](int code) { seq_release(s); delete s; return code; };
-    s->slots.resize(nslots);
-    int maxHeads = 1, maxC = 1;
-    for (int i = 0; i < nslots; i++)
-    {
-        const Layer& L = x->layers[phys_of(x, i)];
-        Slot& sl = s->slots[i];
-        sl.full = L.full;
-        sl.C = L.kvHeads * L.headDim;
-        sl.kv.ring = L.full ? 0 : 1;
-        // Sliding slots keep f32 rows of their window (a window is small); full slots the format asked for.
-        sl.kv.format = L.full ? format : KV_F32;
-        if ((rc = alloc_kv(s, sl.kv, slot_rows(x, L.full, capacity), sl.C, L.kvHeads))) return fail(rc);
-        if ((rc = alloc_f(s, &sl.khist, (size_t)(c.convK - 1) * sl.C))) return fail(rc);
-        if ((rc = alloc_f(s, &sl.vhist, (size_t)(c.convK - 1) * sl.C))) return fail(rc);
-        if ((rc = alloc_f(s, &sl.ahist, (size_t)(c.convK - 1) * d))) return fail(rc);
-        if ((rc = alloc_f(s, &sl.mhist, (size_t)(c.convK - 1) * d))) return fail(rc);
-        maxHeads = std::max(maxHeads, L.heads * L.headDim);
-        maxC = std::max(maxC, sl.C);
-    }
-    int visits = c.loopStart + c.passes * core + (c.layers - c.loopEnd) + 2;
-    s->hbuf.resize(visits);
-    for (auto& p : s->hbuf) if ((rc = alloc_f(s, &p, R * d))) return fail(rc);
-    float** heads[] = { &s->q, &s->gate, &s->tmp };
-    for (auto p : heads) if ((rc = alloc_f(s, p, R * maxHeads))) return fail(rc);
-    float** kv[] = { &s->k, &s->v };
-    for (auto p : kv) if ((rc = alloc_f(s, p, R * maxC))) return fail(rc);
-    if ((rc = alloc_f(s, &s->r, R * 64 * c.relDim))) return fail(rc);
-    if ((rc = alloc_f(s, &s->sinks, R * 256))) return fail(rc);
-    if ((rc = alloc_f(s, &s->rlogits, R * c.experts))) return fail(rc);
-    if ((rc = alloc_f(s, &s->kdyn, R * 64 * c.convK))) return fail(rc);
-    if ((rc = alloc_f(s, &s->vdyn, R * 64 * c.convK))) return fail(rc);
-    if ((rc = alloc_f(s, &s->part, (size_t)max_parts(x, s) * 130))) return fail(rc);
-    if ((rc = alloc_f(s, &s->mixed, R * 3 * d))) return fail(rc);
-    if ((rc = alloc_f(s, &s->msg, R * 4 * d))) return fail(rc);
-    if ((rc = alloc_f(s, &s->cat, 3 * R * 2 * d))) return fail(rc);      // three gates at once (message_gates)
-    if ((rc = alloc_f(s, &s->gvec, 3 * R * c.rank))) return fail(rc);
-    float** rows[] = { &s->attn, &s->xq, &s->xk, &s->xv, &s->nq, &s->nk, &s->nv, &s->res, &s->mlpIn, &s->mlpGated, &s->normed, &s->ffn };
-    for (auto p : rows) if ((rc = alloc_f(s, p, R * d))) return fail(rc);
-    if ((rc = alloc_f(s, &s->act, R * c.topK * c.width))) return fail(rc);
-    if ((rc = alloc_f(s, &s->epart, R * c.topK * d))) return fail(rc);
-    if ((rc = alloc_f(s, &s->logits, c.vocab))) return fail(rc);
-    if ((rc = alloc_f(s, &s->wt, R * c.topK))) return fail(rc);
-    if ((rc = alloc_f(s, &s->idx, R * c.topK))) return fail(rc);
-    if ((rc = alloc_f(s, &s->order, R * c.topK))) return fail(rc);
-    if ((rc = alloc_f(s, &s->offsets, c.experts + 1))) return fail(rc);
-    if ((rc = alloc_f(s, &s->gorder, 3 * (R * c.topK + c.experts)))) return fail(rc);
-    {
-        size_t most = 1;
-        for (const Layer& L : x->layers) most = std::max(most, (size_t)L.heads * (size_t)std::max(L.extent, 1));
-        if ((rc = alloc_f(s, &s->rb, R * most))) return fail(rc);
-    }
-    if ((rc = alloc_f(s, &s->ggroups, 3 * (R * c.topK + c.experts)))) return fail(rc);
-    if ((rc = alloc_f(s, &s->dToks, R + 1))) return fail(rc);
-    s->dPos = s->dToks + R;
-    if (cudaHostAlloc((void**)&s->hToks, (R + 1) * sizeof(int), cudaHostAllocDefault) != cudaSuccess) return fail(-2000);
-    if (cudaHostAlloc((void**)&s->hLogits, (size_t)c.vocab * sizeof(float), cudaHostAllocDefault) != cudaSuccess) return fail(-2001);
-    if ((rc = ok(cudaDeviceSynchronize()))) return fail(rc);
-    *out = s;
-    return 0;
-}
-
-INK_EXPORT long long ink_seq_bytes(void* seq) { return ((Seq*)seq)->bytes; }
-INK_EXPORT int ink_seq_position(void* seq) { return ((Seq*)seq)->pos; }
-INK_EXPORT int ink_seq_capacity(void* seq) { return ((Seq*)seq)->capacity; }
-
-INK_EXPORT int ink_seq_reset(void* ctx, void* seq)
-{
-    ((Seq*)seq)->pos = 0;   // every row and history is written before it is read
-    return 0;
-}
-
-INK_EXPORT int ink_seq_free(void* ctx, void* seq)
-{
-    Seq* s = (Seq*)seq;
-    cudaDeviceSynchronize();
-    seq_release(s);
-    delete s;
-    return 0;
-}
-
-// Room for `capacity` positions: each slot whose rows depend on it moves to a
-// larger allocation (the rows so far are kept), and the step graph is captured
-// again.
-INK_EXPORT int ink_seq_grow(void* ctx, void* seq, int capacity)
-{
-    Ctx* x = (Ctx*)ctx;
-    Seq* s = (Seq*)seq;
-    if (capacity <= s->capacity) return 0;
-    TRY(cudaStreamSynchronize(x->stream));
-    auto drop = [&](void* p) {
-        if (!p) return;
-        auto it = std::find(s->owned.begin(), s->owned.end(), p);
-        if (it != s->owned.end()) s->owned.erase(it);
-        cudaFree(p);
-    };
-    for (size_t i = 0; i < s->slots.size(); i++)
-    {
-        Slot& sl = s->slots[i];
-        const Layer& L = x->layers[phys_of(x, (int)i)];
-        int rows = slot_rows(x, sl.full, capacity);
-        if (rows <= sl.kv.cap) continue;
-        // A ring that grows has not wrapped yet: it held fewer rows than the
-        // positions so far would need only once the capacity exceeded it.
-        KvSlot old = sl.kv;
-        long long before = kv_bytes(old.cap, sl.C, L.kvHeads, old.format);
-        if (int rc = alloc_kv(s, sl.kv, rows, sl.C, L.kvHeads)) { sl.kv = old; return rc; }
-        size_t n = (size_t)std::min(s->pos, old.cap);
-        size_t el = old.format == KV_F32 ? 4 : 2;
-        if (old.format == KV_FP4)
+        if (!(hd == 16 || hd == 32 || hd == 64 || hd == 128) || heads > 64) return -4006;
+        if (extent > 0)
+            k_relbias<<<dim3(T, heads), 256, 0, st>>>(r, relProj, rb, heads, dRel, extent);
+        TileArgs ta = {};
+        ta.q = q; ta.rb = rb; ta.kv = *kv; ta.part = part;
+        ta.heads = heads; ta.kvHeads = kvHeads; ta.extent = extent; ta.window = window; ta.splits = splits; ta.T = T;
+        ta.scale = scale;
+        dim3 grid(heads, splits, (T + kTQ - 1) / kTQ);
+        switch (hd)
         {
-            TRY(cudaMemcpy(sl.kv.k, old.k, n * sl.C / 2, cudaMemcpyDeviceToDevice));
-            TRY(cudaMemcpy(sl.kv.v, old.v, n * sl.C / 2, cudaMemcpyDeviceToDevice));
-            TRY(cudaMemcpy(sl.kv.ks, old.ks, n * sl.C / 16, cudaMemcpyDeviceToDevice));
-            TRY(cudaMemcpy(sl.kv.vs, old.vs, n * sl.C / 16, cudaMemcpyDeviceToDevice));
-            TRY(cudaMemcpy(sl.kv.kg, old.kg, n * L.kvHeads * 4, cudaMemcpyDeviceToDevice));
-            TRY(cudaMemcpy(sl.kv.vg, old.vg, n * L.kvHeads * 4, cudaMemcpyDeviceToDevice));
+            case 16: k_attn_tiles<16><<<grid, 128, 0, st>>>(ta, pos); break;
+            case 32: k_attn_tiles<32><<<grid, 128, 0, st>>>(ta, pos); break;
+            case 64: k_attn_tiles<64><<<grid, 128, 0, st>>>(ta, pos); break;
+            default: k_attn_tiles<128><<<grid, 128, 0, st>>>(ta, pos); break;
         }
-        else
-        {
-            TRY(cudaMemcpy(sl.kv.k, old.k, n * sl.C * el, cudaMemcpyDeviceToDevice));
-            TRY(cudaMemcpy(sl.kv.v, old.v, n * sl.C * el, cudaMemcpyDeviceToDevice));
-        }
-        drop(old.k); drop(old.v); drop(old.ks); drop(old.vs); drop(old.kg); drop(old.vg);
-        s->bytes -= before;
+        return 0;
     }
-    // A larger cache may take more splits than the scratch was sized for.
-    drop(s->part);
-    if (int rc = alloc_f(s, &s->part, (size_t)max_parts(x, s) * 130)) return rc;
-    TRY(cudaDeviceSynchronize());
-    s->capacity = capacity;
-    if (s->exec) { cudaGraphExecDestroy(s->exec); s->exec = nullptr; }
-    if (s->graph) { cudaGraphDestroy(s->graph); s->graph = nullptr; }
+    AttnArgs aa = {};
+    aa.q = q; aa.r = r; aa.relProj = relProj;
+    aa.kv = *kv;
+    aa.part = part;
+    aa.heads = heads; aa.kvHeads = kvHeads; aa.hd = hd; aa.dRel = dRel; aa.extent = extent;
+    aa.window = window; aa.splits = splits; aa.scale = scale;
+    k_attn<<<dim3(heads, splits, T), 128, 0, st>>>(aa, pos);
     return 0;
 }
 
-// The KV bytes a sequence of `capacity` positions would hold.
-INK_EXPORT long long ink_seq_estimate(void* ctx, int capacity, int format)
+/// The split partials merged with each head's sink logit (sinks null: none;
+/// sinkStride the logits' row stride, 0 for one per head), then the sigmoid
+/// output gate (null: none): out [T x heads x hd].
+DEPTH_EXPORT int amqe_depth_attention_merge(Engine* e, const float* part, const float* sinks, int sinkStride, const float* gate,
+                                            float* out, int heads, int splits, int hd, int T)
 {
-    Ctx* x = (Ctx*)ctx;
-    const InkConfig& c = x->c;
-    int core = c.loopEnd - c.loopStart, nslots = c.layers + (c.passes - 1) * core;
-    long long total = 0;
-    for (int i = 0; i < nslots; i++)
-    {
-        const Layer& L = x->layers[phys_of(x, i)];
-        int C = L.kvHeads * L.headDim;
-        total += kv_bytes(slot_rows(x, L.full, capacity), C, L.kvHeads, L.full ? format : KV_F32);
-        total += 4LL * (c.convK - 1) * (2LL * C + 2LL * c.d);
-    }
-    return total;
-}
-
-// Feeds one token; copies the logits out when `logits` is given. `graphs`
-// 0 runs the launches directly (for debugging), otherwise the step's graph.
-INK_EXPORT int ink_step(void* ctx, void* seq, int token, float* logits, int graphs)
-{
-    Ctx* x = (Ctx*)ctx;
-    Seq* s = (Seq*)seq;
-    if (s->pos >= s->capacity) return -3000;
-    if (token < 0 || token >= x->c.paddedVocab) return -3001;
-    s->hToks[0] = token;
-    s->hToks[kChunk] = s->pos;
-    TRY(cudaMemcpyAsync(s->dToks, s->hToks, sizeof(int), cudaMemcpyHostToDevice, x->stream));
-    TRY(cudaMemcpyAsync(s->dPos, s->hToks + kChunk, sizeof(int), cudaMemcpyHostToDevice, x->stream));
-    x->err = 0;
-    if (!graphs)
-    {
-        record(x, s, 1, false);
-        if (x->err) return x->err;
-        TRY(cudaGetLastError());
-    }
-    else
-    {
-        if (!s->exec)
-        {
-            TRY(cudaStreamBeginCapture(x->stream, cudaStreamCaptureModeThreadLocal));
-            record(x, s, 1, false);
-            cudaError_t e = cudaStreamEndCapture(x->stream, &s->graph);
-            if (e != cudaSuccess) return -(int)e;
-            if (x->err) { cudaGraphDestroy(s->graph); s->graph = nullptr; return x->err; }
-            TRY(cudaGraphInstantiate(&s->exec, s->graph, 0));
-        }
-        TRY(cudaGraphLaunch(s->exec, x->stream));
-    }
-    if (logits)
-    {
-        TRY(cudaMemcpyAsync(s->hLogits, s->logits, (size_t)x->c.vocab * sizeof(float), cudaMemcpyDeviceToHost, x->stream));
-    }
-    TRY(cudaStreamSynchronize(x->stream));
-    if (logits) memcpy(logits, s->hLogits, (size_t)x->c.vocab * sizeof(float));
-    s->pos++;
+    k_attn_merge<<<dim3(heads, T), 128, 0, amqe_stream(e)>>>(part, sinks, sinkStride, gate, out, splits, hd);
     return 0;
 }
 
-// Feeds `count` tokens in chunks of up to kChunk; the logits of every position
-// into `logits` (count x vocab) when `every`, else only the last position's
-// (vocab), or none when `logits` is null. A chunk of one is a step.
-INK_EXPORT int ink_prefill(void* ctx, void* seq, const int* tokens, int count, float* logits, int every, int graphs)
+/// out = conv(x) + add, a residual short convolution over this slot's history
+/// [(K-1) x C] for T rows at positions *pos.. (w null: out = x + add); add may be null.
+DEPTH_EXPORT int amqe_residual_conv(Engine* e, const float* x, const float* w, float* hist, const float* add, float* out,
+                                    int C, int K, int T, const int* pos)
 {
-    Ctx* x = (Ctx*)ctx;
-    Seq* s = (Seq*)seq;
-    int vocab = x->c.vocab;
-    if (s->pos + count > s->capacity) return -3000;
-    for (int i = 0; i < count; i++) if (tokens[i] < 0 || tokens[i] >= x->c.paddedVocab) return -3001;
-    if (every && logits && !s->every)
+    if (w && K < 2) return -4007;
+    k_shortconv<<<(C + 255) / 256, 256, 0, amqe_stream(e)>>>(x, w, hist, add, out, C, K, pos, T);
+    return 0;
+}
+
+/// Sigmoid routing normalised over the chosen experts, T rows of router logits
+/// [T x experts]: idx, wt [T x topK]; bias (null: none) chooses only.
+DEPTH_EXPORT int amqe_route_sigmoid_selected(Engine* e, const float* logits, const float* bias, int experts, int topK,
+                                             float routeScale, int* idx, float* wt, int T)
+{
+    if (experts > 512 || topK > 32) return -4008;
+    k_router<<<T, 32, 0, amqe_stream(e)>>>(logits, bias, experts, topK, routeScale, idx, wt);
+    return 0;
+}
+
+/// Packed experts through a softcapped GLU (gate and up rows interleaved, gate
+/// j = row 2j: cap(g)·sigmoid(g)·cap(u)) for T rows of x [T x d] routed to idx with
+/// weights wt [T x topK]: ffn [T x d]. A step's experts on the engine's decode
+/// kernels, a chunk's grouped by expert on its tensor cores, and with prompts at
+/// f32 (or a form or shape the engine's kernels do not take) the f32 kernels here.
+/// Scratch: act [T x topK x width], part [T x topK x d], order [T x topK],
+/// offsets [experts + 1], gorder and ggroups [3 x (T x topK + experts)].
+DEPTH_EXPORT int amqe_packed_experts(Engine* e, const Experts* gateUp, const Experts* down, int experts, int d, int width, int topK,
+                                     float gateCap, float upCap, const float* x, int T, const int* idx, const float* wt,
+                                     float* act, float* part, float* ffn, int* order, int* offsets, int* gorder, int* ggroups)
+{
+    cudaStream_t st = amqe_stream(e);
+    if (experts > 512 || topK > 32) return -4009;
+    const Experts& w13 = *gateUp;
+    const Experts& w2 = *down;
+    bool grouped = T > 1 && d % 32 == 0 && width % 32 == 0 && d % 8 == 0;
+    if (!grouped && T <= 8)
     {
-        if (int rc = alloc_f(s, &s->every, (size_t)kChunk * vocab)) return rc;
-        TRY(cudaDeviceSynchronize());
+        int rc = amqe_moe_experts_paired_step(e, w13.w, w13.type, w13.scales, w13.rowScale, w2.w, w2.type, w2.scales, w2.rowScale,
+                                              experts, d, width, topK, gateCap, upCap, x, d, T, idx, act, part);
+        if (rc == 0)
+        {
+            k_expert_wsum<<<dim3((d + 255) / 256, T), 256, 0, st>>>(part, wt, topK, d, ffn);
+            return 0;
+        }
+        if (rc != -100) return rc;
     }
-    for (int done = 0; done < count;)
+    if (!grouped)
     {
-        int T = std::min(kChunk, count - done);
-        bool last = done + T == count;
-        if (T == 1)
+        for (int t = 0; t < T; t++)
         {
-            float* row = logits == nullptr ? nullptr : every ? logits + (size_t)done * vocab : last ? logits : nullptr;
-            if (int rc = ink_step(ctx, seq, tokens[done], row, graphs)) return rc;
-            done++;
-            continue;
+            k_expert_up<<<dim3(topK, (width + 7) / 8), 256, 0, st>>>(w13, x + (long long)t * d, idx + t * topK,
+                                                                     act + (long long)t * topK * width, width, gateCap, upCap);
+            k_expert_down<<<dim3(topK, (d + 7) / 8), 256, 0, st>>>(w2, act + (long long)t * topK * width, idx + t * topK,
+                                                                  wt + t * topK, part + (long long)t * topK * d, d, width);
         }
-        memcpy(s->hToks, tokens + done, (size_t)T * sizeof(int));
-        s->hToks[kChunk] = s->pos;
-        TRY(cudaMemcpyAsync(s->dToks, s->hToks, (size_t)T * sizeof(int), cudaMemcpyHostToDevice, x->stream));
-        TRY(cudaMemcpyAsync(s->dPos, s->hToks + kChunk, sizeof(int), cudaMemcpyHostToDevice, x->stream));
-        bool all = every && logits;
-        x->err = 0;
-        record(x, s, T, all);
-        if (x->err) return x->err;
-        TRY(cudaGetLastError());
-        if (all)
-        {
-            TRY(cudaMemcpyAsync(logits + (size_t)done * vocab, s->every, (size_t)T * vocab * sizeof(float), cudaMemcpyDeviceToHost, x->stream));
-        }
-        else if (logits && last)
-        {
-            TRY(cudaMemcpyAsync(s->hLogits, s->logits, (size_t)vocab * sizeof(float), cudaMemcpyDeviceToHost, x->stream));
-        }
-        TRY(cudaStreamSynchronize(x->stream));
-        if (!all && logits && last) memcpy(logits, s->hLogits, (size_t)vocab * sizeof(float));
-        s->pos += T;
-        done += T;
+        k_expert_sum<<<dim3((d + 255) / 256, T), 256, 0, st>>>(part, topK, d, ffn);
+        return 0;
     }
+    int gu = w13.type == W_F32 ? -1 : w13.type, dn = w2.type == W_F32 ? -1 : w2.type;
+    int rc = gu < 0 || dn < 0 ? -100
+        : amqe_moe_experts_paired(e, w13.w, gu, w13.scales, w13.rowScale, w2.w, dn, w2.scales, w2.rowScale,
+                                  experts, d, width, topK, gateCap, upCap, x, d, T, idx, gorder, ggroups, part);
+    if (rc == 0)
+    {
+        k_expert_wsum<<<dim3((d + 255) / 256, T), 256, 0, st>>>(part, wt, topK, d, ffn);
+        return 0;
+    }
+    if (rc != -100) return rc;
+    k_group<<<1, 1024, 0, st>>>(idx, T * topK, experts, offsets, order);
+    k_expert_up_g<<<dim3(experts, (width + 31) / 32), 256, 0, st>>>(w13, x, offsets, order, topK, act, width, gateCap, upCap);
+    k_expert_down_g<<<dim3(experts, (d + 63) / 64), 256, 0, st>>>(w2, act, offsets, order, wt, part, d, width);
+    k_expert_sum<<<dim3((d + 255) / 256, T), 256, 0, st>>>(part, topK, d, ffn);
     return 0;
 }
 
-// The output of layer visit `visit` (0 .. 47 in run order) for the first
-// `rows` rows of the last chunk a prefill ran: every visit of a prompt that fit
-// in one chunk, the layer outputs a reference records. Diagnostics only.
-INK_EXPORT int ink_seq_visit(void* ctx, void* seq, int visit, float* out, int rows)
+/// NVFP4's per-expert factor as the engine's row scale: out[e x rows + r] = factor[e].
+DEPTH_EXPORT int amqe_expert_row_scale(Engine* e, const float* factor, int rows, long long count, float* out)
 {
-    Ctx* x = (Ctx*)ctx;
-    Seq* s = (Seq*)seq;
-    if (visit < 0 || visit + 1 >= (int)s->hbuf.size() || rows < 1 || rows > kChunk) return -3002;
-    TRY(cudaStreamSynchronize(x->stream));
-    TRY(cudaMemcpy(out, s->hbuf[visit + 1], (size_t)rows * x->c.d * sizeof(float), cudaMemcpyDeviceToHost));
+    k_expand_factor<<<(unsigned)((count + 255) / 256), 256, 0, amqe_stream(e)>>>(factor, rows, count, out);
     return 0;
 }
 
-INK_EXPORT int ink_free(void* ctx)
+/// T tokens' embedding rows, RMS-normed with normW (null: no gain) when normed.
+DEPTH_EXPORT int amqe_embed_rows(Engine* e, const Mat* table, const int* tokens, const float* normW, int normed, float eps,
+                                 float* out, int T)
 {
-    Ctx* x = (Ctx*)ctx;
-    cudaDeviceSynchronize();
-    for (void* p : x->owned) cudaFree(p);
-    amqe_destroy(x->eng);   // and its stream
-    delete x;
+    k_embed<<<T, 256, 0, amqe_stream(e)>>>(*table, tokens, normW, out, eps, normed);
     return 0;
 }
 
-INK_EXPORT const char* ink_error_string(int code)
+/// x = cap · tanh(x / cap), n values.
+DEPTH_EXPORT int amqe_softcap(Engine* e, float* x, long long n, float cap)
 {
-    return code < 0 && code > -1000 ? cudaGetErrorString((cudaError_t)(-code)) : "amql_inkling error";
-}
-
-/// Prompts at f32 (1): projections as f32 SGEMMs, and the experts and the
-/// attention as the f32 kernels here, which keeps a chunk within 1e-3 of the
-/// managed runtime. 0 (the default): tensor cores, the engine's BF16 GEMMs and
-/// the FP16 tiled attention (k_attn_tiles).
-INK_EXPORT int ink_set_prefill_f32(void* ctx, int f32)
-{
-    ((Ctx*)ctx)->exactPrefill = f32 ? 1 : 0;
-    return amqe_set_prefill_f32(((Ctx*)ctx)->eng, f32);
+    k_softcap<<<(unsigned)((n + 255) / 256), 256, 0, amqe_stream(e)>>>(x, (int)n, cap);
+    return 0;
 }

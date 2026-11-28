@@ -29,13 +29,13 @@ public static partial class Planner
         var surface = component.Execution
             ?? throw new ContainerException(
                 $"component '{componentId}' has no execution surface — nothing to execute");
-        if (surface.Inkling2 is not null && surface.DepthLoop is null)
+        if (surface.Unread is { Count: > 0 } unread)
         {
-            // Encoded before the generic surfaces existed: the facts are there,
-            // the planner's description is not (amql-cli graph upgrade adds it).
+            // Written by another build: what this build would plan is not what
+            // the graph says (amql-cli graph upgrade rewrites the ones it knows).
             throw new UnsupportedOperatorException(
-                $"component '{componentId}' records its looped stack only in the facts of a dedicated session; " +
-                "its graph predates the generic depth surfaces — rewrite it with 'amql-cli graph upgrade <container>'");
+                $"component '{componentId}' records surface facts this build does not read ({string.Join(", ", unread.Keys)}); " +
+                "if an older build encoded it, rewrite its graph with 'amql-cli graph upgrade <container>'");
         }
         var normSurface = surface.Norm;
 

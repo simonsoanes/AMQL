@@ -13,9 +13,10 @@ namespace Amql.Tests;
 /// conditioning (separate inputs, query scale and clip, log-scaling, a relative
 /// bias, sinks, a separate output gate) and packed experts with sigmoid routing
 /// and a softcapped GLU — planned from the generic surfaces and run by
-/// GenericRuntime's row-exact path, against Inkling2Model (a transcription of
-/// the reference) on the tiny looped fixture, its experts stored plain, NVFP4
-/// and MXFP8.
+/// GenericRuntime's row-exact path, on the tiny looped fixture, its experts
+/// stored plain, NVFP4 and MXFP8. (Its logits are held to transformers' in
+/// ArchZooTests, the quantised experts to their decoded values in
+/// LoopedCheckpointTests, and the device engine to this path in DepthGpuTests.)
 /// </summary>
 public sealed class DepthOpsTests
 {
@@ -29,7 +30,7 @@ public sealed class DepthOpsTests
     private static string Encode(TempDir dir)
     {
         string quantised = Path.Combine(dir.Path, "q"), decoded = Path.Combine(dir.Path, "dq");
-        Inkling2Tests.WriteCheckpoints(quantised, decoded);
+        LoopedCheckpointTests.WriteCheckpoints(quantised, decoded);
         string container = Path.Combine(dir.Path, "qc");
         ModelToContainer.Encode(quantised, container, "looped-q", NoVision);
         return container;
@@ -115,91 +116,61 @@ public sealed class DepthOpsTests
         Assert.Equal(new[] { 2, 2, 3, 3 }, plan.Layers[5].MessageGates!.Select(g => g.QueryRow));
     }
 
-    /// <summary>
-    /// The planned row-exact path against Inkling2Model, token by token: the
-    /// prompt, then a greedy continuation. Every logit of every step must be the
-    /// same f32 value, and every visit's output the same vector.
-    /// </summary>
+    /// <summary>The planned path through a DecodeSession — prompt prefill
+    /// (position by position), steps, and a reset — gives exactly what stepping
+    /// the runtime token by token gives, every visit's output included.</summary>
     [Fact]
-    public void LoopedDepth_PlannedRuntime_Matches_The_Oracle_Bit_For_Bit()
+    public void LoopedDepth_DecodeSession_Prefills_And_Steps_Like_The_Runtime()
     {
         using var dir = new TempDir();
         using var container = Vindex3Container.Open(Encode(dir));
         using var store = container.CreateOperandStore();
-        var oracle = Inkling2Model.Load(container, store);
         var plan = Planner.Plan(container, "target", store);
         var runtime = new GenericRuntime(plan, store);
-
-        var oracleVisits = new List<float[]>();
-        var plannedVisits = new List<float[]>();
-        oracle.OnVisitOutput = (_, h) => oracleVisits.Add(h);
-        runtime.VisitOutputCapture = (_, h) => plannedVisits.Add(h);
-
-        var (ids, _) = ArchZooTests.Golden("inkling2_loop");
-        double worst = 0;
-        int steps = 0;
-        float[] Compare(int token)
-        {
-            var expected = oracle.Step(token);
-            var actual = runtime.FinalNormAndHead(runtime.StepForward(token)).Row(0).ToArray();
-            worst = Math.Max(worst, Worst(actual, expected));
-            steps++;
-            return expected;
-        }
-        float[] last = null!;
-        foreach (int token in ids)
-        {
-            last = Compare(token);
-        }
-        for (int i = 0; i < 8; i++)
-        {
-            last = Compare(ArgMax(last));
-        }
-        _output.WriteLine($"{steps} steps ({ids.Length} prompt, {steps - ids.Length} greedy), {plannedVisits.Count} visits: worst logit diff {worst:G4}");
-        Assert.Equal(oracleVisits.Count, plannedVisits.Count);
-        for (int v = 0; v < oracleVisits.Count; v++)
-        {
-            Assert.Equal(oracleVisits[v], plannedVisits[v]);
-        }
-        Assert.Equal(0.0, worst);
-    }
-
-    /// <summary>The planned path through a DecodeSession: prompt prefill (position by
-    /// position), steps, and a reset, against the oracle.</summary>
-    [Fact]
-    public void LoopedDepth_DecodeSession_Prefills_And_Steps_Like_The_Oracle()
-    {
-        using var dir = new TempDir();
-        using var container = Vindex3Container.Open(Encode(dir));
-        using var store = container.CreateOperandStore();
-        var oracle = Inkling2Model.Load(container, store);
-        using var session = new DecodeSession(Planner.Plan(container, "target", store), store);
+        var stepped = new List<float[]>();
+        runtime.VisitOutputCapture = (_, h) => stepped.Add(h);
+        using var session = new DecodeSession(plan, store) { AllowGpuEngine = false };
+        var sessionVisits = new List<float[]>();
+        session.Runtime.VisitOutputCapture = (_, h) => sessionVisits.Add(h);
         Assert.Equal("cpu", session.Backend);
         var (ids, _) = ArchZooTests.Golden("inkling2_loop");
+        float[] expected = null!;
+        foreach (int token in ids)
+        {
+            expected = runtime.FinalNormAndHead(runtime.StepForward(token)).Row(0).ToArray();
+        }
+        var continuation = new List<float[]>();
+        var tokens = new List<int>();
+        for (int i = 0; i < 4; i++)
+        {
+            tokens.Add(ArgMax(i == 0 ? expected : continuation[^1]));
+            continuation.Add(runtime.FinalNormAndHead(runtime.StepForward(tokens[^1])).Row(0).ToArray());
+        }
         for (int round = 0; round < 2; round++)
         {
-            oracle.Reset();
             session.Reset();
-            var expected = oracle.Prefill(ids)[^1];
-            var actual = session.Prefill(ids).Row(0).ToArray();
-            Assert.Equal(expected, actual);
+            sessionVisits.Clear();
+            Assert.Equal(expected, session.Prefill(ids).Row(0).ToArray());
             for (int i = 0; i < 4; i++)
             {
-                int next = ArgMax(expected);
-                expected = oracle.Step(next);
-                Assert.Equal(expected, session.Step(next).Row(0).ToArray());
+                Assert.Equal(continuation[i], session.Step(tokens[i]).Row(0).ToArray());
+            }
+            Assert.Equal(stepped.Count, sessionVisits.Count);
+            for (int v = 0; v < stepped.Count; v++)
+            {
+                Assert.Equal(stepped[v], sessionVisits[v]);
             }
         }
     }
 
     [Fact]
-    public void GpuEngine_Refuses_The_Depth_Ops_By_Name()
+    public void LoopedDepth_Plan_Runs_By_Visit_On_Both_Paths()
     {
         using var dir = new TempDir();
         using var container = Vindex3Container.Open(Encode(dir));
         using var store = container.CreateOperandStore();
         var plan = Planner.Plan(container, "target", store);
-        Assert.Equal("looped depth (a range of layers run several times)", GpuEngine.Unsupported(plan));
+        Assert.Null(GpuEngine.Unsupported(plan));
         Assert.Null(GenericRuntime.RowPathRefusal(plan));
         var runtime = new GenericRuntime(plan, store);
         Assert.Throws<UnsupportedOperatorException>(() =>
@@ -207,9 +178,10 @@ public sealed class DepthOpsTests
     }
 
     /// <summary>
-    /// A graph written before the generic surfaces (only the dedicated session's
-    /// facts) is refused by the planner with the upgrade named; the upgrade gives
-    /// exactly the graph a fresh encode writes, and the planner then plans it.
+    /// A graph written by an older build (only the config adapter's facts, under a
+    /// key this build does not read) is refused by the planner naming the key and
+    /// the upgrade; the upgrade gives exactly the graph a fresh encode writes, and
+    /// the planner then plans it.
     /// </summary>
     [Fact]
     public void GraphUpgrade_Rebuilds_The_Generic_Surfaces_From_The_Recorded_Facts()
@@ -222,7 +194,7 @@ public sealed class DepthOpsTests
 
         // The graph as the converter wrote it before: only the facts.
         var component = current.Components.Single();
-        var facts = component.Execution!.Inkling2!;
+        var facts = Inkling2.ReadFacts(Path.Combine(containerDir, ModelToContainer.SourceConfigFile));
         var norm = new NormSpec { Kind = NormType.RmsNorm, Eps = facts.Eps, WeightOffset = 0f };
         var old = new SystemGraph
         {
@@ -237,7 +209,7 @@ public sealed class DepthOpsTests
                     NumLayers = component.NumLayers, HiddenSize = component.HiddenSize, Attention = component.Attention,
                     Execution = new ExecutionSurface
                     {
-                        ContextLength = component.Execution.ContextLength,
+                        ContextLength = component.Execution!.ContextLength,
                         Attention = new AttentionSurface
                         {
                             NumQHeads = facts.FullHeads, NumKvHeads = facts.FullKvHeads, HeadDim = facts.FullHeadDim,
@@ -246,7 +218,7 @@ public sealed class DepthOpsTests
                         Ffn = new FfnSurface { IntermediateSize = facts.ExpertWidth, Activation = Activation.Silu, FfnType = FfnType.Gated },
                         Norm = new NormSurface { Pre = norm, Post = norm, FinalNorm = norm, Placement = NormPlacement.PreOnly },
                         Head = new HeadSurface { VocabSize = facts.PaddedVocab, FinalLogitSoftcapping = (float)facts.FinalSoftcap },
-                        Inkling2 = facts,
+                        Unread = new Dictionary<string, JsonElement> { [Inkling2.FactsKey] = JsonSerializer.SerializeToElement(facts, ViJson.Options) },
                     },
                 },
             },
@@ -257,84 +229,18 @@ public sealed class DepthOpsTests
         {
             var refusal = Assert.Throws<UnsupportedOperatorException>(() => Planner.Plan(before, "target", store));
             Assert.Contains("graph upgrade", refusal.Message);
-            // The dedicated session still reads the old graph.
-            Assert.True(Inkling2Model.Serves(before));
+            Assert.Contains(Inkling2.FactsKey, refusal.Message);
         }
 
-        var (upgraded, names) = Inkling2.UpgradeGraph(JsonSerializer.Deserialize<SystemGraph>(File.ReadAllBytes(graphPath), ViJson.Options)!);
+        var (upgraded, names) = GraphUpgrade.Apply(JsonSerializer.Deserialize<SystemGraph>(File.ReadAllBytes(graphPath), ViJson.Options)!);
         Assert.Equal(new[] { "target" }, names);
         Assert.Equal(System.Text.Encoding.UTF8.GetString(fresh),
             System.Text.Encoding.UTF8.GetString(JsonSerializer.SerializeToUtf8Bytes(upgraded, ViJson.Options)));
-        Assert.Empty(Inkling2.UpgradeGraph(upgraded).Upgraded);
+        Assert.Empty(GraphUpgrade.Apply(upgraded).Upgraded);
 
         File.WriteAllBytes(graphPath, JsonSerializer.SerializeToUtf8Bytes(upgraded, ViJson.Options));
         using var after = Vindex3Container.Open(containerDir);
         using var afterStore = after.CreateOperandStore();
         Assert.True(Planner.Plan(after, "target", afterStore).RunsByVisit);
-    }
-    /// <summary>
-    /// The real checkpoint on the CPU (<c>AMQL_TEST_CONTAINER</c> naming a looped
-    /// container whose graph carries the generic surfaces, e.g. one rewritten by
-    /// <c>amql-cli graph upgrade</c>): a prompt and a greedy continuation on the
-    /// planned row-exact path, then the same tokens on Inkling2Model, one model
-    /// in memory at a time. Every logit of every step must agree exactly.
-    /// <c>AMQL_TEST_STEPS</c> sets the continuation (4), <c>AMQL_TEST_PROMPT</c> the prompt.
-    /// </summary>
-    [Fact]
-    public void LoopedDepth_Real_Checkpoint_Planned_Cpu_Matches_The_Oracle_When_Available()
-    {
-        if (RealCheckpoint.Container(c => c.Graph?.Components.FirstOrDefault(x => x.Id == "target")?.Execution is
-                { DepthLoop: not null, Inkling2: not null }) is not { } containerDir)
-        {
-            return;
-        }
-        int steps = int.TryParse(RealCheckpoint.Setting("STEPS"), out var n) ? n : 4;
-        var tokenizer = HfTokenizer.FromModelDir(containerDir);
-        var ids = tokenizer.Encode(RealCheckpoint.Setting("PROMPT") ?? "The capital of France is").Ids.ToArray();
-        var clock = System.Diagnostics.Stopwatch.StartNew();
-
-        var planned = new List<float[]>();
-        var fed = ids.ToList();
-        using (var container = Vindex3Container.Open(containerDir))
-        using (var store = container.CreateOperandStore())
-        {
-            var plan = Planner.Plan(container, "target", store);
-            _output.WriteLine($"planned: {plan.Schedule.Count} visits over {plan.Layers.Count} layers; GPU engine: {GpuEngine.Unsupported(plan)}");
-            var runtime = new GenericRuntime(plan, store);
-            for (int i = 0; i < fed.Count; i++)
-            {
-                planned.Add(runtime.FinalNormAndHead(runtime.StepForward(fed[i])).Row(0).ToArray());
-                if (i == fed.Count - 1 && fed.Count < ids.Length + steps)
-                {
-                    fed.Add(ArgMax(planned[^1]));
-                }
-            }
-        }
-        _output.WriteLine($"planned path: {fed.Count} tokens in {clock.Elapsed.TotalSeconds:F0}s (load included)");
-        GC.Collect();
-        GC.WaitForPendingFinalizers();
-        GC.Collect();
-
-        clock.Restart();
-        var oracleLogits = new List<float[]>();
-        using (var container = Vindex3Container.Open(containerDir))
-        using (var store = container.CreateOperandStore())
-        {
-            var oracle = Inkling2Model.Load(container, store);
-            foreach (int token in fed)
-            {
-                oracleLogits.Add(oracle.Step(token));
-            }
-        }
-        _output.WriteLine($"oracle: {fed.Count} tokens in {clock.Elapsed.TotalSeconds:F0}s (load included)");
-
-        double worst = 0;
-        for (int t = 0; t < fed.Count; t++)
-        {
-            worst = Math.Max(worst, Worst(planned[t], oracleLogits[t]));
-        }
-        string text = tokenizer.Decode(fed.Skip(ids.Length).ToList());
-        _output.WriteLine($"ids [{string.Join(",", ids)}] greedy [{string.Join(",", fed.Skip(ids.Length))}] '{text}'; worst logit diff over {fed.Count} steps {worst:G4}");
-        Assert.Equal(0.0, worst);
     }
 }

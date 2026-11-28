@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # build-cuda.sh — build the optional amql_cuda native backend (Linux).
 # Requires: CUDA Toolkit (nvcc), GCC toolchain.
-# Produces: native/amql_cuda/bin/libamql_cuda.so (the engine, and Inkling 2
-#           looped's kernels beside it)
+# Produces: native/amql_cuda/bin/libamql_cuda.so (the engine)
 # Exit code 0 on success, 1 on any failure.
 #
 # Environment overrides:
@@ -54,7 +53,7 @@ echo "[amql-cuda] compiling amql_cuda.cu -arch=$CUDA_ARCH ..."
     -Xcompiler -fPIC \
     --shared \
     -o bin/libamql_cuda.so \
-    amql_cuda.cu amql_engine.cu amql_moe.cu amql_vision.cu amql_graph.cu amql_inkling.cu \
+    amql_cuda.cu amql_engine.cu amql_moe.cu amql_vision.cu amql_graph.cu amql_depth.cu \
     -lcublas -lcudart
 
 echo "[amql-cuda] built bin/libamql_cuda.so"

@@ -210,16 +210,10 @@ public sealed class ModelHost : IDisposable
             }
             var tokenizer = HfTokenizer.FromTokenizerFile(tokenizerPath);
             var store = container.CreateOperandStore();
-            // Inkling 2 looped is not a plan: it runs on its own GPU path or
-            // its managed runtime (the session is made with the generator).
-            bool inkling = Inkling2Model.Serves(container, component.Id);
-            ComponentOpPlan plan = null!;
+            ComponentOpPlan plan;
             try
             {
-                if (!inkling)
-                {
-                    plan = Planner.Plan(container, component.Id, store);
-                }
+                plan = Planner.Plan(container, component.Id, store);
             }
             catch (UnsupportedOperatorException e)
             {
@@ -228,14 +222,14 @@ public sealed class ModelHost : IDisposable
                 return new ModelHost(id, path, container, null, null, null, null, null, notes);
             }
 
-            if (!inkling && surface?.Embedding is { } embedding)
+            if (surface?.Embedding is { } embedding)
             {
                 var embedder = new Embedder(new DecodeSession(plan, store), tokenizer, EmbeddingPooling.From(embedding),
                     (int)(surface.ContextLength ?? int.MaxValue));
                 return new ModelHost(id, path, container, store, null, null, embedder, null, notes);
             }
 
-            if (!inkling && plan.Output is null)
+            if (plan.Output is null)
             {
                 notes.Add("the plan has no output head, so it cannot generate");
                 return new ModelHost(id, path, container, store, null, null, null, null, notes);
@@ -274,13 +268,7 @@ public sealed class ModelHost : IDisposable
             var prior = tokenizer.AddedTokenId("<|im_start|>") is { } start && tokenizer.AddedTokenId("<|im_end|>") is { } end
                 ? ChatPrior.ForChatMl(t => tokenizer.EncodeToIds(t), ids => tokenizer.DecodeText(ids, skipSpecialTokens: false), start, end)
                 : null;
-            var session = inkling ? DecodeSession.ForInkling2(container, store) : new DecodeSession(plan, store);
-            if (inkling)
-            {
-                notes.Add(session.Backend == "gpu"
-                    ? "Inkling 2 looped on its GPU path (amql_cuda): experts as stored, one request at a time"
-                    : $"Inkling 2 looped on the managed runtime: {session.GpuRefusal}");
-            }
+            var session = new DecodeSession(plan, store);
             var generator = new TextGenerator(session, loaded, prior, tokenizer, template,
                 StopTokens.Resolve(path, tokenizer, template), (int)(surface?.ContextLength ?? int.MaxValue));
             if (VisionPlan.Build(container, store, out string? noVision) is { } vision)
@@ -379,12 +367,13 @@ public static class StopTokens
         }
         // What the template ends a turn with, after words and after calls.
         var dialect = template.Dialect;
-        foreach (string end in dialect.Calls is null ? new[] { dialect.AfterReply } : [dialect.AfterReply, dialect.BeforeResult])
+        if (TurnMarks.ReplyEnd(tokenizer, dialect) is { } replyEnd)
         {
-            if (TurnMarks.First(tokenizer, end) is { } id)
-            {
-                ids.Add(id);
-            }
+            ids.Add(replyEnd);
+        }
+        if (dialect.Calls is not null && TurnMarks.First(tokenizer, dialect.BeforeResult) is { } afterCall)
+        {
+            ids.Add(afterCall);
         }
         return ids;
     }
@@ -912,6 +901,10 @@ public sealed class TextGenerator : IDisposable
         else if (partner.DeviceEngine() is not { } engine)
         {
             BatchRefusal = $"the GPU engine does not run this model ({partner.GpuRefusal})";
+        }
+        else if (engine.BatchRefusal is { } alone)
+        {
+            BatchRefusal = alone;
         }
         else
         {

@@ -336,14 +336,13 @@ public static class ModelExporter
         // processor configs, generation config — has to come back out, or the
         // exported checkpoint can tokenize but not format a conversation.
         var ancillary = HfAncillaryFiles.CopyInto(container.Root, outDir);
-        // Inkling 2's experts go back as stored, so the file describing
-        // their formats does too (it is never carried for other families,
-        // whose exports may be re-encoded).
-        string quantConfig = Path.Combine(container.Root, Amql.Hf.Inkling2.QuantConfigFile);
-        if (graph.Components.Any(c => c.Execution?.Inkling2 is not null) && File.Exists(quantConfig))
+        // A container carries the checkpoint's quant config only when its
+        // tensors are kept as stored: they go back as stored, so it does too.
+        string quantConfig = Path.Combine(container.Root, Amql.Hf.HfAncillaryFiles.QuantConfigFile);
+        if (File.Exists(quantConfig))
         {
-            File.Copy(quantConfig, Path.Combine(outDir, Amql.Hf.Inkling2.QuantConfigFile), overwrite: true);
-            ancillary = ancillary.Append(Amql.Hf.Inkling2.QuantConfigFile).ToList();
+            File.Copy(quantConfig, Path.Combine(outDir, Amql.Hf.HfAncillaryFiles.QuantConfigFile), overwrite: true);
+            ancillary = ancillary.Append(Amql.Hf.HfAncillaryFiles.QuantConfigFile).ToList();
         }
         if (ancillary.Count > 0)
         {

@@ -51,17 +51,14 @@ public class GpuEngineTests : IDisposable
             new ArchMapper.EncodeOptions { IncludeVision = false, IncludeMtp = false });
         using var container = Vindex3Container.Open(containerDir);
         using var store = container.CreateOperandStore();
-        if (Inkling2Model.Serves(container))
+        var plan = Planner.Plan(container, "target", store);
+        if (plan.RunsByVisit)
         {
-            // Inkling 2's looped stack plans (see DepthOpsTests), but the engine
-            // does not run its depth ops yet and refuses them by name; its own
-            // GPU path (amql_inkling.cu in amql_cuda) is held to its managed runtime.
-            Assert.Equal("looped depth (a range of layers run several times)",
-                GpuEngine.Unsupported(Planner.Plan(container, "target", store)));
-            InklingMatchesManaged(container, store, family);
+            // A plan run by visit (looped depth, a block residual) takes the
+            // engine's visit path, held to the planned CPU path in DepthGpuTests.
+            Assert.Null(GpuEngine.Unsupported(plan));
             return;
         }
-        var plan = Planner.Plan(container, "target", store);
 
         string? refusal = GpuEngine.Unsupported(plan);
         if (Refused.Contains(family))
@@ -102,147 +99,6 @@ public class GpuEngineTests : IDisposable
                 a = gpu.Step(next).FirstRow().ToArray();
                 b = cpu.Step(next).FirstRow().ToArray();
             }
-        }
-    }
-
-    /// <summary>The tiny Inkling 2 with its experts NVFP4 (amax / denominator),
-    /// MXFP8 and plain, mixed inside the loop: the GPU path's expert readers
-    /// against the managed runtime's, f32 rows, to 1e-3 of the largest logit with
-    /// prompts at f32. Then the default prompt path, the engine's BF16 tensor cores
-    /// over the same experts decoded once per chunk, against the f32 one visit by
-    /// visit: within 2% through the prelude and the core's first pass (all three
-    /// expert forms). Past that a random router's near ties flip under BF16
-    /// rounding (visit 7 sends four tokens to other experts), and the sliding
-    /// window spreads it, so the logits are the real checkpoint's to judge.</summary>
-    [Fact]
-    public void Inkling2_Quantised_Experts_Match_Managed_Path()
-    {
-        if (!Inkling2Gpu.Available)
-        {
-            return;
-        }
-        using var dir = new TempDir();
-        string quantised = Path.Combine(dir.Path, "q"), containerDir = Path.Combine(dir.Path, "c");
-        Inkling2Tests.WriteCheckpoints(quantised, Path.Combine(dir.Path, "dq"));
-        ModelToContainer.Encode(quantised, containerDir, "inkling2-q",
-            new ArchMapper.EncodeOptions { IncludeVision = false, IncludeMtp = false });
-        using var container = Vindex3Container.Open(containerDir);
-        using var store = container.CreateOperandStore();
-        using var gpu = Inkling2Gpu.TryCreate(container, store, out var reason);
-        Assert.True(gpu is not null, reason);
-        gpu.KvFormat = "f32";
-        gpu.ExactPrefill = true;
-        var managed = Inkling2Model.Load(container, store);
-        Assert.Contains("NVFP4", managed.ExpertForms);
-        Assert.Contains("MXFP8", managed.ExpertForms);
-        var (ids, _) = ArchZooTests.Golden("inkling2_loop");
-        var prompt = Enumerable.Range(0, 40).Select(i => ids[i % ids.Length]).ToArray();
-        var reference = managed.Prefill(prompt);
-        using var seq = gpu.NewSequence(64);
-        var mine = seq.PrefillAll(prompt);
-        for (int t = 0; t < prompt.Length; t++)
-        {
-            AssertClose(mine[t], reference[t], $"quantised inkling2, position {t}");
-        }
-
-        int hidden = container.Graph!.Component("target").HiddenSize;
-        const int Visits = 7;   // the prelude (4) and the first pass's first three
-        var exact = seq.VisitOutputs(Visits, prompt.Length, hidden);
-        gpu.ExactPrefill = false;
-        using var tensor = gpu.NewSequence(64);
-        tensor.PrefillAll(prompt);
-        var fast = tensor.VisitOutputs(Visits, prompt.Length, hidden);
-        for (int v = 0; v < Visits; v++)
-        {
-            // Measured against the visit's largest value: a row of small values rounds alike.
-            AssertClose(fast[v].SelectMany(r => r).ToArray(), exact[v].SelectMany(r => r).ToArray(),
-                $"quantised inkling2, BF16 prompt, visit {v}", 2e-2);
-        }
-    }
-
-    /// <summary>
-    /// Inkling 2 looped on its GPU path against <see cref="Inkling2Model"/>: every
-    /// position of a 3-, 21- and 200-token prompt (the tiny model's window is 4,
-    /// so the sliding slots' rings wrap 50 times and its full slots grow past
-    /// their first allocation), then greedy steps. With f32 rows the two differ
-    /// only in summation order (f32 warp trees against the managed path's double
-    /// sums) through 20 layer visits, so the logits agree to 1e-3 of the largest;
-    /// FP16 rows round every key and value (2e-2). NVFP4 rows are 4-bit, so they
-    /// are held to the decision instead: the same greedy token at most positions.
-    /// The replayed CUDA graph is the direct launches, to the bit.
-    /// </summary>
-    private static void InklingMatchesManaged(Vindex3Container container, OperandStore store, string family)
-    {
-        using var gpu = Inkling2Gpu.TryCreate(container, store, out var reason);
-        Assert.True(gpu is not null, $"{family}: Inkling 2 GPU path refused — {reason}");
-        gpu.ExactPrefill = true;
-        var managed = Inkling2Model.Load(container, store);
-        var (ids, _) = ArchZooTests.Golden(family);
-        foreach (int length in new[] { 3, 21, 200 })
-        {
-            var prompt = Enumerable.Range(0, length).Select(i => ids[i % ids.Length]).ToArray();
-            managed.Reset();
-            var reference = managed.Prefill(prompt);
-            var steps = new List<(int Token, float[] Logits)>();
-            for (int s = 0; s < 4; s++)
-            {
-                int next = Sampler.ArgMax(s == 0 ? reference[^1] : steps[^1].Logits);
-                steps.Add((next, managed.Step(next)));
-            }
-            foreach (var (format, tolerance) in new[] { ("f32", 1e-3), ("fp16", 2e-2), ("nvfp4", double.NaN) })
-            {
-                gpu.KvFormat = format;
-                using var seq = gpu.NewSequence(capacity: 64);
-                var mine = seq.PrefillAll(prompt);
-                var after = steps.Select(s => seq.Step(s.Token)).ToList();
-                string where = $"{family}, {length}-token prompt, {format} rows";
-                if (double.IsNaN(tolerance))
-                {
-                    int agree = Enumerable.Range(0, length).Count(t => Sampler.ArgMax(mine[t]) == Sampler.ArgMax(reference[t]));
-                    Assert.True(agree >= length * 0.8, $"{where}: argmax agrees at {agree}/{length}");
-                    continue;
-                }
-                for (int t = 0; t < length; t++)
-                {
-                    AssertClose(mine[t], reference[t], $"{where}, position {t}", tolerance);
-                }
-                for (int s = 0; s < steps.Count; s++)
-                {
-                    AssertClose(after[s], steps[s].Logits, $"{where}, step {s}", tolerance);
-                }
-            }
-        }
-
-        // A step's replayed graph is its direct launches, to the bit; a prompt fed
-        // a token at a time (the step kernels) agrees with the same prompt in one
-        // chunk (the batched kernels) to f32 rounding; a reset sequence repeats itself.
-        gpu.KvFormat = "f32";
-        gpu.ContextLength = 1024;   // past the tiny model's 256, so the prompt takes three chunks
-        var tokens = Enumerable.Range(0, 600).Select(i => ids[i % ids.Length]).ToArray();
-        try
-        {
-            gpu.UseGraphs = false;
-            using var direct = gpu.NewSequence(capacity: 16);
-            var a = tokens.Select(direct.Step).ToList();
-            gpu.UseGraphs = true;
-            using var graphed = gpu.NewSequence(capacity: 16);
-            var b = tokens.Select(graphed.Step).ToList();
-            for (int t = 0; t < tokens.Length; t++)
-            {
-                Assert.True(a[t].SequenceEqual(b[t]), $"{family}: graphed step {t} differs from its direct launches");
-            }
-            using var chunked = gpu.NewSequence(capacity: 16);
-            var c = chunked.PrefillAll(tokens);
-            for (int t = 0; t < tokens.Length; t++)
-            {
-                AssertClose(c[t], b[t], $"{family}, chunked prompt against steps, position {t}");
-            }
-            chunked.Reset();
-            Assert.Equal(c[^1], chunked.PrefillAll(tokens)[^1]);
-        }
-        finally
-        {
-            gpu.UseGraphs = true;
         }
     }
 

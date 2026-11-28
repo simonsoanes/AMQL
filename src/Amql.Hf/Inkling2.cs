@@ -11,8 +11,8 @@ namespace Amql.Hf;
 /// that attends over blocks of earlier states, and a core of layers run
 /// several times. This is its config adapter: it reads the checkpoint's keys
 /// and names, and describes the stack with the generic surfaces the planner
-/// reads (<see cref="DescribeSurface"/>) and a role map of its tensors, beside
-/// the facts its dedicated session (<c>Inkling2Model</c>, <c>Inkling2Gpu</c>) reads.
+/// reads (<see cref="DescribeSurface"/>) and a role map of its tensors; the
+/// runtimes know the stack only by those surfaces.
 /// <para>
 /// Two spellings of the config are read: the checkpoint's own
 /// (<c>text_config</c> with <c>loop_config</c>, <c>local_layer_ids</c>,
@@ -26,9 +26,8 @@ public static class Inkling2
     public const string Prefix = "model.llm.";
     public const string Architecture = "Inkling2LoopForCausalLM";
 
-    /// <summary>The checkpoint's description of its stored formats, carried
-    /// through encode and export unchanged (the experts are too).</summary>
-    public const string QuantConfigFile = "hf_quant_config.json";
+    /// <summary>Where builds before the generic surfaces recorded this adapter's facts.</summary>
+    public const string FactsKey = "inkling2";
 
     /// <summary>Whether <paramref name="configPath"/> describes an Inkling 2 looped model.</summary>
     public static bool Describes(string configPath)
@@ -42,7 +41,7 @@ public static class Inkling2
         return type is "inkling2_loop" or "inkling2_loop_text" || textType is "inkling2_loop_text";
     }
 
-    public static Inkling2Surface ReadFacts(string configPath)
+    public static Inkling2Facts ReadFacts(string configPath)
     {
         using var doc = JsonDocument.Parse(File.ReadAllBytes(configPath));
         var root = doc.RootElement;
@@ -131,7 +130,7 @@ public static class Inkling2
         }
 
         int vocab = Int(text, "vocab_size");
-        return new Inkling2Surface
+        return new Inkling2Facts
         {
             FullLayers = full,
             FullHeads = Int(text, "num_attention_heads"),
@@ -171,10 +170,10 @@ public static class Inkling2
     /// reads (depth loop, block residual, message gates, residual convolutions,
     /// the attention's conditioning and relative bias, the packed experts'
     /// routing and gate) with the layer role map that names this checkpoint's
-    /// tensors, beside the facts themselves for the dedicated session. A fresh
-    /// encode and <see cref="UpgradeGraph"/> both build it here, so the two agree.
+    /// tensors. A fresh encode and <see cref="UpgradeGraph"/> both build it here,
+    /// so the two agree.
     /// </summary>
-    public static ExecutionSurface DescribeSurface(Inkling2Surface facts, long? contextLength)
+    public static ExecutionSurface DescribeSurface(Inkling2Facts facts, long? contextLength)
     {
         if (facts.SlidingHeads != facts.FullHeads)
         {
@@ -265,7 +264,6 @@ public static class Inkling2
                 ["block_residual.eps"] = "modeling_inkling2_loop: the depth mix normalises its states with a fixed 1e-6",
                 ["message_gates.skip_blocks"] = "modeling_inkling2_loop: a pass's first block is the state the loop restarts from",
             },
-            Inkling2 = facts,
         };
     }
 
@@ -318,21 +316,24 @@ public static class Inkling2
     }
 
     /// <summary>
-    /// Rewrites a system graph encoded before the generic surfaces existed:
-    /// every component that carries Inkling 2's facts but no depth loop gets
-    /// <see cref="DescribeSurface"/> of those facts (its context length kept).
-    /// Tensors and every other component are untouched. Returns the components
-    /// rewritten (none when the graph is already current).
+    /// Rewrites a system graph written by an older build: every component that
+    /// carries Inkling 2's facts (<c>execution.inkling2</c>, which this build no
+    /// longer reads) gets <see cref="DescribeSurface"/> of those facts (its
+    /// context length kept), and the facts are dropped. Tensors and every other
+    /// component are untouched. Returns the components rewritten (none when the
+    /// graph is already current).
     /// </summary>
     public static (SystemGraph Graph, IReadOnlyList<string> Upgraded) UpgradeGraph(SystemGraph graph)
     {
         var upgraded = new List<string>();
         var components = graph.Components.Select(c =>
         {
-            if (c.Execution is not { Inkling2: { } facts, DepthLoop: null } old)
+            if (c.Execution is not { Unread: { } unread } old || !unread.TryGetValue(FactsKey, out var recorded))
             {
                 return c;
             }
+            var facts = recorded.Deserialize<Inkling2Facts>(ViJson.Options)
+                        ?? throw new ContainerException($"component '{c.Id}': '{FactsKey}' records no facts");
             upgraded.Add(c.Id);
             return new Component
             {
@@ -607,4 +608,69 @@ public static partial class ArchMapper
                     $"'{name}' is {Shape(info)}: not an expert stack of [{experts}, {rows}, {cols}] in F32/BF16/F16, NVFP4 or MXFP8");
         }
     }
+}
+
+/// <summary>
+/// Inkling 2 (<c>inkling2_loop</c>): the config's facts, as the adapter reads
+/// them before it describes the stack with the generic surfaces (see
+/// <see cref="Inkling2.DescribeSurface"/>). Builds before those surfaces wrote
+/// these facts into the graph as <c>execution.inkling2</c>;
+/// <see cref="Inkling2.UpgradeGraph"/> reads them back from there.
+/// Layers <see cref="LoopStart"/> to <see cref="LoopEnd"/> run
+/// <see cref="LoopPasses"/> times; every pass after the first restarts from the
+/// layers before the loop and is gated on messages from the pass before it,
+/// with its own keys, values and convolution states.
+/// </summary>
+public sealed class Inkling2Facts
+{
+    /// <summary>Per layer: true for full attention (<c>hybrid</c>), false for a
+    /// sliding window (<c>hybrid_sliding</c>).</summary>
+    public required IReadOnlyList<bool> FullLayers { get; init; }
+
+    public required int FullHeads { get; init; }
+    public required int FullKvHeads { get; init; }
+    public required int FullHeadDim { get; init; }
+    public required int SlidingHeads { get; init; }
+    public required int SlidingKvHeads { get; init; }
+    public required int SlidingHeadDim { get; init; }
+    public required int SlidingWindow { get; init; }
+
+    /// <summary>Width per head of the states that mix the relative bias profiles.</summary>
+    public required int RelativeDim { get; init; }
+
+    /// <summary>How far back the full layers' relative bias reaches; a sliding
+    /// layer's reaches its window.</summary>
+    public required int RelativeExtent { get; init; }
+
+    /// <summary>Full layers scale queries and relative states by
+    /// <c>1 + alpha·ln(max(1, (pos+1)/floor))</c>.</summary>
+    public required int LogScalingFloor { get; init; }
+    public required double LogScalingAlpha { get; init; }
+
+    public required double QkClip { get; init; }
+    public required double RelativeClip { get; init; }
+    public required int ConvKernel { get; init; }
+
+    /// <summary>Layers per block of the attention residuals.</summary>
+    public required int BlockSize { get; init; }
+
+    public required int Experts { get; init; }
+    public required int TopK { get; init; }
+    public required int ExpertWidth { get; init; }
+    public required double RouteScale { get; init; }
+    public required double GateSoftcap { get; init; }
+    public required double UpSoftcap { get; init; }
+    public required double FinalSoftcap { get; init; }
+
+    public required int LoopStart { get; init; }
+    public required int LoopEnd { get; init; }
+    public required int LoopPasses { get; init; }
+    public required int GateRank { get; init; }
+
+    public required double Eps { get; init; }
+
+    /// <summary>Rows of the embedding and head; logits past
+    /// <see cref="UnpaddedVocab"/> are padding.</summary>
+    public required int PaddedVocab { get; init; }
+    public required int UnpaddedVocab { get; init; }
 }

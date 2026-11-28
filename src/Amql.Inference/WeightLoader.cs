@@ -74,6 +74,10 @@ public sealed class WeightLoader
 
     public WeightWorkingSet WorkingSet => _workingSet;
 
+    /// <summary>The store the weights are read from (the device engine reads
+    /// packed expert stacks from it as stored).</summary>
+    internal OperandStore Store => _store;
+
     private RowOperands? _rows;
 
     /// <summary>The row-exact path's operands over the same store (resolved on

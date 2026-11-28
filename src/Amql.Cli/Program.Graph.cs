@@ -6,8 +6,8 @@ namespace Amql.Cli;
 // ── graph: rewrite a container's system graph without re-encoding ──────────
 //
 // 'graph upgrade' rewrites system_graph.json with the generic surfaces the
-// planner reads, built from the facts the graph already records (today: a
-// looped stack encoded with only its dedicated session's facts). The tensors,
+// planner reads, built from facts an older build recorded that this one no
+// longer reads (a config adapter's: see Amql.Hf.GraphUpgrade). The tensors,
 // the index and every other file are untouched, so it needs only the graph:
 // the segments need not be present.
 
@@ -42,7 +42,7 @@ internal static partial class Program
         }
         var graph = JsonSerializer.Deserialize<SystemGraph>(File.ReadAllBytes(graphPath), ViJson.Options)
                     ?? throw new CliException($"{graphPath} is empty");
-        var (upgraded, components) = Amql.Hf.Inkling2.UpgradeGraph(graph);
+        var (upgraded, components) = Amql.Hf.GraphUpgrade.Apply(graph);
         if (components.Count == 0)
         {
             Console.WriteLine($"{graphPath}: already current (no component to upgrade)");

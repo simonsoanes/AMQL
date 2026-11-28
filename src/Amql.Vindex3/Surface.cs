@@ -723,71 +723,6 @@ public sealed class NgramEmbeddingSurface
 // ── The surface proper ─────────────────────────────────────────────────────
 
 /// <summary>
-/// Inkling 2 (<c>inkling2_loop</c>): every fact its dedicated session
-/// (<c>Inkling2Model</c>, <c>Inkling2Gpu</c>) reads, as the config states it.
-/// Kept beside the generic surfaces (<see cref="DepthLoopSurface"/>,
-/// <see cref="BlockResidualSurface"/>, …) that describe the same stack to the
-/// planner, until the device engine runs those; the planner never reads it.
-/// Layers <see cref="LoopStart"/> to <see cref="LoopEnd"/> run
-/// <see cref="LoopPasses"/> times; every pass after the first restarts from the
-/// layers before the loop and is gated on messages from the pass before it,
-/// with its own keys, values and convolution states.
-/// </summary>
-public sealed class Inkling2Surface
-{
-    /// <summary>Per layer: true for full attention (<c>hybrid</c>), false for a
-    /// sliding window (<c>hybrid_sliding</c>).</summary>
-    public required IReadOnlyList<bool> FullLayers { get; init; }
-
-    public required int FullHeads { get; init; }
-    public required int FullKvHeads { get; init; }
-    public required int FullHeadDim { get; init; }
-    public required int SlidingHeads { get; init; }
-    public required int SlidingKvHeads { get; init; }
-    public required int SlidingHeadDim { get; init; }
-    public required int SlidingWindow { get; init; }
-
-    /// <summary>Width per head of the states that mix the relative bias profiles.</summary>
-    public required int RelativeDim { get; init; }
-
-    /// <summary>How far back the full layers' relative bias reaches; a sliding
-    /// layer's reaches its window.</summary>
-    public required int RelativeExtent { get; init; }
-
-    /// <summary>Full layers scale queries and relative states by
-    /// <c>1 + alpha·ln(max(1, (pos+1)/floor))</c>.</summary>
-    public required int LogScalingFloor { get; init; }
-    public required double LogScalingAlpha { get; init; }
-
-    public required double QkClip { get; init; }
-    public required double RelativeClip { get; init; }
-    public required int ConvKernel { get; init; }
-
-    /// <summary>Layers per block of the attention residuals.</summary>
-    public required int BlockSize { get; init; }
-
-    public required int Experts { get; init; }
-    public required int TopK { get; init; }
-    public required int ExpertWidth { get; init; }
-    public required double RouteScale { get; init; }
-    public required double GateSoftcap { get; init; }
-    public required double UpSoftcap { get; init; }
-    public required double FinalSoftcap { get; init; }
-
-    public required int LoopStart { get; init; }
-    public required int LoopEnd { get; init; }
-    public required int LoopPasses { get; init; }
-    public required int GateRank { get; init; }
-
-    public required double Eps { get; init; }
-
-    /// <summary>Rows of the embedding and head; logits past
-    /// <see cref="UnpaddedVocab"/> are padding.</summary>
-    public required int PaddedVocab { get; init; }
-    public required int UnpaddedVocab { get; init; }
-}
-
-/// <summary>
 /// What the generic operations need to run a component: grouped by op
 /// (attention, ffn, norm, optional head), every value fully resolved at
 /// build time. Presence means presence in schema ≥ 6 (older graphs refused
@@ -866,11 +801,12 @@ public sealed class ExecutionSurface
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public NgramEmbeddingSurface? NgramEmbedding { get; init; }
 
-    /// <summary>Inkling 2's facts for its dedicated session (see
-    /// <see cref="Inkling2Surface"/>); the planner reads the generic surfaces
-    /// below instead.</summary>
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public Inkling2Surface? Inkling2 { get; init; }
+    /// <summary>Keys of the surface this build does not read (a graph written
+    /// by another build): the planner refuses a component that has any, naming
+    /// them, rather than run it as something it is not. <c>amql-cli graph
+    /// upgrade</c> rewrites a graph whose keys a config adapter recognises.</summary>
+    [JsonExtensionData]
+    public Dictionary<string, JsonElement>? Unread { get; init; }
 
     /// <summary>A range of layers run several times (see <see cref="DepthLoopSurface"/>).</summary>
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]

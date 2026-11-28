@@ -752,7 +752,7 @@ internal static partial class Program
         // What the chat template ends an assistant's turn with.
         try
         {
-            if (ChatTemplate.Load(dir) is { } template && TurnMarks.First(tokenizer, template.Dialect.AfterReply) is { } end)
+            if (ChatTemplate.Load(dir) is { } template && TurnMarks.ReplyEnd(tokenizer, template.Dialect) is { } end)
             {
                 ids.Add(end);
             }
@@ -909,51 +909,6 @@ internal static partial class Program
 
     // ── generate ───────────────────────────────────────────────────────────
 
-    /// <summary>Inkling 2 looped: not a plan, so none of the planned stack's
-    /// options (traces, working sets, patches) apply. Its GPU path when there is
-    /// one, else the managed runtime; prints the tokens, the text and the speeds.</summary>
-    private static int GenerateInkling2(Vindex3Container container, int[] tokens, int steps, SamplingConfig config,
-        HfTokenizer? tokenizer, IReadOnlySet<int>? stopTokens)
-    {
-        var clock = System.Diagnostics.Stopwatch.StartNew();
-        using var store = container.CreateOperandStore();
-        using var session = DecodeSession.ForInkling2(container, store);
-        Console.WriteLine(session.Backend == "gpu"
-            ? $"inkling2:  GPU path (amql_cuda), experts as stored, {GpuEngine.RequestedKvFormat} KV rows; loaded in {clock.Elapsed.TotalSeconds:F1}s"
-            : $"inkling2:  managed runtime ({session.GpuRefusal}); loaded in {clock.Elapsed.TotalSeconds:F1}s");
-        long limit = container.Graph?.Component("target").Execution?.ContextLength ?? int.MaxValue;
-        int budget = steps < 0 ? (int)Math.Min(int.MaxValue, limit - tokens.Length) : steps;
-        clock.Restart();
-        var logits = session.Prefill(tokens).FirstRow().ToArray();
-        double prefillSeconds = clock.Elapsed.TotalSeconds;
-        var rng = new Random(config.Seed);
-        bool sampling = config.Temperature > 0f || config.TopK > 0 || config.TopP > 0;
-        var generated = new List<int>();
-        clock.Restart();
-        for (int i = 0; i < budget; i++)
-        {
-            int token = sampling ? Sampler.Sample(logits, config, rng) : Sampler.ArgMax(logits);
-            generated.Add(token);
-            string? text = tokenizer?.TokenInfo(token).DecodedText;
-            Console.WriteLine(text is { Length: > 0 } ? $"{token}  ({text})" : $"{token}");
-            if (stopTokens?.Contains(token) == true || i == budget - 1)
-            {
-                break;
-            }
-            logits = session.Step(token).FirstRow().ToArray();
-        }
-        double decodeSeconds = clock.Elapsed.TotalSeconds;
-        if (tokenizer is not null)
-        {
-            Console.WriteLine($"text:      {tokenizer.Decode(tokens.Concat(generated).ToArray())}");
-        }
-        Console.WriteLine($"position: {tokens.Length + generated.Count}");
-        Console.WriteLine($"speed:     prompt {tokens.Length} tokens in {prefillSeconds:F2}s ({tokens.Length / prefillSeconds:F1} tok/s), " +
-                          $"{generated.Count} generated, {Math.Max(0, generated.Count - 1)} steps in {decodeSeconds:F2}s " +
-                          $"({Math.Max(0, generated.Count - 1) / Math.Max(decodeSeconds, 1e-9):F1} tok/s)");
-        return 0;
-    }
-
     private static int Generate(string[] args)
     {
         var containerDir = Arg(args, 0) ?? throw new CliException("generate requires a container directory");
@@ -1064,10 +1019,6 @@ internal static partial class Program
         };
 
         using var container = Vindex3Container.Open(containerDir);
-        if (Inkling2Model.Serves(container, component))
-        {
-            return GenerateInkling2(container, tokens, steps, config, tokenizer, stopTokens);
-        }
         if (steps < 0 && maxContextLength is null)
         {
             var graph = container.Graph;
@@ -1249,6 +1200,12 @@ internal static partial class Program
             Console.WriteLine($"text:      {tokenizer.Decode(generatedIds)}");
         }
         Console.WriteLine($"position: {prefill.Length + steps2.Count}");
+        if (InferenceRunner.LastSpeed is { } speed)
+        {
+            Console.WriteLine($"speed:     {speed.Backend}, prompt {speed.PromptTokens} tokens in {speed.PrefillSeconds:F2}s " +
+                              $"({speed.PromptTokens / Math.Max(speed.PrefillSeconds, 1e-9):F1} tok/s), {speed.Steps} steps in " +
+                              $"{speed.DecodeSeconds:F2}s ({speed.Steps / Math.Max(speed.DecodeSeconds, 1e-9):F1} tok/s)");
+        }
 
         // Read the trace back rather than trusting the write: it proves the
         // JSON round-trips before anything downstream depends on the format.

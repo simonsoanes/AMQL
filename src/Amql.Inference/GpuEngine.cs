@@ -154,6 +154,17 @@ public sealed partial class GpuEngine : IDisposable
         WeightsVersion = weights.Version;
         try
         {
+            if (plan.RunsByVisit)
+            {
+                // The visit path (GpuEngine.Visits.cs): its own layers, scratch and sequences.
+                _vocab = plan.Output!.VocabSize;
+                _layers = [];
+                _embed = _head = null!;   // the visit path's own (VisitDevice)
+                BuildVisitDevice(plan, weights);
+                Check(Native.amqe_host_alloc(out _hostLogits, (nuint)((long)_vocab * 4)), "host alloc");
+                _main = NewSequence();
+                return;
+            }
             var embedOp = plan.Embedding!;
             _vocab = plan.Output!.VocabSize;
             _embed = Matrix(weights, embedOp.Table, embedOp.VocabSize, embedOp.HiddenSize);
@@ -462,6 +473,10 @@ public sealed partial class GpuEngine : IDisposable
     /// <summary>Why the engine cannot run this plan, or null when it can.</summary>
     public static string? Unsupported(ComponentOpPlan plan)
     {
+        if (plan.RunsByVisit)
+        {
+            return VisitUnsupported(plan);
+        }
         if (plan.Diffusion is not null)
         {
             return "masked diffusion";
@@ -470,52 +485,10 @@ public sealed partial class GpuEngine : IDisposable
         {
             return "Qwen4 gated residual";
         }
-        // The row-exact path's ops have no device kernels in this engine yet.
-        if (plan.DepthLoop is not null)
-        {
-            return "looped depth (a range of layers run several times)";
-        }
-        if (plan.BlockResidual is not null)
-        {
-            return "block attention residual (depth mixing)";
-        }
+        // The visit path's ops (above) run only there.
         if (plan.Output?.TableRows is not null)
         {
             return "a padded vocabulary";
-        }
-        foreach (var layer in plan.Layers)
-        {
-            if (layer.MessageGates is not null)
-            {
-                return "cross-pass message gates";
-            }
-            if (layer.MixerOutputConv is not null || layer.FfnOutputConv is not null ||
-                layer.Attention is { KeyConv: not null } or { ValueConv: not null })
-            {
-                return "residual short convolutions";
-            }
-            if (layer.Attention is { RelativeBias: not null })
-            {
-                return "a learned relative score bias";
-            }
-            if (layer.Attention is { Sink: not null })
-            {
-                return "attention sink logits";
-            }
-            if (layer.Attention is { IsConditioned: true })
-            {
-                return "attention conditioning (separate inputs, query scale or clip, log-scaling, a separate output gate)";
-            }
-            if (layer.Ffn?.Routed is { Packed: not null })
-            {
-                return "packed experts in their stored formats";
-            }
-            if (layer.Ffn?.Routed is { } routedFfn &&
-                (routedFfn.RoutingPolicy == ExpertRoutingPolicy.SigmoidNormalisedOverSelected || routedFfn.SelectionBias is not null ||
-                 routedFfn.GatePolicy is not ExpertGateGated))
-            {
-                return "sigmoid routing with a selection bias, or a softcapped GLU";
-            }
         }
         foreach (var layer in plan.Layers)
         {
@@ -707,6 +680,12 @@ public sealed partial class GpuEngine : IDisposable
     /// Release it when done.</summary>
     public GpuSequence NewSequence()
     {
+        if (_visits is not null)
+        {
+            var depth = new GpuSequence(0) { Depth = NewDepthSequence(4096) };
+            _sequences.Add(depth);
+            return depth;
+        }
         var seq = new GpuSequence(_layers.Length) { Pos = Alloc(16) };
         for (int i = 0; i < _layers.Length; i++)
         {
@@ -742,6 +721,15 @@ public sealed partial class GpuEngine : IDisposable
     /// <summary>Frees a sequence's state.</summary>
     public void Release(GpuSequence seq)
     {
+        if (_visits is not null)
+        {
+            if (!ReferenceEquals(seq, _main) && _sequences.Remove(seq) && seq.Depth is { } s)
+            {
+                ReleaseDepth(s);
+                seq.Released = true;
+            }
+            return;
+        }
         if (ReferenceEquals(seq, _main) || !_sequences.Remove(seq))
         {
             return;
@@ -767,6 +755,13 @@ public sealed partial class GpuEngine : IDisposable
     /// <summary>Starts a sequence again: position 0, zero recurrent state.</summary>
     public void Reset(GpuSequence seq)
     {
+        if (_visits is not null)
+        {
+            // Every row and history is written before it is read.
+            Live(seq);
+            seq.Position = 0;
+            return;
+        }
         Live(seq);
         // Position 0, the sequence's exact rows kept (see SetExactRows).
         UploadPos(seq.Pos, 0, ExactSpec(seq));
@@ -803,6 +798,10 @@ public sealed partial class GpuEngine : IDisposable
     /// mark again.</summary>
     public void Mark(GpuSequence seq)
     {
+        if (_visits is not null)
+        {
+            throw NotOnVisits("a mark");
+        }
         Live(seq);
         seq.MarkState ??= new IntPtr[_layers.Length];
         seq.MarkConv ??= new IntPtr[_layers.Length];
@@ -846,6 +845,10 @@ public sealed partial class GpuEngine : IDisposable
     /// state saved there and its position, with the KV cache as it was.</summary>
     public void Rewind(GpuSequence seq)
     {
+        if (_visits is not null)
+        {
+            throw NotOnVisits("a rewind");
+        }
         Live(seq);
         if (seq.MarkedAt < 0 || seq.MarkState is null || seq.MarkConv is null)
         {
@@ -970,6 +973,10 @@ public sealed partial class GpuEngine : IDisposable
     /// FP16 (half the memory, ~2e-4 relative rounding) rather than f32.</summary>
     public void SetExactRows(GpuSequence seq, int rows, bool f16 = false)
     {
+        if (_visits is not null)
+        {
+            return;   // a full slot holds every row in one format
+        }
         Live(seq);
         if (seq.Position != 0)
         {
@@ -1129,6 +1136,10 @@ public sealed partial class GpuEngine : IDisposable
     /// (f32 values, or NVFP4 rows of <see cref="KvRowBytes"/> bytes).</summary>
     public byte[] DownloadKvRows(GpuSequence seq, int layer, bool values, int rows)
     {
+        if (_visits is not null)
+        {
+            throw NotOnVisits("reading cache rows");
+        }
         Live(seq);
         var host = new byte[KvBytes(layer, rows, seq)];
         var h = GCHandle.Alloc(host, GCHandleType.Pinned);
@@ -1147,6 +1158,10 @@ public sealed partial class GpuEngine : IDisposable
     /// keys (or values) as f32, [rows × kvDim]. F32 caches only.</summary>
     public float[] DownloadKv(GpuSequence seq, int layer, bool values, int rows)
     {
+        if (_visits is not null)
+        {
+            throw NotOnVisits("reading cache rows");
+        }
         Live(seq);
         if (_kvFp4)
         {
@@ -1210,6 +1225,10 @@ public sealed partial class GpuEngine : IDisposable
     /// verify's snapshots.</summary>
     public long DeviceBytes(GpuSequence seq)
     {
+        if (_visits is not null)
+        {
+            return seq.Depth?.Bytes ?? 0;
+        }
         long bytes = 0;
         for (int i = 0; i < _layers.Length; i++)
         {
@@ -1245,6 +1264,10 @@ public sealed partial class GpuEngine : IDisposable
     /// <summary>Bytes <see cref="SaveMark"/> writes for the sequence.</summary>
     public long MarkBytes(GpuSequence seq)
     {
+        if (_visits is not null)
+        {
+            throw NotOnVisits("a mark");
+        }
         long at = Math.Max(0, seq.MarkedAt);
         long bytes = MarkHeader;
         for (int i = 0; i < _layers.Length; i++)
@@ -1274,6 +1297,10 @@ public sealed partial class GpuEngine : IDisposable
     /// its rows are the same bytes, its steps the same to f32 rounding.)</summary>
     public void SaveMark(GpuSequence seq, Stream to)
     {
+        if (_visits is not null)
+        {
+            throw NotOnVisits("a saved mark");
+        }
         Live(seq);
         if (seq.MarkedAt < 0 || seq.MarkState is null || seq.MarkConv is null)
         {
@@ -1351,6 +1378,10 @@ public sealed partial class GpuEngine : IDisposable
     /// rewinds) exactly as the sequence that was saved.</summary>
     public GpuSequence RestoreMark(Stream from)
     {
+        if (_visits is not null)
+        {
+            throw NotOnVisits("a restored mark");
+        }
         var head = new byte[MarkHeader];
         from.ReadExactly(head);
         int at = BitConverter.ToInt32(head, 0);
@@ -1462,6 +1493,15 @@ public sealed partial class GpuEngine : IDisposable
     /// position and returns the last token's logits.</summary>
     public float[] Prefill(GpuSequence seq, ReadOnlySpan<int> tokens)
     {
+        if (_visits is not null)
+        {
+            Live(seq);
+            if (tokens.Length == 0)
+            {
+                throw new ArgumentException("prefill requires at least one token", nameof(tokens));
+            }
+            return DepthPrefill(seq, tokens, every: false)[0];
+        }
         Live(seq);
         if (tokens.Length == 0)
         {
@@ -1543,6 +1583,10 @@ public sealed partial class GpuEngine : IDisposable
     /// </summary>
     public void Verify(GpuSequence seq, ReadOnlySpan<int> tokens)
     {
+        if (_visits is not null)
+        {
+            throw NotOnVisits("a verify");
+        }
         Live(seq);
         int n = tokens.Length;
         if (n < 1 || n > MaxDrafts + 1)
@@ -1578,6 +1622,10 @@ public sealed partial class GpuEngine : IDisposable
     /// state as it was there, and the drafter catches up on them.</summary>
     public void Accept(GpuSequence seq, int rows)
     {
+        if (_visits is not null)
+        {
+            throw NotOnVisits("accepting drafts");
+        }
         Live(seq);
         int n = seq.VerifyRows;
         if (n == 0 || rows < 1 || rows > n)
@@ -1622,6 +1670,10 @@ public sealed partial class GpuEngine : IDisposable
     /// </summary>
     public int[] Draft(GpuSequence seq, int token, int count)
     {
+        if (_visits is not null)
+        {
+            throw NotOnVisits("a draft");
+        }
         Live(seq);
         count = Math.Min(count, MaxDrafts);
         if (!HasDrafter || !seq.MtpValid || seq.Position < 1 || count < 1)
@@ -1775,6 +1827,16 @@ public sealed partial class GpuEngine : IDisposable
     /// </summary>
     public void StepInPlace(IReadOnlyList<GpuSequence> seqs, ReadOnlySpan<int> tokens)
     {
+        if (_visits is not null)
+        {
+            if (seqs.Count != 1 || tokens.Length != 1)
+            {
+                throw NotOnVisits("a batch of sequences");
+            }
+            Live(seqs[0]);
+            DepthStep(seqs[0], tokens[0]);
+            return;
+        }
         int b = seqs.Count;
         if (b < 1 || b > MaxBatch || tokens.Length != b)
         {
@@ -1890,6 +1952,10 @@ public sealed partial class GpuEngine : IDisposable
     /// see <see cref="RopeExtendsBeyond"/>).</summary>
     public void Plan(GpuSequence seq, long positions)
     {
+        if (_visits is not null)
+        {
+            return;   // no rotary to choose
+        }
         Live(seq);
         ChooseRope(seq, positions);
     }
@@ -1906,6 +1972,10 @@ public sealed partial class GpuEngine : IDisposable
     /// </summary>
     public (float[] Mass, float[] Logits) ReadAttention(GpuSequence seq, ReadOnlySpan<int> tokens)
     {
+        if (_visits is not null)
+        {
+            throw NotOnVisits("reading attention");
+        }
         Live(seq);
         int end = seq.Position + tokens.Length;
         Reserve(seq, end);
@@ -1958,6 +2028,12 @@ public sealed partial class GpuEngine : IDisposable
     /// Throws when the device has no room.</summary>
     public void Reserve(GpuSequence seq, int positions)
     {
+        if (_visits is not null)
+        {
+            Live(seq);
+            DepthRoom(seq, positions);
+            return;
+        }
         Live(seq);
         ChooseRope(seq, positions);
         if (EnsureKv(seq, positions))
@@ -3439,6 +3515,10 @@ public sealed partial class GpuEngine : IDisposable
     /// <param name="rows">Tokens a step: more than one is what a verify runs, but for its head.</param>
     public IReadOnlyList<(string Op, double Microseconds)> ProfileDecode(int[] prompt, int steps, int rows = 1)
     {
+        if (_visits is not null)
+        {
+            throw NotOnVisits("a decode profile");
+        }
         var seq = NewSequence();
         try
         {
@@ -3479,6 +3559,10 @@ public sealed partial class GpuEngine : IDisposable
     /// tokens as one prompt on a fresh sequence, microseconds a run.</summary>
     public IReadOnlyList<(string Op, double Microseconds)> Profile(ReadOnlySpan<int> tokens, int repeat)
     {
+        if (_visits is not null)
+        {
+            throw NotOnVisits("a profile");
+        }
         var seq = NewSequence();
         try
         {
@@ -3521,6 +3605,20 @@ public sealed partial class GpuEngine : IDisposable
         {
             Native.amqe_sync(_engine);
             DropPasses();
+        }
+        if (_visits is { } visits)
+        {
+            foreach (var seq in _sequences)
+            {
+                if (seq.Depth is { } depth && depth.Graph != IntPtr.Zero)
+                {
+                    Native.amqe_pass_free(depth.Graph);
+                    depth.Graph = IntPtr.Zero;
+                }
+            }
+            Native.amqe_host_free(visits.HostTokens);
+            Native.amqe_host_free(visits.HostLogits);
+            _visits = null;
         }
         foreach (var ptr in _allocations)
         {
@@ -3729,6 +3827,9 @@ public sealed class GpuSequence
 
     internal IntPtr Pos;
     internal readonly IntPtr[] K, V, State, Conv;
+
+    // The visit path's slots, when the engine runs a plan by visit.
+    internal GpuEngine.DepthSequence? Depth;
     internal IntPtr[]? MarkState, MarkConv;
     internal int KvCapacity;
     internal bool Released;

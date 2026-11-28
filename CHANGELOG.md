@@ -319,6 +319,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- **runtime:** looped and depth-mixed stacks run on the GPU engine like any planned model ([docs](docs/depth-ops.md#runtime-the-device-engines-visit-path)). The engine's visit path walks the plan's visit schedule over neutral primitives in `amql_depth.cu` (depth mixes with the following norm fused, batched message gates, residual convolutions static or with dynamic taps, attention with a relative bias, sinks and a separate output gate, sigmoid routing over the chosen experts, packed NVFP4/MXFP8 experts through a softcapped GLU); each layer's weights go up once for all its visits, and a step is one captured graph. `amql-server`, `generate` and `DecodeSession.Open` open Inkling-2-Mini through the planner: against the planned CPU path the top five agree at all 614 positions (worst logit diff 4.0e-4, f32 prompts), and it runs as fast as the dedicated path did (about 142 tok/s decode from a short prompt, 1,800-2,000 tok/s prompts to 64K). One sequence at a time (`GpuEngine.BatchRefusal`).
+- **graph:** a surface key this build does not read is refused by the planner, naming it; `amql-cli graph upgrade` rewrites graphs that recorded Inkling 2's config facts (`execution.inkling2`), which encode no longer writes.
+- **cli:** `generate` prints its speeds (prompt and steps, the device engine's upload not counted) for every model.
 - **inkling 2:** decode is about 141 tok/s from a short prompt (125 before): the block-residual mixes hold each state in registers and take 3.0 µs instead of 10.4 ([docs](docs/inkling-2.md)).
 - **tests:** the real-checkpoint tests read one set of variables for every model: `AMQL_TEST_CONTAINER`, and `AMQL_TEST_REFERENCE`, `_DIRECTIONS`, `_STEPS` and `_SPEED`. Each test checks the container is its kind of model and skips it otherwise. They were `AMQL_INKLING_*` and `AMQL_MDLM_CONTAINER`.
 - **gpu:** `AMQL_GPU_GRAPHS=0` (was `AMQL_INKLING_GRAPHS`) and `AMQL_TILED_ATTENTION=0` (was `AMQL_INK_TILED`).
@@ -360,6 +363,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Removed
 
+- **inkling 2:** the dedicated runtimes: `Inkling2Model`, `Inkling2Gpu` and `amql_inkling.cu` with its `ink_*` exports, `DecodeSession.ForInkling2` and `AMQL_RUNTIME=planned`. The planned paths replace them (on the tiny fixture the GPU visit path gave exactly their logits).
 - **cli:** unexpected errors no longer print a full stack trace by default — one `error: …` line plus a hint to re-run with `--verbose`
 
 ---

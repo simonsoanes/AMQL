@@ -16,6 +16,12 @@ namespace Amql.Hf;
 /// </summary>
 public static class HfAncillaryFiles
 {
+    /// <summary>A checkpoint's description of how its tensors are stored
+    /// quantised. It travels with a container whose config adapter keeps those
+    /// tensors as stored (so it is still true of them), and comes back out on
+    /// export from any container that carries it.</summary>
+    public const string QuantConfigFile = "hf_quant_config.json";
+
     /// <summary>Copied in this order; missing files are skipped silently, since
     /// a text-only checkpoint legitimately has no preprocessor config.</summary>
     public static readonly IReadOnlyList<string> Names = new[]

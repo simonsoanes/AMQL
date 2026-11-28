@@ -2,8 +2,10 @@
 
 `thinkingmachines/Inkling-2-Mini`, `model_type` `inkling2_loop`: 24 layers of
 2304, 128 experts (top 8, width 1152), layers 6-17 run three times, no rotary.
-This note covers what AMQL does with the real checkpoint, what was found about
-its expert scales, what 1M context needs, and its GPU path.
+A model note: how the checkpoint is imported, what was found about its expert
+scales, and what 1M context needs. Nothing in the runtimes is this model's: its
+config adapter (`src/Amql.Hf/Inkling2.cs`) describes the stack with the generic
+surfaces of [depth-ops.md](depth-ops.md), and both runtimes run that plan.
 
 ## Import: experts kept as stored
 
@@ -41,32 +43,20 @@ amql-cli encode D:\Models\Inkling-2-Mini --out <container> --no-vision
 
 ## Described generically
 
-The graph describes the stack to the planner by structure, not by family: a
-depth loop (layers 6-17 three times, each pass with its own cache slots), a
-block residual (a bank of block inputs every 6 layers, depth mixes at each
-sub-block and at the final norm), cross-pass message gates, residual short
-convolutions, and the attention's conditioning (separate q/k/v inputs, query
-scale and clip, log-scaling on the full layers, a relative bias, projected
-sinks, a separate output gate), with packed experts routed by sigmoid scores
-and a softcapped GLU. See [depth-ops.md](depth-ops.md) for each surface and
-plan op. `GenericRuntime` runs that plan on the CPU and matches `Inkling2Model`
-bit for bit on the tiny fixture; the device engine does not run those ops yet,
-so `amql-server`, `generate` and `DecodeSession.Open` still use the dedicated
-session below (`AMQL_RUNTIME=planned` opens the planned path in
-`DecodeSession.Open`). A container encoded before this needs
-`amql-cli graph upgrade <container>` (graph only; tensors untouched).
-
-## Runtime (host memory)
-
-`Inkling2Model` keeps every expert stack packed and decodes only the rows of
-the 8 experts a token routes to, row by row, exactly as transformers'
-`Inkling2LoopDequantizeExperts` computes them in f32: `(E2M1 × E4M3 block
-scale) × (amax / denominator)` for NVFP4, `E4M3 × 2^(s-127)` for MXFP8. Large
-BF16 matrices (embedding, head, attention projections) stay BF16 and are
-widened as read (exact); small tensors are widened to f32 once. Host memory is
-about 19 GB, 15.7 GB of it the experts. A tensor stored F32 (the tiny arch-zoo
-fixture) runs exactly as before. Rows of large matrices are spread over the
-`ComputeBudget` cores.
+The config adapter describes the stack by structure: a depth loop (layers 6-17
+three times, each pass with its own cache slots), a block residual (a bank of
+block inputs every 6 layers, depth mixes at each sub-block and at the final
+norm), cross-pass message gates, residual short convolutions, and the
+attention's conditioning (separate q/k/v inputs on the full layers, query scale
+and clip, log-scaling on the full layers, a relative bias, projected sinks, a
+separate output gate), with packed experts routed by sigmoid scores and a
+softcapped GLU, a weighted embedding norm and a padded vocabulary. See
+[depth-ops.md](depth-ops.md) for each surface, its plan op and how the CPU's
+row-exact path and the device engine's visit path run it. `amql-server`,
+`generate` and `DecodeSession.Open` open it like any planned model: the device
+engine when there is one (one request at a time), else the CPU. A container
+encoded before these surfaces needs `amql-cli graph upgrade <container>`
+(graph only; tensors untouched).
 
 ## Per-pass expert scales: there are none
 
@@ -98,14 +88,14 @@ from transformers' single per-expert factor (llama.cpp PR #32704 was cited).
 
 ## Checking against transformers
 
-- `Inkling2Tests.Quantised_Experts_Are_Kept_As_Stored_And_Match_Their_Decoded_Values`:
+- `LoopedCheckpointTests.PackedExperts_Are_Kept_As_Stored_And_Match_Their_Decoded_Values`:
   the tiny arch-zoo model with its experts quantised in all three forms
   (plain, NVFP4 with amax/denominator, MXFP8, mixed inside the loop) gives
   bit-identical logits to the same model with those values decoded to F32 by
   transformers' formula.
-- `Inkling2Tests.Quantised_Experts_Export_As_Stored`: export gives back every
+- `LoopedCheckpointTests.PackedExperts_Export_As_Stored`: export gives back every
   tensor with its dtype, shape and bytes, and re-imports to the same logits.
-- `Inkling2Tests.Real_Checkpoint_Matches_Transformers_When_Available` runs
+- `LoopedCheckpointTests.LoopedDepth_Real_Checkpoint_Matches_Transformers_When_Available` runs
   when two variables are set: `AMQL_TEST_CONTAINER` (a container encoded as
   above) and `AMQL_TEST_REFERENCE` (the output of
   `scripts/reference/stream_reference.py`, which runs transformers a layer at a
@@ -116,11 +106,11 @@ from transformers' single per-expert factor (llama.cpp PR #32704 was cited).
     coordinates.
   - `{name}.last.f32`: the last position's logits.
 
-  It compares the managed runtime and, where it runs, the GPU path. The
+  It compares the planned CPU path and, where it runs, the device engine. The
   reference may run in bf16, so the test asserts decisions: the top token at
   90% of positions and at the last, the last top five, and the first four
   greedy tokens. It prints the differences.
-- `Inkling2Tests.Real_Checkpoint_Completes_A_Plain_Prompt_When_Available`
+- `LoopedCheckpointTests.LoopedDepth_Real_Checkpoint_Completes_A_Plain_Prompt_When_Available`
   (`AMQL_TEST_CONTAINER` alone) is a smoke test without a reference.
 
 The first reference, `golden.py`, loaded the whole model in transformers (bf16
@@ -130,8 +120,9 @@ replaces it.
 
 Measured on 2026-11-27 against the bf16 reference, which has two prompts: the
 plain "The capital of France is" (5 tokens) and the chat-templated "What is 17
-times 23? Answer briefly." (26 tokens). The managed runtime and the GPU path
-give the same numbers to the printed precision:
+times 23? Answer briefly." (26 tokens). The CPU runtime and the GPU path (then
+the dedicated ones this build replaced, which the planned paths match) gave the
+same numbers to the printed precision:
 
 | | plain0 | chat0 |
 |---|---|---|
@@ -175,193 +166,56 @@ A slot holds 8 KV heads × 128 × (K + V) = 2048 values per token.
 | 40 sliding slots, window 1024, FP16 | fixed | 160 MiB |
 
 Plus the convolution histories (K-1 = 3 states per convolution per slot,
-negligible). The GPU path holds the sliding slots as rings of their window
+negligible). The device engine holds the sliding slots as rings of their window
 plus a prompt chunk (1,280 rows, f32) and the full slots in the KV format
-asked for; their sizes as measured are in the GPU section. Remaining work for
-1M:
+asked for (sizes below). Remaining work for 1M:
 
-- The managed runtime keeps every key of every slot in f32 (including the
+- The CPU's row-exact path keeps every key of every slot in f32 (including the
   sliding ones), about 384 KiB per token. It is a reference, not a server.
 - With 17.6 GiB of weights on a 32 GB card, 1M fits only with NVFP4 rows
   (about 10 GiB). FP16 rows reach about 256K.
-- The managed runtime's prompt attention is per query over its keys. The
-  GPU path's runs on tensor cores in tiles (see below), so prompt speed stays
-  nearly flat to 64K tokens there.
+- The CPU path's prompt attention is per query over its keys. The device
+  engine's runs on tensor cores in tiles, so prompt speed stays nearly flat to
+  64K tokens there.
 
-## GPU path
+## On the GPU
 
-`native/amql_cuda/amql_inkling.cu`, built into `amql_cuda.dll` beside the
-engine by `build-cuda.cmd` (with `VCVARS_VER=14.44`) or `build-cuda.sh`, and
-`src/Amql.Inference/Inkling2Gpu.cs`. What is Inkling's own is in that file:
-the attention with its extras, the short convolutions, the loop and its message
-gates, and a step's GEMVs. A prompt chunk's projections and experts are the
-engine's, the same tensor-core GEMMs and grouped experts the other models'
-prompts run (`amqe_linear`, `amqe_moe_experts_paired`). The kernels mirror
-`Inkling2Model` step for step.
+The device engine's visit path ([depth-ops.md](depth-ops.md#runtime-the-device-engines-visit-path))
+runs it with the experts as stored. Measured on the RTX 5090 (32 GB) on
+2026-11-28 with nothing else running:
 
-- **Weights as stored.** The experts go up as the checkpoint holds them: NVFP4
-  elements, E4M3 block scales and the per-expert factor `amax / denominator`
-  (layers 0-19), MXFP8 elements and E8M0 exponents (20-23), or plain F32/BF16
-  (the tiny fixture). The large matrices stay BF16 and the small tensors are
-  widened to f32. The weights take 17.64 GiB of device memory: the
-  container's size, plus the NVFP4 experts' factor for every row (0.05 GiB),
-  which is the form the engine's experts take it in.
-- **A step** reads its token and position from device memory, so the whole
-  step (48 layer visits, the loop's three passes, the messages between them)
-  is captured once as a CUDA graph and replayed for every token.
-  - **Launches shared:** projections that share an input run as one launch,
-    and so do the q, k and v message gates' three steps, their three norms,
-    and the queries' and relative coefficients' preparation.
-  - **Norms in the mixes:** a norm that follows a block-residual mix is done
-    in the mix's own kernel.
-  - **Experts:** only the 8 chosen experts' rows are read, on the engine's
-    decode kernels (`amqe_moe_experts_paired_step`). The up projection reads
-    each output's gate and up rows together through Inkling's capped SwiGLU.
-    The down projection gives each warp four of a pair's short rows (1,152
-    wide), and the weighted sum is a kernel of its own.
-  - **Router:** its top 8 is one warp.
-- **A prompt** runs in chunks of up to 256 tokens with a token dimension.
-  - **Projections:** the engine's BF16 tensor-core GEMMs (cuBLAS), with the
-    activations rounded to BF16 and the products summed in f32.
-  - **Experts:** the chunk's (token, choice) pairs are grouped by expert. Each
-    chosen expert is decoded to BF16 once per chunk, which is exact for NVFP4
-    and MXFP8 since an element times its block scale fits in BF16, and runs as
-    a batched GEMM. The per-expert factor is applied in f32 afterwards, and
-    gate and up rows stay interleaved, as the checkpoint stores them, with
-    Inkling's softcaps.
-  - **f32 prompts:** `Inkling2Gpu.ExactPrefill` (`ink_set_prefill_f32`) keeps a
-    chunk at f32: SGEMMs over widened weights and f32 expert kernels, within
-    1e-3 of the managed runtime.
-  - **Token by token:** the short convolutions and the cache rows advance one
-    token at a time inside their kernels.
-- **Per-pass slots.** Every layer visit has its own slot: 24 physical layers
-  plus 2 × 12 for the core's extra passes, 48 slots. A sliding slot is a ring
-  of its window plus one chunk (1,024 + 256 rows, f32), so the rows a chunk
-  writes never overwrite keys its own earlier rows still read. A full slot
-  holds every position in the KV format asked for: `f32`, `fp16` (the
-  default) or `nvfp4` (E2M1 codes, an E4M3 scale per 16 values and an f32
-  scale per head and row). The format is `GpuEngine.RequestedKvFormat`
-  (`AMQL_KV_FORMAT`, `--kv-format`). Full slots grow by doubling, keeping
-  their rows, and the step graph is captured again.
-- **Attention** has the model's extras: the sink logit in the softmax's
-  denominator, the relative bias `r · P[:, dist]` within 1,024 of the newest
-  key, the full layers' log scaling on q and r, the q and k L2 clips, the
-  value RMS, and the sigmoid output gate. The clips and scaling are applied to
-  q, r, k and v before the attention, and the sink and gate where the key
-  splits are merged, so the attention itself is masked softmax attention with
-  a bias near the diagonal.
-  - **A step** is split-key flash decoding.
-  - **A prompt chunk** is FlashAttention-2 on the tensor cores
-    (`k_attn_tiles`). A block takes one head, 64 of the chunk's queries and one
-    key split. Each tile of 64 keys is decoded once from the slot's format
-    (f32, fp16 or NVFP4) into FP16 in shared memory and serves all 64 queries.
-    Q·Kᵀ and P·V are `mma.m16n8k16` with f32 sums, and the softmax is f32.
-    The relative bias for the chunk is computed first, as a table of query,
-    head and distance, and added to the scores within its extent.
-  - **The old kernel:** `ExactPrefill` keeps a chunk on the f32 per-query
-    kernel, and so does `AMQL_TILED_ATTENTION=0`.
+- **Against the planned CPU path** (f32 rows and f32 prompts, four prompts of
+  5, 7, 20 and 582 tokens, the last over three chunks): the top five at all 614
+  positions agree in set and order, the worst logit difference is 4.0e-4, and
+  the greedy continuations are token for token the same. With BF16 prompts (the
+  default) the top token agrees at 612 of 614; the largest logit differences
+  (up to 14) are in the improbable tail, where the softcap at 30 compresses
+  values and BF16 then shifts them.
+- **Speed**, a prompt fed in chunks and then 128 greedy steps after it; the
+  dedicated path the visit path replaced, measured the same way in the same
+  session, is in brackets:
 
-**Served.** `ModelHost` sends an Inkling 2 container to
-`DecodeSession.ForInkling2`: the GPU path when a device and the library are
-there and `AMQL_GPU_ENGINE` is not 0, otherwise the managed runtime. It runs
-one request at a time, with no continuous batching. `amql-cli generate` does
-the same and prints both speeds:
+  | KV rows | prompt tokens | prompt tok/s | decode tok/s after it |
+  |---|---|---|---|
+  | fp16 | 5 | — | 143 (140) |
+  | fp16 | 512 | 2,007 (2,017) | 136 (130) |
+  | fp16 | 4,096 | 2,019 (2,037) | 128 (125) |
+  | fp16 | 16,384 | 1,999 (2,015) | 121 (120) |
+  | fp16 | 65,536 | 1,855 (1,868) | 101 (101) |
+  | nvfp4 | 4,096 | 1,956 (1,973) | 122 (117) |
+  | nvfp4 | 65,536 | 1,791 (1,805) | 63 (63) |
 
-```
-amql-cli generate <container> --prompt "The capital of France is" --steps 64
-```
-
-Measured on the RTX 5090 (32 GB) on 2026-11-27 with nothing else running:
-
-- **Matches the managed runtime.** The tiny model agrees to 1e-3 of the
-  largest logit with f32 rows. Each prompt is 3, 21 or 200 tokens; the sliding
-  rings wrap and the full slots grow. FP16 rows agree to 2e-2, and NVFP4 rows
-  give the same top token at at least 80% of positions. A 600-token prompt in
-  three chunks matches the same tokens fed one at a time, and a replayed step
-  graph matches its direct launches bit for bit. The tiny model with NVFP4,
-  MXFP8 and plain experts mixed also agrees to 1e-3. All of these compare f32
-  prompts (`ExactPrefill`).
-- **BF16 prompts on the tiny model.** With mixed experts, each layer visit's
-  output matches the f32 prompt's within 0.7% through the prelude and the
-  core's first pass, which covers all three expert forms. At the seventh visit,
-  BF16 rounding flips a near tie of the random router for four tokens: 8
-  experts, 2 chosen. The sliding window then spreads that, so the tiny model
-  can't judge BF16 logits. The real checkpoint does.
-- **On the real checkpoint** (f32 rows) there are four prompts of 5, 7, 20 and
-  582 tokens; the last spans three chunks. With f32 prompts, the top five at all
-  614 positions agree in set and order, the worst logit difference is 3.5e-4,
-  and the greedy continuations are token for token the same.
-- **BF16 prompts on the real checkpoint** (the default) give the same top
-  token as the managed runtime at all 614 positions. Against the same prompt
-  at f32 on the GPU, over the 582-token prompt:
-  - **Distribution:** the KL divergence is 5e-5 at the median and 0.014 at
-    most, and the top token's probability moves by 3% at most.
-  - **Logits:** the largest differences, up to 14, are in the improbable tail,
-    where the softcap at 30 compresses values and BF16 then shifts them. That
-    is also why the top-5 set agrees at only 375 of the 614 positions.
-- **Speed**, with a prompt fed in chunks and then 128 greedy steps after it:
-
-  | KV rows | prompt tokens | prompt tok/s | per-query attention | all f32 kernels | decode tok/s after it | decode before |
-  |---|---|---|---|---|---|---|
-  | f32 | 512 | 1,992 | 1,844 | 630 | 116 | 100 |
-  | fp16 | 4,096 | 2,002 | 1,390 | 580 | 113 | 98 |
-  | nvfp4 | 4,096 | 1,955 | 1,214 | 522 | 105 | 93 |
-  | fp16 | 16,384 | 1,985 | 1,157 | 536 | 109 | 95 |
-  | nvfp4 | 16,384 | 1,928 | 710 | 400 | 95 | 84 |
-  | fp16 | 65,536 | 1,839 | 654 | 397 | 93 | 83 |
-  | nvfp4 | 65,536 | 1,787 | 265 | 208 | 60 | 56 |
-
-  The columns:
-  - **Prompt tok/s:** the default, tensor-core projections, experts and
-    attention.
-  - **Per-query attention:** the same run with `AMQL_TILED_ATTENTION=0`.
-  - **All f32 kernels:** projections, experts and attention all on Inkling's
-    own f32 kernels.
-  - **Decode before:** with Inkling's own expert kernels and a launch for
-    every gate, norm and head preparation (see Decode below).
-
-  Repeated runs vary by about 8%. The first prompt of a run is slower, at
-  about 800 tok/s for 512 tokens, because cuBLAS picks its algorithms on it.
-  The decode speed after a prompt is the same with either attention, since a
-  step does not use the tiled kernel.
-- **The tiled attention is as close to f32 as the per-query one.** On a
-  2,048-token prompt (four key splits in the full layers, the sliding windows
-  wrapped), BF16 prompts compared with f32 prompts:
-
-  | KV rows | attention | same top token | KL median | KL p99 | KL max |
-  |---|---|---|---|---|---|
-  | fp16 | per query | 2,045 / 2,048 | 1.1e-5 | 0.015 | 0.14 |
-  | fp16 | tiled | 2,043 / 2,048 | 1.2e-5 | 0.014 | 0.15 |
-  | nvfp4 | per query | 2,046 / 2,048 | 2.0e-5 | 0.011 | 0.17 |
-  | nvfp4 | tiled | 2,046 / 2,048 | 2.0e-5 | 0.012 | 0.24 |
-
-  The tail comes from the BF16 projections and experts, not the attention.
-
-- **Decode.** `amql-cli generate` on a 5-token prompt decodes at about 141
-  tok/s, up from 105.
-  - **Gains:** the engine's expert kernels gave about 8%, and the shared
-    launches and the norms inside the mixes about 10% more. The mixes then
-    went from 10.4 to 3.0 µs each (120 a step) by holding each thread's
-    float4 of every state in registers, one round of loads, and doing the
-    softmax in one warp: 125 to 141 tok/s.
-  - **Bound:** decode reads about 5.4 GB a token, 2.6 GB of attention
-    projections over 48 visits, 1.85 GB of chosen experts and 0.9 GB of head.
-    That puts the bandwidth bound near 330 tok/s.
-  - **Profile of a step** (about 8 ms on the GPU):
-    - the projections and head, 2.5 ms, at about 77% of bandwidth;
-    - the experts, about 2.4 ms;
-    - the rest, about 900 small kernels at a few microseconds each.
-  - **Ruled out:**
-    - programmatic dependent launch, on every launch, gained nothing inside
-      the graph. Rewriting the captured graph's kernel edges to programmatic
-      ones on the all-blocks-launched port, except behind one-block kernels
-      (753 of 987 edges), gained nothing either: 139.8 against 141.6 tok/s.
-    - a down projection that gives a warp 8 of the 1,152-wide rows as one
-      run of 288 16-byte chunks (so no lane idles on a second pass) was 7%
-      slower than the engine's kernel, its loads issued first or not.
-- **Memory.** The weights take 17.64 GiB. A sequence's KV rows and
-  convolution histories (40 sliding rings of 1,280 f32 rows, plus the 8 full
-  slots) take:
+  `amql-cli generate <container> --prompt "The capital of France is" --steps 128`
+  prints the same: about 142 tok/s. The first prompt of a run is slower (about
+  800 tok/s for 512 tokens) while cuBLAS picks its algorithms.
+- **Decode** reads about 5.4 GB a token (2.6 GB of attention projections over
+  48 visits, 1.85 GB of chosen experts, 0.9 GB of head), so the bandwidth bound
+  is near 330 tok/s. A step is about 8 ms on the GPU: the projections and head
+  2.5 ms at about 77% of bandwidth, the experts about 2.4 ms, and about 900
+  small kernels. Programmatic dependent launch gained nothing inside the graph.
+- **Memory.** The weights take 17.6 GiB, the chunk scratch and a first
+  sequence about 1.3 GiB more. A sequence's KV rows and convolution histories
+  (40 sliding rings of 1,280 f32 rows, plus the 8 full slots):
 
   | positions | f32 | fp16 | nvfp4 |
   |---|---|---|---|
@@ -371,17 +225,8 @@ Measured on the RTX 5090 (32 GB) on 2026-11-27 with nothing else running:
   | 262,144 | 16.39 GiB | 8.39 GiB | 2.77 GiB |
   | 1,048,576 | 64.39 GiB | 32.39 GiB | 9.89 GiB |
 
-  The step's and a chunk's scratch add about 0.3 GiB. At a 65,536-token
-  prompt the device held 22.2 GiB in all with fp16 rows, and 20.8 GiB with
-  nvfp4 rows. So 1M fits on the 32 GB card only with nvfp4 rows: 17.6 + 9.9
-  GiB plus scratch.
+  So 1M fits on the 32 GB card only with nvfp4 rows.
 
-Not done yet:
-
-- Batching several requests in one step.
-- Decode: the block-residual mixes (about 1 ms a step) and the experts'
-  down projection (about 21 us a layer for 12 MB, short rows) are the next
-  targets. At 64K positions with NVFP4 rows, the step's attention is too.
-- W4A4 prefill, which `hf_quant_config.json` describes (`required_activation_quantization`).
-- KV paging and marks.
-- The vision tower and the drafter.
+Not done yet: batching several requests in one step, marks and paging on the
+visit path, W4A4 prefill (`hf_quant_config.json`'s
+`required_activation_quantization`), the vision tower and the drafter.
