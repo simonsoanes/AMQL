@@ -6,7 +6,7 @@
 #
 #   sh scripts/moe/run_bar.sh [cli] [work-dir] [container]
 set -e
-CLI=${1:-./bin/amql-cli.exe}
+CLI=${1:-./bin/win-x64/Release/amql-cli.exe}
 W=${2:-containers/moe}
 BASE=${3:-containers/qwen3.5-0.8b}
 E="code=$W/experts2/code,math=$W/experts2/math,structured=$W/experts2/structured,chat=$W/experts2/chat"

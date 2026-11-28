@@ -6,7 +6,7 @@ on it, and the startup log says why.
 
 ```bash
 dotnet build -c Release src/Amql.Server
-./bin/Release/amql-server --model von=<von-container> --model chat=<qwen-container> --model emb=<embedding-container> \
+./bin/win-x64/Release/amql-server --model von=<von-container> --model chat=<qwen-container> --model emb=<embedding-container> \
                           --urls http://127.0.0.1:8000 [--api-key KEY] [--max-tokens N] [--no-warm] \
                           [--adapter [id=]<dir>[,<dir>…]] [--think] [--temperature T] [--top-p P] [--top-k K] \
                           [--config <models.json>] [--max-ram GB] [--gpu-memory GB] [--cpu] [--no-batch] [--batch-bf16]
@@ -526,7 +526,7 @@ container's own (`"adapters": ["stop-circling"]`). Adapters read an image's toke
 images and adapters run together.
 
 ```bash
-dotnet bin/Release/amql-server.dll --model qwen=<qwen3.5-0.8b container> --think \
+dotnet bin/win-x64/Release/amql-server.dll --model qwen=<qwen3.5-0.8b container> --think \
     --adapter qwen=<adapters>/stop-circling
 ```
 

@@ -43,7 +43,7 @@ foreach ($rid in $Runtimes) {
         Get-ChildItem $stage -Filter 'libamql_*.so' | Remove-Item
     } else {
         Get-ChildItem $stage -Filter 'amql_*.dll' | Remove-Item
-        foreach ($lib in 'native/amql_cuda/bin/libamql_cuda.so', 'native/amql_cuda/bin/libamql_inkling.so') {
+        foreach ($lib in 'native/amql_cuda/bin/libamql_cuda.so') {
             if (Test-Path $lib) { Copy-Item $lib $stage }
             else { Write-Warning "$lib is not built: the $rid archive runs on the CPU only (native/amql_cuda/build-cuda.sh)" }
         }

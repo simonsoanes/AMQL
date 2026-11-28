@@ -9,18 +9,18 @@
 # no .NET install. Run it on the Spark itself, or on any machine with the .NET 11
 # SDK (WSL, Windows via scripts/publish-linux.ps1) and copy the folder over.
 #
-#   scripts/publish-linux.sh                 # linux-arm64 → bin/linux-arm64
+#   scripts/publish-linux.sh                 # linux-arm64 → bin/linux-arm64/Release
 #   RID=linux-x64 scripts/publish-linux.sh   # an x86-64 Linux box (or WSL)
 #   OUT=/opt/amql scripts/publish-linux.sh
 #
-# Then:  bin/linux-arm64/amql-gui       (in a terminal: ssh -t, tmux, a console)
+# Then:  bin/linux-arm64/Release/amql-gui       (in a terminal: ssh -t, tmux, a console)
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 RID="${RID:-linux-arm64}"
-OUT="${OUT:-bin/$RID}"
 CONFIG="${CONFIG:-Release}"
+OUT="${OUT:-bin/$RID/$CONFIG}"
 mkdir -p "$OUT"
 
 for project in Amql.Cli Amql.Server Amql.Gui; do
@@ -30,7 +30,7 @@ for project in Amql.Cli Amql.Server Amql.Gui; do
 done
 
 # The Windows builds of the native libraries come along with Amql.Inference; they are no use here.
-rm -f "$OUT/amql_cuda.dll" "$OUT/amql_inkling.dll"
+rm -f "$OUT/amql_cuda.dll"
 
 staged=0
 for lib in native/amql_cuda/bin/libamql_cuda.so; do

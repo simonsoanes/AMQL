@@ -47,9 +47,9 @@ The short way, with AMQL Studio's text UI to choose models, start the server and
 ([docs](amql-studio.md#text-ui-linux-dgx-spark)):
 
 ```bash
-scripts/publish-linux.sh                              # or scripts\publish-linux.ps1 on Windows, then copy bin/linux-arm64
-CLI_OUT=bin/linux-arm64 bash native/amql_cuda/build-cuda.sh   # sm_121 is read from nvidia-smi
-tmux new -s amql bin/linux-arm64/amql-gui
+scripts/publish-linux.sh                              # or scripts\publish-linux.ps1 on Windows, then copy bin/linux-arm64/Release
+CLI_OUT=bin/linux-arm64/Release bash native/amql_cuda/build-cuda.sh   # sm_121 is read from nvidia-smi
+tmux new -s amql bin/linux-arm64/Release/amql-gui
 ```
 
 The steps below do the same by hand.
@@ -64,7 +64,7 @@ This produces `bin/libamql_cuda.so`.
 ### Step 2: Stage the library
 Copy `bin/libamql_cuda.so` next to the server or CLI binary:
 ```bash
-cp bin/libamql_cuda.so ../../src/Amql.Cli/bin/Release/net11.0/
+cp bin/libamql_cuda.so ../../bin/linux-arm64/Release/
 # or wherever the published output lives
 ```
 Or set `LD_LIBRARY_PATH` to include the `bin/` directory.

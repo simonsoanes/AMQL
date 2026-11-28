@@ -9,7 +9,7 @@ rem   CUDA_ROOT  — path to the CUDA Toolkit (default: auto-detect v13.x)
 rem   CUDA_ARCH  — target SM architecture (default: sm_120; e.g. sm_121)
 rem   VCVARS     — path to vcvars64.bat (default: VS 2022 Enterprise)
 rem   VCVARS_VER — MSVC toolset for vcvars64.bat, e.g. 14.44 (nvcc 13.3's cudafe++ crashes on 14.52's headers)
-rem   CLI_OUT    — optional deployment directory (default: src\Amql.Cli\bin\Release\net10.0)
+rem   CLI_OUT    — optional deployment directory (default: the Release build, bin\win-x64\Release)
 
 setlocal
 cd /d "%~dp0"
@@ -83,7 +83,7 @@ echo [amql-cuda] built bin\amql_cuda.dll
 
 rem ── Stage next to the CLI ────────────────────────────────────────────
 if not defined CLI_OUT (
-    set CLI_OUT=D:\Dev\AMQL\src\Amql.Cli\bin\Release\net10.0
+    set CLI_OUT=%~dp0..\..\bin\win-x64\Release
 )
 if exist "%CLI_OUT%" (
     copy /y bin\amql_cuda.dll "%CLI_OUT%\" >nul

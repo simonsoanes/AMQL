@@ -31,14 +31,22 @@ Or build the published standalone executable:
 
 ### Shared output folder
 
-Every project under `src/` writes to a single `bin/<Configuration>/` at the
-repository root, rather than to a per-project `bin/`. So `bin/Release/` holds
-`amql-cli.exe`, `amql-gui.exe` and all the `Amql.*` libraries side by side:
+Every project under `src/` writes to one folder per runtime and configuration
+at the repository root, `bin/<runtime>/<Configuration>/`, rather than to a
+per-project `bin/`. So after `dotnet build -c Release` on Windows,
+`bin/win-x64/Release/` holds `amql-cli.exe`, `amql-gui.exe` and all the `Amql.*`
+libraries side by side:
 
 ```bash
-.\bin\Release\amql-cli.exe help
-.\bin\Release\amql-gui.exe
+.\bin\win-x64\Release\amql-cli.exe help
+.\bin\win-x64\Release\amql-gui.exe
 ```
+
+A debug build goes to `bin/win-x64/Debug/`, and `scripts/publish-linux.sh` to
+`bin/linux-arm64/Release/` (its build output stays under `obj/`). The single-file
+CLI from `scripts/publish-exe.cmd` and release archives go to `dist/`, since a
+self-contained build beside the framework-dependent ones would stop their
+launchers.
 
 This is configured in `src/Directory.Build.props` and is deliberately scoped to
 `src/` — `tests/Amql.Tests` keeps its own output folder so xunit and its runner

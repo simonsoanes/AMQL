@@ -26,7 +26,7 @@ TOOL="-"
 if [ $TOOLS = 1 ]; then
   $BIN/llama-server.exe -m "$GGUF" -ngl 99 -c 16384 --jinja --port 18091 --host 127.0.0.1 -np 1 > $LOG/$LABEL-server.log 2>&1 &
   for i in $(seq 1 60); do curl -s http://127.0.0.1:18091/health 2>/dev/null | grep -q ok && break; sleep 1; done
-  TOOL=$(/d/Dev/AMQL/bin/Release/amql-cli.exe tool-eval --endpoint http://127.0.0.1:18091/v1 --cases /d/Dev/AMQL/tests/Amql.Tests/fixtures/tool-eval-cases.jsonl --report $LOG/$LABEL-tools.json 2>&1 | tee $LOG/$LABEL-tools.log | grep -oE '^tool-eval: [0-9]+/[0-9]+' | sed 's/tool-eval: //')
+  TOOL=$(/d/Dev/AMQL/bin/win-x64/Release/amql-cli.exe tool-eval --endpoint http://127.0.0.1:18091/v1 --cases /d/Dev/AMQL/tests/Amql.Tests/fixtures/tool-eval-cases.jsonl --report $LOG/$LABEL-tools.json 2>&1 | tee $LOG/$LABEL-tools.log | grep -oE '^tool-eval: [0-9]+/[0-9]+' | sed 's/tool-eval: //')
   powershell -NoProfile -Command "Get-Process llama-server -ErrorAction SilentlyContinue | Stop-Process -Force" >/dev/null 2>&1
   sleep 1
 fi

@@ -2,7 +2,7 @@
 # amql-server and amql-cli, self-contained, in one folder to copy to the target
 # (the DGX Spark by default). See publish-linux.sh for what the folder holds.
 #
-#   scripts\publish-linux.ps1                     # linux-arm64 → bin\linux-arm64
+#   scripts\publish-linux.ps1                     # linux-arm64 → bin\linux-arm64\Release
 #   scripts\publish-linux.ps1 -Rid linux-x64      # x86-64 Linux, or WSL
 #
 # The CUDA library is not cross-compiled: build it on the target with
@@ -15,7 +15,7 @@ param(
 )
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
-if (-not $Out) { $Out = Join-Path $root "bin\$Rid" }
+if (-not $Out) { $Out = Join-Path $root "bin\$Rid\$Configuration" }
 New-Item -ItemType Directory -Force $Out | Out-Null
 
 foreach ($project in "Amql.Cli", "Amql.Server", "Amql.Gui") {
@@ -26,7 +26,7 @@ foreach ($project in "Amql.Cli", "Amql.Server", "Amql.Gui") {
 }
 
 # The Windows builds of the native libraries come along with Amql.Inference; they are no use on Linux.
-Remove-Item (Join-Path $Out "amql_cuda.dll"), (Join-Path $Out "amql_inkling.dll") -ErrorAction SilentlyContinue
+Remove-Item (Join-Path $Out "amql_cuda.dll") -ErrorAction SilentlyContinue
 
 foreach ($lib in "libamql_cuda.so") {
     $path = Join-Path $root "native\amql_cuda\bin\$lib"

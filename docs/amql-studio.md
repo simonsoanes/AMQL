@@ -12,7 +12,7 @@ dotnet build src/Amql.Gui
 ```
 
 ```powershell
-.\bin\amql-gui.exe
+.\bin\win-x64\Release\amql-gui.exe
 ```
 
 (The output folder follows `src/Directory.Build.props`. `dotnet run --project src/Amql.Gui` also works.)
@@ -180,18 +180,18 @@ Build it for the Spark (linux-arm64), on the Spark or from Windows, as one self-
 `amql-server` and `amql-cli` beside it:
 
 ```bash
-scripts/publish-linux.sh                    # → bin/linux-arm64   (RID=linux-x64 for x86-64 Linux or WSL)
+scripts/publish-linux.sh                    # → bin/linux-arm64/Release   (RID=linux-x64 for x86-64 Linux or WSL)
 ```
 
 ```powershell
-scripts\publish-linux.ps1                   # the same from Windows; copy bin\linux-arm64 to the Spark
+scripts\publish-linux.ps1                   # the same from Windows; copy bin\linux-arm64\Release to the Spark
 ```
 
 On the Spark, build the CUDA library and put it beside the server (it picks `sm_121` from the GPU itself):
 
 ```bash
-CLI_OUT=bin/linux-arm64 bash native/amql_cuda/build-cuda.sh
-bin/linux-arm64/amql-gui                     # in a terminal: ssh -t, tmux, a console
+CLI_OUT=bin/linux-arm64/Release bash native/amql_cuda/build-cuda.sh
+bin/linux-arm64/Release/amql-gui                     # in a terminal: ssh -t, tmux, a console
 ```
 
 The folder needs no .NET install. Run it inside `tmux` to keep the server running when the SSH session drops:
@@ -226,10 +226,10 @@ text UI starts and lays out on a new machine (on Linux it still needs a terminal
 ## How it finds amql-cli and amql-server
 
 There is no setting for where the executables are. AMQL Studio looks beside itself, in the folder above it, in
-the repository's `bin`, `bin/Debug`, `bin/Release`, `bin-dev` and publish folders (found by walking up to
-`AMQL.slnx`), and on `PATH`. It uses the most recently built copy. A copy whose libraries are missing from its
+the repository's build folders for its own runtime, `bin/win-x64/Release` and `bin/win-x64/Debug` (or
+`bin/linux-arm64/…` on the Spark), and `bin-dev` (found by walking up to `AMQL.slnx`), and on `PATH`. It uses the most recently built copy. A copy whose libraries are missing from its
 folder (a partial build output) is skipped. On Linux it looks for `amql-cli` and `amql-server` without the
-`.exe`, and also in the per-runtime folders a cross-build writes (`bin/Release/linux-arm64` and its `publish`). With no build at all but a repository present, it runs the
+`.exe`. With no build at all but a repository present, it runs the
 project from source with `dotnet run`. The Home page and the Server page show which build is in use. The Tools
 page's ⋯ menu looks again after a rebuild, and starting the server always looks again.
 

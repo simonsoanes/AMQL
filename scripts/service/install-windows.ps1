@@ -6,7 +6,7 @@
 .DESCRIPTION
   Run in an elevated PowerShell. -Source is a release archive (amql-<version>-win-x64.zip)
   or a folder holding amql-manager.exe, amql-server.exe and amql-cli.exe (a publish, or
-  bin/Release). The install goes to -Root:
+  bin/win-x64/Release). The install goes to -Root:
 
     <Root>\versions\<version>\   this install
     <Root>\current               the version run
@@ -19,7 +19,7 @@
 
 .EXAMPLE
   scripts/service/install-windows.ps1 -Source dist/amql-1.1.0-win-x64.zip
-  scripts/service/install-windows.ps1 -Source bin/Release -Urls http://0.0.0.0:8100
+  scripts/service/install-windows.ps1 -Source bin/win-x64/Release -Urls http://0.0.0.0:8100
 #>
 param(
     [Parameter(Mandatory)] [string] $Source,

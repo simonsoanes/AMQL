@@ -42,7 +42,7 @@ build.
 
 There is no setting for where `amql-cli` or `amql-server` live. `ToolLocator` looks at every candidate and
 uses the most recently built one that is complete. The candidates are: beside the app, the folder above it,
-the repository's `bin`, `bin/Release`, `bin/Debug`, `bin-dev` and publish folders, and `PATH`.
+the repository's `bin/<runtime>/Release` and `bin/<runtime>/Debug` (`bin/win-x64/Release` on Windows), `bin-dev`, and `PATH`.
 
 A candidate is complete when its own dll and every project library in its `.deps.json` sit beside it, so a
 partial build output is skipped. With nothing built but the repository present, the tool runs with

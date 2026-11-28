@@ -46,3 +46,6 @@ export/
 ## Local research notes and AMQL project files
 .research/
 *.amqlproj
+
+## Release artefacts (scripts/publish-exe.cmd, scripts/release/package.ps1)
+dist/

@@ -19,9 +19,9 @@ public sealed record ToolLocation(string FileName, IReadOnlyList<string> PrefixA
 /// location is looked at and the most recently built executable wins, so a
 /// fresh Release build is picked over a stale Debug one (and the other way
 /// round) without anyone pointing the GUI at a path:
-///   1. beside the GUI (the shared bin/&lt;Configuration&gt;/ output and installs);
+///   1. beside the GUI (the shared bin/&lt;runtime&gt;/&lt;Configuration&gt;/ output and installs);
 ///   2. the folder above it;
-///   3. the repository's bin/Debug, bin/Release, bin, bin-dev and publish outputs,
+///   3. the repository's bin/&lt;runtime&gt;/Release and Debug (and bin-dev),
 ///      found by walking up to AMQL.slnx from the GUI and the working directory;
 ///   4. every folder on PATH.
 /// When no executable exists but the repository does, the tool is run from
@@ -191,26 +191,17 @@ public static class ToolLocator
     public static string ExecutableName(string tool) => OperatingSystem.IsWindows() ? tool + ".exe" : tool;
 
     /// <summary>
-    /// The repository's output folders, for this machine. On Windows the shared
-    /// bin/&lt;Configuration&gt; folders; on Linux also the per-runtime folders a
-    /// cross-build from Windows writes (bin/Release/linux-arm64 for the DGX Spark)
-    /// and their publish folders, since a checkout may be shared between the two.
+    /// The repository's output folders for this machine's runtime: one per
+    /// configuration, bin/win-x64/Release on Windows and bin/linux-arm64/Release
+    /// on the DGX Spark (a checkout may be shared, and a cross-build from Windows
+    /// publishes there too); see src/Directory.Build.props.
     /// </summary>
     private static IEnumerable<string> BuildFolders()
     {
-        yield return "bin/Release";
-        yield return "bin/Debug";
-        yield return "bin";
+        string rid = System.Runtime.InteropServices.RuntimeInformation.RuntimeIdentifier;   // win-x64, linux-arm64
+        yield return $"bin/{rid}/Release";
+        yield return $"bin/{rid}/Debug";
         yield return "bin-dev";
-        if (OperatingSystem.IsWindows())
-        {
-            yield return "bin/Release/win-x64/publish";
-            yield break;
-        }
-        string rid = System.Runtime.InteropServices.RuntimeInformation.RuntimeIdentifier;   // linux-arm64 on the Spark
-        yield return $"bin/Release/{rid}";
-        yield return $"bin/Release/{rid}/publish";
-        yield return $"bin/{rid}";
     }
 
     /// <summary>Walks up from a directory to the folder holding AMQL.slnx.</summary>

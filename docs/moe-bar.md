@@ -98,7 +98,7 @@ The old topics hold, within 0.007. After 10 steps, chat has closed 46% of its ga
 
 ```bash
 python scripts/moe/make_topic_sets.py containers/qwen3.5-0.8b <post-training-dir> containers/moe/data2 --train 256 --scan 400000
-for t in code math structured chat; do ./bin/amql-cli.exe lora-train containers/qwen3.5-0.8b --data containers/moe/data2/$t.train.jsonl --eval containers/moe/data2/$t.eval.jsonl --out containers/moe/experts2/$t --layers 18,19,20,21,22,23 --rank 8 --alpha 16 --lr 5e-4 --steps 60 --batch 16 --eval-every 15 --keep-best --target-loss 0 --grad-checks 0 --no-decode; done
+for t in code math structured chat; do ./bin/win-x64/Release/amql-cli.exe lora-train containers/qwen3.5-0.8b --data containers/moe/data2/$t.train.jsonl --eval containers/moe/data2/$t.eval.jsonl --out containers/moe/experts2/$t --layers 18,19,20,21,22,23 --rank 8 --alpha 16 --lr 5e-4 --steps 60 --batch 16 --eval-every 15 --keep-best --target-loss 0 --grad-checks 0 --no-decode; done
 sh scripts/moe/run_bar.sh
 ```
 
