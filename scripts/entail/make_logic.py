@@ -484,8 +484,10 @@ def cuts(t, codes_of):
             continue
         for text in (name, " " + name):
             pieces = [t.decode([i]) for i in t.encode(text, add_special_tokens=False).ids]
+            # ' X|OR' and ' <|->' need their lead: the tail alone means something else.
+            # ' |IFF' does not: the tail alone is the whole operator, and the lead a plain blank.
             if len(pieces) == 2 and codes_of(pieces[0]) is None and codes_of(pieces[1]) is not None \
-                    and len(codes_of(pieces[1])) == 1:
+                    and len(codes_of(pieces[1])) == 1 and codes_of(pieces[1]) != [code]:
                 found[(pieces[0], pieces[1])] = code
     return [(lead, tail, code) for (lead, tail), code in sorted(found.items())]
 
@@ -526,8 +528,13 @@ def main():
         vocabulary = json.load(f)["model"]["vocab"]
     t = Tokenizer.from_file(sys.argv[1])
     words = sorted({t.decode([i]) for i in vocabulary.values()})
-    pieces = [t.decode([i]) for i in t.encode(" tautology", add_special_tokens=False).ids]
-    said = {" a", " contradiction", " contingent", *pieces}
+    def cut(word):
+        return [t.decode([i]) for i in t.encode(word, add_special_tokens=False).ids]
+    pieces = cut(" tautology")
+    contra, depend = cut(" contradiction"), cut(" contingent")
+    said = {" a", *pieces}
+    said |= {" contradiction"} if len(contra) == 1 else set(contra)
+    said |= {" contingent"} if len(depend) == 1 else set(depend)
     lines = []
     pairs = cuts(t, events)
     leads = {lead for lead, _, _ in pairs}
@@ -544,6 +551,33 @@ def main():
     emits = [f'emit "{w}" when o[C_WORD + {i}]' for i, w in enumerate(pieces)]
     text = (RULES.replace("@TOKENS@", "\n".join(lines)).replace("@CUTS@", "\n".join(cut_lines(pairs)))
             .replace("@ALWAYS@", "\n".join(always)).replace("@WORD@", "\n".join(emits)))
+    # A verdict word the partner writes in pieces is said a piece at a time, coded after
+    # the pieces of " tautology".
+    more = 0
+    for word, cutw, at, const, tail in ((" contradiction", contra, 1, "C_CONTRA", "vNever"),
+                                        (" contingent", depend, 0, "C_DEPEND", "vDepends")):
+        if len(cutw) == 1:
+            continue
+        codes = [f"C_WORD + {len(pieces) + more + j}" for j in range(len(cutw))]
+        old = f"entail code[{at}] = {const} when {tail}\nentail code[{at + 1}] = C_END when {tail}\n"
+        assert old in text, old
+        text = text.replace(old, "".join(f"entail code[{at + j}] = {c} when {tail}\n" for j, c in enumerate(codes))
+                            + f"entail code[{at + len(cutw)}] = C_END when {tail}\n")
+        old = f'emit "{word}" when o[{const}]\n'
+        assert old in text, old
+        text = text.replace(old, "".join(f'emit "{w}" when o[{c}]\n' for w, c in zip(cutw, codes)))
+        more += len(cutw)
+    # A tokenizer that writes "))" as two tokens spends more of them on an expression:
+    # Inkling 2 needs 34 for what Qwen writes in 30.
+    if t.token_to_id("))") is None:
+        old = "const W = 30    # tokens in an expression"
+        assert old in text
+        text = text.replace(old, "const W = 34    # tokens in an expression: this tokenizer writes \"))\" as two")
+    if more:
+        n = len(pieces) + more
+        old = "state o[C_WORD + 5]\nfor d in 1 to C_WORD + 4\n"
+        assert old in text
+        text = text.replace(old, f"state o[C_WORD + {max(5, n)}]\nfor d in 1 to C_WORD + {max(5, n) - 1}\n")
     with open(sys.argv[2], "w", encoding="utf8", newline="\n") as f:
         f.write(text)
     print(len(lines), "tokens;", "tautology is", pieces, "; cut operators:", [a + b for a, b, _ in pairs] or "none")

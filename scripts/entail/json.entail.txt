@@ -56,10 +56,16 @@ const T_COLON = 4    # completes a marker or "Valid:"
 # q: quotes that count. lw: white space comes first.
 # ec: after a lone backslash, 1 if this token starts a legal escape, 2 if it starts
 # with a quote or backslash, which would change how it reads.
+# Lanes starting z are a token of that second kind read from inside a string with its
+# first character escaped, as it is after a lone backslash: qe is the change in its
+# quotes, ue and noE its un and noI; qb marks such a token (ec 2). lz: its number opens the token with 0 and a digit.
+# ze: it ends in a number that is just 0 here, 1 if that number began here, 2 if the
+# token opens with it, so it may go on a number before.
 
 state uf, us, ua, ub, uc, un_, ud, uv, uh, uk, ux1, ux2, ux3, uy1, uy2, uy3
 state wf, ws, wa, wb, wc, wn, wd, wv, wh, wk, wx1, wx2, wx3, wy1, wy2, wy3
-state q, okO, noI, un, tag, ec, lw, blank
+state zf, zs, za, zb, zc, zn, zd, zv, zh, zk, zx1, zx2, zx3, zy1, zy2, zy3
+state q, okO, noI, un, tag, ec, lw, blank, qe, ue, noE, lz, ze, qb
 
 token "\t" means okO = 1, noI = 1, lw = 1, blank = 1
 token "\t\t" means okO = 1, noI = 1, lw = 1, blank = 1
@@ -1942,293 +1948,293 @@ token "!(\q\{" means noI = 1, q = 1
 token "!(\q\{}\q," means noI = 1, q = 2
 token "!=\q" means wf = 6, wa = 6, wn = 1, q = 1
 token "!\e" means un = 1
-token "\q" means okO = 1, uf = 5, ua = 5, un_ = 1, wf = 6, wa = 6, wn = 1, q = 1, ec = 2
-token "\q!" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q\q" means okO = 1, uf = 5, us = 6, ua = 6, ub = 5, un_ = 2, noI = 1, q = 2, ec = 2
-token "\q\q\q" means noI = 1, q = 3, ec = 2
-token "\q\q\q." means noI = 1, q = 3, ec = 2
-token "\q\q," means okO = 1, uf = 5, us = 6, ua = 3, ub = 6, uc = 5, un_ = 3, noI = 1, q = 2, ec = 2
-token "\q\q." means noI = 1, q = 2, ec = 2
-token "\q\q:" means okO = 1, uf = 5, us = 6, ua = 4, ub = 6, uc = 5, un_ = 3, noI = 1, q = 2, ec = 2
-token "\q#" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q$" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q$\{" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q%" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q%(" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q&" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q'" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q'," means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q';" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q(" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q)" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q)!=" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q)(" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q))" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q)))" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q)));" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q))," means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q))." means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q));" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q)+" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q)," means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q),\q" means okO = 1, uf = 5, us = 6, ua = 6, ub = 5, un_ = 2, noI = 1, q = 2, ec = 2
-token "\q)->" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q)." means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q):" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q);" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q);//" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q)==" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q)[" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q)]" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q)\{" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q)}" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q*" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q**" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q*," means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q+" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q+\q" means okO = 1, uf = 5, us = 6, ua = 6, ub = 5, un_ = 2, noI = 1, q = 2, ec = 2
-token "\q," means okO = 1, uf = 5, ua = 5, un_ = 1, wf = 6, ws = 3, wa = 3, wb = 6, wn = 2, q = 1, ec = 2
-token "\q,\q" means okO = 1, uf = 5, us = 6, ua = 6, ub = 5, un_ = 2, wf = 6, ws = 3, wa = 5, wb = 3, wc = 6, wn = 3, q = 2, ec = 2
-token "\q,\q\q," means wf = 6, ws = 3, wa = 3, wb = 6, wc = 5, wn = 3, q = 3, ec = 2
-token "\q,\q\q,\q" means wf = 6, ws = 3, wa = 5, wb = 3, wc = 6, wn = 3, q = 4, ec = 2
-token "\q,\q#" means wf = 6, ws = 3, wa = 5, wb = 3, wc = 6, wn = 3, q = 2, ec = 2
-token "\q,\q+" means wf = 6, ws = 3, wa = 5, wb = 3, wc = 6, wn = 3, q = 2, ec = 2
-token "\q,\q\e" means wf = 6, ws = 3, wa = 5, wb = 3, wc = 6, wn = 3, un = 1, q = 2, ec = 2
-token "\q,$" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q,&" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q,'" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q,(" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q,-" means okO = 1, uf = 5, ua = 5, un_ = 1, wf = 6, ws = 3, wa = 9, wb = 3, wc = 6, wn = 3, wv = 1, wh = 1, wk = 1, q = 1, ec = 2
-token "\q,@\q" means okO = 1, uf = 5, us = 6, ua = 6, ub = 5, un_ = 2, noI = 1, q = 2, ec = 2
-token "\q,[" means okO = 1, uf = 5, ua = 5, un_ = 1, wf = 6, ws = 3, wa = 2, wb = 3, wc = 6, wn = 3, wd = 1, wv = 1, wy1 = 2, q = 1, ec = 2
-token "\q,__" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q,\{" means okO = 1, uf = 5, ua = 5, un_ = 1, wf = 6, ws = 3, wa = 1, wb = 3, wc = 6, wn = 3, wd = 1, wv = 1, wy1 = 1, q = 1, ec = 2
-token "\q-" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q--" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q." means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q.\q" means okO = 1, uf = 5, us = 6, ua = 6, ub = 5, un_ = 2, noI = 1, q = 2, ec = 2
-token "\q.$" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q.$_" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q.**" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q.." means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q..." means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q./" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q/" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q/>" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q/>.</" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q/><" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q/></" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q:" means okO = 1, uf = 5, ua = 5, un_ = 1, wf = 6, ws = 4, wa = 4, wb = 6, wn = 2, q = 1, ec = 2
-token "\q:\q" means okO = 1, uf = 5, us = 6, ua = 6, ub = 5, un_ = 2, wf = 6, ws = 4, wa = 5, wb = 4, wc = 6, wn = 3, q = 2, ec = 2
-token "\q:\q\q" means wf = 6, ws = 4, wa = 6, wb = 5, wc = 4, wn = 3, q = 3, ec = 2
-token "\q:\q\q,\q" means wf = 6, ws = 4, wa = 5, wb = 3, wc = 6, wn = 3, q = 4, ec = 2
-token "\q:\q'" means wf = 6, ws = 4, wa = 5, wb = 4, wc = 6, wn = 3, q = 2, ec = 2
-token "\q:\q+" means wf = 6, ws = 4, wa = 5, wb = 4, wc = 6, wn = 3, q = 2, ec = 2
-token "\q:\q/" means wf = 6, ws = 4, wa = 5, wb = 4, wc = 6, wn = 3, q = 2, ec = 2
-token "\q:-" means okO = 1, uf = 5, ua = 5, un_ = 1, wf = 6, ws = 4, wa = 9, wb = 4, wc = 6, wn = 3, wh = 1, wk = 1, q = 1, ec = 2
-token "\q:@\q" means okO = 1, uf = 5, us = 6, ua = 6, ub = 5, un_ = 2, noI = 1, q = 2, ec = 2
-token "\q:[" means okO = 1, uf = 5, ua = 5, un_ = 1, wf = 6, ws = 4, wa = 2, wb = 4, wc = 6, wn = 3, wd = 1, wy1 = 2, q = 1, ec = 2
-token "\q:[\q" means okO = 1, uf = 5, us = 6, ua = 6, ub = 5, un_ = 2, wf = 6, ws = 4, wa = 5, wb = 2, wc = 4, wn = 3, wd = 1, wy1 = 2, q = 2, ec = 2
-token "\q:[-" means okO = 1, uf = 5, ua = 5, un_ = 1, wf = 6, ws = 4, wa = 9, wb = 2, wc = 4, wn = 3, wd = 1, wh = 1, wk = 1, wy1 = 2, q = 1, ec = 2
-token "\q:[\{\q" means okO = 1, uf = 5, us = 6, ua = 6, ub = 5, un_ = 2, wf = 6, ws = 4, wa = 5, wb = 1, wc = 2, wn = 3, wd = 2, wy1 = 2, wy2 = 1, q = 2, ec = 2
-token "\q:\{\q" means okO = 1, uf = 5, us = 6, ua = 6, ub = 5, un_ = 2, wf = 6, ws = 4, wa = 5, wb = 1, wc = 4, wn = 3, wd = 1, wy1 = 1, q = 2, ec = 2
-token "\q;" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q;//" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q;}" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q<" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q</" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q<<" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q<?" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q=>" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q=>\q" means okO = 1, uf = 5, us = 6, ua = 6, ub = 5, un_ = 2, noI = 1, q = 2, ec = 2
-token "\q=>$" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q>" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q>#" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q>$" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q>$\{" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q>%" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q>&" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q>&#" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q>'" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q>'+" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q>'," means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q>'." means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q>'.$" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q>(" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q>*</" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q>//" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q><" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q><!--" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q></" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q><?" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q><?=" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q><?=$" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q>@" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q>\e" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q>\{" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q>\{\{" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q>\{\{$" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q>×</" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q?" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q@" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qA" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qAfter" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qAll" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qAnd" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qAs" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qAt" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qB" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qBut" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qC" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qD" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qDo" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qDon" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qE" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qF" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qFor" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qG" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qH" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qHe" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qHow" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qI" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qIf" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qIn" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qIt" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qJust" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qL" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qM" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qMy" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qN" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qNo" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qNot" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qNow" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qOh" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qOn" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qOne" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qOur" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qP" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qPeople" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qS" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qShe" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qSo" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qSome" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qT" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qThat" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qThe" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qThere" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qThese" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qThey" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qThis" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qTo" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qW" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qWe" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qWell" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qWhat" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qWhen" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qWhile" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qWhy" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qWith" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qYeah" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qYes" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qYou" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q[" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q\e" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q]" means okO = 1, uf = 5, ua = 5, un_ = 1, wf = 6, ws = 7, wa = 7, wb = 6, wn = 2, wd = -1, wx1 = 2, q = 1, ec = 2
-token "\q]')." means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q](" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q])" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q]))" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q])," means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q])." means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q]);" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q]," means okO = 1, uf = 5, ua = 5, un_ = 1, wf = 6, ws = 7, wa = 3, wb = 7, wc = 6, wn = 3, wd = -1, wx1 = 2, q = 1, ec = 2
-token "\q],\q" means okO = 1, uf = 5, us = 6, ua = 6, ub = 5, un_ = 2, wf = 6, ws = 7, wa = 5, wb = 3, wc = 7, wn = 3, wd = -1, wx1 = 2, q = 2, ec = 2
-token "\q],[\q" means okO = 1, uf = 5, us = 6, ua = 6, ub = 5, un_ = 2, wf = 6, ws = 7, wa = 5, wb = 2, wc = 3, wn = 3, wv = 1, wx1 = 2, wy1 = 2, q = 2, ec = 2
-token "\q]->" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q]." means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q].\q" means okO = 1, uf = 5, us = 6, ua = 6, ub = 5, un_ = 2, noI = 1, q = 2, ec = 2
-token "\q].(" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q]/" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q]:" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q];" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q]=" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q]=\q" means okO = 1, uf = 5, us = 6, ua = 6, ub = 5, un_ = 2, noI = 1, q = 2, ec = 2
-token "\q]=$" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q]==" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q]==\q" means okO = 1, uf = 5, us = 6, ua = 6, ub = 5, un_ = 2, noI = 1, q = 2, ec = 2
-token "\q]=>" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q][" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q][\q" means okO = 1, uf = 5, us = 6, ua = 6, ub = 5, un_ = 2, noI = 1, q = 2, ec = 2
-token "\q][$" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q]]" means okO = 1, uf = 5, ua = 5, un_ = 1, wf = 6, ws = 7, wa = 7, wb = 7, wc = 6, wn = 3, wd = -2, wx1 = 2, wx2 = 2, q = 1, ec = 2
-token "\q]}" means okO = 1, uf = 5, ua = 5, un_ = 1, wf = 6, ws = 7, wa = 7, wb = 7, wc = 6, wn = 3, wd = -2, wx1 = 2, wx2 = 1, q = 1, ec = 2
-token "\q^" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q_" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q`" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qa" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qbytes" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qc" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qclass" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qcontext" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qcrypto" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qd" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qdata" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qdefault" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qdescription" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qdisplay" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qencoding" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qerrors" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qf" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qfmt" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qg" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qgithub" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qgo" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qgroup" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qh" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qhttp" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qhttps" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qid" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qin" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qindices" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qio" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qis" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qk" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qlabel" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qlog" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qmath" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qname" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qnet" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qnil" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qos" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qpath" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qprofile" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qs" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qstrconv" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qstrings" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qstruct" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qsync" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qtesting" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qtext" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qtime" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qtitle" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qtype" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qurl" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qurls" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\quse" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\quser" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qvalue" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qw" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\qx" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q\{" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q|" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q}" means okO = 1, uf = 5, ua = 5, un_ = 1, wf = 6, ws = 7, wa = 7, wb = 6, wn = 2, wd = -1, wx1 = 1, q = 1, ec = 2
-token "\q})" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q}," means okO = 1, uf = 5, ua = 5, un_ = 1, wf = 6, ws = 7, wa = 3, wb = 7, wc = 6, wn = 3, wd = -1, wx1 = 1, q = 1, ec = 2
-token "\q},\q" means okO = 1, uf = 5, us = 6, ua = 6, ub = 5, un_ = 2, wf = 6, ws = 7, wa = 5, wb = 3, wc = 7, wn = 3, wd = -1, wx1 = 1, q = 2, ec = 2
-token "\q},\{\q" means okO = 1, uf = 5, us = 6, ua = 6, ub = 5, un_ = 2, wf = 6, ws = 7, wa = 5, wb = 1, wc = 3, wn = 3, wv = 1, wx1 = 1, wy1 = 1, q = 2, ec = 2
-token "\q}}" means okO = 1, uf = 5, ua = 5, un_ = 1, wf = 6, ws = 7, wa = 7, wb = 7, wc = 6, wn = 3, wd = -2, wx1 = 1, wx2 = 1, q = 1, ec = 2
-token "\q،" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
-token "\q—" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ec = 2
+token "\q" means okO = 1, uf = 5, ua = 5, un_ = 1, wf = 6, wa = 6, wn = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q!" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q\q" means okO = 1, uf = 5, us = 6, ua = 6, ub = 5, un_ = 2, noI = 1, q = 2, zf = 6, za = 6, zn = 1, qe = -1, ec = 2, qb = 1
+token "\q\q\q" means noI = 1, q = 3, noE = 1, qe = -1, ec = 2, qb = 1
+token "\q\q\q." means noI = 1, q = 3, noE = 1, qe = -1, ec = 2, qb = 1
+token "\q\q," means okO = 1, uf = 5, us = 6, ua = 3, ub = 6, uc = 5, un_ = 3, noI = 1, q = 2, zf = 6, zs = 3, za = 3, zb = 6, zn = 2, qe = -1, ec = 2, qb = 1
+token "\q\q." means noI = 1, q = 2, noE = 1, qe = -1, ec = 2, qb = 1
+token "\q\q:" means okO = 1, uf = 5, us = 6, ua = 4, ub = 6, uc = 5, un_ = 3, noI = 1, q = 2, zf = 6, zs = 4, za = 4, zb = 6, zn = 2, qe = -1, ec = 2, qb = 1
+token "\q#" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q$" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q$\{" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q%" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q%(" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q&" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q'" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q'," means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q';" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q(" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q)" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q)!=" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q)(" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q))" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q)))" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q)));" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q))," means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q))." means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q));" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q)+" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q)," means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q),\q" means okO = 1, uf = 5, us = 6, ua = 6, ub = 5, un_ = 2, noI = 1, q = 2, zf = 6, za = 6, zn = 1, qe = -1, ec = 2, qb = 1
+token "\q)->" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q)." means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q):" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q);" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q);//" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q)==" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q)[" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q)]" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q)\{" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q)}" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q*" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q**" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q*," means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q+" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q+\q" means okO = 1, uf = 5, us = 6, ua = 6, ub = 5, un_ = 2, noI = 1, q = 2, zf = 6, za = 6, zn = 1, qe = -1, ec = 2, qb = 1
+token "\q," means okO = 1, uf = 5, ua = 5, un_ = 1, wf = 6, ws = 3, wa = 3, wb = 6, wn = 2, q = 1, qe = -1, ec = 2, qb = 1
+token "\q,\q" means okO = 1, uf = 5, us = 6, ua = 6, ub = 5, un_ = 2, wf = 6, ws = 3, wa = 5, wb = 3, wc = 6, wn = 3, q = 2, zf = 6, za = 6, zn = 1, qe = -1, ec = 2, qb = 1
+token "\q,\q\q," means wf = 6, ws = 3, wa = 3, wb = 6, wc = 5, wn = 3, q = 3, noE = 1, qe = -1, ec = 2, qb = 1
+token "\q,\q\q,\q" means wf = 6, ws = 3, wa = 5, wb = 3, wc = 6, wn = 3, q = 4, noE = 1, qe = -1, ec = 2, qb = 1
+token "\q,\q#" means wf = 6, ws = 3, wa = 5, wb = 3, wc = 6, wn = 3, q = 2, noE = 1, qe = -1, ec = 2, qb = 1
+token "\q,\q+" means wf = 6, ws = 3, wa = 5, wb = 3, wc = 6, wn = 3, q = 2, noE = 1, qe = -1, ec = 2, qb = 1
+token "\q,\q\e" means wf = 6, ws = 3, wa = 5, wb = 3, wc = 6, wn = 3, un = 1, q = 2, noE = 1, qe = -1, ec = 2, qb = 1
+token "\q,$" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q,&" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q,'" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q,(" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q,-" means okO = 1, uf = 5, ua = 5, un_ = 1, wf = 6, ws = 3, wa = 9, wb = 3, wc = 6, wn = 3, wv = 1, wh = 1, wk = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q,@\q" means okO = 1, uf = 5, us = 6, ua = 6, ub = 5, un_ = 2, noI = 1, q = 2, zf = 6, za = 6, zn = 1, qe = -1, ec = 2, qb = 1
+token "\q,[" means okO = 1, uf = 5, ua = 5, un_ = 1, wf = 6, ws = 3, wa = 2, wb = 3, wc = 6, wn = 3, wd = 1, wv = 1, wy1 = 2, q = 1, qe = -1, ec = 2, qb = 1
+token "\q,__" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q,\{" means okO = 1, uf = 5, ua = 5, un_ = 1, wf = 6, ws = 3, wa = 1, wb = 3, wc = 6, wn = 3, wd = 1, wv = 1, wy1 = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q-" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q--" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q." means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q.\q" means okO = 1, uf = 5, us = 6, ua = 6, ub = 5, un_ = 2, noI = 1, q = 2, zf = 6, za = 6, zn = 1, qe = -1, ec = 2, qb = 1
+token "\q.$" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q.$_" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q.**" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q.." means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q..." means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q./" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q/" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q/>" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q/>.</" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q/><" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q/></" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q:" means okO = 1, uf = 5, ua = 5, un_ = 1, wf = 6, ws = 4, wa = 4, wb = 6, wn = 2, q = 1, qe = -1, ec = 2, qb = 1
+token "\q:\q" means okO = 1, uf = 5, us = 6, ua = 6, ub = 5, un_ = 2, wf = 6, ws = 4, wa = 5, wb = 4, wc = 6, wn = 3, q = 2, zf = 6, za = 6, zn = 1, qe = -1, ec = 2, qb = 1
+token "\q:\q\q" means wf = 6, ws = 4, wa = 6, wb = 5, wc = 4, wn = 3, q = 3, noE = 1, qe = -1, ec = 2, qb = 1
+token "\q:\q\q,\q" means wf = 6, ws = 4, wa = 5, wb = 3, wc = 6, wn = 3, q = 4, noE = 1, qe = -1, ec = 2, qb = 1
+token "\q:\q'" means wf = 6, ws = 4, wa = 5, wb = 4, wc = 6, wn = 3, q = 2, noE = 1, qe = -1, ec = 2, qb = 1
+token "\q:\q+" means wf = 6, ws = 4, wa = 5, wb = 4, wc = 6, wn = 3, q = 2, noE = 1, qe = -1, ec = 2, qb = 1
+token "\q:\q/" means wf = 6, ws = 4, wa = 5, wb = 4, wc = 6, wn = 3, q = 2, noE = 1, qe = -1, ec = 2, qb = 1
+token "\q:-" means okO = 1, uf = 5, ua = 5, un_ = 1, wf = 6, ws = 4, wa = 9, wb = 4, wc = 6, wn = 3, wh = 1, wk = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q:@\q" means okO = 1, uf = 5, us = 6, ua = 6, ub = 5, un_ = 2, noI = 1, q = 2, zf = 6, za = 6, zn = 1, qe = -1, ec = 2, qb = 1
+token "\q:[" means okO = 1, uf = 5, ua = 5, un_ = 1, wf = 6, ws = 4, wa = 2, wb = 4, wc = 6, wn = 3, wd = 1, wy1 = 2, q = 1, qe = -1, ec = 2, qb = 1
+token "\q:[\q" means okO = 1, uf = 5, us = 6, ua = 6, ub = 5, un_ = 2, wf = 6, ws = 4, wa = 5, wb = 2, wc = 4, wn = 3, wd = 1, wy1 = 2, q = 2, zf = 6, za = 6, zn = 1, qe = -1, ec = 2, qb = 1
+token "\q:[-" means okO = 1, uf = 5, ua = 5, un_ = 1, wf = 6, ws = 4, wa = 9, wb = 2, wc = 4, wn = 3, wd = 1, wh = 1, wk = 1, wy1 = 2, q = 1, qe = -1, ec = 2, qb = 1
+token "\q:[\{\q" means okO = 1, uf = 5, us = 6, ua = 6, ub = 5, un_ = 2, wf = 6, ws = 4, wa = 5, wb = 1, wc = 2, wn = 3, wd = 2, wy1 = 2, wy2 = 1, q = 2, zf = 6, za = 6, zn = 1, qe = -1, ec = 2, qb = 1
+token "\q:\{\q" means okO = 1, uf = 5, us = 6, ua = 6, ub = 5, un_ = 2, wf = 6, ws = 4, wa = 5, wb = 1, wc = 4, wn = 3, wd = 1, wy1 = 1, q = 2, zf = 6, za = 6, zn = 1, qe = -1, ec = 2, qb = 1
+token "\q;" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q;//" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q;}" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q<" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q</" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q<<" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q<?" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q=>" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q=>\q" means okO = 1, uf = 5, us = 6, ua = 6, ub = 5, un_ = 2, noI = 1, q = 2, zf = 6, za = 6, zn = 1, qe = -1, ec = 2, qb = 1
+token "\q=>$" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q>" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q>#" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q>$" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q>$\{" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q>%" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q>&" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q>&#" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q>'" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q>'+" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q>'," means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q>'." means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q>'.$" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q>(" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q>*</" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q>//" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q><" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q><!--" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q></" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q><?" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q><?=" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q><?=$" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q>@" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q>\e" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ue = 1, qe = -1, ec = 2, qb = 1
+token "\q>\{" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q>\{\{" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q>\{\{$" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q>×</" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q?" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q@" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qA" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qAfter" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qAll" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qAnd" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qAs" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qAt" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qB" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qBut" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qC" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qD" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qDo" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qDon" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qE" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qF" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qFor" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qG" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qH" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qHe" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qHow" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qI" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qIf" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qIn" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qIt" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qJust" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qL" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qM" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qMy" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qN" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qNo" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qNot" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qNow" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qOh" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qOn" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qOne" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qOur" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qP" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qPeople" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qS" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qShe" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qSo" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qSome" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qT" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qThat" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qThe" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qThere" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qThese" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qThey" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qThis" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qTo" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qW" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qWe" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qWell" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qWhat" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qWhen" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qWhile" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qWhy" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qWith" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qYeah" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qYes" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qYou" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q[" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q\e" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, ue = 1, qe = -1, ec = 2, qb = 1
+token "\q]" means okO = 1, uf = 5, ua = 5, un_ = 1, wf = 6, ws = 7, wa = 7, wb = 6, wn = 2, wd = -1, wx1 = 2, q = 1, qe = -1, ec = 2, qb = 1
+token "\q]')." means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q](" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q])" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q]))" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q])," means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q])." means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q]);" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q]," means okO = 1, uf = 5, ua = 5, un_ = 1, wf = 6, ws = 7, wa = 3, wb = 7, wc = 6, wn = 3, wd = -1, wx1 = 2, q = 1, qe = -1, ec = 2, qb = 1
+token "\q],\q" means okO = 1, uf = 5, us = 6, ua = 6, ub = 5, un_ = 2, wf = 6, ws = 7, wa = 5, wb = 3, wc = 7, wn = 3, wd = -1, wx1 = 2, q = 2, zf = 6, za = 6, zn = 1, qe = -1, ec = 2, qb = 1
+token "\q],[\q" means okO = 1, uf = 5, us = 6, ua = 6, ub = 5, un_ = 2, wf = 6, ws = 7, wa = 5, wb = 2, wc = 3, wn = 3, wv = 1, wx1 = 2, wy1 = 2, q = 2, zf = 6, za = 6, zn = 1, qe = -1, ec = 2, qb = 1
+token "\q]->" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q]." means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q].\q" means okO = 1, uf = 5, us = 6, ua = 6, ub = 5, un_ = 2, noI = 1, q = 2, zf = 6, za = 6, zn = 1, qe = -1, ec = 2, qb = 1
+token "\q].(" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q]/" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q]:" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q];" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q]=" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q]=\q" means okO = 1, uf = 5, us = 6, ua = 6, ub = 5, un_ = 2, noI = 1, q = 2, zf = 6, za = 6, zn = 1, qe = -1, ec = 2, qb = 1
+token "\q]=$" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q]==" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q]==\q" means okO = 1, uf = 5, us = 6, ua = 6, ub = 5, un_ = 2, noI = 1, q = 2, zf = 6, za = 6, zn = 1, qe = -1, ec = 2, qb = 1
+token "\q]=>" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q][" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q][\q" means okO = 1, uf = 5, us = 6, ua = 6, ub = 5, un_ = 2, noI = 1, q = 2, zf = 6, za = 6, zn = 1, qe = -1, ec = 2, qb = 1
+token "\q][$" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q]]" means okO = 1, uf = 5, ua = 5, un_ = 1, wf = 6, ws = 7, wa = 7, wb = 7, wc = 6, wn = 3, wd = -2, wx1 = 2, wx2 = 2, q = 1, qe = -1, ec = 2, qb = 1
+token "\q]}" means okO = 1, uf = 5, ua = 5, un_ = 1, wf = 6, ws = 7, wa = 7, wb = 7, wc = 6, wn = 3, wd = -2, wx1 = 2, wx2 = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q^" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q_" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q`" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qa" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qbytes" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qc" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qclass" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qcontext" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qcrypto" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qd" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qdata" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qdefault" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qdescription" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qdisplay" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qencoding" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qerrors" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qf" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qfmt" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qg" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qgithub" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qgo" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qgroup" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qh" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qhttp" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qhttps" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qid" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qin" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qindices" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qio" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qis" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qk" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qlabel" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qlog" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qmath" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qname" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qnet" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qnil" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qos" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qpath" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qprofile" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qs" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qstrconv" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qstrings" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qstruct" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qsync" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qtesting" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qtext" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qtime" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qtitle" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qtype" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qurl" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qurls" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\quse" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\quser" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qvalue" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qw" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\qx" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q\{" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q|" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q}" means okO = 1, uf = 5, ua = 5, un_ = 1, wf = 6, ws = 7, wa = 7, wb = 6, wn = 2, wd = -1, wx1 = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q})" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q}," means okO = 1, uf = 5, ua = 5, un_ = 1, wf = 6, ws = 7, wa = 3, wb = 7, wc = 6, wn = 3, wd = -1, wx1 = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q},\q" means okO = 1, uf = 5, us = 6, ua = 6, ub = 5, un_ = 2, wf = 6, ws = 7, wa = 5, wb = 3, wc = 7, wn = 3, wd = -1, wx1 = 1, q = 2, zf = 6, za = 6, zn = 1, qe = -1, ec = 2, qb = 1
+token "\q},\{\q" means okO = 1, uf = 5, us = 6, ua = 6, ub = 5, un_ = 2, wf = 6, ws = 7, wa = 5, wb = 1, wc = 3, wn = 3, wv = 1, wx1 = 1, wy1 = 1, q = 2, zf = 6, za = 6, zn = 1, qe = -1, ec = 2, qb = 1
+token "\q}}" means okO = 1, uf = 5, ua = 5, un_ = 1, wf = 6, ws = 7, wa = 7, wb = 7, wc = 6, wn = 3, wd = -2, wx1 = 1, wx2 = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q،" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\q—" means okO = 1, uf = 5, ua = 5, un_ = 1, noI = 1, q = 1, qe = -1, ec = 2, qb = 1
 token "#\q" means wf = 6, wa = 6, wn = 1, q = 1
 token "#\q," means wf = 6, ws = 3, wa = 3, wb = 6, wn = 2, q = 1
 token "#\e" means un = 1
@@ -3573,7 +3579,7 @@ token "/\{\{" means ec = 1
 token "/\{\{$" means ec = 1
 token "/\{}/" means ec = 1
 token "/~" means ec = 1
-token "0" means okO = 1, uf = 9, ua = 9, un_ = 1, uh = 3, uk = 3
+token "0" means okO = 1, uf = 9, ua = 9, un_ = 1, uh = 3, uk = 3, ze = 2
 token "1" means okO = 1, uf = 9, ua = 9, un_ = 1, uh = 2, uk = 2
 token "2" means okO = 1, uf = 9, ua = 9, un_ = 1, uh = 2, uk = 2
 token "3" means okO = 1, uf = 9, ua = 9, un_ = 1, uh = 2, uk = 2
@@ -3743,238 +3749,238 @@ token "[]\{\q" means wf = 6, wa = 6, wn = 1, q = 1
 token "[]}" means okO = 1, uf = 2, us = 7, ua = 7, ub = 7, uc = 2, un_ = 3, ud = -1, ux1 = 1
 token "[e" means okO = 1, uf = 2, us = 9, ua = 9, ub = 2, un_ = 2, ud = 1, uh = 5, uk = 5, uy1 = 2
 token "[\{" means okO = 1, uf = 2, us = 1, ua = 1, ub = 2, un_ = 2, ud = 2, uy1 = 2, uy2 = 1
-token "\e" means un = 1, ec = 2
-token "\e\q" means ec = 2
-token "\e\q\q" means wf = 6, wa = 6, wn = 1, q = 1, ec = 2
-token "\e\q\q," means wf = 6, ws = 3, wa = 3, wb = 6, wn = 2, q = 1, ec = 2
-token "\e\q)" means ec = 2
-token "\e\q," means ec = 2
-token "\e\q,\e" means un = 1, ec = 2
-token "\e\q,\e\q" means ec = 2
-token "\e\q:" means ec = 2
-token "\e\q:\e\q" means ec = 2
-token "\e\q:\{\e\q" means ec = 2
-token "\e\q>" means ec = 2
-token "\e\q>\q" means wf = 6, wa = 6, wn = 1, q = 1, ec = 2
-token "\e\q><" means ec = 2
-token "\e\q></" means ec = 2
-token "\e\q>\e" means un = 1, ec = 2
-token "\e\q\e" means un = 1, ec = 2
-token "\e\q]" means ec = 2
-token "\e$" means noI = 1, ec = 2
-token "\e'" means noI = 1, ec = 2
-token "\e'," means noI = 1, ec = 2
-token "\e'\e" means noI = 1, un = 1, ec = 2
-token "\e(" means noI = 1, ec = 2
-token "\e)" means noI = 1, ec = 2
-token "\e-" means noI = 1, ec = 2
-token "\e." means noI = 1, ec = 2
-token "\e/" means ec = 2
-token "\e/\e/" means ec = 2
-token "\e:" means noI = 1, ec = 2
-token "\e<" means noI = 1, ec = 2
-token "\e<^" means noI = 1, ec = 2
-token "\eAPI" means noI = 1, ec = 2
-token "\eAbstract" means noI = 1, ec = 2
-token "\eAction" means noI = 1, ec = 2
-token "\eActive" means noI = 1, ec = 2
-token "\eActiveForm" means noI = 1, ec = 2
-token "\eAdmin" means noI = 1, ec = 2
-token "\eAnnotation" means noI = 1, ec = 2
-token "\eApi" means noI = 1, ec = 2
-token "\eApp" means noI = 1, ec = 2
-token "\eAppData" means noI = 1, ec = 2
-token "\eApplication" means noI = 1, ec = 2
-token "\eArray" means noI = 1, ec = 2
-token "\eAuth" means noI = 1, ec = 2
-token "\eBackend" means noI = 1, ec = 2
-token "\eBase" means noI = 1, ec = 2
-token "\eBlock" means noI = 1, ec = 2
-token "\eBlueprint" means noI = 1, ec = 2
-token "\eBridge" means noI = 1, ec = 2
-token "\eBuilder" means noI = 1, ec = 2
-token "\eBundle" means noI = 1, ec = 2
-token "\eC" means noI = 1, ec = 2
-token "\eCMS" means noI = 1, ec = 2
-token "\eCache" means noI = 1, ec = 2
-token "\eCarbon" means noI = 1, ec = 2
-token "\eCatalog" means noI = 1, ec = 2
-token "\eCategory" means noI = 1, ec = 2
-token "\eClient" means noI = 1, ec = 2
-token "\eCollection" means noI = 1, ec = 2
-token "\eCollections" means noI = 1, ec = 2
-token "\eColumn" means noI = 1, ec = 2
-token "\eCommand" means noI = 1, ec = 2
-token "\eCommon" means noI = 1, ec = 2
-token "\eComponent" means noI = 1, ec = 2
-token "\eConfig" means noI = 1, ec = 2
-token "\eConfiguration" means noI = 1, ec = 2
-token "\eConsole" means noI = 1, ec = 2
-token "\eContainer" means noI = 1, ec = 2
-token "\eContext" means noI = 1, ec = 2
-token "\eContracts" means noI = 1, ec = 2
-token "\eController" means noI = 1, ec = 2
-token "\eControllers" means noI = 1, ec = 2
-token "\eCore" means noI = 1, ec = 2
-token "\eCustomer" means noI = 1, ec = 2
-token "\eD" means noI = 1, ec = 2
-token "\eDB" means noI = 1, ec = 2
-token "\eData" means noI = 1, ec = 2
-token "\eDatabase" means noI = 1, ec = 2
-token "\eDb" means noI = 1, ec = 2
-token "\eDependency" means noI = 1, ec = 2
-token "\eDependencyInjection" means noI = 1, ec = 2
-token "\eDesktop" means noI = 1, ec = 2
-token "\eDoctrine" means noI = 1, ec = 2
-token "\eDomain" means noI = 1, ec = 2
-token "\eE" means noI = 1, ec = 2
-token "\eEloquent" means noI = 1, ec = 2
-token "\eEntities" means noI = 1, ec = 2
-token "\eEntity" means noI = 1, ec = 2
-token "\eEvent" means noI = 1, ec = 2
-token "\eEvents" means noI = 1, ec = 2
-token "\eException" means noI = 1, ec = 2
-token "\eExceptions" means noI = 1, ec = 2
-token "\eExtension" means noI = 1, ec = 2
-token "\eF" means noI = 1, ec = 2
-token "\eFacades" means noI = 1, ec = 2
-token "\eFactories" means noI = 1, ec = 2
-token "\eFactory" means noI = 1, ec = 2
-token "\eField" means noI = 1, ec = 2
-token "\eFile" means noI = 1, ec = 2
-token "\eForm" means noI = 1, ec = 2
-token "\eFoundation" means noI = 1, ec = 2
-token "\eFramework" means noI = 1, ec = 2
-token "\eFrameworkBundle" means noI = 1, ec = 2
-token "\eGeneratedValue" means noI = 1, ec = 2
-token "\eHas" means noI = 1, ec = 2
-token "\eHelper" means noI = 1, ec = 2
-token "\eHelpers" means noI = 1, ec = 2
-token "\eHtml" means noI = 1, ec = 2
-token "\eHttp" means noI = 1, ec = 2
-token "\eHttpFoundation" means noI = 1, ec = 2
-token "\eId" means noI = 1, ec = 2
-token "\eImage" means noI = 1, ec = 2
-token "\eInput" means noI = 1, ec = 2
-token "\eJson" means noI = 1, ec = 2
-token "\eL" means noI = 1, ec = 2
-token "\eLib" means noI = 1, ec = 2
-token "\eLog" means noI = 1, ec = 2
-token "\eM" means noI = 1, ec = 2
-token "\eMail" means noI = 1, ec = 2
-token "\eMapping" means noI = 1, ec = 2
-token "\eMessage" means noI = 1, ec = 2
-token "\eMiddleware" means noI = 1, ec = 2
-token "\eMigration" means noI = 1, ec = 2
-token "\eMigrations" means noI = 1, ec = 2
-token "\eModel" means noI = 1, ec = 2
-token "\eModels" means noI = 1, ec = 2
-token "\eModule" means noI = 1, ec = 2
-token "\eModules" means noI = 1, ec = 2
-token "\eNotifications" means noI = 1, ec = 2
-token "\eORM" means noI = 1, ec = 2
-token "\eObject" means noI = 1, ec = 2
-token "\eOptionsResolver" means noI = 1, ec = 2
-token "\eOrder" means noI = 1, ec = 2
-token "\eP" means noI = 1, ec = 2
-token "\ePage" means noI = 1, ec = 2
-token "\ePersistence" means noI = 1, ec = 2
-token "\ePhp" means noI = 1, ec = 2
-token "\ePlugin" means noI = 1, ec = 2
-token "\ePost" means noI = 1, ec = 2
-token "\eProduct" means noI = 1, ec = 2
-token "\eQuery" means noI = 1, ec = 2
-token "\eQueue" means noI = 1, ec = 2
-token "\eR" means noI = 1, ec = 2
-token "\eRedirect" means noI = 1, ec = 2
-token "\eRepositories" means noI = 1, ec = 2
-token "\eRepository" means noI = 1, ec = 2
-token "\eRequest" means noI = 1, ec = 2
-token "\eRequests" means noI = 1, ec = 2
-token "\eResource" means noI = 1, ec = 2
-token "\eResources" means noI = 1, ec = 2
-token "\eResponse" means noI = 1, ec = 2
-token "\eRoute" means noI = 1, ec = 2
-token "\eRouting" means noI = 1, ec = 2
-token "\eS" means noI = 1, ec = 2
-token "\eSchema" means noI = 1, ec = 2
-token "\eSecurity" means noI = 1, ec = 2
-token "\eSeeder" means noI = 1, ec = 2
-token "\eService" means noI = 1, ec = 2
-token "\eServices" means noI = 1, ec = 2
-token "\eSession" means noI = 1, ec = 2
-token "\eStorage" means noI = 1, ec = 2
-token "\eSupport" means noI = 1, ec = 2
-token "\eSystem" means noI = 1, ec = 2
-token "\eTable" means noI = 1, ec = 2
-token "\eTemplate" means noI = 1, ec = 2
-token "\eTest" means noI = 1, ec = 2
-token "\eTestCase" means noI = 1, ec = 2
-token "\eTests" means noI = 1, ec = 2
-token "\eTraits" means noI = 1, ec = 2
-token "\eTwig" means noI = 1, ec = 2
-token "\eType" means noI = 1, ec = 2
-token "\eUnit" means noI = 1, ec = 2
-token "\eUrl" means noI = 1, ec = 2
-token "\eUser" means noI = 1, ec = 2
-token "\eV" means noI = 1, ec = 2
-token "\eValidation" means noI = 1, ec = 2
-token "\eValidator" means noI = 1, ec = 2
-token "\eView" means noI = 1, ec = 2
-token "\eWeb" means noI = 1, ec = 2
-token "\e[" means noI = 1, ec = 2
-token "\e\e" means ec = 2
-token "\e\e\q" means wf = 6, wa = 6, wn = 1, q = 1, ec = 2
-token "\e\e." means ec = 2
-token "\e\e/" means ec = 2
-token "\e\e\e" means un = 1, ec = 2
-token "\e\e\e\e" means ec = 2
-token "\e_" means noI = 1, ec = 2
-token "\ea" means noI = 1, ec = 2
-token "\eadmin" means noI = 1, ec = 2
-token "\eapplication" means noI = 1, ec = 2
-token "\eb" means ec = 2
-token "\ebase" means ec = 2
-token "\ebrief" means ec = 2
-token "\ecommon" means noI = 1, ec = 2
-token "\econtrollers" means noI = 1, ec = 2
-token "\ecore" means noI = 1, ec = 2
-token "\ed" means noI = 1, ec = 2
-token "\edata" means noI = 1, ec = 2
-token "\edb" means noI = 1, ec = 2
-token "\ee" means noI = 1, ec = 2
-token "\ef" means ec = 2
-token "\egrid" means noI = 1, ec = 2
-token "\ehelpers" means noI = 1, ec = 2
-token "\ehtdocs" means noI = 1, ec = 2
-token "\emodel" means noI = 1, ec = 2
-token "\emodels" means noI = 1, ec = 2
-token "\emodules" means noI = 1, ec = 2
-token "\en" means ec = 2
-token "\eparam" means noI = 1, ec = 2
-token "\er" means ec = 2
-token "\es" means noI = 1, ec = 2
-token "\esystem" means noI = 1, ec = 2
-token "\et" means ec = 2
-token "\eu" means ec = 2
-token "\euB" means ec = 2
-token "\euC" means ec = 2
-token "\euD" means ec = 2
-token "\euc" means ec = 2
-token "\euff" means ec = 2
-token "\ev" means noI = 1, ec = 2
-token "\eviews" means noI = 1, ec = 2
-token "\eweb" means noI = 1, ec = 2
-token "\ewidgets" means noI = 1, ec = 2
-token "\ex" means noI = 1, ec = 2
-token "\exa" means noI = 1, ec = 2
-token "\exaa" means noI = 1, ec = 2
-token "\exb" means noI = 1, ec = 2
-token "\exc" means noI = 1, ec = 2
-token "\exd" means noI = 1, ec = 2
-token "\exe" means noI = 1, ec = 2
-token "\exf" means noI = 1, ec = 2
-token "\exff" means noI = 1, ec = 2
+token "\e" means un = 1, ec = 2, qb = 1
+token "\e\q" means zf = 6, za = 6, zn = 1, qe = 1, ec = 2, qb = 1
+token "\e\q\q" means wf = 6, wa = 6, wn = 1, q = 1, noE = 1, qe = 1, ec = 2, qb = 1
+token "\e\q\q," means wf = 6, ws = 3, wa = 3, wb = 6, wn = 2, q = 1, noE = 1, qe = 1, ec = 2, qb = 1
+token "\e\q)" means noE = 1, qe = 1, ec = 2, qb = 1
+token "\e\q," means zf = 6, zs = 3, za = 3, zb = 6, zn = 2, qe = 1, ec = 2, qb = 1
+token "\e\q,\e" means un = 1, noE = 1, qe = 1, ec = 2, qb = 1
+token "\e\q,\e\q" means noE = 1, qe = 2, ec = 2, qb = 1
+token "\e\q:" means zf = 6, zs = 4, za = 4, zb = 6, zn = 2, qe = 1, ec = 2, qb = 1
+token "\e\q:\e\q" means noE = 1, qe = 2, ec = 2, qb = 1
+token "\e\q:\{\e\q" means noE = 1, qe = 2, ec = 2, qb = 1
+token "\e\q>" means noE = 1, qe = 1, ec = 2, qb = 1
+token "\e\q>\q" means wf = 6, wa = 6, wn = 1, q = 1, noE = 1, qe = 1, ec = 2, qb = 1
+token "\e\q><" means noE = 1, qe = 1, ec = 2, qb = 1
+token "\e\q></" means noE = 1, qe = 1, ec = 2, qb = 1
+token "\e\q>\e" means un = 1, noE = 1, qe = 1, ec = 2, qb = 1
+token "\e\q\e" means un = 1, noE = 1, qe = 1, ec = 2, qb = 1
+token "\e\q]" means zf = 6, zs = 7, za = 7, zb = 6, zn = 2, zd = -1, zx1 = 2, qe = 1, ec = 2, qb = 1
+token "\e$" means noI = 1, ec = 2, qb = 1
+token "\e'" means noI = 1, ec = 2, qb = 1
+token "\e'," means noI = 1, ec = 2, qb = 1
+token "\e'\e" means noI = 1, un = 1, ue = 1, ec = 2, qb = 1
+token "\e(" means noI = 1, ec = 2, qb = 1
+token "\e)" means noI = 1, ec = 2, qb = 1
+token "\e-" means noI = 1, ec = 2, qb = 1
+token "\e." means noI = 1, ec = 2, qb = 1
+token "\e/" means ec = 2, qb = 1
+token "\e/\e/" means ec = 2, qb = 1
+token "\e:" means noI = 1, ec = 2, qb = 1
+token "\e<" means noI = 1, ec = 2, qb = 1
+token "\e<^" means noI = 1, ec = 2, qb = 1
+token "\eAPI" means noI = 1, ec = 2, qb = 1
+token "\eAbstract" means noI = 1, ec = 2, qb = 1
+token "\eAction" means noI = 1, ec = 2, qb = 1
+token "\eActive" means noI = 1, ec = 2, qb = 1
+token "\eActiveForm" means noI = 1, ec = 2, qb = 1
+token "\eAdmin" means noI = 1, ec = 2, qb = 1
+token "\eAnnotation" means noI = 1, ec = 2, qb = 1
+token "\eApi" means noI = 1, ec = 2, qb = 1
+token "\eApp" means noI = 1, ec = 2, qb = 1
+token "\eAppData" means noI = 1, ec = 2, qb = 1
+token "\eApplication" means noI = 1, ec = 2, qb = 1
+token "\eArray" means noI = 1, ec = 2, qb = 1
+token "\eAuth" means noI = 1, ec = 2, qb = 1
+token "\eBackend" means noI = 1, ec = 2, qb = 1
+token "\eBase" means noI = 1, ec = 2, qb = 1
+token "\eBlock" means noI = 1, ec = 2, qb = 1
+token "\eBlueprint" means noI = 1, ec = 2, qb = 1
+token "\eBridge" means noI = 1, ec = 2, qb = 1
+token "\eBuilder" means noI = 1, ec = 2, qb = 1
+token "\eBundle" means noI = 1, ec = 2, qb = 1
+token "\eC" means noI = 1, ec = 2, qb = 1
+token "\eCMS" means noI = 1, ec = 2, qb = 1
+token "\eCache" means noI = 1, ec = 2, qb = 1
+token "\eCarbon" means noI = 1, ec = 2, qb = 1
+token "\eCatalog" means noI = 1, ec = 2, qb = 1
+token "\eCategory" means noI = 1, ec = 2, qb = 1
+token "\eClient" means noI = 1, ec = 2, qb = 1
+token "\eCollection" means noI = 1, ec = 2, qb = 1
+token "\eCollections" means noI = 1, ec = 2, qb = 1
+token "\eColumn" means noI = 1, ec = 2, qb = 1
+token "\eCommand" means noI = 1, ec = 2, qb = 1
+token "\eCommon" means noI = 1, ec = 2, qb = 1
+token "\eComponent" means noI = 1, ec = 2, qb = 1
+token "\eConfig" means noI = 1, ec = 2, qb = 1
+token "\eConfiguration" means noI = 1, ec = 2, qb = 1
+token "\eConsole" means noI = 1, ec = 2, qb = 1
+token "\eContainer" means noI = 1, ec = 2, qb = 1
+token "\eContext" means noI = 1, ec = 2, qb = 1
+token "\eContracts" means noI = 1, ec = 2, qb = 1
+token "\eController" means noI = 1, ec = 2, qb = 1
+token "\eControllers" means noI = 1, ec = 2, qb = 1
+token "\eCore" means noI = 1, ec = 2, qb = 1
+token "\eCustomer" means noI = 1, ec = 2, qb = 1
+token "\eD" means noI = 1, ec = 2, qb = 1
+token "\eDB" means noI = 1, ec = 2, qb = 1
+token "\eData" means noI = 1, ec = 2, qb = 1
+token "\eDatabase" means noI = 1, ec = 2, qb = 1
+token "\eDb" means noI = 1, ec = 2, qb = 1
+token "\eDependency" means noI = 1, ec = 2, qb = 1
+token "\eDependencyInjection" means noI = 1, ec = 2, qb = 1
+token "\eDesktop" means noI = 1, ec = 2, qb = 1
+token "\eDoctrine" means noI = 1, ec = 2, qb = 1
+token "\eDomain" means noI = 1, ec = 2, qb = 1
+token "\eE" means noI = 1, ec = 2, qb = 1
+token "\eEloquent" means noI = 1, ec = 2, qb = 1
+token "\eEntities" means noI = 1, ec = 2, qb = 1
+token "\eEntity" means noI = 1, ec = 2, qb = 1
+token "\eEvent" means noI = 1, ec = 2, qb = 1
+token "\eEvents" means noI = 1, ec = 2, qb = 1
+token "\eException" means noI = 1, ec = 2, qb = 1
+token "\eExceptions" means noI = 1, ec = 2, qb = 1
+token "\eExtension" means noI = 1, ec = 2, qb = 1
+token "\eF" means noI = 1, ec = 2, qb = 1
+token "\eFacades" means noI = 1, ec = 2, qb = 1
+token "\eFactories" means noI = 1, ec = 2, qb = 1
+token "\eFactory" means noI = 1, ec = 2, qb = 1
+token "\eField" means noI = 1, ec = 2, qb = 1
+token "\eFile" means noI = 1, ec = 2, qb = 1
+token "\eForm" means noI = 1, ec = 2, qb = 1
+token "\eFoundation" means noI = 1, ec = 2, qb = 1
+token "\eFramework" means noI = 1, ec = 2, qb = 1
+token "\eFrameworkBundle" means noI = 1, ec = 2, qb = 1
+token "\eGeneratedValue" means noI = 1, ec = 2, qb = 1
+token "\eHas" means noI = 1, ec = 2, qb = 1
+token "\eHelper" means noI = 1, ec = 2, qb = 1
+token "\eHelpers" means noI = 1, ec = 2, qb = 1
+token "\eHtml" means noI = 1, ec = 2, qb = 1
+token "\eHttp" means noI = 1, ec = 2, qb = 1
+token "\eHttpFoundation" means noI = 1, ec = 2, qb = 1
+token "\eId" means noI = 1, ec = 2, qb = 1
+token "\eImage" means noI = 1, ec = 2, qb = 1
+token "\eInput" means noI = 1, ec = 2, qb = 1
+token "\eJson" means noI = 1, ec = 2, qb = 1
+token "\eL" means noI = 1, ec = 2, qb = 1
+token "\eLib" means noI = 1, ec = 2, qb = 1
+token "\eLog" means noI = 1, ec = 2, qb = 1
+token "\eM" means noI = 1, ec = 2, qb = 1
+token "\eMail" means noI = 1, ec = 2, qb = 1
+token "\eMapping" means noI = 1, ec = 2, qb = 1
+token "\eMessage" means noI = 1, ec = 2, qb = 1
+token "\eMiddleware" means noI = 1, ec = 2, qb = 1
+token "\eMigration" means noI = 1, ec = 2, qb = 1
+token "\eMigrations" means noI = 1, ec = 2, qb = 1
+token "\eModel" means noI = 1, ec = 2, qb = 1
+token "\eModels" means noI = 1, ec = 2, qb = 1
+token "\eModule" means noI = 1, ec = 2, qb = 1
+token "\eModules" means noI = 1, ec = 2, qb = 1
+token "\eNotifications" means noI = 1, ec = 2, qb = 1
+token "\eORM" means noI = 1, ec = 2, qb = 1
+token "\eObject" means noI = 1, ec = 2, qb = 1
+token "\eOptionsResolver" means noI = 1, ec = 2, qb = 1
+token "\eOrder" means noI = 1, ec = 2, qb = 1
+token "\eP" means noI = 1, ec = 2, qb = 1
+token "\ePage" means noI = 1, ec = 2, qb = 1
+token "\ePersistence" means noI = 1, ec = 2, qb = 1
+token "\ePhp" means noI = 1, ec = 2, qb = 1
+token "\ePlugin" means noI = 1, ec = 2, qb = 1
+token "\ePost" means noI = 1, ec = 2, qb = 1
+token "\eProduct" means noI = 1, ec = 2, qb = 1
+token "\eQuery" means noI = 1, ec = 2, qb = 1
+token "\eQueue" means noI = 1, ec = 2, qb = 1
+token "\eR" means noI = 1, ec = 2, qb = 1
+token "\eRedirect" means noI = 1, ec = 2, qb = 1
+token "\eRepositories" means noI = 1, ec = 2, qb = 1
+token "\eRepository" means noI = 1, ec = 2, qb = 1
+token "\eRequest" means noI = 1, ec = 2, qb = 1
+token "\eRequests" means noI = 1, ec = 2, qb = 1
+token "\eResource" means noI = 1, ec = 2, qb = 1
+token "\eResources" means noI = 1, ec = 2, qb = 1
+token "\eResponse" means noI = 1, ec = 2, qb = 1
+token "\eRoute" means noI = 1, ec = 2, qb = 1
+token "\eRouting" means noI = 1, ec = 2, qb = 1
+token "\eS" means noI = 1, ec = 2, qb = 1
+token "\eSchema" means noI = 1, ec = 2, qb = 1
+token "\eSecurity" means noI = 1, ec = 2, qb = 1
+token "\eSeeder" means noI = 1, ec = 2, qb = 1
+token "\eService" means noI = 1, ec = 2, qb = 1
+token "\eServices" means noI = 1, ec = 2, qb = 1
+token "\eSession" means noI = 1, ec = 2, qb = 1
+token "\eStorage" means noI = 1, ec = 2, qb = 1
+token "\eSupport" means noI = 1, ec = 2, qb = 1
+token "\eSystem" means noI = 1, ec = 2, qb = 1
+token "\eTable" means noI = 1, ec = 2, qb = 1
+token "\eTemplate" means noI = 1, ec = 2, qb = 1
+token "\eTest" means noI = 1, ec = 2, qb = 1
+token "\eTestCase" means noI = 1, ec = 2, qb = 1
+token "\eTests" means noI = 1, ec = 2, qb = 1
+token "\eTraits" means noI = 1, ec = 2, qb = 1
+token "\eTwig" means noI = 1, ec = 2, qb = 1
+token "\eType" means noI = 1, ec = 2, qb = 1
+token "\eUnit" means noI = 1, ec = 2, qb = 1
+token "\eUrl" means noI = 1, ec = 2, qb = 1
+token "\eUser" means noI = 1, ec = 2, qb = 1
+token "\eV" means noI = 1, ec = 2, qb = 1
+token "\eValidation" means noI = 1, ec = 2, qb = 1
+token "\eValidator" means noI = 1, ec = 2, qb = 1
+token "\eView" means noI = 1, ec = 2, qb = 1
+token "\eWeb" means noI = 1, ec = 2, qb = 1
+token "\e[" means noI = 1, ec = 2, qb = 1
+token "\e\e" means ue = 1, ec = 2, qb = 1
+token "\e\e\q" means wf = 6, wa = 6, wn = 1, q = 1, qe = -1, ec = 2, qb = 1
+token "\e\e." means noE = 1, ec = 2, qb = 1
+token "\e\e/" means ec = 2, qb = 1
+token "\e\e\e" means un = 1, ec = 2, qb = 1
+token "\e\e\e\e" means ue = 1, ec = 2, qb = 1
+token "\e_" means noI = 1, ec = 2, qb = 1
+token "\ea" means noI = 1, ec = 2, qb = 1
+token "\eadmin" means noI = 1, ec = 2, qb = 1
+token "\eapplication" means noI = 1, ec = 2, qb = 1
+token "\eb" means ec = 2, qb = 1
+token "\ebase" means ec = 2, qb = 1
+token "\ebrief" means ec = 2, qb = 1
+token "\ecommon" means noI = 1, ec = 2, qb = 1
+token "\econtrollers" means noI = 1, ec = 2, qb = 1
+token "\ecore" means noI = 1, ec = 2, qb = 1
+token "\ed" means noI = 1, ec = 2, qb = 1
+token "\edata" means noI = 1, ec = 2, qb = 1
+token "\edb" means noI = 1, ec = 2, qb = 1
+token "\ee" means noI = 1, ec = 2, qb = 1
+token "\ef" means ec = 2, qb = 1
+token "\egrid" means noI = 1, ec = 2, qb = 1
+token "\ehelpers" means noI = 1, ec = 2, qb = 1
+token "\ehtdocs" means noI = 1, ec = 2, qb = 1
+token "\emodel" means noI = 1, ec = 2, qb = 1
+token "\emodels" means noI = 1, ec = 2, qb = 1
+token "\emodules" means noI = 1, ec = 2, qb = 1
+token "\en" means ec = 2, qb = 1
+token "\eparam" means noI = 1, ec = 2, qb = 1
+token "\er" means ec = 2, qb = 1
+token "\es" means noI = 1, ec = 2, qb = 1
+token "\esystem" means noI = 1, ec = 2, qb = 1
+token "\et" means ec = 2, qb = 1
+token "\eu" means ec = 2, qb = 1
+token "\euB" means ec = 2, qb = 1
+token "\euC" means ec = 2, qb = 1
+token "\euD" means ec = 2, qb = 1
+token "\euc" means ec = 2, qb = 1
+token "\euff" means ec = 2, qb = 1
+token "\ev" means noI = 1, ec = 2, qb = 1
+token "\eviews" means noI = 1, ec = 2, qb = 1
+token "\eweb" means noI = 1, ec = 2, qb = 1
+token "\ewidgets" means noI = 1, ec = 2, qb = 1
+token "\ex" means noI = 1, ec = 2, qb = 1
+token "\exa" means noI = 1, ec = 2, qb = 1
+token "\exaa" means noI = 1, ec = 2, qb = 1
+token "\exb" means noI = 1, ec = 2, qb = 1
+token "\exc" means noI = 1, ec = 2, qb = 1
+token "\exd" means noI = 1, ec = 2, qb = 1
+token "\exe" means noI = 1, ec = 2, qb = 1
+token "\exf" means noI = 1, ec = 2, qb = 1
+token "\exff" means noI = 1, ec = 2, qb = 1
 token "]" means okO = 1, uf = 7, ua = 7, un_ = 1, ud = -1, ux1 = 2
 token "]\q" means wf = 6, wa = 6, wn = 1, q = 1
 token "]\q)" means noI = 1, q = 1
@@ -10028,11 +10034,41 @@ entail atValid when pTag == T_VALID, tag == T_COLON
 
 # ─── 3. Strings ─────────────────────────────────────────────────────────────
 #
+# A tokenizer may cut an escape: Inkling 2 writes \"hi\"" as \ " hi \ "". A token after
+# a lone backslash starts with the escaped character, and is read without it. Whether
+# the token before ended in a lone backslash depends on its own start, so two back are
+# looked at; a longer run of cut escapes is left unsure.
+
+state pUn1, pUe1, pQb1, pUn2, pQb2, pUn3, pUnE, esc, qcor
+attend back 1
+    pUn1 <- un
+    pUe1 <- ue
+    pQb1 <- qb
+end
+attend back 2
+    pUn2 <- un
+    pQb2 <- qb
+end
+attend back 3
+    pUn3 <- un
+end
+entail pUnE when pUn1, not pUn2
+entail pUnE when pUn1, pUn2, not pQb1
+entail pUnE when pUn2, pQb1, pUe1
+entail esc when pUnE, qb
+# The change in quotes. It goes into the count below too, so the strings wait no longer.
+entail qcor = qe when pUn1, not pUn2, qb
+entail qcor = qe when pUn1, pUn2, not pQb1, qb
+entail qcor = qe when pUn2, pQb1, pUe1, qb
+#
 # cq[j]: quotes in the last 2^j tokens, back to the marker.
 # rs[j]: the marker is among them.
 
 state cq[NS + 1] scale 1/4, rs[NS + 1], pq[NS] scale 1/4, pr[NS]
 entail cq[0] = q
+entail cq[0] = qe when pUn1, not pUn2, qb
+entail cq[0] = qe when pUn1, pUn2, not pQb1, qb
+entail cq[0] = qe when pUn2, pQb1, pUe1, qb
 entail rs[0] when mark
 for j in 0 to NS - 1
     attend back 2^j
@@ -10046,7 +10082,7 @@ for j in 0 to NS - 1
 end
 let active = rs[NS]
 
-let before = cq[NS] - q
+let before = cq[NS] - q - qcor
 state qt[QM + 1]
 for t in 1 to QM
     entail qt[t] when before >= t
@@ -10056,26 +10092,27 @@ entail ins = (sum t in 1 to QM : (2*(t - 2*floor(t/2)) - 1) * qt[t])
 
 # The token, in the mode it was entered.
 state tF, tS, tA, tB, tC, tN, tD, tV, tH, tK, tX1, tX2, tX3, tY1, tY2, tY3
-def pick(out, u, w)
+def pick(out, u, w, z)
     entail out = u when not ins
-    entail out = w when ins
+    entail out = w when ins, not esc
+    entail out = z when ins, esc
 end
-call pick(tF, uf, wf)
-call pick(tS, us, ws)
-call pick(tA, ua, wa)
-call pick(tB, ub, wb)
-call pick(tC, uc, wc)
-call pick(tN, un_, wn)
-call pick(tD, ud, wd)
-call pick(tV, uv, wv)
-call pick(tH, uh, wh)
-call pick(tK, uk, wk)
-call pick(tX1, ux1, wx1)
-call pick(tX2, ux2, wx2)
-call pick(tX3, ux3, wx3)
-call pick(tY1, uy1, wy1)
-call pick(tY2, uy2, wy2)
-call pick(tY3, uy3, wy3)
+call pick(tF, uf, wf, zf)
+call pick(tS, us, ws, zs)
+call pick(tA, ua, wa, za)
+call pick(tB, ub, wb, zb)
+call pick(tC, uc, wc, zc)
+call pick(tN, un_, wn, zn)
+call pick(tD, ud, wd, zd)
+call pick(tV, uv, wv, zv)
+call pick(tH, uh, wh, zh)
+call pick(tK, uk, wk, zk)
+call pick(tX1, ux1, wx1, zx1)
+call pick(tX2, ux2, wx2, zx2)
+call pick(tX3, ux3, wx3, zx3)
+call pick(tY1, uy1, wy1, zy1)
+call pick(tY2, uy2, wy2, zy2)
+call pick(tY3, uy3, wy3, zy3)
 
 # ─── 4. Depth ───────────────────────────────────────────────────────────────
 
@@ -10292,13 +10329,11 @@ for d in 3 to D
     entail m3 = pTy[d-3] when pDl[d]
 end
 
-state fault, pUn
-attend back 1
-    pUn <- un
-end
+state fault
 entail fault when not ins, okO <= 0, not mark
-entail fault when ins, pUn >= 1, ec <= 0
-entail fault when ins, noI >= 1
+entail fault when ins, pUnE, ec <= 0
+entail fault when ins, not esc, noI >= 1
+entail fault when ins, esc, noE >= 1
 
 entail fault when p_start, tF == 3
 entail fault when p_start, tF == 4
@@ -10473,13 +10508,21 @@ entail fault when curNum, pNum >= 1, pK == 6, tH == 5
 entail fault when curNum, pNum >= 1, pK == 6, tH == 6
 entail fault when curNum, pNum >= 1, tH == N_DOT, pSt >= 1
 entail fault when curNum, pNum >= 1, tH == N_EXP, pSt == 2
-entail fault when curNum, pNum >= 1, pK == N_ZERO, tH >= N_DIGIT, tH <= N_ZERO, pSt <= 0, ppK <= 1
+# A number does not start with 0 and another digit, across tokens or within one.
+state pZe
+attend back 1
+    pZe <- ze
+end
+entail fault when curNum, pNum >= 1, pZe == 2, tH >= N_DIGIT, tH <= N_ZERO, pSt <= 0, ppK <= 1
+entail fault when curNum, pNum >= 1, pZe == 1, tH >= N_DIGIT, tH <= N_ZERO, pSt <= 0
+entail fault when curNum, pNum <= 0, lz >= 1
+entail fault when curNum, pNum >= 1, pK == 1, lz >= 1
 entail fault when p_numi, not curNum
 entail fault when curNum, pNum >= 1, lw
 
 state cf[NS + 1] scale 1/4, cu[NS + 1] scale 1/4, pf[NS] scale 1/4, pu[NS] scale 1/4
 entail cf[0] = fault when not mark
-entail cu[0] = 1 when ins, pUn >= 1, ec >= 2
+entail cu[0] = 1 when ins, esc, pUn3, pQb2
 for j in 0 to NS - 1
     attend back 2^j
         pf[j] <- cf[j]

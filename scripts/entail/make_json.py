@@ -51,7 +51,13 @@ class Read:
         self.bad = False           # no JSON text could hold this
         self.unsure = False        # it ends part-way through an escape
         self.comma_value = False   # a comma, then something that cannot be a key
+        # A number's digits may come several to a token (Inkling 2 writes 29089 as 290|89):
+        self.lead_zero = False     # its first number, if it opens the token, starts 0 then a digit
+        self.end_zero = 0          # it ends in a number that is just 0 here: 1 one this token began, 2 one it may go on
+        self.run, self.run_first = "", False
         self.scan(text, inside)
+        if self.events and self.events[-1] == NUM and self.run in ("0", "-0"):
+            self.end_zero = 2 if self.run_first and self.run == "0" else 1
 
     def event(self, e):
         if self.events and e not in FOLLOWS[self.events[-1]]:
@@ -60,13 +66,21 @@ class Read:
             self.comma_value = True
         self.events.append(e)
 
-    def number(self, k):
+    def number(self, k, c):
         if self.events and self.events[-1] == NUM:
             if k not in NEXT_CHAR[self.last_num]:
                 self.bad = True
         else:
             self.event(NUM)
             self.first_num = k
+            self.run, self.run_first = "", len(self.events) == 1
+        whole = self.run.lstrip("-")
+        if whole == "0" and c in "0123456789":
+            if self.run_first:
+                self.lead_zero = True      # a fault only if the number starts here
+            else:
+                self.bad = True            # it does start here: 05 is no number
+        self.run += c
         self.last_num = k
 
     def scan(self, text, inside):
@@ -122,15 +136,15 @@ class Read:
                 i += 5
             elif c in "-0123456789.eE+":
                 if c == "-":
-                    self.number(N_SIGN if self.events[-1:] == [NUM] and self.last_num == N_EXP else N_MINUS)
+                    self.number(N_SIGN if self.events[-1:] == [NUM] and self.last_num == N_EXP else N_MINUS, c)
                 elif c == "+":
-                    self.number(N_SIGN)
+                    self.number(N_SIGN, c)
                 elif c == ".":
-                    self.number(N_DOT)
+                    self.number(N_DOT, c)
                 elif c in "eE":
-                    self.number(N_EXP)
+                    self.number(N_EXP, c)
                 else:
-                    self.number(N_ZERO if c == "0" else N_DIGIT)
+                    self.number(N_ZERO if c == "0" else N_DIGIT, c)
                 i += 1
             else:
                 self.bad = True
@@ -251,10 +265,16 @@ const T_COLON = 4    # completes a marker or "Valid:"
 # q: quotes that count. lw: white space comes first.
 # ec: after a lone backslash, 1 if this token starts a legal escape, 2 if it starts
 # with a quote or backslash, which would change how it reads.
+# Lanes starting z are a token of that second kind read from inside a string with its
+# first character escaped, as it is after a lone backslash: qe is the change in its
+# quotes, ue and noE its un and noI; qb marks such a token (ec 2). lz: its number opens the token with 0 and a digit.
+# ze: it ends in a number that is just 0 here, 1 if that number began here, 2 if the
+# token opens with it, so it may go on a number before.
 
 state uf, us, ua, ub, uc, un_, ud, uv, uh, uk, ux1, ux2, ux3, uy1, uy2, uy3
 state wf, ws, wa, wb, wc, wn, wd, wv, wh, wk, wx1, wx2, wx3, wy1, wy2, wy3
-state q, okO, noI, un, tag, ec, lw, blank
+state zf, zs, za, zb, zc, zn, zd, zv, zh, zk, zx1, zx2, zx3, zy1, zy2, zy3
+state q, okO, noI, un, tag, ec, lw, blank, qe, ue, noE, lz, ze, qb
 
 @TOKENS@
 
@@ -271,11 +291,41 @@ entail atValid when pTag == T_VALID, tag == T_COLON
 
 # ─── 3. Strings ─────────────────────────────────────────────────────────────
 #
+# A tokenizer may cut an escape: Inkling 2 writes \"hi\"" as \ " hi \ "". A token after
+# a lone backslash starts with the escaped character, and is read without it. Whether
+# the token before ended in a lone backslash depends on its own start, so two back are
+# looked at; a longer run of cut escapes is left unsure.
+
+state pUn1, pUe1, pQb1, pUn2, pQb2, pUn3, pUnE, esc, qcor
+attend back 1
+    pUn1 <- un
+    pUe1 <- ue
+    pQb1 <- qb
+end
+attend back 2
+    pUn2 <- un
+    pQb2 <- qb
+end
+attend back 3
+    pUn3 <- un
+end
+entail pUnE when pUn1, not pUn2
+entail pUnE when pUn1, pUn2, not pQb1
+entail pUnE when pUn2, pQb1, pUe1
+entail esc when pUnE, qb
+# The change in quotes. It goes into the count below too, so the strings wait no longer.
+entail qcor = qe when pUn1, not pUn2, qb
+entail qcor = qe when pUn1, pUn2, not pQb1, qb
+entail qcor = qe when pUn2, pQb1, pUe1, qb
+#
 # cq[j]: quotes in the last 2^j tokens, back to the marker.
 # rs[j]: the marker is among them.
 
 state cq[NS + 1] scale 1/4, rs[NS + 1], pq[NS] scale 1/4, pr[NS]
 entail cq[0] = q
+entail cq[0] = qe when pUn1, not pUn2, qb
+entail cq[0] = qe when pUn1, pUn2, not pQb1, qb
+entail cq[0] = qe when pUn2, pQb1, pUe1, qb
 entail rs[0] when mark
 for j in 0 to NS - 1
     attend back 2^j
@@ -289,7 +339,7 @@ for j in 0 to NS - 1
 end
 let active = rs[NS]
 
-let before = cq[NS] - q
+let before = cq[NS] - q - qcor
 state qt[QM + 1]
 for t in 1 to QM
     entail qt[t] when before >= t
@@ -299,26 +349,27 @@ entail ins = (sum t in 1 to QM : (2*(t - 2*floor(t/2)) - 1) * qt[t])
 
 # The token, in the mode it was entered.
 state tF, tS, tA, tB, tC, tN, tD, tV, tH, tK, tX1, tX2, tX3, tY1, tY2, tY3
-def pick(out, u, w)
+def pick(out, u, w, z)
     entail out = u when not ins
-    entail out = w when ins
+    entail out = w when ins, not esc
+    entail out = z when ins, esc
 end
-call pick(tF, uf, wf)
-call pick(tS, us, ws)
-call pick(tA, ua, wa)
-call pick(tB, ub, wb)
-call pick(tC, uc, wc)
-call pick(tN, un_, wn)
-call pick(tD, ud, wd)
-call pick(tV, uv, wv)
-call pick(tH, uh, wh)
-call pick(tK, uk, wk)
-call pick(tX1, ux1, wx1)
-call pick(tX2, ux2, wx2)
-call pick(tX3, ux3, wx3)
-call pick(tY1, uy1, wy1)
-call pick(tY2, uy2, wy2)
-call pick(tY3, uy3, wy3)
+call pick(tF, uf, wf, zf)
+call pick(tS, us, ws, zs)
+call pick(tA, ua, wa, za)
+call pick(tB, ub, wb, zb)
+call pick(tC, uc, wc, zc)
+call pick(tN, un_, wn, zn)
+call pick(tD, ud, wd, zd)
+call pick(tV, uv, wv, zv)
+call pick(tH, uh, wh, zh)
+call pick(tK, uk, wk, zk)
+call pick(tX1, ux1, wx1, zx1)
+call pick(tX2, ux2, wx2, zx2)
+call pick(tX3, ux3, wx3, zx3)
+call pick(tY1, uy1, wy1, zy1)
+call pick(tY2, uy2, wy2, zy2)
+call pick(tY3, uy3, wy3, zy3)
 
 # ─── 4. Depth ───────────────────────────────────────────────────────────────
 
@@ -518,13 +569,11 @@ for d in 3 to D
     entail m3 = pTy[d-3] when pDl[d]
 end
 
-state fault, pUn
-attend back 1
-    pUn <- un
-end
+state fault
 entail fault when not ins, okO <= 0, not mark
-entail fault when ins, pUn >= 1, ec <= 0
-entail fault when ins, noI >= 1
+entail fault when ins, pUnE, ec <= 0
+entail fault when ins, not esc, noI >= 1
+entail fault when ins, esc, noE >= 1
 
 @LEGAL@
 
@@ -557,13 +606,21 @@ entail curNum when tF == E_NUM
 @NUMBER@
 entail fault when curNum, pNum >= 1, tH == N_DOT, pSt >= 1
 entail fault when curNum, pNum >= 1, tH == N_EXP, pSt == 2
-entail fault when curNum, pNum >= 1, pK == N_ZERO, tH >= N_DIGIT, tH <= N_ZERO, pSt <= 0, ppK <= 1
+# A number does not start with 0 and another digit, across tokens or within one.
+state pZe
+attend back 1
+    pZe <- ze
+end
+entail fault when curNum, pNum >= 1, pZe == 2, tH >= N_DIGIT, tH <= N_ZERO, pSt <= 0, ppK <= 1
+entail fault when curNum, pNum >= 1, pZe == 1, tH >= N_DIGIT, tH <= N_ZERO, pSt <= 0
+entail fault when curNum, pNum <= 0, lz >= 1
+entail fault when curNum, pNum >= 1, pK == 1, lz >= 1
 entail fault when p_numi, not curNum
 entail fault when curNum, pNum >= 1, lw
 
 state cf[NS + 1] scale 1/4, cu[NS + 1] scale 1/4, pf[NS] scale 1/4, pu[NS] scale 1/4
 entail cf[0] = fault when not mark
-entail cu[0] = 1 when ins, pUn >= 1, ec >= 2
+entail cu[0] = 1 when ins, esc, pUn3, pQb2
 for j in 0 to NS - 1
     attend back 2^j
         pf[j] <- cf[j]
@@ -660,6 +717,10 @@ def main():
         if not out.bad:
             lanes["okO"] = 1
             lanes.update({("un_" if k == "un" else k): v for k, v in out.lanes("u").items()})
+            if out.lead_zero:
+                lanes["lz"] = 1
+            if out.end_zero:
+                lanes["ze"] = out.end_zero
         if not within.bad:
             lanes.update(within.lanes("w"))
         else:
@@ -668,6 +729,16 @@ def main():
             lanes["un"] = 1
         if within.quotes:
             lanes["q"] = within.quotes
+        if w[0] in '"\\':
+            escaped = Read(w[1:], True)
+            if escaped.bad:
+                lanes["noE"] = 1
+            else:
+                lanes.update(escaped.lanes("z"))
+            if escaped.unsure:
+                lanes["ue"] = 1
+            if escaped.quotes != within.quotes:
+                lanes["qe"] = escaped.quotes - within.quotes
         if w in tags:
             lanes["tag"] = tags[w]
         if not out.bad and w[0] in " \n\t\r":
@@ -679,6 +750,7 @@ def main():
             lanes["ec"] = 1
         elif w[0] in '"\\':
             lanes["ec"] = 2
+            lanes["qb"] = 1
         if lanes:
             table.append(f"token {text} means " + ", ".join(f"{k} = {v}" for k, v in lanes.items()))
             count += 1

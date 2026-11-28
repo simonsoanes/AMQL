@@ -54,6 +54,19 @@ the offsets that gives; it writes the answer in the same cuts, so ` 5536 days` c
 scanner over the whole vocabulary, from inside and outside a string, and that scanner
 decides both the verdict and the guard's token sets, so the two can't disagree.
 
+The other three needed the same care for Inkling. Where digits come one to a token, they
+are written as before:
+
+- **Bases.** `make_bases.py` reads a number by its cuts, `110|1` for 1101, and writes the
+  answer in them. An answer with a letter in it is still written a character at a time.
+- **Logic.** Inkling writes ` IFF` as a blank then `IFF`. A cut operator only needs its
+  lead when the tail alone means something else, as `OR` does in ` X|OR`. Otherwise every
+  blank would read as ↔. ` contingent` is two tokens, ` conting|ent`, and is written as
+  two. A tokenizer that writes `))` as two tokens gets a window of 34 tokens, not 30.
+- **JSON.** A leading zero is judged by what a token's number holds, so `290|89` is no
+  longer `0` followed by a digit. A token after a cut escape, as in `\|"hi\|""`, is read
+  with its first character escaped.
+
 ## Results
 
 Qwen 3.5 0.8B, on the CPU. Each prompt opens with a short drill so that the base model

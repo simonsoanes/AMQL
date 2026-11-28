@@ -4,6 +4,11 @@
 
 A tokenizer cuts hexadecimal wherever it likes: 0xDEADBEEF is 0|xDE|ADB|EE|F. So every
 token that could stand in a hexadecimal number is listed with its digits, lowest first.
+
+Qwen and Gemma write one decimal digit to a token, and the rules are written for that.
+A tokenizer that groups digits (Inkling 2 cuts 1048575 as 104|857|5 and 1101 as 110|1)
+gets the same rules with the number reading, the question's base and the answer rewritten
+for its cuts: see grouped(). For one digit to a token the rules are used as they stand.
 """
 import json
 import re
@@ -431,6 +436,227 @@ emit end when o[C_END]
 """
 
 
+SAMPLES = ["7", "12", "123", "1234", "100045", "5536", "09", "000001", "1011", "77777777"]
+
+
+def cuts(tokenizer, digits):
+    """The group sizes, left to right, in which the tokenizer writes a number of this many digits."""
+    shapes = set()
+    for sample in SAMPLES + [str(10 ** (digits - 1)), "9" * digits, "0" * digits, "1" * digits]:
+        s = (sample * 40)[:digits]
+        for text in (s, " " + s, "0b" + s + " in", "x-" + s + "-"):
+            pieces = [tokenizer.decode([i]) for i in tokenizer.encode(text, add_special_tokens=False).ids]
+            run = [q for q in pieces if re.fullmatch(r"[0-9]+", q)]
+            if text.startswith("0b"):
+                run = run[1:]
+            if "".join(run) != s:
+                raise SystemExit(f"cannot read how {text!r} is cut: {pieces}")
+            shapes.add(tuple(len(q) for q in run))
+    if len(shapes) != 1:
+        raise SystemExit(f"a number of {digits} digits is cut more than one way: {sorted(shapes)}")
+    return shapes.pop()
+
+
+def spots(shape):
+    """For a number cut as shape (left to right): per token, its offset back from the
+    number's last token, its digit count, and the place of its lowest digit."""
+    out, place = [], 0
+    for i, n in enumerate(reversed(shape)):
+        out.append((i, n, place))
+        place += n
+    return out
+
+
+def at(o, i):
+    return f"{o}+{i}" if i else f"{o}"
+
+
+def digit_form(o, q):
+    """The digit at place q of the token at offset o."""
+    return f"vv[{o}]" if q == 0 else f"uu[{o}][{q}]"
+
+
+def number_conds(shape, o):
+    """Conditions: a number cut as shape ends at offset o."""
+    return [f"dn[{at(o, i)}][{n}]" for i, n, _ in spots(shape)]
+
+
+def number_value(shape, o):
+    terms = []
+    for i, n, low in spots(shape):
+        for q in range(n):
+            f = digit_form(at(o, i), q)
+            terms.append(f"{10 ** (low + q)}*{f}" if low + q else f)
+    return " + ".join(terms)
+
+
+def replace(text, old, new):
+    if old not in text:
+        raise SystemExit(f"rules changed: cannot find {old[:60]!r}")
+    return text.replace(old, new)
+
+
+def grouped(text, shape, words):
+    """The rules for a tokenizer that writes up to three digits to a token: a number is
+    read by its cuts, and the answer is written in them."""
+    T = {L: len(shape[L]) for L in shape}
+    W = T[32] + 3
+    S = 2 + max(T[32], 10)
+    NH = 10                     # an answer with a letter in it has at most 10 digits
+    text = replace(text, "const W  = 35    # 32 binary digits, their prefix, and what stands before it",
+                   f"const W  = {W}    # 32 binary digits, their prefix, and what stands before it")
+    text = replace(text, "const S  = 34    # answer tokens: a blank, 32 digits, the end of the answer",
+                   f"const S  = {S}    # answer tokens: a blank, 32 digits in their cuts, the end of the answer\n"
+                   "const C2 = 19    # two digits: C2 + their value, to 118\n"
+                   "const C3 = 119   # three digits: C3 + their value, to 1118\n"
+                   "const NO = 1119  # output codes")
+    text = replace(text, "state val, kind, hl, n0, n1, n2, n3, n4, n5, n6, n7",
+                   "state val, kind, hl, nd, n0, n1, n2, n3, n4, n5, n6, n7")
+    table = sorted((w for w in words if re.fullmatch(r"[0-9]{1,3}", w)), key=lambda w: (len(w), w))
+    lines = []
+    for w in table:
+        parts = [f"val = {w[-1]}" if w[-1] != "0" else None, "kind = K_DIGIT", f"hl = {len(w)}", f"nd = {len(w)}"]
+        parts += [f"n{i} = {c}" for i, c in enumerate(reversed(w)) if c != "0"]
+        lines.append(f'token "{w}" means ' + ", ".join(x for x in parts if x))
+    text = replace(text, 'for d in 0 to 9\n    token "{d}" means val = d, kind = K_DIGIT, hl = 1, n0 = d\nend',
+                   "# A digit token: nd digits, n0 the lowest; val is its lowest digit too.\n" + "\n".join(lines))
+    text = replace(text, "    entail zr[k] when dg[k], vv[k] == 0\n", "")
+    sight = """# The digits above a token's lowest, and how many it holds, as far back as a number goes.
+state wd[W + 1], wu[W + 1][3]
+for k in 1 to W
+    attend back k
+        wd[k] <- nd
+        wu[k][1] <- n1
+        wu[k][2] <- n2
+    end
+end
+let dd[0] = nd
+let uu[0][1] = n1
+let uu[0][2] = n2
+for k in 1 to W
+    let dd[k] = wd[k]
+    let uu[k][1] = wu[k][1]
+    let uu[k][2] = wu[k][2]
+end
+state dn[W + 1][4]
+for k in 0 to W
+    for n in 1 to 3
+        entail dn[k][n] when dg[k], dd[k] == n
+    end
+    entail zr[k] when dn[k][1], vv[k] == 0
+end
+
+# ─── 3. A number ending at this token"""
+    text = replace(text, "# ─── 3. A number ending at this token", sight)
+
+    run = ["state run[33], plain, pB, pO",
+           "# run[n]: a number of n digits ends here, in the tokenizer's cuts."]
+    for L in range(1, 33):
+        t, c = T[L], number_conds(shape[L], 0)
+        cond = c[0] if t == 1 else " + ".join(c) + f" >= {t}"
+        run.append(f"entail run[{L}] when {cond}, not dg[{t}]")
+        run.append(f"entail plain when run[{L}], not bad[{t}]")
+        run.append(f"entail pB when run[{L}], kk[{t}] == K_B, zr[{t + 1}], not dg[{t + 2}]")
+        run.append(f"entail pO when run[{L}], kk[{t}] == K_O, zr[{t + 1}], not dg[{t + 2}]")
+    run += ["", "state mv[32]"]
+    for i in range(32):
+        where = {}
+        for L in range(i + 1, 33):
+            for o, n, low in spots(shape[L]):
+                if low <= i < low + n:
+                    where.setdefault(digit_form(o, i - low), []).append(L)
+        for form, Ls in where.items():
+            when = f"run[{Ls[0]}]" if len(Ls) == 1 else "(" + " + ".join(f"run[{L}]" for L in Ls) + ") >= 1"
+            run.append(f"entail mv[{i}] = {form} when {when}")
+    old_run = text[text.index("state run[33], plain, pB, pO"):text.index("let lenv = ")]
+    text = text.replace(old_run, "\n".join(run) + "\n")
+
+    # The question: a base named by a number has that number's cuts.
+    ask = ["state ender, tg[3], tb[3], Tv",
+           "entail ender when kk[0] == K_IS",
+           "entail ender when kk[0] == K_EQ",
+           "entail tg[1] when ender, kk[1] == K_NAME",
+           "entail tg[2] when ender, kk[1] == K_AL, kk[2] == K_NAME",
+           "entail Tv = vv[1] when tg[1]",
+           "entail Tv = vv[2] when tg[2]"]
+    for L in (1, 2):
+        t = T[L]
+        ask.append(f"entail tb[{L}] when ender, {', '.join(number_conds(shape[L], 1))}, gp[{1 + t}], kk[{2 + t}] == K_BASE")
+        ask.append(f"entail Tv = {number_value(shape[L], 1)} when tb[{L}]")
+    pps = sorted({3, 4} | {T[L] + 4 for L in (1, 2)})
+    ptn = max(pps) + T[2] + 3
+    ask += ["", f"state pp[{max(pps) + 1}], bare",
+            "entail pp[3] when tg[1], kk[2] == K_IN",
+            "entail pp[4] when tg[2], kk[3] == K_IN"]
+    for L in (1, 2):
+        ask.append(f"entail pp[{T[L] + 4}] when tb[{L}], kk[{T[L] + 3}] == K_IN")
+    ask += ["entail bare when ender, not tg[1], not tg[2], not tb[1], not tb[2]",
+            "entail Tv = 10 when bare", "",
+            "# The source's own base, if a word says so.",
+            f"state wName[{max(pps) + 1}], wB[3][{max(pps) + 1}], Bw, worded, ptr[{ptn}]"]
+    for p in pps:
+        ask += [f"entail wName[{p}] when pp[{p}], kk[{p}] == K_NAME",
+                f"entail Bw = vv[{p}] when wName[{p}]",
+                f"entail worded when wName[{p}]",
+                f"entail ptr[{p + 1}] when wName[{p}]"]
+        for L in (1, 2):
+            t = T[L]
+            ask += [f"entail wB[{L}][{p}] when pp[{p}], {', '.join(number_conds(shape[L], p))}, gp[{p + t}], kk[{p + t + 1}] == K_BASE",
+                    f"entail Bw = {number_value(shape[L], p)} when wB[{L}][{p}]",
+                    f"entail worded when wB[{L}][{p}]",
+                    f"entail ptr[{p + t + 2}] when wB[{L}][{p}]"]
+        ask.append(f"entail ptr[{p}] when pp[{p}], not wName[{p}], not wB[1][{p}], not wB[2][{p}]")
+    ask.append("entail ptr[1] when bare")
+    old_ask = text[text.index("state ender, tg[5], Tv"):text.index("entail ptr[1] when bare") + len("entail ptr[1] when bare")]
+    text = text.replace(old_ask, "\n".join(ask))
+
+    # The answer: digits in their cuts, an answer with a letter one character at a time.
+    code = ["state code[S] scale 1/64",
+            "entail code[0] = C_BLANK when live >= 1",
+            "",
+            "# dec: every digit of the answer is below 10, so it is written in the tokenizer's cuts.",
+            f"state big[32], dec, tD[32], tH[{NH}]",
+            "for m in 0 to 31",
+            "    entail big[m] when res[m] >= 10",
+            "end",
+            "entail dec when live >= 1, (sum m in 0 to 31 : big[m]) <= 0",
+            "for k in 0 to 31",
+            "    entail tD[k] when top[k], dec",
+            "end",
+            f"for k in 0 to {NH - 1}",
+            "    entail tH[k] when top[k], not dec",
+            "    for s in 0 to k",
+            "        entail code[1+s] = res[k-s] + 1 when tH[k]",
+            "    end",
+            "    entail code[k+2] = C_END when tH[k]",
+            "end"]
+    for k in range(32):
+        L = k + 1
+        place = L
+        for s, n in enumerate(shape[L]):
+            place -= n
+            ds = [f"res[{place + q}]" for q in range(n)]
+            if n == 1:
+                value = f"{ds[0]} + 1"
+            else:
+                value = f"C{n} + " + " + ".join((f"{10 ** q}*{d}" if q else d) for q, d in reversed(list(enumerate(ds))))
+            code.append(f"entail code[{1 + s}] = {value} when tD[{k}]")
+        code.append(f"entail code[{1 + T[L]}] = C_END when tD[{k}]")
+    old_code = text[text.index("state code[S]\n"):text.index("# ─── 8. Writing it out")]
+    text = text.replace(old_code, "\n".join(code) + "\n\n")
+    text = replace(text, "state seen[S]\n", "state seen[S] scale 1/64\n")
+    text = replace(text, "state say\n", "state say scale 1/64\n")
+    text = replace(text, "state o[19]\nfor d in 1 to 18\n", "state o[NO]\nfor d in 1 to NO - 1\n")
+    text = replace(text, 'emit " " when o[C_BLANK]',
+                   'for a in 0 to 9\n    for b in 0 to 9\n        emit "{a}{b}" when o[C2 + 10*a + b]\n'
+                   '        for c in 0 to 9\n            emit "{a}{b}{c}" when o[C3 + 100*a + 10*b + c]\n'
+                   '        end\n    end\nend\nemit " " when o[C_BLANK]')
+    text = replace(text, "#  Generated by make_bases.py. Edit the rules there.",
+                   "#  Generated by make_bases.py, for a tokenizer that writes up to three digits\n"
+                   "#  to a token: numbers are read and written in its cuts. Edit the rules there.")
+    return text
+
+
 def token_line(text):
     letters = text[1:] if text.startswith("x") else text
     if text.startswith("x"):
@@ -457,6 +683,14 @@ def main():
     words = sorted({t.decode([i]) for i in vocabulary.values()})
     table = [w for w in words if re.fullmatch(r"[a-fA-F]{1,8}|x[0-9a-fA-F]{0,8}", w)]
     text = RULES.replace("@TOKENS@", "\n".join(token_line(w) for w in table))
+    shape = {L: cuts(t, L) for L in range(1, 33)}
+    if max(max(c) for c in shape.values()) > 1:
+        have = set(words)
+        missing = [f"{v:0{n}d}" for n in (2, 3) for v in range(10 ** n) if f"{v:0{n}d}" not in have]
+        if missing or max(max(c) for c in shape.values()) > 3:
+            raise SystemExit(f"digit tokens the rules cannot read: {missing[:5]}")
+        text = grouped(text, shape, words)
+        print("numbers cut as", ", ".join("|".join(str(n) for n in shape[L]) for L in (4, 8, 32)))
     with open(sys.argv[2], "w", encoding="utf8", newline="\n") as f:
         f.write(text)
     print(len(table), "tokens")
