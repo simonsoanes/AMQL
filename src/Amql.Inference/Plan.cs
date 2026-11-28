@@ -67,12 +67,12 @@ public sealed class AttentionOp
 
     public bool VFromK { get; init; }
 
-    /// <summary>Hard attention output gate (Qwen3.5): <c>q_proj</c> is
+    /// <summary>Hard attention output gate (as Qwen 3.5 has): <c>q_proj</c> is
     /// [hidden, 2×QDim], the second half gates the attention output
     /// elementwise — <c>o_proj(attn_out ⊙ sigmoid(gate))</c>.</summary>
     public bool OutputGate { get; init; }
 
-    /// <summary>LFM3's per-head output gate: <c>gate_proj</c> [heads, hidden]
+    /// <summary>Per-head output gate: <c>gate_proj</c> [heads, hidden]
     /// on the mixer input, each head's context scaled by
     /// <c>sigmoid(gate_proj·x)[head]</c> before <c>o_proj</c>.</summary>
     public OperandRef? HeadGate { get; init; }
@@ -108,8 +108,8 @@ public sealed class AttentionOp
     /// two halves of the rotary window.</summary>
     public bool RopeInterleaved { get; init; }
 
-    /// <summary>QSA (Qwen4): the indexer that selects which keys each query
-    /// may attend to; null attends to every visible key.</summary>
+    /// <summary>Block-sparse attention: the indexer that selects which keys
+    /// each query may attend to; null attends to every visible key.</summary>
     public SparseIndexerOp? Indexer { get; init; }
 
     /// <summary>Width of the q_proj operand: QDim when ungated, 2×QDim
@@ -344,7 +344,7 @@ public sealed class RoutedFfnOp
 }
 
 /// <summary>
-/// A dense FFN beside routed experts in one layer (Gemma 4's MoE). With x the
+/// A dense FFN beside routed experts in one layer (as Gemma 4's MoE has). With x the
 /// residual after attention:
 /// <code>
 /// d   = DenseOut(Dense(pre_ffn_norm(x)))
@@ -368,7 +368,7 @@ public sealed class LayerFfn
 }
 
 /// <summary>
-/// The Qwen3.5-style linear-attention operator (GatedDeltaNet): a
+/// The gated delta-rule linear-attention operator (GatedDeltaNet): a
 /// depthwise causal conv over the qkv stream, then a gated delta-rule
 /// recurrence with per-(key)-head state, a z-gated RMSNorm on the value
 /// head dim, and the output projection. Position-free (NoPE). The state
@@ -394,8 +394,8 @@ public sealed class LinearAttentionOp
     public required int HiddenSize { get; init; }
     public required double NormEps { get; init; }
 
-    /// <summary>The gated norm's activation on z: SiLU in Qwen3.5, sigmoid
-    /// where Qwen4 says so (<c>output_gate_type</c>).</summary>
+    /// <summary>The gated norm's activation on z: SiLU by default, sigmoid
+    /// where the surface declares it (<c>output_gate_type</c>).</summary>
     public bool SigmoidGate { get; init; }
 
     public int KeyDim => NumKHeads * HeadKDim;
@@ -406,7 +406,7 @@ public sealed class LinearAttentionOp
 }
 
 /// <summary>
-/// LFM2/LFM3 gated short convolution: <c>in_proj</c> [3·hidden, hidden]
+/// Gated short convolution: <c>in_proj</c> [3·hidden, hidden]
 /// yields (B, C, x); the depthwise causal conv runs over <c>B ⊙ x</c> with no
 /// activation, its output is gated by <c>C</c>, then <c>out_proj</c>. The
 /// conv state is the last (kernel-1) rows of <c>B ⊙ x</c>.
@@ -432,7 +432,7 @@ public sealed class LayerPlan
     /// <summary>The linear-attention op (present on linear layers).</summary>
     public LinearAttentionOp? LinearAttention { get; init; }
 
-    /// <summary>The short-convolution op (present on LFM2.5 conv layers).</summary>
+    /// <summary>The short-convolution op (present on conv layers).</summary>
     public ConvOp? Conv { get; init; }
 
     /// <summary>Norm sites; which of these are bound follows the
@@ -446,12 +446,12 @@ public sealed class LayerPlan
 
     public LayerFfn? Ffn { get; init; }
 
-    /// <summary>Qwen4's Gated Residual around the mixer and the FFN (present
+    /// <summary>The gated residual around the mixer and the FFN (present
     /// together, and then the layer carries no norms).</summary>
     public HyperConnectionOp? MixerHyperConnection { get; init; }
     public HyperConnectionOp? FfnHyperConnection { get; init; }
 
-    /// <summary>Qwen4's n-gram embedding, added to the residual streams before
+    /// <summary>The hashed n-gram embedding, added to the residual streams before
     /// the mixer reads them.</summary>
     public NgramEmbeddingOp? Ngram { get; init; }
 
@@ -530,19 +530,19 @@ public sealed class ComponentOpPlan
     public required List<LayerPlan> Layers { get; init; }
 
     /// <summary>The final norm; null when the component ends in a
-    /// <see cref="FinalMixer"/> instead (Qwen4's Gated Residual).</summary>
+    /// <see cref="FinalMixer"/> instead (a multi-stream gated residual).</summary>
     public NormOp? FinalNorm { get; init; }
 
-    /// <summary>Qwen4: the residual is <see cref="HyperConnectionOp.Streams"/>
+    /// <summary>Under a gated residual the residual is <see cref="HyperConnectionOp.Streams"/>
     /// streams wide, and this read (without a write) narrows it to the hidden
-    /// state the head reads, where other families apply the final norm.</summary>
+    /// state the head reads, where other stacks apply the final norm.</summary>
     public HyperConnectionOp? FinalMixer { get; init; }
 
     public OutputOp? Output { get; init; }
 
-    /// <summary>Multiplier on each branch at every decoder add (Granite:
-    /// h' = h + branch·scale, at both the mixer and the FFN join). 1.0 is the
-    /// plain add every other family uses.</summary>
+    /// <summary>Multiplier on each branch at every decoder add
+    /// (h' = h + branch·scale, at both the mixer and the FFN join; Granite has
+    /// one). 1.0 is the plain add.</summary>
     public double ResidualScale { get; init; } = 1.0;
 
     /// <summary>The container's drafter over this component's caches, when it has one.</summary>
@@ -595,11 +595,11 @@ public sealed class ComponentOpPlan
     /// <summary>The final norm, or a refusal naming the operator that stands in
     /// for it — for consumers that read a plain norm's weight.</summary>
     public NormOp RequireFinalNorm(string consumer) => FinalNorm ?? throw new UnsupportedOperatorException(
-        $"{consumer} reads a final norm, but this component ends in a gated-residual mixer (Qwen4)");
+        $"{consumer} reads a final norm, but this component ends in a gated-residual mixer");
 }
 
 /// <summary>
-/// One Gated Residual site (Qwen4's hyper-connections) over a residual of
+/// One gated residual site (hyper-connections) over a residual of
 /// <see cref="Streams"/> × <see cref="HiddenSize"/>:
 /// <code>
 /// n      = rmsnorm per stream (1+w)
@@ -624,7 +624,7 @@ public sealed class HyperConnectionOp
 }
 
 /// <summary>
-/// The QSA indexer of one softmax layer (see <c>SparseAttentionSurface</c>):
+/// The block-sparse attention indexer of one softmax layer (see <c>SparseAttentionSurface</c>):
 /// <c>QkProj</c> yields <see cref="Heads"/> query heads and one key head; the
 /// keys are pooled per block of <see cref="CompressRatio"/> tokens, normalised
 /// and rotated at the block's first position, and each query keeps its
@@ -652,7 +652,7 @@ public sealed class SparseIndexerOp
 }
 
 /// <summary>
-/// Qwen4's n-gram embedding (PLE) on one layer: hashed n-gram rows from a
+/// The hashed n-gram embedding on one layer: hashed n-gram rows from a
 /// sharded table, projected to a value and one key per residual stream; the
 /// normalised streams gate the value, and a dilated depthwise conv (dilation =
 /// n-gram size) adds local context. The result is added to every stream.
@@ -661,7 +661,7 @@ public sealed class NgramEmbeddingOp
 {
     public required NgramEmbeddingSurface Surface { get; init; }
 
-    /// <summary>Position of this layer among the PLE layers (the hash seed).</summary>
+    /// <summary>Position of this layer among the n-gram-embedding layers (the hash seed).</summary>
     public required int PleIndex { get; init; }
 
     /// <summary>The table's row-shards, in order, and the first row each holds.</summary>

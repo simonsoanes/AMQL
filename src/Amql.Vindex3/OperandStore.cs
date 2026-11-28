@@ -523,7 +523,7 @@ public sealed class OperandStore : IDisposable
     /// <summary>
     /// Reads chosen rows of a 2-D tensor, widened to f32, without touching the
     /// rest of it: row <c>rows[i]</c> lands at <c>target[i·cols ..]</c>. This is
-    /// how a table too large to hold (Qwen4's ~51B-parameter n-gram embedding)
+    /// how a table too large to hold (a hashed n-gram embedding of ~51B parameters)
     /// is looked up — a few rows per token, straight from the segment.
     /// </summary>
     public void ReadRowsWidened(OperandRef operand, ReadOnlySpan<long> rows, Span<float> target)

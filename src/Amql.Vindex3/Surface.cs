@@ -43,7 +43,7 @@ public enum NormPlacement
     PreOnly,
     PrePost,
 
-    /// <summary>LFM3's sandwich: a pre norm into each sub-block and a post
+    /// <summary>Sandwich (as LFM3 has): a pre norm into each sub-block and a post
     /// norm on each sub-block's output before its residual add
     /// (operator_norm / post_operator_norm, ffn_norm / post_ffn_norm).</summary>
     Sandwich,
@@ -625,10 +625,10 @@ public sealed class OptionMarkerSurface
     public bool DigitSplit { get; init; }
 }
 
-// ── Qwen4 (qwen4_exp) operators ─────────────────────────────────────────────
+// ── multi-stream residual, block-sparse attention, n-gram embedding ──────────
 
 /// <summary>
-/// Gated Residual (hyper-connections, Qwen4): the residual stream is
+/// Gated residual (hyper-connections): the residual stream is
 /// <see cref="Streams"/> parallel copies of the hidden state (width
 /// <c>Streams × hidden</c>). Each sub-block reads a gated mean of the streams
 /// and writes its output back into every stream with its own gate:
@@ -651,7 +651,7 @@ public sealed class HyperConnectionSurface
 }
 
 /// <summary>
-/// QSA, Qwen's sparse attention: each softmax layer carries an indexer that
+/// Block-sparse attention (QSA in Qwen3.8-Flash-Next): each softmax layer carries an indexer that
 /// picks which keys a query may attend to. Keys are pooled (mean) in blocks of
 /// <see cref="CompressRatio"/> consecutive visible tokens, normalised and
 /// rotated at the block's first position; a query scores every complete block
@@ -679,7 +679,7 @@ public sealed class SparseAttentionSurface
 }
 
 /// <summary>
-/// Qwen4's per-layer n-gram embedding (PLE): hashed 2…N-gram ids look up a
+/// Per-layer hashed n-gram embedding (PLE): hashed 2…N-gram ids look up a
 /// large table whose rows are projected into a value and one key per residual
 /// stream; the normalised streams gate the value, and a dilated depthwise conv
 /// adds local context. Applied before the layer's attention read on the
@@ -788,16 +788,16 @@ public sealed class ExecutionSurface
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public DiffusionSurface? Diffusion { get; init; }
 
-    /// <summary>Qwen4's Gated Residual: present means the residual stream is
+    /// <summary>The gated residual: present means the residual stream is
     /// several streams wide and the layers carry no norms of their own.</summary>
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public HyperConnectionSurface? HyperConnections { get; init; }
 
-    /// <summary>QSA: every softmax layer selects its keys with an indexer.</summary>
+    /// <summary>Block-sparse attention: every softmax layer selects its keys with an indexer.</summary>
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public SparseAttentionSurface? SparseAttention { get; init; }
 
-    /// <summary>Qwen4's hashed n-gram embedding on selected layers.</summary>
+    /// <summary>The hashed n-gram embedding on selected layers.</summary>
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public NgramEmbeddingSurface? NgramEmbedding { get; init; }
 

@@ -1087,7 +1087,7 @@ public sealed class WeightLoader
 
     /// <summary>Reads chosen rows of a table straight from storage, widened to
     /// f32 — nothing cached, nothing charged to the working set. For tables too
-    /// large to load (Qwen4's n-gram embedding). A patch on the table refuses:
+    /// large to load (a hashed n-gram embedding). A patch on the table refuses:
     /// a row read would silently miss it.</summary>
     public void ReadRows(OperandRef operand, ReadOnlySpan<long> rows, Span<float> target)
     {

@@ -1,8 +1,8 @@
 namespace Amql.Vindex3;
 
 /// <summary>
-/// The arithmetic of Qwen4's hashed n-gram table (transformers
-/// <c>Qwen4ExpTextNGramEmbedding</c>): which prime-sized slice of the table
+/// The arithmetic of a hashed n-gram table (as transformers'
+/// <c>Qwen4ExpTextNGramEmbedding</c> computes it): which prime-sized slice of the table
 /// each hash head owns, the odd multipliers the token ids are hashed with, and
 /// the ids a token's n-grams look up. Pure functions of the surface and the
 /// token history, shared by import (to check the shards hold the table the

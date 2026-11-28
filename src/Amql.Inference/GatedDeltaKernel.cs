@@ -500,7 +500,7 @@ public static class GatedDeltaKernel
     /// width <c>headVDim</c> (positions × heads flattened):
     /// <c>x̂ × weight × silu(z)</c>. The weight applies directly — no
     /// 1+w offset — unlike the layer norms.</summary>
-    /// <para>Qwen4 can gate with a sigmoid instead (<c>output_gate_type</c>):
+    /// <para>A surface can declare a sigmoid gate instead (<c>output_gate_type</c>):
     /// <c>x̂ × weight × sigmoid(z)</c>.</para>
     public static Tensor2D GatedRMSNorm(Tensor2D x, Tensor2D z, float[] weight, double eps, bool sigmoidGate = false)
     {

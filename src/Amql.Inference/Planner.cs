@@ -123,10 +123,10 @@ public static partial class Planner
         if ((surface.SparseAttention is not null || surface.NgramEmbedding is not null) && surface.HyperConnections is null)
         {
             throw new UnsupportedOperatorException(
-                $"component '{componentId}': QSA and the n-gram embedding are judged only inside Qwen4's gated residual");
+                $"component '{componentId}': block-sparse attention and the n-gram embedding are judged only inside a multi-stream gated residual");
         }
 
-        // Qwen4: the gated residual's final mixer stands where the final norm does.
+        // Under a gated residual, its final mixer stands where the final norm does.
         HyperConnectionOp? finalMixer = surface.HyperConnections is { } hc
             ? BindHyperConnection(store, finalNormObj.Id, string.Empty, hc, normSurface.FinalNorm, component.HiddenSize, inject: false, layer: -1)
             : null;
@@ -399,7 +399,7 @@ public static partial class Planner
 
     /// <summary>Builds the linear-attention operator (GatedDeltaNet) for a
     /// linear layer. Geometry comes from the persisted linear surface; the
-    /// tensor names are those of the Qwen3.5 GatedDeltaNet.</summary>
+    /// tensor names are the GatedDeltaNet's (linear_attn.in_proj_qkv, conv1d, A_log, …).</summary>
     private static LinearAttentionOp BuildLinearAttention(
         OperandStore store, string stackId, int layer,
         ExecutionSurface surface, NormSurface normSurface, int hiddenSize)
@@ -464,7 +464,7 @@ public static partial class Planner
         OperandStore store, string stackId, int layer,
         ExecutionSurface surface, int hiddenSize)
     {
-        // LFM2/LFM3 conv tensor names: conv.in_proj, conv.conv, conv.out_proj
+        // Short-conv tensor names: conv.in_proj, conv.conv, conv.out_proj
         string inProjName = $"{layer}.conv.in_proj.weight";
         string convWeightName = $"{layer}.conv.conv.weight";
         string convBiasName = $"{layer}.conv.conv.bias";
@@ -723,10 +723,10 @@ public static partial class Planner
         };
     }
 
-    // ── Qwen4: gated residual, QSA indexer, n-gram embedding ─────────────
+    // ── gated residual, block-sparse attention indexer, n-gram embedding ──
 
-    /// <summary>A Qwen4 layer: no norm sites; a gated residual around the mixer
-    /// and around the FFN, and on the PLE layers the n-gram embedding.</summary>
+    /// <summary>A gated-residual layer: no norm sites; a gated residual around the mixer
+    /// and around the FFN, and on its listed layers the n-gram embedding.</summary>
     private static LayerPlan BuildHyperLayer(
         OperandStore store, string stackId, int layer, AttentionLayerPolicy policy, ExecutionSurface surface,
         FfnSurface ffnSurface, NormSurface normSurface, LayerRoleMap roles, int hiddenSize, HyperConnectionSurface hyper,
@@ -812,11 +812,11 @@ public static partial class Planner
         var kNorm = Shaped("k_layernorm.weight", sparse.HeadDim);
         if (sparse.KvHeads != 1)
         {
-            throw new UnsupportedOperatorException($"layer {layer}: a QSA indexer with {sparse.KvHeads} key heads has no managed implementation");
+            throw new UnsupportedOperatorException($"layer {layer}: a sparse-attention indexer with {sparse.KvHeads} key heads has no managed implementation");
         }
         if (sparse.CompressRatio <= 0 || sparse.Budget % sparse.CompressRatio != 0)
         {
-            throw new ContainerException($"layer {layer}: QSA budget {sparse.Budget} is not a whole number of {sparse.CompressRatio}-token blocks");
+            throw new ContainerException($"layer {layer}: sparse-attention budget {sparse.Budget} is not a whole number of {sparse.CompressRatio}-token blocks");
         }
         // The indexer rotates the same leading dims, at the same frequencies,
         // as the attention: the attention's rotary width over the indexer head.
@@ -834,11 +834,11 @@ public static partial class Planner
                 RotaryFactor = (double)partial.RotaryWidth(attnSurface.HeadDim) / sparse.HeadDim,
             },
             var other => throw new UnsupportedOperatorException(
-                $"layer {layer}: a QSA indexer under position policy '{other.GetType().Name}' has no managed implementation"),
+                $"layer {layer}: a sparse-attention indexer under position policy '{other.GetType().Name}' has no managed implementation"),
         };
         if (position is PositionPartialRope p && (p.RotaryFactor > 1.0 || p.RotaryWidth(sparse.HeadDim) % 2 != 0))
         {
-            throw new ContainerException($"layer {layer}: the attention's rotary width does not fit the QSA head of {sparse.HeadDim}");
+            throw new ContainerException($"layer {layer}: the attention's rotary width does not fit the sparse-attention indexer's head of {sparse.HeadDim}");
         }
         return new SparseIndexerOp
         {
@@ -858,12 +858,12 @@ public static partial class Planner
         OperandRef Shaped(string stem, params long[] shape)
         {
             string name = prefix + stem;
-            Require(store, stackId, name, layer, "QSA indexer");
+            Require(store, stackId, name, layer, "sparse-attention indexer");
             var actual = store.ShapeOf(stackId, name);
             if (actual.Length != shape.Length || actual.Zip(shape).Any(d => d.Second >= 0 && d.First != d.Second))
             {
                 throw new ContainerException(
-                    $"operand closure: '{stackId}/{name}' has shape [{string.Join(", ", actual)}], the QSA indexer needs [{string.Join(", ", shape)}]");
+                    $"operand closure: '{stackId}/{name}' has shape [{string.Join(", ", actual)}], the sparse-attention indexer needs [{string.Join(", ", shape)}]");
             }
             return new OperandRef(stackId, name);
         }

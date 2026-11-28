@@ -483,7 +483,7 @@ public sealed partial class GpuEngine : IDisposable
         }
         if (plan.FinalMixer is not null)
         {
-            return "Qwen4 gated residual";
+            return "a multi-stream gated residual";
         }
         // The visit path's ops (above) run only there.
         if (plan.Output?.TableRows is not null)
@@ -494,7 +494,7 @@ public sealed partial class GpuEngine : IDisposable
         {
             if (layer.Ngram is not null || layer.Attention?.Indexer is not null)
             {
-                return "Qwen4 QSA / n-gram embedding";
+                return "block-sparse attention / n-gram embedding";
             }
             if (layer.LinearAttention is { SigmoidGate: true })
             {

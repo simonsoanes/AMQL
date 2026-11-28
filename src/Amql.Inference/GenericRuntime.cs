@@ -78,7 +78,7 @@ public sealed partial class GenericRuntime
             }
         }
         _passTokens = tokens.ToArray();
-        // Qwen4's gated residual carries every stream from the start: the
+        // A multi-stream gated residual carries every stream from the start: the
         // embedding repeated once per stream.
         return _plan.ResidualStreams > 1 ? RepeatStreams(hidden, _plan.ResidualStreams) : hidden;
     }
@@ -378,7 +378,7 @@ public sealed partial class GenericRuntime
             : null;
 
         Tensor2D output;
-        // QSA: the indexer picks each query's keys. Null means every row keeps
+        // Block-sparse attention: the indexer picks each query's keys. Null means every row keeps
         // every visible key (no more complete blocks than its budget), and the
         // attention below is exactly the dense one.
         if (attn.Indexer is { } indexer &&
@@ -466,7 +466,7 @@ public sealed partial class GenericRuntime
 
         Report(layer, "attn_context", null, output, 0);
 
-        // Per-head output gate (LFM3): each head's context × sigmoid(gate_proj·h).
+        // Per-head output gate: each head's context × sigmoid(gate_proj·h).
         if (attn.HeadGate is { } headGateRef)
         {
             var headGate = TensorOps.MatMulTransposedB(h, _weights.Matrix(headGateRef, attn.NumQHeads, hidden));
@@ -630,7 +630,8 @@ public sealed partial class GenericRuntime
     {
         _linearStates.Clear();
         _convStates.Clear();
-        ResetQwen4State();
+        ResetHyperConnectionState();
+        ResetSparseAttentionState();
         ResetVisitState();
         SessionPosition = 0;
         if (_patches.Count > 0)
@@ -941,7 +942,7 @@ public sealed partial class GenericRuntime
         return mixture;
     }
 
-    // ── conv layer (LFM2/LFM3 gated short convolution) ──────────────────
+    // ── conv layer (gated short convolution) ─────────────────────────────
 
     /// <summary>Per conv layer: the last (kernel-1) rows of B⊙x, oldest
     /// first, zero before the session's first token.</summary>
@@ -1288,7 +1289,7 @@ public sealed partial class GenericRuntime
     {
         if (_plan.FinalMixer is { } mixer)
         {
-            // Qwen4: the streams are read into one hidden state, not normalised in place.
+            // A gated residual: the streams are read into one hidden state, not normalised in place.
             return HyperRead(hidden, mixer).Read;
         }
         if (_plan.RunsByVisit)
