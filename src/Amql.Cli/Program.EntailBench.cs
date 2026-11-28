@@ -29,7 +29,11 @@ internal static partial class Program
         var template = ChatTemplate.Load(tokenizerDir);
         bool think = !args.Contains("--no-think");
         // The token that closes reasoning in this model's own template: </think>, Gemma 4's <channel|>.
-        string thinkClose = template?.Dialect.ThinkCloseMark is { Length: > 0 } mark ? mark : "</think>";
+        // Where the close is several tokens (<|end_message|><|message_model|><|content_text|>),
+        // its last: the answer starts after it, as {mark:think_close} reads it.
+        string thinkClose = template?.Dialect.ThinkCloseMark is { Length: > 0 } mark
+            ? tokenizer.EncodeToIds(mark) is { Count: > 1 } closeIds ? tokenizer.DecodeText(new List<int> { closeIds[^1] }, skipSpecialTokens: false) : mark
+            : "</think>";
         int maxTokens = IntOption(args, "--max-tokens", think ? 2048 : 512);
         string? reportPath = OptionValue(args, "--report");
         // --score answer (the default) reads a committed number; --score tools reads what a

@@ -8,6 +8,26 @@ public static class TurnMarks
     /// <summary>The first token of its own (an added token) in a piece of template text, or null.</summary>
     public static int? First(HfTokenizer tokenizer, string text) => All(tokenizer, text) is [var first, ..] ? first : null;
 
+    /// <summary>
+    /// The token a reply ends on: the first of its own the template writes after a reply,
+    /// passing over any it also writes to close reasoning. Where every message ends with the
+    /// same token (<c>&lt;|end_message|&gt;</c>, then <c>&lt;|content_model_end_sampling|&gt;</c>
+    /// after the last), that token closes the thinking too and must not end the reply.
+    /// </summary>
+    public static int? ReplyEnd(HfTokenizer tokenizer, ChatDialect dialect)
+    {
+        var closes = dialect.ThinkCloseMark.Length > 0 ? All(tokenizer, dialect.ThinkCloseMark) : [];
+        var ends = All(tokenizer, dialect.AfterReply);
+        foreach (int id in ends)
+        {
+            if (!closes.Contains(id))
+            {
+                return id;
+            }
+        }
+        return ends.Count > 0 ? ends[0] : null;
+    }
+
     /// <summary>The tokens that open a user's turn, name the user in it, open the assistant's turn (when that
     /// is another token), and open a call's result (when it is in the assistant's turn); each null when there is none.</summary>
     public static (int? Turn, int? User, int? Reply, int? Result) Openers(HfTokenizer tokenizer, ChatDialect dialect)
