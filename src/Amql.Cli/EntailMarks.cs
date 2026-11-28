@@ -10,6 +10,9 @@ namespace Amql.Cli;
 /// <remarks>
 /// <list type="table">
 /// <item><term>think_open, think_close</term><description>The tokens that open and close reasoning: <c>&lt;think&gt;</c>, <c>&lt;/think&gt;</c>; <c>&lt;|channel&gt;</c>, <c>&lt;channel|&gt;</c>.</description></item>
+/// <item><term>think_end</term><description>The token to write to close reasoning: the close's first token. The same as
+/// think_close where the close is one token; where it is several (<c>&lt;|end_message|&gt;&lt;|message_model|&gt;&lt;|content_text|&gt;</c>)
+/// the model writes the rest itself.</description></item>
 /// <item><term>reply_open</term><description>The last token the template writes between reasoning and the reply: <c>\n\n</c> after Qwen's <c>&lt;/think&gt;</c>, Gemma's <c>&lt;channel|&gt;</c> itself. The reply's first token comes next.</description></item>
 /// <item><term>call_open</term><description>The token a call starts with: <c>&lt;tool_call&gt;</c>, <c>&lt;|tool_call&gt;</c>.</description></item>
 /// <item><term>turn_open</term><description>The token a turn starts with, before its role: <c>&lt;|im_start|&gt;</c>, <c>&lt;|turn&gt;</c>.</description></item>
@@ -19,7 +22,7 @@ namespace Amql.Cli;
 /// </remarks>
 public static class EntailMarks
 {
-    private static readonly Regex Name = new(@"(?<!\\)\{mark:(think_open|think_close|reply_open|call_open|turn_open|turn_close|eos|system|user|assistant)\}", RegexOptions.CultureInvariant);
+    private static readonly Regex Name = new(@"(?<!\\)\{mark:(think_open|think_close|think_end|reply_open|call_open|turn_open|turn_close|eos|system|user|assistant)\}", RegexOptions.CultureInvariant);
 
     private const string SystemProbe = "qzsystemq", UserProbe = "qzuserq", SaidProbe = "Qzsaidq";
 
@@ -90,8 +93,15 @@ public static class EntailMarks
         var dialect = template.Dialect;
         if (dialect.ThinkOpenMark.Length > 0 && dialect.ThinkCloseMark.Length > 0)
         {
-            Put("think_open", Pieces(dialect.ThinkOpenMark).FirstOrDefault());
-            Put("think_close", Pieces(dialect.ThinkCloseMark).LastOrDefault());
+            // Where the open and close share pieces (a turn header written by both, as
+            // <|message_model|> is around <|content_thinking|>), the open is its first piece the
+            // close does not write. The close is read on its last piece, and written from its
+            // first (think_end): the model writes the rest, as after its own close.
+            var closePieces = Pieces(dialect.ThinkCloseMark);
+            var openPieces = Pieces(dialect.ThinkOpenMark);
+            Put("think_open", openPieces.FirstOrDefault(p => !closePieces.Contains(p)) ?? openPieces.FirstOrDefault());
+            Put("think_close", closePieces.LastOrDefault());
+            Put("think_end", closePieces.FirstOrDefault());
             // What the template writes after the close mark, newlines included, ends with the reply's lead.
             string close = dialect.ThinkClose!;
             string after = close[(close.IndexOf(dialect.ThinkCloseMark, StringComparison.Ordinal) + dialect.ThinkCloseMark.Length)..];

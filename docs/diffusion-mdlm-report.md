@@ -25,7 +25,7 @@ one thing from Qwen3: the causal mask becomes a padding-only mask. Logits at pos
 - **Reference:** `scripts/diffusion/mdlm_ref.py` is a float32 PyTorch forward built from the safetensors. Running the checkpoint's remote code was blocked. The reference was checked in causal mode against transformers' `Qwen3ForCausalLM`, with a max difference of 2e-5.
 - **AMQL vs reference, real 0.6B:**
   - Argmax agrees at all 56 positions (a chat prompt plus 32 masks).
-  - Sampled logits are within 0.05 (`MaskedDiffusionTests.Real_Checkpoint_Matches_Reference_When_Available`, gated on `AMQL_MDLM_CONTAINER`).
+  - Sampled logits are within 0.05 (`MaskedDiffusionTests.Real_Checkpoint_Matches_Reference_When_Available`, gated on `AMQL_TEST_CONTAINER` naming an MDLM container).
   - Full generations match **token for token** for "capital of France" (32/32/32) and "prime function" (128/128/32 and 140/140/20), on both the f32 CPU path and the FP16 GPU path.
 - **AMQL vs reference, synthetic 2-layer checkpoint:**
   - Every logit matches within 1e-3.

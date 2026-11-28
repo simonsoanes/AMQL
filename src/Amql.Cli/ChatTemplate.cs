@@ -213,6 +213,12 @@ public sealed class ChatTemplate
         {
             values["thinking"] = thinking;
         }
+        if (Reads.Contains("reasoning_effort"))
+        {
+            // A template that takes an effort rather than a switch: none when not
+            // thinking, its own default when thinking.
+            values["reasoning_effort"] = thinking ? null : "none";
+        }
         foreach (var (name, value) in variables ?? new Dictionary<string, JsonElement>())
         {
             if (name is not ("messages" or "tools" or "add_generation_prompt" or "bos_token" or "eos_token"))

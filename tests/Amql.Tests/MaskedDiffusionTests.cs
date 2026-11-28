@@ -250,12 +250,13 @@ public class MaskedDiffusionTests
     }
 
     /// <summary>The published 0.6B checkpoint, when a container of it is to
-    /// hand (<c>AMQL_MDLM_CONTAINER</c>): logits over the chat prompt plus 32
+    /// hand (<c>AMQL_TEST_CONTAINER</c>): logits over the chat prompt plus 32
     /// masks against the reference, at a strided sample of the vocabulary.</summary>
     [Fact]
     public void Real_Checkpoint_Matches_Reference_When_Available()
     {
-        if (Environment.GetEnvironmentVariable("AMQL_MDLM_CONTAINER") is not { Length: > 0 } containerDir)
+        if (RealCheckpoint.Container(c => c.Graph?.Components.FirstOrDefault(x => x.Id == "target")?.Execution?.Diffusion is not null)
+            is not { } containerDir)
         {
             return;
         }

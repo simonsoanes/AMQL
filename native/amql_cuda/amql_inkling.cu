@@ -795,6 +795,64 @@ __global__ void k_mix(States st, const float* __restrict__ queries, float* __res
     for (int j = threadIdx.x; j < d; j += blockDim.x) no[j] = o[j] * rinv * (nw ? nw[j] : 1.f);
 }
 
+// The same with each thread holding one float4 of every state in registers
+// (d % 4 == 0, d / 4 <= 1024 threads): one round of loads, the weighting from
+// registers, the softmax in one warp.
+__global__ void __launch_bounds__(1024) k_mix4(States st, const float* __restrict__ queries, float* __restrict__ out, int d, MixNorm mn)
+{
+    __shared__ float sh[32];
+    __shared__ float part[10][2][32];
+    __shared__ float w[10];
+    const int n = st.n, d4 = d >> 2, j = threadIdx.x;
+    const bool live = j < d4;
+    long long ro = (long long)blockIdx.y * d;
+    float4 q = live ? reinterpret_cast<const float4*>(queries + (long long)blockIdx.x * d)[j] : make_float4(0.f, 0.f, 0.f, 0.f);
+    float4 v[10];
+    #pragma unroll
+    for (int i = 0; i < 10; i++)
+        v[i] = live && i < n ? reinterpret_cast<const float4*>(st.s[i] + ro)[j] : make_float4(0.f, 0.f, 0.f, 0.f);
+    const int lane = j & 31, wp = j >> 5, warps = blockDim.x >> 5;
+    #pragma unroll
+    for (int i = 0; i < 10; i++)
+    {
+        if (i >= n) break;
+        float a = warp_sum(v[i].x * v[i].x + v[i].y * v[i].y + v[i].z * v[i].z + v[i].w * v[i].w);
+        float b = warp_sum(q.x * v[i].x + q.y * v[i].y + q.z * v[i].z + q.w * v[i].w);
+        if (lane == 0) { part[i][0][wp] = a; part[i][1][wp] = b; }
+    }
+    __syncthreads();
+    if (wp == 0)
+    {
+        float a = 0.f, b = 0.f;
+        if (lane < n)
+            for (int k = 0; k < warps; k++) { a += part[lane][0][k]; b += part[lane][1][k]; }
+        float inv = rsqrtf(a / d + 1e-6f);
+        float logit = lane < n ? b * inv * rsqrtf((float)d) : -INFINITY;
+        float m = warp_max(logit);
+        float e = lane < n ? expf(logit - m) : 0.f;
+        float sum = warp_sum(e);
+        if (lane < n) w[lane] = e / sum * inv;
+    }
+    __syncthreads();
+    float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
+    #pragma unroll
+    for (int i = 0; i < 10; i++)
+    {
+        if (i >= n) break;
+        const float wi = w[i];
+        acc.x += wi * v[i].x; acc.y += wi * v[i].y; acc.z += wi * v[i].z; acc.w += wi * v[i].w;
+    }
+    float* o = out + ((long long)blockIdx.x * gridDim.y + blockIdx.y) * d;
+    if (live) reinterpret_cast<float4*>(o)[j] = acc;
+    float* no = mn.out[blockIdx.x];
+    if (no == nullptr) return;
+    float rinv = rsqrtf(block_sum(acc.x * acc.x + acc.y * acc.y + acc.z * acc.z + acc.w * acc.w, sh) / d + mn.eps);
+    if (!live) return;
+    const float* nw = mn.w[blockIdx.x];
+    float4 g = nw ? reinterpret_cast<const float4*>(nw)[j] : make_float4(1.f, 1.f, 1.f, 1.f);
+    reinterpret_cast<float4*>(no + ro)[j] = make_float4(acc.x * rinv * g.x, acc.y * rinv * g.y, acc.z * rinv * g.z, acc.w * rinv * g.w);
+}
+
 // The message gate's input: [h / rms(h); m / rms(m)].
 // Up to three gates at once (q, k and v take theirs side by side): grid (T, n).
 struct GateCats { const float* h[3]; const float* m[3]; float* cat[3]; };
@@ -1633,7 +1691,16 @@ static void mix(Ctx* x, const std::vector<float*>& blocks, const float* partial,
     mn.eps = x->c.eps;
     if (normOut)
         for (int i = 0; i < count; i++) { mn.w[i] = normW[i]; mn.out[i] = normOut[i]; }
-    k_mix<<<dim3(count, T), 1024, 0, x->stream>>>(st, queries, out, x->c.d, mn);
+    const int d = x->c.d;
+    // The float4 kernel when every vector it reads or writes is 16-byte aligned.
+    auto al = [](const void* p) { return ((uintptr_t)p & 15) == 0; };
+    bool fit = d % 4 == 0 && d / 4 <= 1024 && st.n <= 10 && al(queries) && al(out);
+    for (int i = 0; i < st.n; i++) fit = fit && al(st.s[i]);
+    for (int i = 0; i < count; i++) fit = fit && al(mn.w[i]) && al(mn.out[i]);
+    if (fit)
+        k_mix4<<<dim3(count, T), ((d / 4 + 31) / 32) * 32, 0, x->stream>>>(st, queries, out, d, mn);
+    else
+        k_mix<<<dim3(count, T), 1024, 0, x->stream>>>(st, queries, out, d, mn);
 }
 
 // Message gates g0 .. g0 + n - 1 (n is 1 or 3): gate g reads h[i] and the
@@ -1776,9 +1843,9 @@ static float* run_layer(Ctx* x, Seq* s, int l, Slot& slot, float* h, std::vector
     aa.window = L.full ? 0 : c.window;
     aa.splits = T == 1 ? splits_for(slot) : std::min(splits_for(slot), kRowSplits);
     aa.scale = 1.f / sqrtf((float)hd);
-    // AMQL_INK_TILED=0 keeps a chunk's attention on the per-query kernel (to compare, or as a way out).
+    // AMQL_TILED_ATTENTION=0 keeps a chunk's attention on the per-query kernel (to compare, or as a way out).
     static int tiledOn = -1;
-    if (tiledOn < 0) { const char* v = getenv("AMQL_INK_TILED"); tiledOn = v && v[0] == '0' ? 0 : 1; }
+    if (tiledOn < 0) { const char* v = getenv("AMQL_TILED_ATTENTION"); tiledOn = v && v[0] == '0' ? 0 : 1; }
     bool tiled = tiledOn && T > 1 && !x->exactPrefill && (hd == 16 || hd == 32 || hd == 64 || hd == 128) && heads <= 64;
     if (tiled)
     {

@@ -65,9 +65,8 @@ internal static partial class Program
 
         using var container = Vindex3Container.Open(containerDir);
         using var store = container.CreateOperandStore();
-        var plan = Planner.Plan(container, OptionValue(args, "--component") ?? "target", store);
         var adapters = OpenAdapters(args, tokenizerDir);
-        var session = new SideBySideSession(new DecodeSession(plan, store, null, EntailWorkingSet(args, container)), adapters)
+        var session = new SideBySideSession(DecodeSession.Open(container, OptionValue(args, "--component") ?? "target", store, EntailWorkingSet(args, container)), adapters)
         {
             PriorPrompt = ChatPriorFor(tokenizer),
         };

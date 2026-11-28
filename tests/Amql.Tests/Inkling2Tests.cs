@@ -186,10 +186,14 @@ public sealed class Inkling2Tests
 
     // ── the real checkpoint against transformers ──────────────────────────────
 
+
+    /// <summary>AMQL_TEST_CONTAINER, when it holds an Inkling 2 model.</summary>
+    private static string? InklingContainer() => RealCheckpoint.Container(c => Inkling2Model.Serves(c, "target"));
+
     /// <summary>
     /// Inkling-2-Mini against transformers, when both are to hand:
-    /// <c>AMQL_INKLING_CONTAINER</c> (encoded with <c>--no-vision</c>) and
-    /// <c>AMQL_INKLING_REFERENCE</c>, the output of
+    /// <c>AMQL_TEST_CONTAINER</c> (encoded with <c>--no-vision</c>) and
+    /// <c>AMQL_TEST_REFERENCE</c>, the output of
     /// <c>scripts/reference/stream_reference.py</c> (see its README):
     /// <c>summary.json</c> (per prompt the ids, the top 20 logits, log-sum-exp
     /// and entropy at every position, and a greedy continuation),
@@ -197,7 +201,7 @@ public sealed class Inkling2Tests
     /// the output's RMS, first coordinates and a fingerprint on 16 fixed unit
     /// directions) and <c>{name}.last.f32</c> (the last position's logits).
     /// The directions come from torch's generator, so they are read from
-    /// <c>AMQL_INKLING_DIRECTIONS</c> (16 x hidden little-endian f32) when
+    /// <c>AMQL_TEST_DIRECTIONS</c> (16 x hidden little-endian f32) when
     /// given; without them the fingerprints are not compared. Both the managed
     /// runtime and the GPU path (where it runs) are compared and every number is
     /// printed. The reference may run in bf16 and these in f32, so the
@@ -208,8 +212,7 @@ public sealed class Inkling2Tests
     [Fact]
     public void Real_Checkpoint_Matches_Transformers_When_Available()
     {
-        if (Environment.GetEnvironmentVariable("AMQL_INKLING_CONTAINER") is not { Length: > 0 } containerDir ||
-            Environment.GetEnvironmentVariable("AMQL_INKLING_REFERENCE") is not { Length: > 0 } referenceDir)
+        if (InklingContainer() is not { } containerDir || RealCheckpoint.Setting("REFERENCE") is not { } referenceDir)
         {
             return;
         }
@@ -221,7 +224,7 @@ public sealed class Inkling2Tests
         var model = Inkling2Model.Load(container, store);
         int hidden = container.Graph!.Component("target").HiddenSize;
         float[][]? directions = null;
-        if (Environment.GetEnvironmentVariable("AMQL_INKLING_DIRECTIONS") is { Length: > 0 } dirPath)
+        if (RealCheckpoint.Setting("DIRECTIONS") is { } dirPath)
         {
             var raw = File.ReadAllBytes(dirPath);
             var flat = new float[raw.Length / 4];
@@ -362,12 +365,12 @@ public sealed class Inkling2Tests
         return max + Math.Log(x.Sum(v => Math.Exp(v - max)));
     }
 
-    /// <summary>The real checkpoint without a reference (<c>AMQL_INKLING_CONTAINER</c>
+    /// <summary>The real checkpoint without a reference (<c>AMQL_TEST_CONTAINER</c>
     /// alone): a plain prompt whose continuation is not in doubt.</summary>
     [Fact]
     public void Real_Checkpoint_Completes_A_Plain_Prompt_When_Available()
     {
-        if (Environment.GetEnvironmentVariable("AMQL_INKLING_CONTAINER") is not { Length: > 0 } containerDir)
+        if (InklingContainer() is not { } containerDir)
         {
             return;
         }
@@ -396,21 +399,21 @@ public sealed class Inkling2Tests
 
     /// <summary>
     /// The real checkpoint on the GPU path against the managed runtime
-    /// (<c>AMQL_INKLING_CONTAINER</c>, a CUDA device and amql_cuda): a few
+    /// (<c>AMQL_TEST_CONTAINER</c>, a CUDA device and amql_cuda): a few
     /// prompts, the top five at every position and a greedy continuation. f32
     /// rows and f32 prompts, so the two differ only in summation order;
-    /// <c>AMQL_INKLING_STEPS</c> sets the greedy length (12). Then the default
+    /// <c>AMQL_TEST_STEPS</c> sets the greedy length (12). Then the default
     /// BF16 prompts, held to the same top token at 95% of positions.
     /// </summary>
     [Fact]
     public void Real_Checkpoint_Gpu_Matches_Managed_When_Available()
     {
-        if (Environment.GetEnvironmentVariable("AMQL_INKLING_CONTAINER") is not { Length: > 0 } containerDir ||
+        if (InklingContainer() is not { } containerDir ||
             !Inkling2Gpu.Available)
         {
             return;
         }
-        int steps = int.TryParse(Environment.GetEnvironmentVariable("AMQL_INKLING_STEPS"), out var n) ? n : 12;
+        int steps = int.TryParse(RealCheckpoint.Setting("STEPS"), out var n) ? n : 12;
         var tokenizer = HfTokenizer.FromModelDir(containerDir);
         using var container = Vindex3Container.Open(containerDir);
         using var store = container.CreateOperandStore();
@@ -490,14 +493,14 @@ public sealed class Inkling2Tests
     }
 
     /// <summary>The GPU path's speeds on the real checkpoint
-    /// (<c>AMQL_INKLING_CONTAINER</c> and <c>AMQL_INKLING_SPEED=1</c>, on a quiet
+    /// (<c>AMQL_TEST_CONTAINER</c> and <c>AMQL_TEST_SPEED=1</c>, on a quiet
     /// machine): a prompt of each length fed in chunks, then 128 greedy steps
     /// after it, per KV format; and the device memory a sequence takes.</summary>
     [Fact]
     public void Real_Checkpoint_Gpu_Speed_When_Available()
     {
-        if (Environment.GetEnvironmentVariable("AMQL_INKLING_CONTAINER") is not { Length: > 0 } containerDir ||
-            Environment.GetEnvironmentVariable("AMQL_INKLING_SPEED") != "1" || !Inkling2Gpu.Available)
+        if (InklingContainer() is not { } containerDir ||
+            RealCheckpoint.Setting("SPEED") != "1" || !Inkling2Gpu.Available)
         {
             return;
         }

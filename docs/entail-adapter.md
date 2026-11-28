@@ -125,18 +125,19 @@ closes, where a turn starts, how a call opens. They differ by family. Qwen write
 and `entail adapter` spells them from the partner's own chat template, learned by
 probing it as the server does ([server.md](server.md#chat-templates)):
 
-| Mark | Qwen 3.5 | Gemma 4 |
-| --- | --- | --- |
-| `{mark:think_open}`, `{mark:think_close}` | `<think>`, `</think>` | `<|channel>`, `<channel|>` |
-| `{mark:reply_open}`, the last token before a reply | `\n\n` | `<channel|>` |
-| `{mark:call_open}` | `<tool_call>` | `<|tool_call>` |
-| `{mark:turn_open}`, `{mark:turn_close}` | `<|im_start|>`, `<|im_end|>` | `<|turn>`, `<turn|>` |
-| `{mark:system}`, `{mark:user}`, `{mark:assistant}` | `system`, `user`, `assistant` | `system`, `user`, `model` |
-| `{mark:eos}` | `<|im_end|>` | `<eos>` |
+| Mark | Qwen 3.5 | Gemma 4 | Inkling 2 |
+| --- | --- | --- | --- |
+| `{mark:think_open}`, `{mark:think_close}` | `<think>`, `</think>` | `<|channel>`, `<channel|>` | `<|content_thinking|>`, `<|content_text|>` |
+| `{mark:think_end}`, what closes reasoning when written | `</think>` | `<channel|>` | `<|end_message|>` |
+| `{mark:reply_open}`, the last token before a reply | `\n\n` | `<channel|>` | `<|content_text|>` |
+| `{mark:call_open}` | `<tool_call>` | `<|tool_call>` | none learned |
+| `{mark:turn_open}`, `{mark:turn_close}` | `<|im_start|>`, `<|im_end|>` | `<|turn>`, `<turn|>` | `<|message_user|>`, `<|end_message|>` |
+| `{mark:system}`, `{mark:user}`, `{mark:assistant}` | `system`, `user`, `assistant` | `system`, `user`, `model` | none (the role is the turn token) |
+| `{mark:eos}` | `<|im_end|>` | `<eos>` | `<|content_model_end_sampling|>` |
 
 ```
 token "{mark:think_close}" means close_think = 1
-emit "{mark:think_close}" when close
+emit "{mark:think_end}" when close
 ```
 
 The adapter keeps the program as spelt, so it loads with no template. A mark the

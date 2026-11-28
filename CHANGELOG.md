@@ -317,6 +317,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- **inkling 2:** decode is about 141 tok/s from a short prompt (125 before): the block-residual mixes hold each state in registers and take 3.0 µs instead of 10.4 ([docs](docs/inkling-2.md)).
+- **tests:** the real-checkpoint tests read one set of variables for every model: `AMQL_TEST_CONTAINER`, and `AMQL_TEST_REFERENCE`, `_DIRECTIONS`, `_STEPS` and `_SPEED`. Each test checks the container is its kind of model and skips it otherwise. They were `AMQL_INKLING_*` and `AMQL_MDLM_CONTAINER`.
+- **gpu:** `AMQL_GPU_GRAPHS=0` (was `AMQL_INKLING_GRAPHS`) and `AMQL_TILED_ATTENTION=0` (was `AMQL_INK_TILED`).
+- **entail:** `{mark:think_end}` is the token a program writes to close reasoning, the first of the template's close; `{mark:think_close}`, the last, is what it reads. They differ where the close is several tokens (`<|end_message|><|message_model|><|content_text|>`), and `{mark:think_open}` skips a turn header the close also writes. `stop-circling` writes `think_end`. A template that takes `reasoning_effort` rather than a thinking switch gets `none` when not thinking.
+- **entail:** `entail eval`, `side` and `bench` open a container however it runs (`DecodeSession.Open`), so an Inkling 2 container runs beside adapters.
 - **inkling 2:** decode is 10-15% faster: about 125 tok/s from a short prompt (105 before), and 93 at 64K positions with fp16 rows (83).
   - **Experts:** a step's experts run on the engine's decode kernels (`amqe_moe_experts_paired_step`). The engine gained an MXFP8 reader and a paired mode for interleaved gate and up rows with Inkling's softcaps.
   - **Fewer launches:** the q, k and v message gates, their norms and the head preparation share launches, and a norm that follows a block-residual mix runs inside the mix.
@@ -324,7 +329,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **inkling 2:** a prompt chunk's attention runs on the tensor cores: FlashAttention-2 with FP16 tiles (`k_attn_tiles`), each tile of 64 keys decoded once from f32, fp16 or NVFP4 rows for 64 queries, with Inkling's relative bias added from a per-chunk table ([docs](docs/inkling-2.md#gpu-path)).
   - **Speed:** on an RTX 5090, prompts now hold about 1,800-2,000 tok/s from 4K to 64K tokens. At 64K that is 1,839 tok/s with fp16 rows (654 with the per-query attention) and 1,787 with NVFP4 rows (265). Decode is unchanged.
   - **Accuracy:** BF16 prompts are as close to f32 with it as with the per-query kernel: on a 2,048-token prompt, the top token agrees at 2,043-2,046 positions and the median KL is 1-2e-5 either way.
-  - **The old kernel:** `ExactPrefill` and `AMQL_INK_TILED=0` keep the per-query kernel.
+  - **The old kernel:** `ExactPrefill` and `AMQL_TILED_ATTENTION=0` keep the per-query kernel.
 - **inkling 2:** Inkling 2's GPU kernels are built into `amql_cuda.dll` with the engine, instead of a library of their own (`amql_inkling.dll` and `build-inkling.cmd` are gone). A prompt chunk's projections and experts now run on the engine's BF16 tensor-core GEMMs and grouped experts, as the other models' prompts do. The engine's experts gained an MXFP8 decode, exact in BF16, and the interleaved, softcapped SwiGLU that Inkling uses (`amqe_moe_experts_paired`); its existing calls are unchanged.
   - **Speed:** on an RTX 5090, prompts run at 1,442-1,834 tok/s up to 4K tokens, against 575-630 before; 1,226 at 16K (536 before) and 686 at 64K (397 before) with fp16 rows. Decode is unchanged.
   - **Matching:** with BF16 prompts, the default, the top token matches the managed runtime at all 614 positions of the real-checkpoint prompts, and the KL divergence from f32 prompts is 5e-5 at the median. `Inkling2Gpu.ExactPrefill` keeps prompts at f32, within 1e-3 of the managed runtime.

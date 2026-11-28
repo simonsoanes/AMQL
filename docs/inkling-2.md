@@ -89,8 +89,8 @@ from transformers' single per-expert factor (llama.cpp PR #32704 was cited).
 - `Inkling2Tests.Quantised_Experts_Export_As_Stored`: export gives back every
   tensor with its dtype, shape and bytes, and re-imports to the same logits.
 - `Inkling2Tests.Real_Checkpoint_Matches_Transformers_When_Available` runs
-  when two variables are set: `AMQL_INKLING_CONTAINER` (a container encoded as
-  above) and `AMQL_INKLING_REFERENCE` (the output of
+  when two variables are set: `AMQL_TEST_CONTAINER` (a container encoded as
+  above) and `AMQL_TEST_REFERENCE` (the output of
   `scripts/reference/stream_reference.py`, which runs transformers a layer at a
   time in a few GB). It reads three files:
   - `summary.json`: per prompt, the ids, the top-k logits, log-sum-exp and
@@ -104,7 +104,7 @@ from transformers' single per-expert factor (llama.cpp PR #32704 was cited).
   90% of positions and at the last, the last top five, and the first four
   greedy tokens. It prints the differences.
 - `Inkling2Tests.Real_Checkpoint_Completes_A_Plain_Prompt_When_Available`
-  (`AMQL_INKLING_CONTAINER` alone) is a smoke test without a reference.
+  (`AMQL_TEST_CONTAINER` alone) is a smoke test without a reference.
 
 The first reference, `golden.py`, loaded the whole model in transformers (bf16
 on CPU). It reached 97 GB private memory and took the machine to its commit
@@ -127,7 +127,7 @@ give the same numbers to the printed precision:
 
 The layer outputs are compared on the reference's 16 fixed directions, made
 once with torch's generator (`torch.Generator().manual_seed(20261127 + 2304)`,
-`randn(16, 2304)`, normalised). They are read from `AMQL_INKLING_DIRECTIONS`.
+`randn(16, 2304)`, normalised). They are read from `AMQL_TEST_DIRECTIONS`.
 The differences are the size bf16 arithmetic gives, and none grows across the
 loop's passes.
 
@@ -242,7 +242,7 @@ prompts run (`amqe_linear`, `amqe_moe_experts_paired`). The kernels mirror
     The relative bias for the chunk is computed first, as a table of query,
     head and distance, and added to the scores within its extent.
   - **The old kernel:** `ExactPrefill` keeps a chunk on the f32 per-query
-    kernel, and so does `AMQL_INK_TILED=0`.
+    kernel, and so does `AMQL_TILED_ATTENTION=0`.
 
 **Served.** `ModelHost` sends an Inkling 2 container to
 `DecodeSession.ForInkling2`: the GPU path when a device and the library are
@@ -297,7 +297,7 @@ Measured on the RTX 5090 (32 GB) on 2026-11-27 with nothing else running:
   The columns:
   - **Prompt tok/s:** the default, tensor-core projections, experts and
     attention.
-  - **Per-query attention:** the same run with `AMQL_INK_TILED=0`.
+  - **Per-query attention:** the same run with `AMQL_TILED_ATTENTION=0`.
   - **All f32 kernels:** projections, experts and attention all on Inkling's
     own f32 kernels.
   - **Decode before:** with Inkling's own expert kernels and a launch for
@@ -320,10 +320,13 @@ Measured on the RTX 5090 (32 GB) on 2026-11-27 with nothing else running:
 
   The tail comes from the BF16 projections and experts, not the attention.
 
-- **Decode.** `amql-cli generate` on a 5-token prompt decodes at about 125
+- **Decode.** `amql-cli generate` on a 5-token prompt decodes at about 141
   tok/s, up from 105.
   - **Gains:** the engine's expert kernels gave about 8%, and the shared
-    launches and the norms inside the mixes about 10% more.
+    launches and the norms inside the mixes about 10% more. The mixes then
+    went from 10.4 to 3.0 µs each (120 a step) by holding each thread's
+    float4 of every state in registers, one round of loads, and doing the
+    softmax in one warp: 125 to 141 tok/s.
   - **Bound:** decode reads about 5.4 GB a token, 2.6 GB of attention
     projections over 48 visits, 1.85 GB of chosen experts and 0.9 GB of head.
     That puts the bandwidth bound near 330 tok/s.
@@ -331,8 +334,14 @@ Measured on the RTX 5090 (32 GB) on 2026-11-27 with nothing else running:
     - the projections and head, 2.5 ms, at about 77% of bandwidth;
     - the experts, about 2.4 ms;
     - the rest, about 900 small kernels at a few microseconds each.
-  - **Ruled out:** programmatic dependent launch, tried for those small
-    kernels, gained nothing inside the graph.
+  - **Ruled out:**
+    - programmatic dependent launch, on every launch, gained nothing inside
+      the graph. Rewriting the captured graph's kernel edges to programmatic
+      ones on the all-blocks-launched port, except behind one-block kernels
+      (753 of 987 edges), gained nothing either: 139.8 against 141.6 tok/s.
+    - a down projection that gives a warp 8 of the 1,152-wide rows as one
+      run of 288 16-byte chunks (so no lane idles on a second pass) was 7%
+      slower than the engine's kernel, its loads issued first or not.
 - **Memory.** The weights take 17.64 GiB. A sequence's KV rows and
   convolution histories (40 sliding rings of 1,280 f32 rows, plus the 8 full
   slots) take:

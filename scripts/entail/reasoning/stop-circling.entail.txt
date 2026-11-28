@@ -49,4 +49,4 @@ entail done when count >= BUDGET, thinking, not last_done, not again
 
 state close
 entail close when done, newline
-emit "{mark:think_close}" when close
+emit "{mark:think_end}" when close

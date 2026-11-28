@@ -56,6 +56,21 @@ public sealed class DecodeSession : IDisposable
             : new DecodeSession(Inkling2Model.Load(container, store), reason);
     }
 
+    /// <summary>
+    /// The session for a container's component, however it runs: a planned
+    /// stack, or a model with a runtime of its own (an Inkling 2 looped
+    /// container, until the planner describes it). The one place callers that
+    /// only need a session should open it from.
+    /// </summary>
+    public static DecodeSession Open(Vindex3Container container, string component, OperandStore store, WeightWorkingSet? workingSet = null)
+    {
+        if (Inkling2Model.Serves(container, component))
+        {
+            return ForInkling2(container, store);
+        }
+        return new DecodeSession(Planner.Plan(container, component, store), store, null, workingSet);
+    }
+
     private InvalidOperationException NoPlan(string what) =>
         new($"{what} needs a planned stack; this session runs {(_model is Inkling2Model ? "Inkling2Model" : _model!.GetType().Name)}");
 

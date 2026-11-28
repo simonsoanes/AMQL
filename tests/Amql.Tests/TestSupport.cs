@@ -3,6 +3,30 @@ using Amql.Vindex3;
 
 namespace Amql.Tests;
 
+/// <summary>The real checkpoints the gated tests read.</summary>
+public static class RealCheckpoint
+{
+    /// <summary>
+    /// <c>AMQL_TEST_CONTAINER</c> when it names a container this test reads
+    /// (<paramref name="suits"/>), otherwise null: one variable for every
+    /// model, and the tests for other families skip it.
+    /// </summary>
+    public static string? Container(Func<Vindex3Container, bool> suits)
+    {
+        if (Environment.GetEnvironmentVariable("AMQL_TEST_CONTAINER") is not { Length: > 0 } dir ||
+            !File.Exists(System.IO.Path.Combine(dir, "index.json")))
+        {
+            return null;
+        }
+        using var container = Vindex3Container.Open(dir);
+        return suits(container) ? dir : null;
+    }
+
+    /// <summary>A further setting of the gated tests (<c>AMQL_TEST_</c> + name), or null.</summary>
+    public static string? Setting(string name) =>
+        Environment.GetEnvironmentVariable("AMQL_TEST_" + name) is { Length: > 0 } v ? v : null;
+}
+
 /// <summary>Disposable temp directory for test fixtures.</summary>
 public sealed class TempDir : IDisposable
 {

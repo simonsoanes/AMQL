@@ -105,7 +105,7 @@ public sealed class Inkling2Gpu : IDisposable
     private bool _exactPrefill;
 
     /// <summary>False runs each step's launches directly instead of replaying the captured graph.</summary>
-    public bool UseGraphs { get; set; } = Environment.GetEnvironmentVariable("AMQL_INKLING_GRAPHS")?.Trim() is not "0";
+    public bool UseGraphs { get; set; } = Environment.GetEnvironmentVariable("AMQL_GPU_GRAPHS")?.Trim() is not "0";
 
     private Inkling2Gpu(IntPtr ctx, Inkling2Surface facts, long context)
     {
